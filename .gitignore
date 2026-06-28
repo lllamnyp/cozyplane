@@ -1,0 +1,6 @@
+/bin/
+cover.out
+*.test
+
+# eBPF CO-RE header (generated at build time via bpftool); not needed for `go build`
+bpf/vmlinux.h
