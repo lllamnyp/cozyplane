@@ -13,6 +13,13 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type overlayEndpoint struct {
+	_       structs.HostLayout
+	Ifindex uint32
+	Mac     [6]uint8
+	Pad     [2]uint8
+}
+
 type overlayLpmKey struct {
 	_         structs.HostLayout
 	Prefixlen uint32
@@ -23,11 +30,13 @@ type overlayLpmKey struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
+	overlayMapLocals            = "locals"
 	overlayMapNetworks          = "networks"
 	overlayMapParams            = "params"
 	overlayMapPorts             = "ports"
 	overlayMapRemotes           = "remotes"
 	overlayProgCozyplaneFromPod = "cozyplane_from_pod"
+	overlayProgCozyplaneToPod   = "cozyplane_to_pod"
 )
 
 // loadOverlay returns the embedded CollectionSpec for overlay.
@@ -73,12 +82,14 @@ type overlaySpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type overlayProgramSpecs struct {
 	CozyplaneFromPod *ebpf.ProgramSpec `ebpf:"cozyplane_from_pod"`
+	CozyplaneToPod   *ebpf.ProgramSpec `ebpf:"cozyplane_to_pod"`
 }
 
 // overlayMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type overlayMapSpecs struct {
+	Locals   *ebpf.MapSpec `ebpf:"locals"`
 	Networks *ebpf.MapSpec `ebpf:"networks"`
 	Params   *ebpf.MapSpec `ebpf:"params"`
 	Ports    *ebpf.MapSpec `ebpf:"ports"`
@@ -111,6 +122,7 @@ func (o *overlayObjects) Close() error {
 //
 // It can be passed to loadOverlayObjects or ebpf.CollectionSpec.LoadAndAssign.
 type overlayMaps struct {
+	Locals   *ebpf.Map `ebpf:"locals"`
 	Networks *ebpf.Map `ebpf:"networks"`
 	Params   *ebpf.Map `ebpf:"params"`
 	Ports    *ebpf.Map `ebpf:"ports"`
@@ -119,6 +131,7 @@ type overlayMaps struct {
 
 func (m *overlayMaps) Close() error {
 	return _OverlayClose(
+		m.Locals,
 		m.Networks,
 		m.Params,
 		m.Ports,
@@ -137,11 +150,13 @@ type overlayVariables struct {
 // It can be passed to loadOverlayObjects or ebpf.CollectionSpec.LoadAndAssign.
 type overlayPrograms struct {
 	CozyplaneFromPod *ebpf.Program `ebpf:"cozyplane_from_pod"`
+	CozyplaneToPod   *ebpf.Program `ebpf:"cozyplane_to_pod"`
 }
 
 func (p *overlayPrograms) Close() error {
 	return _OverlayClose(
 		p.CozyplaneFromPod,
+		p.CozyplaneToPod,
 	)
 }
 

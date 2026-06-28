@@ -34,6 +34,9 @@ What kube-ovn gets *right* and we must keep:
    exotic userspace forwarding on the pod fast path.
 5. **One CNI, many postures.** System workloads get flat reachability; tenant
    workloads get isolated VPCs. Same CNI, selected per workload.
+6. **Placement independence.** Enforcement never depends on whether two pods
+   share a node. No same-node fast path that skips the policy hooks; locality
+   affects transport only. (See §4 — the invariant.)
 
 ## 2. The three planes
 
@@ -128,6 +131,32 @@ recommendation for both open questions about implementation.
   place a userspace datapath may earn its keep is **dedicated gateway nodes**
   (VPC↔internet, heavy SNAT/NAT64, IPsec/WireGuard termination) — an optional,
   isolated role, not the common case.
+
+### Placement independence (invariant)
+
+**Every packet is policy-enforced at two hooks it always traverses regardless of
+pod placement, and pod locality determines only transport — never whether a
+packet is inspected.** Concretely:
+
+- **Egress hook** — `from_pod`, at the source pod's host-veth ingress. Every
+  packet a pod emits crosses it *before* any locality decision.
+- **Ingress hook** — `to_pod`, at the destination pod's host-veth egress. Every
+  delivery path leaves via the destination veth — same-node redirect, cross-node
+  decap-then-route, and the node→pod bridge alike — so this hook sees all of it.
+
+Same-node traffic is therefore **not** special-cased: it is delivered by an eBPF
+redirect *through* the destination's ingress hook, not by a kernel-routing
+shortcut that would skip enforcement. Co-located pods cannot bypass isolation or
+(future) network policy; behaviour does not depend on the scheduler. This is a
+deliberate rejection of the common "same-node fast path" optimization, which
+makes behaviour placement-dependent and is a well-known source of policy-bypass
+bugs and placement-coupled debugging. Locality changes only the transport
+(direct redirect vs Geneve), and only because a remote destination *must* be
+encapsulated.
+
+Network policy / security groups live in these two hooks: egress rules in
+`from_pod`, ingress rules in `to_pod`. Because both hooks are universal, a rule is
+enforced identically no matter where source and destination are scheduled.
 
 ### Encapsulation
 

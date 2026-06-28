@@ -27,8 +27,11 @@ const (
 	// pinned so the agent and the (short-lived) CNI plugin share them.
 	PinRoot = "/sys/fs/bpf/cozyplane"
 
-	// progPinName is the pinned name of the from-pod classifier program.
+	// progPinName is the pinned name of the from-pod (egress) classifier.
 	progPinName = "cozyplane_from_pod"
+
+	// toPodPinName is the pinned name of the to-pod (ingress) classifier.
+	toPodPinName = "cozyplane_to_pod"
 
 	// GeneveDevice is the per-node collect_metadata Geneve device.
 	GeneveDevice = "cozyplane0"

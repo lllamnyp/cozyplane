@@ -343,18 +343,21 @@ func setupVeth(args *skel.CmdArgs, cniVersion string, podIP net.IP, mtu int, net
 	defer hostNS.Close()
 
 	var hostVethName string
+	var podMAC net.HardwareAddr
 	if err := ns.WithNetNSPath(args.Netns, func(ns.NetNS) error {
 		hostVeth, _, e := ip.SetupVethWithName(contVethName, hostVethNameFor(args.ContainerID), mtu, "", hostNS)
 		if e != nil {
 			return e
 		}
 		hostVethName = hostVeth.Name
-		return configurePodIface(podIP)
+		mac, e := configurePodIface(podIP)
+		podMAC = mac
+		return e
 	}); err != nil {
 		return nil, err
 	}
 
-	if err := configureHostVeth(hostVethName, podIP, netID); err != nil {
+	if err := configureHostVeth(hostVethName, podIP, netID, podMAC); err != nil {
 		return nil, err
 	}
 
@@ -378,35 +381,38 @@ func ipamStdin(stdin []byte, podCIDR string) ([]byte, error) {
 }
 
 // configurePodIface sets the pod's eth0 address, brings it up, and installs the
-// link-local default route. Runs inside the pod netns.
-func configurePodIface(podIP net.IP) error {
+// link-local default route. Runs inside the pod netns. Returns the eth0 MAC so
+// the host side can record it for same-node redirect delivery.
+func configurePodIface(podIP net.IP) (net.HardwareAddr, error) {
 	link, err := netlink.LinkByName(contVethName)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := netlink.AddrAdd(link, &netlink.Addr{IPNet: &net.IPNet{IP: podIP, Mask: net.CIDRMask(32, 32)}}); err != nil {
-		return fmt.Errorf("add pod address: %w", err)
+		return nil, fmt.Errorf("add pod address: %w", err)
 	}
 	if err := netlink.LinkSetUp(link); err != nil {
-		return err
+		return nil, err
 	}
+	mac := link.Attrs().HardwareAddr
 	if err := netlink.RouteAdd(&netlink.Route{
 		LinkIndex: link.Attrs().Index,
 		Scope:     netlink.SCOPE_LINK,
 		Dst:       &net.IPNet{IP: linkLocalGW, Mask: net.CIDRMask(32, 32)},
 	}); err != nil {
-		return fmt.Errorf("add gateway route: %w", err)
+		return nil, fmt.Errorf("add gateway route: %w", err)
 	}
 	if err := netlink.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Gw: linkLocalGW}); err != nil {
-		return fmt.Errorf("add default route: %w", err)
+		return nil, fmt.Errorf("add default route: %w", err)
 	}
-	return nil
+	return mac, nil
 }
 
 // configureHostVeth brings up the host-side veth, enables proxy_arp and
-// forwarding, installs the /32 route, attaches the classifier, and records the
-// pod's network id.
-func configureHostVeth(name string, podIP net.IP, netID uint32) error {
+// forwarding, installs the /32 route (host->local-pod), attaches both classifier
+// hooks (from_pod ingress, to_pod egress), and records the pod's network id and
+// local endpoint.
+func configureHostVeth(name string, podIP net.IP, netID uint32, podMAC net.HardwareAddr) error {
 	hv, err := netlink.LinkByName(name)
 	if err != nil {
 		return err
@@ -431,15 +437,32 @@ func configureHostVeth(name string, podIP net.IP, netID uint32) error {
 		return fmt.Errorf("add pod /32 route: %w", err)
 	}
 
-	prog, err := datapath.OpenPinnedProgram()
+	idx := hv.Attrs().Index
+
+	fromPod, err := datapath.OpenPinnedProgram()
 	if err != nil {
 		return err
 	}
-	defer prog.Close()
-	if err := datapath.AttachIngress(hv.Attrs().Index, prog); err != nil {
+	defer fromPod.Close()
+	if err := datapath.AttachIngress(idx, fromPod); err != nil {
 		return err
 	}
-	return datapath.SetPortNet(hv.Attrs().Index, netID)
+
+	toPod, err := datapath.OpenPinnedToPod()
+	if err != nil {
+		return err
+	}
+	defer toPod.Close()
+	if err := datapath.AttachEgress(idx, toPod); err != nil {
+		return err
+	}
+
+	if err := datapath.SetPortNet(idx, netID); err != nil {
+		return err
+	}
+	// Record the local endpoint so same-node traffic to this pod is delivered by
+	// eBPF redirect (through to_pod), not a kernel-routing shortcut.
+	return datapath.SetLocal(podIP, idx, podMAC)
 }
 
 func cmdDel(args *skel.CmdArgs) error {
@@ -483,9 +506,15 @@ func cmdDel(args *skel.CmdArgs) error {
 		return nil
 	}
 	return ns.WithNetNSPath(args.Netns, func(ns.NetNS) error {
-		_, e := ip.DelLinkByNameAddr(contVethName)
+		addrs, e := ip.DelLinkByNameAddr(contVethName)
 		if e == ip.ErrLinkNotFound {
 			return nil
+		}
+		// Release the locals entry for the pod's address(es).
+		for _, a := range addrs {
+			if a.IP != nil {
+				_ = datapath.DelLocal(a.IP)
+			}
 		}
 		return e
 	})

@@ -58,7 +58,12 @@ func (m *Manager) Load(vni uint32) error {
 	progPath := filepath.Join(PinRoot, progPinName)
 	_ = os.Remove(progPath)
 	if err := m.objs.CozyplaneFromPod.Pin(progPath); err != nil {
-		return fmt.Errorf("pin program: %w", err)
+		return fmt.Errorf("pin from_pod program: %w", err)
+	}
+	toPodPath := filepath.Join(PinRoot, toPodPinName)
+	_ = os.Remove(toPodPath)
+	if err := m.objs.CozyplaneToPod.Pin(toPodPath); err != nil {
+		return fmt.Errorf("pin to_pod program: %w", err)
 	}
 
 	if err := m.objs.Params.Put(cfgVNI, vni); err != nil {

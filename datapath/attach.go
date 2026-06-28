@@ -40,11 +40,20 @@ func linkPinPath(ifindex int, ingress bool) string {
 	return filepath.Join(PinRoot, "links", fmt.Sprintf("%s-%d", dir, ifindex))
 }
 
-// OpenPinnedProgram loads the classifier program from its bpffs pin.
+// OpenPinnedProgram loads the from-pod (egress) classifier from its bpffs pin.
 func OpenPinnedProgram() (*ebpf.Program, error) {
 	prog, err := ebpf.LoadPinnedProgram(filepath.Join(PinRoot, progPinName), nil)
 	if err != nil {
-		return nil, fmt.Errorf("open pinned program: %w", err)
+		return nil, fmt.Errorf("open pinned from_pod program: %w", err)
+	}
+	return prog, nil
+}
+
+// OpenPinnedToPod loads the to-pod (ingress) classifier from its bpffs pin.
+func OpenPinnedToPod() (*ebpf.Program, error) {
+	prog, err := ebpf.LoadPinnedProgram(filepath.Join(PinRoot, toPodPinName), nil)
+	if err != nil {
+		return nil, fmt.Errorf("open pinned to_pod program: %w", err)
 	}
 	return prog, nil
 }
@@ -85,11 +94,14 @@ func attachTCX(ifindex int, prog *ebpf.Program, attach ebpf.AttachType, ingress 
 	return l.Close()
 }
 
-// DetachVeth removes the pinned ingress link for an interface (used on CNI DEL).
-// Removing the pin drops the last reference, detaching the program.
+// DetachVeth removes the pinned ingress (from_pod) and egress (to_pod) links for
+// an interface (used on CNI DEL). Removing a pin drops the last reference,
+// detaching the program.
 func DetachVeth(ifindex int) error {
-	if err := os.Remove(linkPinPath(ifindex, true)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+	for _, ingress := range []bool{true, false} {
+		if err := os.Remove(linkPinPath(ifindex, ingress)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
 	return nil
 }

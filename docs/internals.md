@@ -65,34 +65,52 @@ maps and one program.
 | `remotes` | LPM trie | dst IP/CIDR → remote node IP | agent (Nodes + Ports) |
 | `networks` | LPM trie | VPC CIDR → network id | agent (VPCs) |
 | `ports` | hash | veth ifindex → network id | plugin (per pod) |
+| `locals` | hash | pod IP → {veth ifindex, pod MAC} | plugin (per pod) |
 | `params` | array | `[0]`=Geneve ifindex, `[1]`=default VNI | agent |
 
 All are pinned under `/sys/fs/bpf/cozyplane/` (`LIBBPF_PIN_BY_NAME`) so the
 short-lived plugin and the long-running agent share the same map instances.
 
-### The program: `cozyplane_from_pod`
+### The programs
 
-Attached at **two** hooks via classic tc (clsact, direct-action):
+cozyplane enforces at **two universal hooks** — see the placement-independence
+invariant in [design.md](design.md) §4. Both run for every packet regardless of
+where source and destination are scheduled. They are attached with **tcx** (BPF
+links, pinned), not classic clsact filters: tcx links coexist with other tcx
+users (notably Cilium, which reconciles tc on every device and strips foreign
+*classic* filters but leaves tcx links alone), and pinning lets them survive the
+short-lived CNI plugin.
 
-- the **ingress** of every pod's host-side veth (a pod's egress), and
-- the **egress** of the node's uplink (host-originated traffic, e.g. the reply
-  path of NATed Service traffic or the apiserver reaching a pod).
+**`cozyplane_from_pod`** — the egress hook. Attached at the **ingress of every
+pod's host-side veth** (a pod's egress) and at the **egress of the node uplink**
+(host-originated traffic). For each IPv4 packet:
 
-For each IPv4 packet it:
+1. exempt traffic to the link-local gateway `169.254.1.1` (replies to bridged
+   node→pod traffic; the host stack/conntrack handles them);
+2. source net = `ports[skb->ifindex]` (absent ⇒ `0`); dest net = `networks[dst]`
+   (absent ⇒ `0`); **drop** if they differ (egress isolation);
+3. if the destination is a **local pod** (`locals[dst]` hit): rewrite the dst MAC
+   to the pod's MAC and `bpf_redirect` to its veth — same-node delivery *through*
+   the destination's ingress hook, no kernel-routing shortcut;
+4. else if **remote** (`remotes[dst]` hit): rewrite the inner dst MAC to the
+   shared overlay MAC, set the Geneve tunnel key (`tunnel_id` = source net id,
+   remote = node IP), `bpf_redirect` to the Geneve device;
+5. else `TC_ACT_OK` (off-cluster / node / fabric-bridge — the kernel handles it,
+   including the conntrack bridge DNAT for VPC fabric IPs).
 
-1. reads the **source net** from `ports[skb->ifindex]` (absent ⇒ `0`; the uplink
-   ifindex is never in `ports`, so host-originated traffic is the default net);
-2. reads the **destination net** from the `networks` LPM (absent ⇒ `0`);
-3. **drops** (`TC_ACT_SHOT`) if the two differ — this is the isolation gate;
-4. looks up the destination in `remotes`. Miss ⇒ `TC_ACT_OK` (local pod, or
-   off-cluster/node traffic the kernel routes). Hit ⇒ encapsulate:
-   - rewrite the inner Ethernet destination to the shared overlay MAC (see
-     below), set the Geneve tunnel key (`tunnel_id` = source net id, remote =
-     the node IP from `remotes`), and `bpf_redirect` to the Geneve device.
+**`cozyplane_to_pod`** — the ingress hook. Attached at the **egress of every
+pod's host-side veth**. Every delivery path leaves via the destination veth
+(same-node redirect from step 3, cross-node decap-then-route, node→pod bridge),
+so this is the placement-independent point for ingress policy. For each packet:
 
-There is deliberately **no receive-side program**. Decapsulation and delivery
-are done by the kernel (see the two tricks below), which keeps the datapath
-small for the prototype.
+1. exempt source `169.254.1.1` (bridge/masqueraded node→pod traffic);
+2. dest net = `ports[skb->ifindex]`; source net = `networks[src]`; **drop** if
+   they differ (ingress isolation); else `TC_ACT_OK`.
+
+Cross-node decapsulation itself is still done by the kernel Geneve device (see
+the two tricks below); the decapped packet is then routed out the destination
+veth and so still passes `to_pod`. Moving decap into an eBPF program (needed for
+overlapping CIDRs) is future work and must preserve this invariant.
 
 ### Trick 1 — the shared Geneve MAC (decap delivery)
 
@@ -249,8 +267,9 @@ datapath/                  Go wrapper around the eBPF datapath
   overlay_bpfel.{go,o}     generated bindings + compiled object (committed)
   datapath.go              Manager: Load/pin, Geneve device, remotes/networks
                            maps, uplink attach, LPM key/byte-order helpers
-  attach.go                clsact + bpf filter attach (ingress/egress)
+  attach.go                tcx link attach/detach (ingress/egress), pinned
   ports.go                 plugin-side access to the pinned `ports` map
+  locals.go                plugin-side access to the pinned `locals` map
   firewall.go              the FORWARD ACCEPT rules (go-iptables)
   bpffs.go                 mount bpffs if absent (kind nodes)
   state.go                 AgentState published for the plugin (agent.json)
