@@ -135,6 +135,36 @@ egress `from_pod` (srcnet 0 because the uplink isn't in `ports`) → `remotes` h
 VPC's id and the tunnel VNI carries it; delivery still works by `/32` route
 because VPC CIDRs are unique cluster-wide today.
 
+### The dual-address bridge (VPC pods)
+
+A VPC pod has two addresses: its `status.podIP` is a unique **fabric** IP from
+the node pod CIDR (allocated by host-local, reachable cluster-wide over the
+default overlay), while its interface carries the **VPC** (tenant) IP. The fabric
+IP is a node-side handle, never configured inside the pod.
+
+The translation is kernel conntrack NAT (in `datapath/bridge.go`, a
+`COZYPLANE-BRIDGE` nat chain):
+
+- **node/Service → pod:** `PREROUTING`/`OUTPUT` DNAT `fabricIP → vpcIP`;
+  `POSTROUTING` SNAT the source `→ 169.254.1.1` (the gateway) for DNATed
+  connections. The pod sees traffic from its gateway and never learns the
+  node/fabric address.
+- **pod → reply:** the pod replies to `169.254.1.1`; `from_pod` exempts that
+  destination (so isolation doesn't drop it), and conntrack reverses the DNAT/SNAT
+  back to the original client.
+
+This gives the design's directional trust for free: the system/default network
+reaches a VPC pod via its fabric IP (north-south, allowed), but a VPC pod can't
+initiate outward (its egress to any non-VPC, non-gateway destination is dropped
+by the isolation rule). Because the fabric IP lives in the node pod CIDR, the
+existing default overlay carries it cross-node, so Services/Endpoints and
+remote-node access to VPC pods work unchanged.
+
+"Stage 1" (built) requires VPC CIDRs unique cluster-wide, because delivery to the
+pod after DNAT is by the VPC IP's `/32` route. Overlapping CIDRs ("stage 2") need
+eBPF-keyed-by-fabric-IP delivery plus BPF conntrack, replacing the kernel-NAT
+path.
+
 ### Addressing / byte order (for maintainers)
 
 - `remotes` / `networks` LPM keys are `{prefixlen uint32, addr uint32}` with
@@ -273,9 +303,11 @@ hack/                       codegen scripts; Makefile drives generate/build
 The design (three planes, dual-address bridge, identity-based policy, etc.) is
 mostly future work. As built:
 
-- VPC CIDRs must be unique cluster-wide (no overlap support → no dual-address
-  bridge yet → no kubelet probes for VPC pods, no fabric hiding).
-- VPCs are closed L3 islands: no Services, egress, DNS, or policy for VPC pods.
+- VPC CIDRs must be unique cluster-wide (overlap needs bridge stage 2 — see
+  "The dual-address bridge").
+- VPC pods can't initiate egress (internet/DNS/default network/other VPCs); only
+  inbound north-south (via the fabric IP) and same-VPC traffic work. No per-VPC
+  gateway (NAT/DNS/controlled doors) yet, and no policy/security groups.
 - IPv4 only; single CIDR per VPC; no VM live-migration plumbing.
 - The API is CRD-backed; the aggregated apiserver (and its server-side atomic
   IPAM/validation) is not yet deployed.

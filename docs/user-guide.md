@@ -12,10 +12,15 @@ where it's headed.
   node's pod CIDR) carried over an eBPF Geneve overlay. Pods reach each other
   across nodes, the node reaches pods (so kubelet probes work), and Services
   keep working through your existing kube-proxy / Cilium-KPR.
-- **VPCs.** A pod attaches to a named `VPC` by annotation, in any namespace, and
-  gets an IP from the VPC's CIDR. Pods in the same VPC reach each other across
-  nodes. Traffic to anything outside the VPC — the default network, the node,
-  other VPCs, the internet — is dropped.
+- **VPCs.** A pod attaches to a named `VPC` by annotation, in any namespace. Its
+  interface gets a (tenant) IP from the VPC's CIDR, while its `status.podIP` is a
+  separate **fabric** IP from the node pod CIDR — so the pod is first-class to
+  Kubernetes (kubelet probes work, Services/Endpoints resolve, controllers can
+  reach it on `status.podIP`) without ever seeing the node/management network.
+  Pods in the same VPC reach each other across nodes; the system/default network
+  can reach a VPC pod via its fabric IP (north-south). A VPC pod itself cannot
+  initiate to anything outside its VPC — the default network, the node, other
+  VPCs, the internet are all dropped.
 
 ## Requirements
 
@@ -112,23 +117,29 @@ spec:
       command: ["sleep", "3600"]
 ```
 
-The pod comes up with an IP from the VPC CIDR:
+The pod's `status.podIP` is a fabric IP (from the node pod CIDR), while its
+interface inside the netns carries the VPC IP. The `Port` shows both:
 
 ```bash
-kubectl get pod app-1 -o wide           # IP 10.10.0.2
-kubectl get ports                       # the claimed Port
-# NAME                 VPC        IP          NODE               POD
-# tenant-a.10-10-0-2   tenant-a   10.10.0.2   <node>             app-1
+kubectl get pod app-1 -o wide    # status.podIP is the fabric IP, e.g. 10.244.2.16
+kubectl exec app-1 -- ip -4 addr show eth0   # the VPC IP, e.g. 10.10.0.2/32
+kubectl get ports -o custom-columns=NAME:.metadata.name,VPCIP:.spec.ip,FABRIC:.spec.fabricIP
+# NAME                 VPCIP       FABRIC
+# tenant-a.10-10-0-2   10.10.0.2   10.244.2.16
 ```
 
-Create a second pod (`app-2`) the same way — ideally scheduled to another node —
-and they can reach each other:
+Create a second pod (`app-2`) the same way — ideally on another node — and:
 
 ```bash
-kubectl exec app-1 -- ping -c2 10.10.0.3      # works (same VPC)
-kubectl exec app-1 -- ping -c2 <default-pod>  # 100% loss (isolated)
-kubectl exec app-1 -- ping -c2 <node-ip>      # 100% loss (isolated)
+kubectl exec app-1 -- ping -c2 10.10.0.3        # same VPC: works (use app-2's VPC IP)
+kubectl exec <default-pod> -- wget -qO- <app-1-fabric-ip>   # north-south: works
+kubectl exec app-1 -- ping -c2 <default-pod>    # isolated: 100% loss
+kubectl exec app-1 -- ping -c2 8.8.8.8          # isolated: 100% loss
 ```
+
+VPC pods support `httpGet`/`tcpSocket` probes (kubelet reaches them via the
+fabric IP through the bridge), and a `Service` whose selector matches VPC pods
+works for traffic *into* them (Endpoints use the fabric IP).
 
 To remove a pod from the VPC, delete the pod; its `Port` (and IP) is released
 automatically.
@@ -138,13 +149,13 @@ automatically.
 These are prototype constraints, not permanent:
 
 - **VPC CIDRs must be unique cluster-wide** (and must not overlap the cluster pod
-  CIDR). Overlapping per-tenant CIDRs require the dual-address bridge, which
-  isn't built yet.
-- **No kubelet probes for VPC pods.** A VPC pod's `status.podIP` is its VPC IP,
-  which the node can't reach (by design — isolation). Use `exec` probes or none
-  on VPC workloads for now. (The bridge will fix this and hide the node network.)
-- **No Services for VPC pods, no egress/DNS, no policy.** A VPC is currently a
-  closed L3 island: same-VPC pods only.
+  CIDR). Overlapping per-tenant CIDRs need bridge "stage 2" (eBPF-keyed delivery
+  by fabric IP); stage 1 keeps delivery IP-keyed.
+- **VPC pods cannot initiate egress** — no internet, no DNS, no reaching the
+  default network or other VPCs. A VPC is a closed island for outbound traffic;
+  only inbound (north-south, via the fabric IP) and same-VPC traffic work. A per
+  VPC gateway (NAT/DNS/controlled doors) is future work.
+- **No network policy / security groups yet** within or across VPCs.
 - **IPv4 only.**
 - **VPC/Port are served as CRDs**, not yet the aggregated API server (the swap is
   transparent to clients).

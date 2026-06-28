@@ -17,10 +17,13 @@ kube-proxy replacement / policy engine.
 - cozyplane as the cluster CNI for the **default/system pod network**, over an
   eBPF Geneve overlay (cross-node pod-to-pod, node↔pod, kubelet probes; coexists
   with kube-proxy / Cilium-KPR for Services).
-- **VPCs**: a pod attaches to a named VPC via an annotation, in any namespace,
-  and gets an IP from the VPC's CIDR. Pods in the same VPC reach each other
-  across nodes; everything else (the default network, the node, other VPCs) is
-  blocked.
+- **VPCs**: a pod attaches to a named VPC via an annotation, in any namespace.
+  Pods in the same VPC reach each other across nodes; a VPC pod can't initiate to
+  anything outside its VPC (default network, node, other VPCs, internet).
+- **Dual-address bridge**: a VPC pod's `status.podIP` is a fabric IP (so kubelet
+  probes, Services and the system network can reach it) while its interface
+  carries the hidden tenant VPC IP — the pod never sees the node/management
+  network.
 
 ## Documentation
 
