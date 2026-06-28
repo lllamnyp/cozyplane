@@ -41,6 +41,17 @@ func OpenPinnedProgram() (*ebpf.Program, error) {
 // Classic tc holds a reference on the program, so the attachment survives the
 // plugin process exiting and is removed automatically when the veth is deleted.
 func AttachIngress(ifindex int, prog *ebpf.Program) error {
+	return attachClsact(ifindex, prog, netlink.HANDLE_MIN_INGRESS)
+}
+
+// AttachEgress attaches the classifier at the egress of the given interface
+// (the node uplink), so host-originated traffic to remote pod CIDRs is also
+// encapsulated.
+func AttachEgress(ifindex int, prog *ebpf.Program) error {
+	return attachClsact(ifindex, prog, netlink.HANDLE_MIN_EGRESS)
+}
+
+func attachClsact(ifindex int, prog *ebpf.Program, parent uint32) error {
 	qdisc := &netlink.GenericQdisc{
 		QdiscAttrs: netlink.QdiscAttrs{
 			LinkIndex: ifindex,
@@ -56,7 +67,7 @@ func AttachIngress(ifindex int, prog *ebpf.Program) error {
 	filter := &netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
 			LinkIndex: ifindex,
-			Parent:    netlink.HANDLE_MIN_INGRESS,
+			Parent:    parent,
 			Handle:    netlink.MakeHandle(0, 1),
 			Protocol:  unix.ETH_P_ALL,
 			Priority:  1,

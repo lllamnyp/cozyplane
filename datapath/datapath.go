@@ -84,6 +84,12 @@ func (m *Manager) EnsureGeneve() error {
 		}
 	}
 
+	// All nodes' Geneve devices share OverlayMAC so decapsulated frames (whose
+	// inner destination MAC the encap path rewrites to it) are delivered as
+	// PACKET_HOST and forwarded to the local pod by the kernel.
+	if err := netlink.LinkSetHardwareAddr(link, OverlayMAC); err != nil {
+		return fmt.Errorf("set geneve MAC: %w", err)
+	}
 	if err := netlink.LinkSetUp(link); err != nil {
 		return fmt.Errorf("set geneve up: %w", err)
 	}
@@ -98,6 +104,39 @@ func (m *Manager) EnsureGeneve() error {
 	_ = WriteProcSys(fmt.Sprintf("net/ipv4/conf/%s/rp_filter", GeneveDevice), "0")
 
 	return nil
+}
+
+// AttachUplink attaches the classifier at the egress of the node's default-route
+// interface so host-originated traffic to remote pod CIDRs is encapsulated too
+// (node→remote-pod reachability). Returns the uplink interface name.
+func (m *Manager) AttachUplink() (string, error) {
+	idx, name, err := defaultRouteLink()
+	if err != nil {
+		return "", err
+	}
+	if err := AttachEgress(idx, m.objs.CozyplaneFromPod); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+// defaultRouteLink returns the ifindex and name of the IPv4 default-route link.
+func defaultRouteLink() (int, string, error) {
+	routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)
+	if err != nil {
+		return 0, "", fmt.Errorf("list routes: %w", err)
+	}
+	for _, r := range routes {
+		isDefault := r.Dst == nil || r.Dst.IP.IsUnspecified()
+		if isDefault && r.Gw != nil && r.LinkIndex > 0 {
+			link, err := netlink.LinkByIndex(r.LinkIndex)
+			if err != nil {
+				return 0, "", err
+			}
+			return r.LinkIndex, link.Attrs().Name, nil
+		}
+	}
+	return 0, "", fmt.Errorf("no default route found")
 }
 
 // SetRemote installs (or replaces) a route to another node's pod CIDR.

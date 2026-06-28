@@ -23,6 +23,12 @@
 #define TC_ACT_OK 0
 #define TC_ACT_SHOT 2
 
+// Every node's Geneve device shares this fixed MAC. The encap path rewrites the
+// inner Ethernet destination to it, so a decapsulated frame is addressed to the
+// receiving node's own Geneve device (PACKET_HOST) and the kernel forwards it to
+// the local pod — no receive-side program needed.
+#define OVERLAY_DMAC { 0x02, 0xcf, 0xcf, 0xcf, 0xcf, 0xcf }
+
 char __license[] SEC("license") = "GPL";
 
 // LPM key: prefixlen + IPv4 address in network byte order.
@@ -87,6 +93,12 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	__u32 geneve_ifindex = cfg(CFG_GENEVE_IFINDEX);
 	if (!geneve_ifindex)
 		return TC_ACT_OK;
+
+	// Address the inner frame to the shared overlay MAC so the receiving
+	// node's Geneve device accepts it as PACKET_HOST and forwards it.
+	__u8 dmac[6] = OVERLAY_DMAC;
+	if (bpf_skb_store_bytes(skb, 0, dmac, sizeof(dmac), 0) < 0)
+		return TC_ACT_SHOT;
 
 	struct bpf_tunnel_key tkey = {};
 	tkey.tunnel_id = cfg(CFG_VNI);

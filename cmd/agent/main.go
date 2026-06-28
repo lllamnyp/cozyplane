@@ -95,6 +95,10 @@ func run(nodeName string, mtu int, vni uint32, log *slog.Logger) error {
 		}
 	}
 
+	if err := datapath.EnsureBPFFS(); err != nil {
+		return fmt.Errorf("ensure bpffs: %w", err)
+	}
+
 	mgr := datapath.New()
 	if err := mgr.Load(vni); err != nil {
 		return fmt.Errorf("load datapath: %w", err)
@@ -103,7 +107,14 @@ func run(nodeName string, mtu int, vni uint32, log *slog.Logger) error {
 	if err := mgr.EnsureGeneve(); err != nil {
 		return fmt.Errorf("ensure geneve: %w", err)
 	}
-	log.Info("datapath loaded", "vni", vni, "geneve", datapath.GeneveDevice)
+	if err := datapath.EnsureForwardRules(); err != nil {
+		return fmt.Errorf("ensure forward rules: %w", err)
+	}
+	uplink, err := mgr.AttachUplink()
+	if err != nil {
+		return fmt.Errorf("attach uplink: %w", err)
+	}
+	log.Info("datapath loaded", "vni", vni, "geneve", datapath.GeneveDevice, "uplink", uplink)
 
 	cfg, err := rest.InClusterConfig()
 	if err != nil {

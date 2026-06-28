@@ -16,6 +16,12 @@ limitations under the License.
 
 package datapath
 
+import "net"
+
+// OverlayMAC is the fixed MAC shared by every node's Geneve device. It must
+// match OVERLAY_DMAC in bpf/overlay.c.
+var OverlayMAC = net.HardwareAddr{0x02, 0xcf, 0xcf, 0xcf, 0xcf, 0xcf}
+
 const (
 	// PinRoot is the bpffs directory where the datapath program and maps are
 	// pinned so the agent and the (short-lived) CNI plugin share them.
