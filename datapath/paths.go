@@ -1,0 +1,43 @@
+/*
+Copyright 2026 The Cozyplane Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package datapath
+
+const (
+	// PinRoot is the bpffs directory where the datapath program and maps are
+	// pinned so the agent and the (short-lived) CNI plugin share them.
+	PinRoot = "/sys/fs/bpf/cozyplane"
+
+	// progPinName is the pinned name of the from-pod classifier program.
+	progPinName = "cozyplane_from_pod"
+
+	// GeneveDevice is the per-node collect_metadata Geneve device.
+	GeneveDevice = "cozyplane0"
+
+	// GenevePort is the Geneve UDP destination port (IANA default).
+	GenevePort = 6081
+
+	// AgentStateFile is where the agent publishes per-node parameters for the
+	// CNI plugin to read (node pod CIDR, MTU, ...).
+	AgentStateFile = "/run/cozyplane/agent.json"
+
+	// config map indices — must match bpf/overlay.c.
+	cfgGeneveIfindex = uint32(0)
+	cfgVNI           = uint32(1)
+)
+
+// DefaultVNI is the VNI used for the default (flat) pod network in M0.
+const DefaultVNI uint32 = 1
