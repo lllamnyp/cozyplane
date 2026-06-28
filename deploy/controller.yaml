@@ -1,0 +1,62 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cozyplane-controller
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cozyplane-controller
+rules:
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpcs"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpcs/status"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cozyplane-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cozyplane-controller
+subjects:
+  - kind: ServiceAccount
+    name: cozyplane-controller
+    namespace: kube-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cozyplane-controller
+  namespace: kube-system
+  labels:
+    app: cozyplane-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cozyplane-controller
+  template:
+    metadata:
+      labels:
+        app: cozyplane-controller
+    spec:
+      serviceAccountName: cozyplane-controller
+      priorityClassName: system-cluster-critical
+      containers:
+        - name: controller
+          image: ghcr.io/lllamnyp/cozyplane:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/sdn-controller"]
+          args: ["--leader-elect=false", "--metrics-bind-address=0", "--health-probe-bind-address=:8081"]
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8081 }
+            initialDelaySeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8081 }

@@ -29,8 +29,12 @@ import (
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
 )
 
-// VPCReconciler reconciles VPC objects. For now it is a stub that observes
-// VPCs; VNI allocation, gateway setup and datapath programming land here.
+// firstVNI is the lowest network id handed out to VPCs. Ids below it are
+// reserved (0 is the default/system network).
+const firstVNI int32 = 100
+
+// VPCReconciler assigns each VPC a unique network id (VNI) and marks it Ready.
+// The datapath (agent) keys isolation and the overlay on this id.
 type VPCReconciler struct {
 	client.Client
 
@@ -40,7 +44,7 @@ type VPCReconciler struct {
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=vpcs,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=vpcs/status,verbs=get;update;patch
 
-// Reconcile is the main reconciliation loop for VPC objects.
+// Reconcile assigns a VNI to the VPC if it has none, then sets phase Ready.
 func (r *VPCReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -49,16 +53,46 @@ func (r *VPCReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
-
-		logger.Error(err, "unable to fetch VPC")
-
 		return ctrl.Result{}, fmt.Errorf("fetch VPC: %w", err)
 	}
 
-	// TODO: allocate VNI, program gateway/datapath, set status.Phase=Ready.
-	logger.V(1).Info("observed VPC", "name", vpc.Name, "vni", vpc.Status.VNI)
+	if vpc.Status.VNI == 0 {
+		vni, err := r.allocateVNI(ctx)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		vpc.Status.VNI = vni
+	}
+	vpc.Status.Phase = sdnv1alpha1.VPCPhaseReady
 
+	if err := r.Status().Update(ctx, vpc); err != nil {
+		if apierrors.IsConflict(err) {
+			return ctrl.Result{Requeue: true}, nil
+		}
+		return ctrl.Result{}, fmt.Errorf("update VPC status: %w", err)
+	}
+
+	logger.Info("VPC ready", "name", vpc.Name, "vni", vpc.Status.VNI)
 	return ctrl.Result{}, nil
+}
+
+// allocateVNI returns the lowest VNI >= firstVNI not used by any other VPC.
+func (r *VPCReconciler) allocateVNI(ctx context.Context) (int32, error) {
+	var list sdnv1alpha1.VPCList
+	if err := r.List(ctx, &list); err != nil {
+		return 0, fmt.Errorf("list VPCs: %w", err)
+	}
+	used := map[int32]bool{}
+	for i := range list.Items {
+		if v := list.Items[i].Status.VNI; v != 0 {
+			used[v] = true
+		}
+	}
+	for vni := firstVNI; ; vni++ {
+		if !used[vni] {
+			return vni, nil
+		}
+	}
 }
 
 // SetupWithManager registers the reconciler with the manager.

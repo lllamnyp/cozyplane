@@ -41,7 +41,10 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
+	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
 	"github.com/lllamnyp/cozyplane/datapath"
+	sdnclientset "github.com/lllamnyp/cozyplane/pkg/generated/sdn/clientset/versioned"
+	sdninformers "github.com/lllamnyp/cozyplane/pkg/generated/sdn/informers/externalversions"
 )
 
 const (
@@ -143,6 +146,14 @@ func run(nodeName string, mtu int, vni uint32, log *slog.Logger) error {
 		return err
 	}
 
+	// VPC watching is best-effort: the default network must work even before the
+	// sdn.cozystack.io API exists, so we don't block readiness on it.
+	if sdnClient, err := sdnclientset.NewForConfig(cfg); err != nil {
+		log.Warn("sdn client init failed; VPC networks won't be programmed", "err", err)
+	} else {
+		watchVPCs(ctx, sdnClient, mgr, log)
+	}
+
 	// Datapath is up and remotes are syncing; expose the CNI to kubelet.
 	if err := writeCNIConf(mtu); err != nil {
 		return fmt.Errorf("write CNI conf: %w", err)
@@ -199,6 +210,42 @@ func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.
 		return fmt.Errorf("node cache failed to sync")
 	}
 	return nil
+}
+
+// watchVPCs mirrors VPC CIDR -> network id into the networks map. Best-effort:
+// it starts the informer without blocking on cache sync, so a missing sdn API
+// (during bootstrap) doesn't stall the agent.
+func watchVPCs(ctx context.Context, client sdnclientset.Interface, mgr *datapath.Manager, log *slog.Logger) {
+	factory := sdninformers.NewSharedInformerFactory(client, 0)
+	informer := factory.Sdn().V1alpha1().VPCs().Informer()
+
+	apply := func(obj any) {
+		vpc, ok := obj.(*sdnv1alpha1.VPC)
+		if !ok || vpc.Status.VNI == 0 || len(vpc.Spec.CIDRs) == 0 {
+			return
+		}
+		if err := mgr.SetNetwork(vpc.Spec.CIDRs[0], uint32(vpc.Status.VNI)); err != nil {
+			log.Error("set network", "vpc", vpc.Name, "err", err)
+			return
+		}
+		log.Info("network set", "vpc", vpc.Name, "cidr", vpc.Spec.CIDRs[0], "vni", vpc.Status.VNI)
+	}
+
+	_, _ = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    apply,
+		UpdateFunc: func(_, newObj any) { apply(newObj) },
+		DeleteFunc: func(obj any) {
+			vpc, ok := obj.(*sdnv1alpha1.VPC)
+			if !ok || len(vpc.Spec.CIDRs) == 0 {
+				return
+			}
+			if err := mgr.DelNetwork(vpc.Spec.CIDRs[0]); err != nil {
+				log.Error("del network", "vpc", vpc.Name, "err", err)
+			}
+		},
+	})
+
+	factory.Start(ctx.Done())
 }
 
 func writeCNIConf(mtu int) error {
