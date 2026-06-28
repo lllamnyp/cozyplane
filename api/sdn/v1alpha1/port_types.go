@@ -29,8 +29,14 @@ type PortSpec struct {
 	// VPC is the name of the VPC this port belongs to.
 	VPC string `json:"vpc"`
 
-	// IP is the address allocated to the pod within the VPC CIDR.
+	// IP is the address allocated to the pod within the VPC CIDR (the tenant
+	// address configured inside the pod).
 	IP string `json:"ip"`
+
+	// FabricIP is the pod's status.podIP: a unique address from the node pod
+	// CIDR, reachable on the default overlay, that the bridge DNATs to IP.
+	// +optional
+	FabricIP string `json:"fabricIP,omitempty"`
 
 	// MAC is the pod interface MAC address.
 	// +optional

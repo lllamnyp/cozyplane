@@ -203,8 +203,15 @@ func schema_cozyplane_api_sdn_v1alpha1_PortSpec(ref common.ReferenceCallback) co
 					},
 					"ip": {
 						SchemaProps: spec.SchemaProps{
-							Description: "IP is the address allocated to the pod within the VPC CIDR.",
+							Description: "IP is the address allocated to the pod within the VPC CIDR (the tenant address configured inside the pod).",
 							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"fabricIP": {
+						SchemaProps: spec.SchemaProps{
+							Description: "FabricIP is the pod's status.podIP: a unique address from the node pod CIDR, reachable on the default overlay, that the bridge DNATs to IP.",
 							Type:        []string{"string"},
 							Format:      "",
 						},

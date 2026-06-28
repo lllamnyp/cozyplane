@@ -57,9 +57,15 @@ spec:
               (<vpc>.<ip-with-dashes>), so creating it is an atomic claim on that IP within
               the VPC — etcd name uniqueness serializes concurrent allocators.
             properties:
+              fabricIP:
+                description: |-
+                  FabricIP is the pod's status.podIP: a unique address from the node pod
+                  CIDR, reachable on the default overlay, that the bridge DNATs to IP.
+                type: string
               ip:
-                description: IP is the address allocated to the pod within the VPC
-                  CIDR.
+                description: |-
+                  IP is the address allocated to the pod within the VPC CIDR (the tenant
+                  address configured inside the pod).
                 type: string
               mac:
                 description: MAC is the pod interface MAC address.

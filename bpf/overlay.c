@@ -111,6 +111,12 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	if ((void *)(ip + 1) > data_end)
 		return TC_ACT_OK;
 
+	// Traffic to the link-local gateway (169.254.1.1) — e.g. a pod's reply to
+	// masqueraded node->pod (bridge) traffic — is handled by the host stack and
+	// conntrack: never isolated, never encapsulated.
+	if (ip->daddr == bpf_htonl(0xA9FE0101))
+		return TC_ACT_OK;
+
 	// Source network: the attached veth's net id (0 = default/system, also for
 	// host-originated traffic on the uplink, whose ifindex isn't in `ports`).
 	__u32 ifindex = skb->ifindex;

@@ -53,6 +53,7 @@ const (
 	labelVPC      = "sdn.cozystack.io/vpc"
 	labelPodNS    = "sdn.cozystack.io/pod-namespace"
 	labelPodName  = "sdn.cozystack.io/pod-name"
+	labelPodUID   = "sdn.cozystack.io/pod-uid"
 )
 
 // linkLocalGW is the on-link next hop installed in every pod, answered by the
@@ -70,6 +71,7 @@ type k8sArgs struct {
 	types.CommonArgs
 	K8S_POD_NAMESPACE types.UnmarshallableString //nolint:revive,stylecheck
 	K8S_POD_NAME      types.UnmarshallableString //nolint:revive,stylecheck
+	K8S_POD_UID       types.UnmarshallableString //nolint:revive,stylecheck
 }
 
 func main() {
@@ -88,12 +90,12 @@ func loadConf(stdin []byte) (*NetConf, error) {
 	return conf, nil
 }
 
-func podIdentity(args *skel.CmdArgs) (namespace, name string, err error) {
+func podIdentity(args *skel.CmdArgs) (namespace, name, uid string, err error) {
 	k8s := k8sArgs{}
 	if err := types.LoadArgs(args.Args, &k8s); err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
-	return string(k8s.K8S_POD_NAMESPACE), string(k8s.K8S_POD_NAME), nil
+	return string(k8s.K8S_POD_NAMESPACE), string(k8s.K8S_POD_NAME), string(k8s.K8S_POD_UID), nil
 }
 
 func sdnClient() (sdnclientset.Interface, error) {
@@ -117,7 +119,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 	if err != nil {
 		return err
 	}
-	podNS, podName, err := podIdentity(args)
+	podNS, podName, podUID, err := podIdentity(args)
 	if err != nil {
 		return err
 	}
@@ -134,7 +136,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 	if vpcName == "" {
 		return addDefault(args, conf)
 	}
-	return addVPC(args, conf, vpcName, podNS, podName)
+	return addVPC(args, conf, vpcName, podNS, podName, podUID)
 }
 
 // addDefault attaches the pod to the default/system network with host-local IPAM.
@@ -180,9 +182,10 @@ func addDefault(args *skel.CmdArgs, conf *NetConf) error {
 	return types.PrintResult(result, conf.CNIVersion)
 }
 
-// addVPC attaches the pod to a VPC: claim an IP via a Port, then set up the veth
-// with the VPC's network id.
-func addVPC(args *skel.CmdArgs, conf *NetConf, vpcName, podNS, podName string) error {
+// addVPC attaches the pod to a VPC using the dual-address bridge: the pod's
+// interface gets the VPC (tenant) IP, while status.podIP is a unique fabric IP
+// from the node pod CIDR that the bridge DNATs to the VPC IP.
+func addVPC(args *skel.CmdArgs, conf *NetConf, vpcName, podNS, podName, podUID string) (err error) {
 	client, err := sdnClient()
 	if err != nil {
 		return fmt.Errorf("sdn client: %w", err)
@@ -210,7 +213,32 @@ func addVPC(args *skel.CmdArgs, conf *NetConf, vpcName, podNS, podName string) e
 		mtu = state.MTU
 	}
 
-	podIP, port, err := claimIP(client, vpc, state, podNS, podName)
+	// Fabric IP (status.podIP): host-local from the node pod CIDR, unique and
+	// reachable on the default overlay.
+	ipamData, err := ipamStdin(args.StdinData, state.PodCIDR)
+	if err != nil {
+		return err
+	}
+	r, err := ipam.ExecAdd(ipamPlugin, ipamData)
+	if err != nil {
+		return fmt.Errorf("fabric ipam add: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = ipam.ExecDel(ipamPlugin, ipamData)
+		}
+	}()
+	fabricRes, err := current.NewResultFromResult(r)
+	if err != nil {
+		return err
+	}
+	if len(fabricRes.IPs) == 0 {
+		return fmt.Errorf("fabric ipam returned no addresses")
+	}
+	fabricIP := fabricRes.IPs[0].Address.IP
+
+	// VPC IP: atomic claim via a Port.
+	vpcIP, port, err := claimIP(client, vpc, state, fabricIP.String(), podNS, podName, podUID)
 	if err != nil {
 		return err
 	}
@@ -220,14 +248,21 @@ func addVPC(args *skel.CmdArgs, conf *NetConf, vpcName, podNS, podName string) e
 		}
 	}()
 
-	result, e := setupVeth(args, conf.CNIVersion, podIP, mtu, uint32(vpc.Status.VNI))
-	if e != nil {
-		err = e
+	// The pod interface carries the VPC IP; tag the veth with the VPC net id.
+	result, err := setupVeth(args, conf.CNIVersion, vpcIP, mtu, uint32(vpc.Status.VNI))
+	if err != nil {
 		return err
 	}
+
+	// Bridge: fabric IP -> VPC IP, source masqueraded to the gateway.
+	if err = datapath.AddBridge(fabricIP.String(), vpcIP.String(), hostVethNameFor(args.ContainerID)); err != nil {
+		return err
+	}
+
+	// Report the fabric IP as status.podIP.
 	result.IPs = []*current.IPConfig{{
 		Interface: current.Int(0),
-		Address:   net.IPNet{IP: podIP, Mask: net.CIDRMask(32, 32)},
+		Address:   net.IPNet{IP: fabricIP, Mask: net.CIDRMask(32, 32)},
 	}}
 	return types.PrintResult(result, conf.CNIVersion)
 }
@@ -235,7 +270,7 @@ func addVPC(args *skel.CmdArgs, conf *NetConf, vpcName, podNS, podName string) e
 // claimIP picks a free IP in the VPC CIDR and atomically claims it by creating a
 // cluster-scoped Port named <vpc>.<ip-dashed>; concurrent claims collide on the
 // name and retry.
-func claimIP(client sdnclientset.Interface, vpc *sdnv1alpha1.VPC, state *datapath.AgentState, podNS, podName string) (net.IP, *sdnv1alpha1.Port, error) {
+func claimIP(client sdnclientset.Interface, vpc *sdnv1alpha1.VPC, state *datapath.AgentState, fabricIP, podNS, podName, podUID string) (net.IP, *sdnv1alpha1.Port, error) {
 	_, ipnet, err := net.ParseCIDR(vpc.Spec.CIDRs[0])
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse vpc CIDR: %w", err)
@@ -267,11 +302,13 @@ func claimIP(client sdnclientset.Interface, vpc *sdnv1alpha1.VPC, state *datapat
 					labelVPC:     vpc.Name,
 					labelPodNS:   podNS,
 					labelPodName: podName,
+					labelPodUID:  podUID,
 				},
 			},
 			Spec: sdnv1alpha1.PortSpec{
 				VPC:          vpc.Name,
 				IP:           ipStr,
+				FabricIP:     fabricIP,
 				Node:         state.NodeName,
 				NodeIP:       state.NodeIP,
 				PodNamespace: podNS,
@@ -412,15 +449,24 @@ func cmdDel(args *skel.CmdArgs) error {
 		_ = datapath.DelPortNet(hv.Attrs().Index)
 	}
 
-	podNS, podName, _ := podIdentity(args)
+	podNS, podName, podUID, _ := podIdentity(args)
 
-	// Release a VPC Port if this pod had one.
-	if client, e := sdnClient(); e == nil && podNS != "" && podName != "" {
+	// Release a VPC Port if this pod had one. Prefer the pod UID (unique, never
+	// reused) so a stale DEL can't delete a newer pod's Port that reuses a name.
+	selector := fmt.Sprintf("%s=%s,%s=%s", labelPodNS, podNS, labelPodName, podName)
+	if podUID != "" {
+		selector = labelPodUID + "=" + podUID
+	}
+	if client, e := sdnClient(); e == nil && (podUID != "" || (podNS != "" && podName != "")) {
 		if list, e := client.SdnV1alpha1().Ports().List(context.TODO(), metav1.ListOptions{
-			LabelSelector: fmt.Sprintf("%s=%s,%s=%s", labelPodNS, podNS, labelPodName, podName),
+			LabelSelector: selector,
 		}); e == nil {
 			for i := range list.Items {
-				_ = client.SdnV1alpha1().Ports().Delete(context.TODO(), list.Items[i].Name, metav1.DeleteOptions{})
+				p := &list.Items[i]
+				if p.Spec.FabricIP != "" {
+					_ = datapath.DelBridge(p.Spec.FabricIP, p.Spec.IP, hostVethNameFor(args.ContainerID))
+				}
+				_ = client.SdnV1alpha1().Ports().Delete(context.TODO(), p.Name, metav1.DeleteOptions{})
 			}
 		}
 	}

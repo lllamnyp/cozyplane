@@ -113,6 +113,9 @@ func run(nodeName string, mtu int, vni uint32, log *slog.Logger) error {
 	if err := datapath.EnsureForwardRules(); err != nil {
 		return fmt.Errorf("ensure forward rules: %w", err)
 	}
+	if err := datapath.EnsureBridgeChain(); err != nil {
+		return fmt.Errorf("ensure bridge chain: %w", err)
+	}
 	uplink, err := mgr.AttachUplink()
 	if err != nil {
 		return fmt.Errorf("attach uplink: %w", err)

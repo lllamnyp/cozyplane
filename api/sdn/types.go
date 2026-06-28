@@ -92,6 +92,7 @@ type PortList struct {
 type PortSpec struct {
 	VPC          string
 	IP           string
+	FabricIP     string
 	MAC          string
 	Node         string
 	NodeIP       string
