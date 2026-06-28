@@ -23,12 +23,13 @@ package v1alpha1
 //
 // PortSpec is the realized network interface of a pod on a VPC.
 //
-// A Port is cluster-scoped and its name encodes the VPC and IP
-// (<vpc>.<ip-with-dashes>), so creating it is an atomic claim on that IP within
-// the VPC — etcd name uniqueness serializes concurrent allocators.
+// A Port is cluster-scoped and its name encodes the VPC's VNI and the IP
+// (v<vni>.<ip-with-dashes>), so creating it is an atomic claim on that IP within
+// the VPC — etcd name uniqueness serializes concurrent allocators. The VNI is
+// globally unique, so the name stays unique even though VPCs are namespaced.
 type PortSpecApplyConfiguration struct {
-	// VPC is the name of the VPC this port belongs to.
-	VPC *string `json:"vpc,omitempty"`
+	// VPCRef identifies the VPC this port belongs to (owner namespace + name).
+	VPCRef *VPCRefApplyConfiguration `json:"vpcRef,omitempty"`
 	// IP is the address allocated to the pod within the VPC CIDR (the tenant
 	// address configured inside the pod).
 	IP *string `json:"ip,omitempty"`
@@ -52,11 +53,11 @@ func PortSpec() *PortSpecApplyConfiguration {
 	return &PortSpecApplyConfiguration{}
 }
 
-// WithVPC sets the VPC field in the declarative configuration to the given value
+// WithVPCRef sets the VPCRef field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
-// If called multiple times, the VPC field is set to the value of the last call.
-func (b *PortSpecApplyConfiguration) WithVPC(value string) *PortSpecApplyConfiguration {
-	b.VPC = &value
+// If called multiple times, the VPCRef field is set to the value of the last call.
+func (b *PortSpecApplyConfiguration) WithVPCRef(value *VPCRefApplyConfiguration) *PortSpecApplyConfiguration {
+	b.VPCRef = value
 	return b
 }
 

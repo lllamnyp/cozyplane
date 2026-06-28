@@ -12,7 +12,7 @@ spec:
     listKind: VPCList
     plural: vpcs
     singular: vpc
-  scope: Cluster
+  scope: Namespaced
   versions:
   - additionalPrinterColumns:
     - jsonPath: .status.vni
@@ -27,7 +27,10 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: VPC is a tenant overlay network.
+        description: |-
+          VPC is a tenant overlay network. It is namespaced: the namespace expresses
+          ownership. A pod's *use* of a VPC is granted separately by a VPCBinding, even
+          within the owner's own namespace.
         properties:
           apiVersion:
             description: |-

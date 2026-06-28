@@ -21,3 +21,5 @@ package v1alpha1
 type PortExpansion interface{}
 
 type VPCExpansion interface{}
+
+type VPCBindingExpansion interface{}

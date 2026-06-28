@@ -31,9 +31,8 @@ type VPCLister interface {
 	// List lists all VPCs in the indexer.
 	// Objects returned here must be treated as read-only.
 	List(selector labels.Selector) (ret []*sdnv1alpha1.VPC, err error)
-	// Get retrieves the VPC from the index for a given name.
-	// Objects returned here must be treated as read-only.
-	Get(name string) (*sdnv1alpha1.VPC, error)
+	// VPCs returns an object that can list and get VPCs.
+	VPCs(namespace string) VPCNamespaceLister
 	VPCListerExpansion
 }
 
@@ -45,4 +44,27 @@ type vPCLister struct {
 // NewVPCLister returns a new VPCLister.
 func NewVPCLister(indexer cache.Indexer) VPCLister {
 	return &vPCLister{listers.New[*sdnv1alpha1.VPC](indexer, sdnv1alpha1.Resource("vpc"))}
+}
+
+// VPCs returns an object that can list and get VPCs.
+func (s *vPCLister) VPCs(namespace string) VPCNamespaceLister {
+	return vPCNamespaceLister{listers.NewNamespaced[*sdnv1alpha1.VPC](s.ResourceIndexer, namespace)}
+}
+
+// VPCNamespaceLister helps list and get VPCs.
+// All objects returned here must be treated as read-only.
+type VPCNamespaceLister interface {
+	// List lists all VPCs in the indexer for a given namespace.
+	// Objects returned here must be treated as read-only.
+	List(selector labels.Selector) (ret []*sdnv1alpha1.VPC, err error)
+	// Get retrieves the VPC from the indexer for a given namespace and name.
+	// Objects returned here must be treated as read-only.
+	Get(name string) (*sdnv1alpha1.VPC, error)
+	VPCNamespaceListerExpansion
+}
+
+// vPCNamespaceLister implements the VPCNamespaceLister
+// interface.
+type vPCNamespaceLister struct {
+	listers.ResourceIndexer[*sdnv1alpha1.VPC]
 }

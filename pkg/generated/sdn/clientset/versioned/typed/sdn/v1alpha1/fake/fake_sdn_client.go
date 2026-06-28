@@ -32,8 +32,12 @@ func (c *FakeSdnV1alpha1) Ports() v1alpha1.PortInterface {
 	return newFakePorts(c)
 }
 
-func (c *FakeSdnV1alpha1) VPCs() v1alpha1.VPCInterface {
-	return newFakeVPCs(c)
+func (c *FakeSdnV1alpha1) VPCs(namespace string) v1alpha1.VPCInterface {
+	return newFakeVPCs(c, namespace)
+}
+
+func (c *FakeSdnV1alpha1) VPCBindings(namespace string) v1alpha1.VPCBindingInterface {
+	return newFakeVPCBindings(c, namespace)
 }
 
 // RESTClient returns a RESTClient that is used to communicate

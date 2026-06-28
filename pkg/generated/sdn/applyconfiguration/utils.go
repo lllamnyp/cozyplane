@@ -38,6 +38,12 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &sdnv1alpha1.PortSpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPC"):
 		return &sdnv1alpha1.VPCApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPCBinding"):
+		return &sdnv1alpha1.VPCBindingApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPCBindingSpec"):
+		return &sdnv1alpha1.VPCBindingSpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPCRef"):
+		return &sdnv1alpha1.VPCRefApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPCSpec"):
 		return &sdnv1alpha1.VPCSpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPCStatus"):

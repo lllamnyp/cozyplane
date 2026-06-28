@@ -20,14 +20,24 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// VPCRef references a VPC by namespace and name. The namespace is the VPC
+// owner's namespace, not necessarily the referrer's.
+type VPCRef struct {
+	// Namespace is the namespace that owns the VPC.
+	Namespace string `json:"namespace"`
+	// Name is the VPC name within that namespace.
+	Name string `json:"name"`
+}
+
 // PortSpec is the realized network interface of a pod on a VPC.
 //
-// A Port is cluster-scoped and its name encodes the VPC and IP
-// (<vpc>.<ip-with-dashes>), so creating it is an atomic claim on that IP within
-// the VPC — etcd name uniqueness serializes concurrent allocators.
+// A Port is cluster-scoped and its name encodes the VPC's VNI and the IP
+// (v<vni>.<ip-with-dashes>), so creating it is an atomic claim on that IP within
+// the VPC — etcd name uniqueness serializes concurrent allocators. The VNI is
+// globally unique, so the name stays unique even though VPCs are namespaced.
 type PortSpec struct {
-	// VPC is the name of the VPC this port belongs to.
-	VPC string `json:"vpc"`
+	// VPCRef identifies the VPC this port belongs to (owner namespace + name).
+	VPCRef VPCRef `json:"vpcRef"`
 
 	// IP is the address allocated to the pod within the VPC CIDR (the tenant
 	// address configured inside the pod).
@@ -60,7 +70,8 @@ type PortSpec struct {
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster
-// +kubebuilder:printcolumn:name="VPC",type=string,JSONPath=`.spec.vpc`
+// +kubebuilder:printcolumn:name="VPC",type=string,JSONPath=`.spec.vpcRef.name`
+// +kubebuilder:printcolumn:name="VPCNamespace",type=string,JSONPath=`.spec.vpcRef.namespace`
 // +kubebuilder:printcolumn:name="IP",type=string,JSONPath=`.spec.ip`
 // +kubebuilder:printcolumn:name="Node",type=string,JSONPath=`.spec.node`
 // +kubebuilder:printcolumn:name="Pod",type=string,JSONPath=`.spec.podName`

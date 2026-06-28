@@ -66,16 +66,55 @@ type VPCStatus struct {
 }
 
 // +genclient
-// +genclient:nonNamespaced
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
-// VPC is a tenant overlay network.
+// VPC is a tenant overlay network. It is namespaced: the namespace expresses
+// ownership of the VPC. Use of a VPC by a pod is granted separately by a
+// VPCBinding (see below) — even within the owner's own namespace.
 type VPC struct {
 	metav1.TypeMeta
 	metav1.ObjectMeta
 
 	Spec   VPCSpec
 	Status VPCStatus
+}
+
+// VPCRef references a VPC by namespace and name. The namespace is the VPC
+// owner's namespace, not necessarily the referrer's.
+type VPCRef struct {
+	Namespace string
+	Name      string
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// VPCBindingList is a list of VPCBinding objects.
+type VPCBindingList struct {
+	metav1.TypeMeta
+	metav1.ListMeta
+
+	Items []VPCBinding
+}
+
+// VPCBindingSpec authorizes pods in the binding's (consumer) namespace to attach
+// to the referenced VPC.
+type VPCBindingSpec struct {
+	// VPCRef is the VPC being made usable, identified by owner namespace + name.
+	VPCRef VPCRef
+}
+
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// VPCBinding grants pods in its own (consumer) namespace permission to attach to
+// the VPC named in spec.vpcRef. It is created by the VPC owner reaching into the
+// consumer namespace; its existence is the datapath-readable, namespace-keyed
+// authorization the CNI checks at attach time.
+type VPCBinding struct {
+	metav1.TypeMeta
+	metav1.ObjectMeta
+
+	Spec VPCBindingSpec
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -90,7 +129,7 @@ type PortList struct {
 
 // PortSpec is the realized network interface of a pod on a VPC.
 type PortSpec struct {
-	VPC          string
+	VPCRef       VPCRef
 	IP           string
 	FabricIP     string
 	MAC          string

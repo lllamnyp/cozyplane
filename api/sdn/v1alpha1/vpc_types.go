@@ -63,16 +63,16 @@ type VPCStatus struct {
 }
 
 // +genclient
-// +genclient:nonNamespaced
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Cluster
 // +kubebuilder:printcolumn:name="VNI",type=integer,JSONPath=`.status.vni`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// VPC is a tenant overlay network.
+// VPC is a tenant overlay network. It is namespaced: the namespace expresses
+// ownership. A pod's *use* of a VPC is granted separately by a VPCBinding, even
+// within the owner's own namespace.
 type VPC struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

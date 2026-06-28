@@ -152,7 +152,102 @@ location + bridge + DNS, then tears down the source. The VPC IP/MAC never change
 so the VM and its in-VPC peers see nothing. (See `design.md` §5, §8 — the DNS
 step is on the cutover critical path precisely because of name-based addressing.)
 
-## 6. First milestone to build
+## 6. Tenancy & authorization (VPC sharing)
+
+How a pod is *authorized* to attach to a VPC. The hard constraint: at CNI/attach
+time the only trustworthy fact about the requester is the **pod's namespace**
+(kubelet hands it to us via `CNI_ARGS`; the annotation is forgeable). The
+identity of whoever created the workload is three hops upstream and gone. So
+every authorization decision must be made earlier, where an authenticated
+identity still exists, and **materialized into an object the datapath can read by
+namespace.**
+
+### Scopes (these refine §2)
+
+- **`VPC` is namespaced** — it lives in the owner tenant's namespace. The
+  namespace *is* the authorization anchor (see below), which is what lets us drop
+  any `use`-verb SAR for same-domain attach.
+- **`Port` stays cluster-scoped**, named by the globally-unique **VNI**:
+  `v<vni>.<ip-dashed>`. Cluster scope keeps the atomic name-based IPAM claim in a
+  single global keyspace; tenants never address Ports by name (they read them
+  through a projected subresource, §6 *Observability*).
+- **`VPCBinding` is namespaced** — it lives in the **consumer (target)**
+  namespace and references the owner VPC via `spec.vpcRef {namespace, name}`.
+
+### Attachment (data plane, no identity)
+
+- Pod annotation: `sdn.cozystack.io/vpc: [<owner-ns>/]<vpc>`. No slash → the
+  pod's own namespace.
+- Attach is **always default-deny** unless a `VPCBinding` in the pod's namespace
+  authorizes `(podNamespace, vpcRef)` — **including the same-namespace case**. A
+  VPC's namespace expresses *ownership*; a `VPCBinding` expresses *use*. Even the
+  owner attaching its own pods creates a binding in its namespace (the `export`
+  SAR passes trivially since it owns the VPC). This keeps one uniform code path —
+  the agent reads only the trustworthy namespace + binding existence, no
+  same-namespace special-casing and no identity required here.
+
+### Authorization (control plane, has identity) — the two-check create gate
+
+A `VPCBinding` is created by the **VPC owner**, reaching into the consumer
+namespace. Create is gated by a conjunction, both checks landing on the same
+principal:
+
+1. **Standard RBAC** — caller has `create vpcbindings` in the target namespace
+   (normal authz chain, before the strategy).
+2. **Custom SAR** — in the create strategy, a `LocalSubjectAccessReview` in the
+   *VPC's* namespace: `verb=export, resource=vpcs, resourceName=<vpc>`.
+
+Check 2 is load-bearing, not hardening: a tenant trivially holds `create
+vpcbindings` in its own namespace, so without the `export` SAR a subtenant could
+point a binding at *anyone's* VPC and attach — a self-service escalation. The
+`export` verb is the only thing standing in that gap. Because both permissions
+must be held by one principal, **the binding never crosses a trust boundary** —
+it is one party exercising authority it already holds on both ends.
+
+### Nested tenancy
+
+This falls out of Cozystack's tenant RBAC hierarchy with no special-casing: a
+parent tenant admin natively holds `export` on their VPC *and* `create
+vpcbindings` in subtenant namespaces, so they can bind their VPC into a
+subtenant. A subtenant holds neither upward.
+
+### Binding vs peering (the AWS line)
+
+`VPCBinding` is the **intra-domain** primitive (one principal with authority on
+both ends). Genuine **cross-tenant** connectivity — two separately-owned VPCs,
+each side independently consenting — is a future **`VPCPeering`** primitive, not
+a binding. Mirrors AWS: RAM/VPC sharing stays within accounts you control;
+cross-account is peering. Collapsing the two is how you accidentally build a
+sharing escape hatch.
+
+### Revocation
+
+The owner deletes the `VPCBinding` (they hold delete in the target namespace) →
+a controller reaps the `Port`s for `(namespace, vpc)` → agents reconcile local
+datapath and **sever** connectivity for the now-unauthorized pods. The pod keeps
+running, disconnected (NetworkPolicy-like). This requires agent-side
+reconciliation of local attachments against live Ports/bindings, not just the
+CNI `DEL` lifecycle path.
+
+### Observability (deferred — exact shape TBD)
+
+A `/ports` virtual subresource on `vpcs` (owner: every Port on the VPC) and on
+`vpcbindings` (consumer: just their namespace's slice), computed and
+RBAC-filtered server-side over the cluster-scoped `Port` collection. Tenants get
+`get vpcbindings/ports` in their namespace; they **never** get `list ports`
+cluster-wide. CRDs can't carry custom subresources, so this lands with the
+aggregated apiserver.
+
+### What needs the aggregated apiserver vs what doesn't
+
+Only the custom `/ports` subresource truly requires it. The object model
+(namespaced VPC, VPCBinding) and the **two-check gate** are deliverable on CRDs
+now: a `ValidatingWebhook` (or `ValidatingAdmissionPolicy` with a CEL
+`authorizer...check("export")`) can run the `export` SAR against the request's
+`userInfo`. So the authorization model can be built and proven without blocking
+on the apiserver lift, then folded into the apiserver's create strategy later.
+
+## 7. First milestone to build
 
 Smallest slice that is observably alive, in order:
 

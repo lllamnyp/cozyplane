@@ -18,9 +18,14 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get"]
-  # Tenant network ids from VPC objects.
+  # Tenant network ids from VPC objects (namespaced; read across all namespaces).
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcs"]
+    verbs: ["get", "list", "watch"]
+  # VPCBindings authorize attachment; the plugin checks them at CNI ADD
+  # (default-deny) and the agent will watch them for revocation.
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpcbindings"]
     verbs: ["get", "list", "watch"]
   # Port claims (the plugin allocates/releases; the agent watches for remotes).
   - apiGroups: ["sdn.cozystack.io"]

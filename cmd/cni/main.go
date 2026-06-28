@@ -15,10 +15,13 @@ limitations under the License.
 */
 
 // Command cozyplane is the CNI plugin. A pod attaches to a VPC by annotation
-// (sdn.cozystack.io/vpc), in any namespace; otherwise it joins the default
-// (system) network. The default network uses host-local IPAM; a VPC pod claims
-// an IP via a cluster-scoped Port (atomic by name). Either way the plugin sets
-// up a Calico-style point-to-point veth and attaches the eBPF classifier.
+// (sdn.cozystack.io/vpc = "[<owner-ns>/]<vpc>"), in any namespace; otherwise it
+// joins the default (system) network. VPC attachment is default-deny: a
+// VPCBinding in the pod's namespace must authorize the target VPC (the VPC's
+// namespace is ownership; a VPCBinding is use). The default network uses
+// host-local IPAM; a VPC pod claims an IP via a cluster-scoped Port (atomic by
+// name, keyed by VNI). Either way the plugin sets up a Calico-style
+// point-to-point veth and attaches the eBPF classifier.
 package main
 
 import (
@@ -47,13 +50,14 @@ import (
 )
 
 const (
-	contVethName  = "eth0"
-	ipamPlugin    = "host-local"
-	vpcAnnotation = "sdn.cozystack.io/vpc"
-	labelVPC      = "sdn.cozystack.io/vpc"
-	labelPodNS    = "sdn.cozystack.io/pod-namespace"
-	labelPodName  = "sdn.cozystack.io/pod-name"
-	labelPodUID   = "sdn.cozystack.io/pod-uid"
+	contVethName      = "eth0"
+	ipamPlugin        = "host-local"
+	vpcAnnotation     = "sdn.cozystack.io/vpc"
+	labelVPC          = "sdn.cozystack.io/vpc"
+	labelVPCNamespace = "sdn.cozystack.io/vpc-namespace"
+	labelPodNS        = "sdn.cozystack.io/pod-namespace"
+	labelPodName      = "sdn.cozystack.io/pod-name"
+	labelPodUID       = "sdn.cozystack.io/pod-uid"
 )
 
 // linkLocalGW is the on-link next hop installed in every pod, answered by the
@@ -126,17 +130,28 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 	// Resolve VPC membership from the pod annotation (best-effort: if the API
 	// is unreachable, fall back to the default network).
-	vpcName := ""
+	vpcAnno := ""
 	if core, e := coreClient(); e == nil && podNS != "" && podName != "" {
 		if pod, e := core.CoreV1().Pods(podNS).Get(context.TODO(), podName, metav1.GetOptions{}); e == nil {
-			vpcName = pod.Annotations[vpcAnnotation]
+			vpcAnno = pod.Annotations[vpcAnnotation]
 		}
 	}
 
-	if vpcName == "" {
+	if vpcAnno == "" {
 		return addDefault(args, conf)
 	}
-	return addVPC(args, conf, vpcName, podNS, podName, podUID)
+	vpcNS, vpcName := parseVPCRef(vpcAnno, podNS)
+	return addVPC(args, conf, vpcNS, vpcName, podNS, podName, podUID)
+}
+
+// parseVPCRef splits the vpc annotation value into (owner namespace, name). The
+// value is "<vpc>" (owner namespace defaults to the pod's namespace) or
+// "<owner-ns>/<vpc>" to reference a VPC owned by another namespace.
+func parseVPCRef(anno, podNS string) (ns, name string) {
+	if i := strings.IndexByte(anno, '/'); i >= 0 {
+		return anno[:i], anno[i+1:]
+	}
+	return podNS, anno
 }
 
 // addDefault attaches the pod to the default/system network with host-local IPAM.
@@ -185,20 +200,28 @@ func addDefault(args *skel.CmdArgs, conf *NetConf) error {
 // addVPC attaches the pod to a VPC using the dual-address bridge: the pod's
 // interface gets the VPC (tenant) IP, while status.podIP is a unique fabric IP
 // from the node pod CIDR that the bridge DNATs to the VPC IP.
-func addVPC(args *skel.CmdArgs, conf *NetConf, vpcName, podNS, podName, podUID string) (err error) {
+func addVPC(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, podUID string) (err error) {
 	client, err := sdnClient()
 	if err != nil {
 		return fmt.Errorf("sdn client: %w", err)
 	}
-	vpc, err := client.SdnV1alpha1().VPCs().Get(context.TODO(), vpcName, metav1.GetOptions{})
+
+	// Authorization (default-deny): a VPCBinding in the pod's namespace must
+	// permit attaching to this VPC. Ownership (the VPC's namespace) is not
+	// enough — use is granted by a binding even within the owner's namespace.
+	if err := requireVPCBinding(client, podNS, vpcNS, vpcName); err != nil {
+		return err
+	}
+
+	vpc, err := client.SdnV1alpha1().VPCs(vpcNS).Get(context.TODO(), vpcName, metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("get vpc %q: %w", vpcName, err)
+		return fmt.Errorf("get vpc %s/%s: %w", vpcNS, vpcName, err)
 	}
 	if vpc.Status.VNI == 0 {
-		return fmt.Errorf("vpc %q is not ready (no VNI assigned yet)", vpcName)
+		return fmt.Errorf("vpc %s/%s is not ready (no VNI assigned yet)", vpcNS, vpcName)
 	}
 	if len(vpc.Spec.CIDRs) == 0 {
-		return fmt.Errorf("vpc %q has no CIDR", vpcName)
+		return fmt.Errorf("vpc %s/%s has no CIDR", vpcNS, vpcName)
 	}
 
 	state, err := datapath.LoadAgentState()
@@ -238,7 +261,7 @@ func addVPC(args *skel.CmdArgs, conf *NetConf, vpcName, podNS, podName, podUID s
 	fabricIP := fabricRes.IPs[0].Address.IP
 
 	// VPC IP: atomic claim via a Port.
-	vpcIP, port, err := claimIP(client, vpc, state, fabricIP.String(), podNS, podName, podUID)
+	vpcIP, port, err := claimIP(client, vpc, vpcNS, state, fabricIP.String(), podNS, podName, podUID)
 	if err != nil {
 		return err
 	}
@@ -267,17 +290,37 @@ func addVPC(args *skel.CmdArgs, conf *NetConf, vpcName, podNS, podName, podUID s
 	return types.PrintResult(result, conf.CNIVersion)
 }
 
+// requireVPCBinding implements default-deny attachment: a VPCBinding in the
+// pod's namespace must reference the target VPC (owner namespace + name). The
+// pod's namespace is trustworthy (kubelet supplies it via CNI_ARGS), so this is
+// a pure data-plane check — no caller identity is involved here; the privileged
+// decision was made when the binding was created.
+func requireVPCBinding(client sdnclientset.Interface, podNS, vpcNS, vpcName string) error {
+	list, err := client.SdnV1alpha1().VPCBindings(podNS).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list vpcbindings in %q: %w", podNS, err)
+	}
+	for i := range list.Items {
+		ref := list.Items[i].Spec.VPCRef
+		if ref.Namespace == vpcNS && ref.Name == vpcName {
+			return nil
+		}
+	}
+	return fmt.Errorf("no VPCBinding in namespace %q authorizes attaching to VPC %s/%s (default-deny)", podNS, vpcNS, vpcName)
+}
+
 // claimIP picks a free IP in the VPC CIDR and atomically claims it by creating a
-// cluster-scoped Port named <vpc>.<ip-dashed>; concurrent claims collide on the
-// name and retry.
-func claimIP(client sdnclientset.Interface, vpc *sdnv1alpha1.VPC, state *datapath.AgentState, fabricIP, podNS, podName, podUID string) (net.IP, *sdnv1alpha1.Port, error) {
+// cluster-scoped Port named v<vni>.<ip-dashed>; concurrent claims collide on the
+// name and retry. The VNI is globally unique, so the name is unique even though
+// VPC names are only unique within a namespace.
+func claimIP(client sdnclientset.Interface, vpc *sdnv1alpha1.VPC, vpcNS string, state *datapath.AgentState, fabricIP, podNS, podName, podUID string) (net.IP, *sdnv1alpha1.Port, error) {
 	_, ipnet, err := net.ParseCIDR(vpc.Spec.CIDRs[0])
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse vpc CIDR: %w", err)
 	}
 
 	list, err := client.SdnV1alpha1().Ports().List(context.TODO(), metav1.ListOptions{
-		LabelSelector: labelVPC + "=" + vpc.Name,
+		LabelSelector: labelVPCNamespace + "=" + vpcNS + "," + labelVPC + "=" + vpc.Name,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("list ports: %w", err)
@@ -297,16 +340,17 @@ func claimIP(client sdnclientset.Interface, vpc *sdnv1alpha1.VPC, state *datapat
 		}
 		port := &sdnv1alpha1.Port{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: portName(vpc.Name, ipStr),
+				Name: portName(vpc.Status.VNI, ipStr),
 				Labels: map[string]string{
-					labelVPC:     vpc.Name,
-					labelPodNS:   podNS,
-					labelPodName: podName,
-					labelPodUID:  podUID,
+					labelVPCNamespace: vpcNS,
+					labelVPC:          vpc.Name,
+					labelPodNS:        podNS,
+					labelPodName:      podName,
+					labelPodUID:       podUID,
 				},
 			},
 			Spec: sdnv1alpha1.PortSpec{
-				VPC:          vpc.Name,
+				VPCRef:       sdnv1alpha1.VPCRef{Namespace: vpcNS, Name: vpc.Name},
 				IP:           ipStr,
 				FabricIP:     fabricIP,
 				Node:         state.NodeName,
@@ -329,8 +373,8 @@ func claimIP(client sdnclientset.Interface, vpc *sdnv1alpha1.VPC, state *datapat
 	return nil, nil, fmt.Errorf("no free address in VPC %q (%s)", vpc.Name, vpc.Spec.CIDRs[0])
 }
 
-func portName(vpc, ip string) string {
-	return vpc + "." + strings.ReplaceAll(ip, ".", "-")
+func portName(vni int32, ip string) string {
+	return fmt.Sprintf("v%d.%s", vni, strings.ReplaceAll(ip, ".", "-"))
 }
 
 // setupVeth creates the pod veth, configures the pod-side address and routes,

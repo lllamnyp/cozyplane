@@ -32,71 +32,71 @@ import (
 	cache "k8s.io/client-go/tools/cache"
 )
 
-// VPCInformer provides access to a shared informer and lister for
-// VPCs.
-type VPCInformer interface {
+// VPCBindingInformer provides access to a shared informer and lister for
+// VPCBindings.
+type VPCBindingInformer interface {
 	Informer() cache.SharedIndexInformer
-	Lister() sdnv1alpha1.VPCLister
+	Lister() sdnv1alpha1.VPCBindingLister
 }
 
-type vPCInformer struct {
+type vPCBindingInformer struct {
 	factory          internalinterfaces.SharedInformerFactory
 	tweakListOptions internalinterfaces.TweakListOptionsFunc
 	namespace        string
 }
 
-// NewVPCInformer constructs a new informer for VPC type.
+// NewVPCBindingInformer constructs a new informer for VPCBinding type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
-func NewVPCInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers) cache.SharedIndexInformer {
-	return NewFilteredVPCInformer(client, namespace, resyncPeriod, indexers, nil)
+func NewVPCBindingInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers) cache.SharedIndexInformer {
+	return NewFilteredVPCBindingInformer(client, namespace, resyncPeriod, indexers, nil)
 }
 
-// NewFilteredVPCInformer constructs a new informer for VPC type.
+// NewFilteredVPCBindingInformer constructs a new informer for VPCBinding type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
-func NewFilteredVPCInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
+func NewFilteredVPCBindingInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
 	return cache.NewSharedIndexInformer(
 		cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
 			ListFunc: func(options v1.ListOptions) (runtime.Object, error) {
 				if tweakListOptions != nil {
 					tweakListOptions(&options)
 				}
-				return client.SdnV1alpha1().VPCs(namespace).List(context.Background(), options)
+				return client.SdnV1alpha1().VPCBindings(namespace).List(context.Background(), options)
 			},
 			WatchFunc: func(options v1.ListOptions) (watch.Interface, error) {
 				if tweakListOptions != nil {
 					tweakListOptions(&options)
 				}
-				return client.SdnV1alpha1().VPCs(namespace).Watch(context.Background(), options)
+				return client.SdnV1alpha1().VPCBindings(namespace).Watch(context.Background(), options)
 			},
 			ListWithContextFunc: func(ctx context.Context, options v1.ListOptions) (runtime.Object, error) {
 				if tweakListOptions != nil {
 					tweakListOptions(&options)
 				}
-				return client.SdnV1alpha1().VPCs(namespace).List(ctx, options)
+				return client.SdnV1alpha1().VPCBindings(namespace).List(ctx, options)
 			},
 			WatchFuncWithContext: func(ctx context.Context, options v1.ListOptions) (watch.Interface, error) {
 				if tweakListOptions != nil {
 					tweakListOptions(&options)
 				}
-				return client.SdnV1alpha1().VPCs(namespace).Watch(ctx, options)
+				return client.SdnV1alpha1().VPCBindings(namespace).Watch(ctx, options)
 			},
 		}, client),
-		&apisdnv1alpha1.VPC{},
+		&apisdnv1alpha1.VPCBinding{},
 		resyncPeriod,
 		indexers,
 	)
 }
 
-func (f *vPCInformer) defaultInformer(client versioned.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
-	return NewFilteredVPCInformer(client, f.namespace, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, f.tweakListOptions)
+func (f *vPCBindingInformer) defaultInformer(client versioned.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
+	return NewFilteredVPCBindingInformer(client, f.namespace, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, f.tweakListOptions)
 }
 
-func (f *vPCInformer) Informer() cache.SharedIndexInformer {
-	return f.factory.InformerFor(&apisdnv1alpha1.VPC{}, f.defaultInformer)
+func (f *vPCBindingInformer) Informer() cache.SharedIndexInformer {
+	return f.factory.InformerFor(&apisdnv1alpha1.VPCBinding{}, f.defaultInformer)
 }
 
-func (f *vPCInformer) Lister() sdnv1alpha1.VPCLister {
-	return sdnv1alpha1.NewVPCLister(f.Informer().GetIndexer())
+func (f *vPCBindingInformer) Lister() sdnv1alpha1.VPCBindingLister {
+	return sdnv1alpha1.NewVPCBindingLister(f.Informer().GetIndexer())
 }

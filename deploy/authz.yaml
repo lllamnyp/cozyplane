@@ -1,0 +1,81 @@
+# Authorization for VPC sharing (see docs/control-plane.md §6).
+#
+# A VPCBinding lives in the *consumer* namespace and grants its pods the right to
+# attach to the VPC named in spec.vpcRef. Creating one is gated by TWO checks,
+# both of which must be satisfied by the same principal (the VPC owner):
+#
+#   1. Standard RBAC: `create vpcbindings` in the target (consumer) namespace.
+#      Enforced by the normal authorization chain — see the owner ClusterRole
+#      below, RoleBound into the namespaces an owner may bind into.
+#   2. The `export` verb on the referenced VPC, checked by the
+#      ValidatingAdmissionPolicy below via a SubjectAccessReview against the
+#      request's user. This is the load-bearing escalation gate: a tenant
+#      trivially holds `create vpcbindings` in its own namespace, so without the
+#      export check it could bind to any VPC and attach. `export` is what stops
+#      a subtenant binding to a VPC it does not own.
+#
+# This is the intra-domain primitive only: it works when one principal holds
+# authority on both ends (an owner, or — via Cozystack nested tenancy — a parent
+# tenant admin reaching into a subtenant namespace). Genuine cross-tenant
+# connectivity is a future VPCPeering primitive, not a binding.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: cozyplane-vpcbinding-export
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["sdn.cozystack.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["vpcbindings"]
+  variables:
+    - name: ref
+      expression: object.spec.vpcRef
+  validations:
+    # The request's user must be allowed to `export` the referenced VPC, in the
+    # VPC's own (owner) namespace. RBAC verbs `["*"]` match the custom `export`
+    # verb, so cluster-admins and full namespace-admins pass automatically.
+    - expression: >-
+        authorizer.group('sdn.cozystack.io').resource('vpcs')
+          .namespace(variables.ref.namespace).name(variables.ref.name)
+          .check('export').allowed()
+      reason: Forbidden
+      messageExpression: >-
+        "creating a VPCBinding to VPC " + variables.ref.namespace + "/" +
+        variables.ref.name + " requires the 'export' verb on that VPC " +
+        "(sdn.cozystack.io vpcs)"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: cozyplane-vpcbinding-export
+spec:
+  policyName: cozyplane-vpcbinding-export
+  validationActions: ["Deny"]
+---
+# Sample owner role. RoleBind this into a tenant's namespace to let that tenant
+# own VPCs (including `export` them) and manage VPCBindings there. To bind a VPC
+# into a *subtenant* namespace, the owner also needs `create vpcbindings` in that
+# subtenant namespace — under Cozystack nested tenancy a parent tenant admin
+# already holds it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cozyplane-vpc-owner
+rules:
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpcs"]
+    # `export` is the virtual verb consumed by the ValidatingAdmissionPolicy.
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "export"]
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpcs/status"]
+    verbs: ["get"]
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpcbindings"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["ports"]
+    verbs: ["get", "list", "watch"]

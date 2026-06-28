@@ -28,6 +28,8 @@ type Interface interface {
 	Ports() PortInformer
 	// VPCs returns a VPCInformer.
 	VPCs() VPCInformer
+	// VPCBindings returns a VPCBindingInformer.
+	VPCBindings() VPCBindingInformer
 }
 
 type version struct {
@@ -48,5 +50,10 @@ func (v *version) Ports() PortInformer {
 
 // VPCs returns a VPCInformer.
 func (v *version) VPCs() VPCInformer {
-	return &vPCInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
+	return &vPCInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// VPCBindings returns a VPCBindingInformer.
+func (v *version) VPCBindings() VPCBindingInformer {
+	return &vPCBindingInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }

@@ -57,6 +57,8 @@ func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Sdn().V1alpha1().Ports().Informer()}, nil
 	case v1alpha1.SchemeGroupVersion.WithResource("vpcs"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Sdn().V1alpha1().VPCs().Informer()}, nil
+	case v1alpha1.SchemeGroupVersion.WithResource("vpcbindings"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Sdn().V1alpha1().VPCBindings().Informer()}, nil
 
 	}
 

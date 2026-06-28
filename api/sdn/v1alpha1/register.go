@@ -47,6 +47,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 	scheme.AddKnownTypes(SchemeGroupVersion,
 		&VPC{},
 		&VPCList{},
+		&VPCBinding{},
+		&VPCBindingList{},
 		&Port{},
 		&PortList{},
 	)

@@ -31,11 +31,11 @@ type fakeVPCs struct {
 	Fake *FakeSdnV1alpha1
 }
 
-func newFakeVPCs(fake *FakeSdnV1alpha1) typedsdnv1alpha1.VPCInterface {
+func newFakeVPCs(fake *FakeSdnV1alpha1, namespace string) typedsdnv1alpha1.VPCInterface {
 	return &fakeVPCs{
 		gentype.NewFakeClientWithListAndApply[*v1alpha1.VPC, *v1alpha1.VPCList, *sdnv1alpha1.VPCApplyConfiguration](
 			fake.Fake,
-			"",
+			namespace,
 			v1alpha1.SchemeGroupVersion.WithResource("vpcs"),
 			v1alpha1.SchemeGroupVersion.WithKind("VPC"),
 			func() *v1alpha1.VPC { return &v1alpha1.VPC{} },

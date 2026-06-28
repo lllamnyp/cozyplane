@@ -52,7 +52,7 @@ func MatchVPC(label labels.Selector, fieldSel fields.Selector) storage.Selection
 
 // SelectableFields returns a field set that represents the object.
 func SelectableFields(obj *sdn.VPC) fields.Set {
-	return generic.ObjectMetaFieldsSet(&obj.ObjectMeta, false)
+	return generic.ObjectMetaFieldsSet(&obj.ObjectMeta, true)
 }
 
 type vpcStrategy struct {
@@ -66,7 +66,7 @@ func NewStrategy(typer runtime.ObjectTyper) vpcStrategy {
 }
 
 func (vpcStrategy) NamespaceScoped() bool {
-	return false
+	return true
 }
 
 func (vpcStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {

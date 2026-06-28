@@ -25,3 +25,15 @@ type PortListerExpansion interface{}
 // VPCListerExpansion allows custom methods to be added to
 // VPCLister.
 type VPCListerExpansion interface{}
+
+// VPCNamespaceListerExpansion allows custom methods to be added to
+// VPCNamespaceLister.
+type VPCNamespaceListerExpansion interface{}
+
+// VPCBindingListerExpansion allows custom methods to be added to
+// VPCBindingLister.
+type VPCBindingListerExpansion interface{}
+
+// VPCBindingNamespaceListerExpansion allows custom methods to be added to
+// VPCBindingNamespaceLister.
+type VPCBindingNamespaceListerExpansion interface{}

@@ -24,36 +24,38 @@ import (
 	v1 "k8s.io/client-go/applyconfigurations/meta/v1"
 )
 
-// VPCApplyConfiguration represents a declarative configuration of the VPC type for use
+// VPCBindingApplyConfiguration represents a declarative configuration of the VPCBinding type for use
 // with apply.
 //
-// VPC is a tenant overlay network. It is namespaced: the namespace expresses
-// ownership. A pod's *use* of a VPC is granted separately by a VPCBinding, even
-// within the owner's own namespace.
-type VPCApplyConfiguration struct {
+// VPCBinding grants pods in its own (consumer) namespace permission to attach to
+// the VPC named in spec.vpcRef. It is created by the VPC owner reaching into the
+// consumer namespace (gated by RBAC create here + an export SAR on the VPC), and
+// its existence is the namespace-keyed, datapath-readable authorization the CNI
+// checks at attach time. A VPC's namespace expresses ownership; a VPCBinding
+// expresses use — required even when the pod and VPC share a namespace.
+type VPCBindingApplyConfiguration struct {
 	v1.TypeMetaApplyConfiguration    `json:",inline"`
 	*v1.ObjectMetaApplyConfiguration `json:"metadata,omitempty"`
-	Spec                             *VPCSpecApplyConfiguration   `json:"spec,omitempty"`
-	Status                           *VPCStatusApplyConfiguration `json:"status,omitempty"`
+	Spec                             *VPCBindingSpecApplyConfiguration `json:"spec,omitempty"`
 }
 
-// VPC constructs a declarative configuration of the VPC type for use with
+// VPCBinding constructs a declarative configuration of the VPCBinding type for use with
 // apply.
-func VPC(name, namespace string) *VPCApplyConfiguration {
-	b := &VPCApplyConfiguration{}
+func VPCBinding(name, namespace string) *VPCBindingApplyConfiguration {
+	b := &VPCBindingApplyConfiguration{}
 	b.WithName(name)
 	b.WithNamespace(namespace)
-	b.WithKind("VPC")
+	b.WithKind("VPCBinding")
 	b.WithAPIVersion("sdn.cozystack.io/v1alpha1")
 	return b
 }
 
-func (b VPCApplyConfiguration) IsApplyConfiguration() {}
+func (b VPCBindingApplyConfiguration) IsApplyConfiguration() {}
 
 // WithKind sets the Kind field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the Kind field is set to the value of the last call.
-func (b *VPCApplyConfiguration) WithKind(value string) *VPCApplyConfiguration {
+func (b *VPCBindingApplyConfiguration) WithKind(value string) *VPCBindingApplyConfiguration {
 	b.TypeMetaApplyConfiguration.Kind = &value
 	return b
 }
@@ -61,7 +63,7 @@ func (b *VPCApplyConfiguration) WithKind(value string) *VPCApplyConfiguration {
 // WithAPIVersion sets the APIVersion field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the APIVersion field is set to the value of the last call.
-func (b *VPCApplyConfiguration) WithAPIVersion(value string) *VPCApplyConfiguration {
+func (b *VPCBindingApplyConfiguration) WithAPIVersion(value string) *VPCBindingApplyConfiguration {
 	b.TypeMetaApplyConfiguration.APIVersion = &value
 	return b
 }
@@ -69,7 +71,7 @@ func (b *VPCApplyConfiguration) WithAPIVersion(value string) *VPCApplyConfigurat
 // WithName sets the Name field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the Name field is set to the value of the last call.
-func (b *VPCApplyConfiguration) WithName(value string) *VPCApplyConfiguration {
+func (b *VPCBindingApplyConfiguration) WithName(value string) *VPCBindingApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	b.ObjectMetaApplyConfiguration.Name = &value
 	return b
@@ -78,7 +80,7 @@ func (b *VPCApplyConfiguration) WithName(value string) *VPCApplyConfiguration {
 // WithGenerateName sets the GenerateName field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the GenerateName field is set to the value of the last call.
-func (b *VPCApplyConfiguration) WithGenerateName(value string) *VPCApplyConfiguration {
+func (b *VPCBindingApplyConfiguration) WithGenerateName(value string) *VPCBindingApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	b.ObjectMetaApplyConfiguration.GenerateName = &value
 	return b
@@ -87,7 +89,7 @@ func (b *VPCApplyConfiguration) WithGenerateName(value string) *VPCApplyConfigur
 // WithNamespace sets the Namespace field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the Namespace field is set to the value of the last call.
-func (b *VPCApplyConfiguration) WithNamespace(value string) *VPCApplyConfiguration {
+func (b *VPCBindingApplyConfiguration) WithNamespace(value string) *VPCBindingApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	b.ObjectMetaApplyConfiguration.Namespace = &value
 	return b
@@ -96,7 +98,7 @@ func (b *VPCApplyConfiguration) WithNamespace(value string) *VPCApplyConfigurati
 // WithUID sets the UID field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the UID field is set to the value of the last call.
-func (b *VPCApplyConfiguration) WithUID(value types.UID) *VPCApplyConfiguration {
+func (b *VPCBindingApplyConfiguration) WithUID(value types.UID) *VPCBindingApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	b.ObjectMetaApplyConfiguration.UID = &value
 	return b
@@ -105,7 +107,7 @@ func (b *VPCApplyConfiguration) WithUID(value types.UID) *VPCApplyConfiguration 
 // WithResourceVersion sets the ResourceVersion field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the ResourceVersion field is set to the value of the last call.
-func (b *VPCApplyConfiguration) WithResourceVersion(value string) *VPCApplyConfiguration {
+func (b *VPCBindingApplyConfiguration) WithResourceVersion(value string) *VPCBindingApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	b.ObjectMetaApplyConfiguration.ResourceVersion = &value
 	return b
@@ -114,7 +116,7 @@ func (b *VPCApplyConfiguration) WithResourceVersion(value string) *VPCApplyConfi
 // WithGeneration sets the Generation field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the Generation field is set to the value of the last call.
-func (b *VPCApplyConfiguration) WithGeneration(value int64) *VPCApplyConfiguration {
+func (b *VPCBindingApplyConfiguration) WithGeneration(value int64) *VPCBindingApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	b.ObjectMetaApplyConfiguration.Generation = &value
 	return b
@@ -123,7 +125,7 @@ func (b *VPCApplyConfiguration) WithGeneration(value int64) *VPCApplyConfigurati
 // WithCreationTimestamp sets the CreationTimestamp field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the CreationTimestamp field is set to the value of the last call.
-func (b *VPCApplyConfiguration) WithCreationTimestamp(value metav1.Time) *VPCApplyConfiguration {
+func (b *VPCBindingApplyConfiguration) WithCreationTimestamp(value metav1.Time) *VPCBindingApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	b.ObjectMetaApplyConfiguration.CreationTimestamp = &value
 	return b
@@ -132,7 +134,7 @@ func (b *VPCApplyConfiguration) WithCreationTimestamp(value metav1.Time) *VPCApp
 // WithDeletionTimestamp sets the DeletionTimestamp field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the DeletionTimestamp field is set to the value of the last call.
-func (b *VPCApplyConfiguration) WithDeletionTimestamp(value metav1.Time) *VPCApplyConfiguration {
+func (b *VPCBindingApplyConfiguration) WithDeletionTimestamp(value metav1.Time) *VPCBindingApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	b.ObjectMetaApplyConfiguration.DeletionTimestamp = &value
 	return b
@@ -141,7 +143,7 @@ func (b *VPCApplyConfiguration) WithDeletionTimestamp(value metav1.Time) *VPCApp
 // WithDeletionGracePeriodSeconds sets the DeletionGracePeriodSeconds field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the DeletionGracePeriodSeconds field is set to the value of the last call.
-func (b *VPCApplyConfiguration) WithDeletionGracePeriodSeconds(value int64) *VPCApplyConfiguration {
+func (b *VPCBindingApplyConfiguration) WithDeletionGracePeriodSeconds(value int64) *VPCBindingApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	b.ObjectMetaApplyConfiguration.DeletionGracePeriodSeconds = &value
 	return b
@@ -151,7 +153,7 @@ func (b *VPCApplyConfiguration) WithDeletionGracePeriodSeconds(value int64) *VPC
 // and returns the receiver, so that objects can be build by chaining "With" function invocations.
 // If called multiple times, the entries provided by each call will be put on the Labels field,
 // overwriting an existing map entries in Labels field with the same key.
-func (b *VPCApplyConfiguration) WithLabels(entries map[string]string) *VPCApplyConfiguration {
+func (b *VPCBindingApplyConfiguration) WithLabels(entries map[string]string) *VPCBindingApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	if b.ObjectMetaApplyConfiguration.Labels == nil && len(entries) > 0 {
 		b.ObjectMetaApplyConfiguration.Labels = make(map[string]string, len(entries))
@@ -166,7 +168,7 @@ func (b *VPCApplyConfiguration) WithLabels(entries map[string]string) *VPCApplyC
 // and returns the receiver, so that objects can be build by chaining "With" function invocations.
 // If called multiple times, the entries provided by each call will be put on the Annotations field,
 // overwriting an existing map entries in Annotations field with the same key.
-func (b *VPCApplyConfiguration) WithAnnotations(entries map[string]string) *VPCApplyConfiguration {
+func (b *VPCBindingApplyConfiguration) WithAnnotations(entries map[string]string) *VPCBindingApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	if b.ObjectMetaApplyConfiguration.Annotations == nil && len(entries) > 0 {
 		b.ObjectMetaApplyConfiguration.Annotations = make(map[string]string, len(entries))
@@ -180,7 +182,7 @@ func (b *VPCApplyConfiguration) WithAnnotations(entries map[string]string) *VPCA
 // WithOwnerReferences adds the given value to the OwnerReferences field in the declarative configuration
 // and returns the receiver, so that objects can be build by chaining "With" function invocations.
 // If called multiple times, values provided by each call will be appended to the OwnerReferences field.
-func (b *VPCApplyConfiguration) WithOwnerReferences(values ...*v1.OwnerReferenceApplyConfiguration) *VPCApplyConfiguration {
+func (b *VPCBindingApplyConfiguration) WithOwnerReferences(values ...*v1.OwnerReferenceApplyConfiguration) *VPCBindingApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	for i := range values {
 		if values[i] == nil {
@@ -194,7 +196,7 @@ func (b *VPCApplyConfiguration) WithOwnerReferences(values ...*v1.OwnerReference
 // WithFinalizers adds the given value to the Finalizers field in the declarative configuration
 // and returns the receiver, so that objects can be build by chaining "With" function invocations.
 // If called multiple times, values provided by each call will be appended to the Finalizers field.
-func (b *VPCApplyConfiguration) WithFinalizers(values ...string) *VPCApplyConfiguration {
+func (b *VPCBindingApplyConfiguration) WithFinalizers(values ...string) *VPCBindingApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	for i := range values {
 		b.ObjectMetaApplyConfiguration.Finalizers = append(b.ObjectMetaApplyConfiguration.Finalizers, values[i])
@@ -202,7 +204,7 @@ func (b *VPCApplyConfiguration) WithFinalizers(values ...string) *VPCApplyConfig
 	return b
 }
 
-func (b *VPCApplyConfiguration) ensureObjectMetaApplyConfigurationExists() {
+func (b *VPCBindingApplyConfiguration) ensureObjectMetaApplyConfigurationExists() {
 	if b.ObjectMetaApplyConfiguration == nil {
 		b.ObjectMetaApplyConfiguration = &v1.ObjectMetaApplyConfiguration{}
 	}
@@ -211,37 +213,29 @@ func (b *VPCApplyConfiguration) ensureObjectMetaApplyConfigurationExists() {
 // WithSpec sets the Spec field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the Spec field is set to the value of the last call.
-func (b *VPCApplyConfiguration) WithSpec(value *VPCSpecApplyConfiguration) *VPCApplyConfiguration {
+func (b *VPCBindingApplyConfiguration) WithSpec(value *VPCBindingSpecApplyConfiguration) *VPCBindingApplyConfiguration {
 	b.Spec = value
 	return b
 }
 
-// WithStatus sets the Status field in the declarative configuration to the given value
-// and returns the receiver, so that objects can be built by chaining "With" function invocations.
-// If called multiple times, the Status field is set to the value of the last call.
-func (b *VPCApplyConfiguration) WithStatus(value *VPCStatusApplyConfiguration) *VPCApplyConfiguration {
-	b.Status = value
-	return b
-}
-
 // GetKind retrieves the value of the Kind field in the declarative configuration.
-func (b *VPCApplyConfiguration) GetKind() *string {
+func (b *VPCBindingApplyConfiguration) GetKind() *string {
 	return b.TypeMetaApplyConfiguration.Kind
 }
 
 // GetAPIVersion retrieves the value of the APIVersion field in the declarative configuration.
-func (b *VPCApplyConfiguration) GetAPIVersion() *string {
+func (b *VPCBindingApplyConfiguration) GetAPIVersion() *string {
 	return b.TypeMetaApplyConfiguration.APIVersion
 }
 
 // GetName retrieves the value of the Name field in the declarative configuration.
-func (b *VPCApplyConfiguration) GetName() *string {
+func (b *VPCBindingApplyConfiguration) GetName() *string {
 	b.ensureObjectMetaApplyConfigurationExists()
 	return b.ObjectMetaApplyConfiguration.Name
 }
 
 // GetNamespace retrieves the value of the Namespace field in the declarative configuration.
-func (b *VPCApplyConfiguration) GetNamespace() *string {
+func (b *VPCBindingApplyConfiguration) GetNamespace() *string {
 	b.ensureObjectMetaApplyConfigurationExists()
 	return b.ObjectMetaApplyConfiguration.Namespace
 }

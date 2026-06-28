@@ -276,7 +276,7 @@ func watchPorts(ctx context.Context, client sdnclientset.Interface, mgr *datapat
 			log.Error("set remote port", "port", port.Name, "err", err)
 			return
 		}
-		log.Info("remote port set", "ip", port.Spec.IP, "nodeIP", port.Spec.NodeIP, "vpc", port.Spec.VPC)
+		log.Info("remote port set", "ip", port.Spec.IP, "nodeIP", port.Spec.NodeIP, "vpc", port.Spec.VPCRef.Namespace+"/"+port.Spec.VPCRef.Name)
 	}
 
 	_, _ = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
