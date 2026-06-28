@@ -53,6 +53,8 @@ func (f *genericInformer) Lister() cache.GenericLister {
 func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource) (GenericInformer, error) {
 	switch resource {
 	// Group=sdn.cozystack.io, Version=v1alpha1
+	case v1alpha1.SchemeGroupVersion.WithResource("ports"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Sdn().V1alpha1().Ports().Informer()}, nil
 	case v1alpha1.SchemeGroupVersion.WithResource("vpcs"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Sdn().V1alpha1().VPCs().Informer()}, nil
 

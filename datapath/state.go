@@ -28,6 +28,8 @@ import (
 // plugin needs only what it can't derive itself.
 type AgentState struct {
 	NodeName string `json:"nodeName"`
+	// NodeIP is this node's host IP (the Geneve tunnel endpoint).
+	NodeIP string `json:"nodeIP"`
 	// PodCIDR is this node's slice of the cluster pod CIDR (default network).
 	PodCIDR string `json:"podCIDR"`
 	// MTU is the pod MTU (underlay MTU minus Geneve overhead).

@@ -136,11 +136,14 @@ func run(nodeName string, mtu int, vni uint32, log *slog.Logger) error {
 	if podCIDR == "" {
 		return fmt.Errorf("node %q has no spec.podCIDR (is --allocate-node-cidrs enabled?)", nodeName)
 	}
-	state := &datapath.AgentState{NodeName: nodeName, PodCIDR: podCIDR, MTU: mtu}
+	state := &datapath.AgentState{NodeName: nodeName, NodeIP: internalIP(self), PodCIDR: podCIDR, MTU: mtu}
 	if err := state.Save(); err != nil {
 		return fmt.Errorf("publish agent state: %w", err)
 	}
-	log.Info("published node state", "podCIDR", podCIDR, "mtu", mtu)
+	if err := datapath.WritePluginKubeconfig(); err != nil {
+		log.Warn("write plugin kubeconfig (VPC attachment unavailable)", "err", err)
+	}
+	log.Info("published node state", "nodeIP", state.NodeIP, "podCIDR", podCIDR, "mtu", mtu)
 
 	if err := watchNodes(ctx, client, mgr, nodeName, log); err != nil {
 		return err
@@ -152,6 +155,7 @@ func run(nodeName string, mtu int, vni uint32, log *slog.Logger) error {
 		log.Warn("sdn client init failed; VPC networks won't be programmed", "err", err)
 	} else {
 		watchVPCs(ctx, sdnClient, mgr, log)
+		watchPorts(ctx, sdnClient, mgr, nodeName, log)
 	}
 
 	// Datapath is up and remotes are syncing; expose the CNI to kubelet.
@@ -241,6 +245,41 @@ func watchVPCs(ctx context.Context, client sdnclientset.Interface, mgr *datapath
 			}
 			if err := mgr.DelNetwork(vpc.Spec.CIDRs[0]); err != nil {
 				log.Error("del network", "vpc", vpc.Name, "err", err)
+			}
+		},
+	})
+
+	factory.Start(ctx.Done())
+}
+
+// watchPorts mirrors remote VPC ports (pods on other nodes) into the remotes
+// map as /32 routes to their node's Geneve endpoint. Best-effort, like watchVPCs.
+func watchPorts(ctx context.Context, client sdnclientset.Interface, mgr *datapath.Manager, selfName string, log *slog.Logger) {
+	factory := sdninformers.NewSharedInformerFactory(client, 0)
+	informer := factory.Sdn().V1alpha1().Ports().Informer()
+
+	apply := func(obj any) {
+		port, ok := obj.(*sdnv1alpha1.Port)
+		if !ok || port.Spec.Node == selfName || port.Spec.IP == "" || port.Spec.NodeIP == "" {
+			return // local ports are reached directly; skip incomplete ones
+		}
+		if err := mgr.SetRemote(port.Spec.IP+"/32", net.ParseIP(port.Spec.NodeIP)); err != nil {
+			log.Error("set remote port", "port", port.Name, "err", err)
+			return
+		}
+		log.Info("remote port set", "ip", port.Spec.IP, "nodeIP", port.Spec.NodeIP, "vpc", port.Spec.VPC)
+	}
+
+	_, _ = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    apply,
+		UpdateFunc: func(_, newObj any) { apply(newObj) },
+		DeleteFunc: func(obj any) {
+			port, ok := obj.(*sdnv1alpha1.Port)
+			if !ok || port.Spec.Node == selfName || port.Spec.IP == "" {
+				return
+			}
+			if err := mgr.DelRemote(port.Spec.IP + "/32"); err != nil {
+				log.Error("del remote port", "port", port.Name, "err", err)
 			}
 		},
 	})

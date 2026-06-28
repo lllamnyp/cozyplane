@@ -77,3 +77,36 @@ type VPC struct {
 	Spec   VPCSpec
 	Status VPCStatus
 }
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// PortList is a list of Port objects.
+type PortList struct {
+	metav1.TypeMeta
+	metav1.ListMeta
+
+	Items []Port
+}
+
+// PortSpec is the realized network interface of a pod on a VPC.
+type PortSpec struct {
+	VPC          string
+	IP           string
+	MAC          string
+	Node         string
+	NodeIP       string
+	PodNamespace string
+	PodName      string
+}
+
+// +genclient
+// +genclient:nonNamespaced
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// Port is a pod's realized interface on a VPC.
+type Port struct {
+	metav1.TypeMeta
+	metav1.ObjectMeta
+
+	Spec PortSpec
+}

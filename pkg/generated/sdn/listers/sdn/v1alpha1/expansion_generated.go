@@ -18,6 +18,10 @@ limitations under the License.
 
 package v1alpha1
 
+// PortListerExpansion allows custom methods to be added to
+// PortLister.
+type PortListerExpansion interface{}
+
 // VPCListerExpansion allows custom methods to be added to
 // VPCLister.
 type VPCListerExpansion interface{}

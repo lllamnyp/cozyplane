@@ -28,12 +28,17 @@ import (
 
 type SdnV1alpha1Interface interface {
 	RESTClient() rest.Interface
+	PortsGetter
 	VPCsGetter
 }
 
 // SdnV1alpha1Client is used to interact with features provided by the sdn.cozystack.io group.
 type SdnV1alpha1Client struct {
 	restClient rest.Interface
+}
+
+func (c *SdnV1alpha1Client) Ports() PortInterface {
+	return newPorts(c)
 }
 
 func (c *SdnV1alpha1Client) VPCs() VPCInterface {

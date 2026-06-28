@@ -32,6 +32,9 @@ import (
 
 func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenAPIDefinition {
 	return map[string]common.OpenAPIDefinition{
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.Port":      schema_cozyplane_api_sdn_v1alpha1_Port(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortList":  schema_cozyplane_api_sdn_v1alpha1_PortList(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortSpec":  schema_cozyplane_api_sdn_v1alpha1_PortSpec(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPC":       schema_cozyplane_api_sdn_v1alpha1_VPC(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCList":   schema_cozyplane_api_sdn_v1alpha1_VPCList(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCSpec":   schema_cozyplane_api_sdn_v1alpha1_VPCSpec(ref),
@@ -90,6 +93,162 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		runtime.TypeMeta{}.OpenAPIModelName():                      schema_k8sio_apimachinery_pkg_runtime_TypeMeta(ref),
 		runtime.Unknown{}.OpenAPIModelName():                       schema_k8sio_apimachinery_pkg_runtime_Unknown(ref),
 		version.Info{}.OpenAPIModelName():                          schema_k8sio_apimachinery_pkg_version_Info(ref),
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_Port(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "Port is a pod's realized interface on a VPC.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"metadata": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref(v1.ObjectMeta{}.OpenAPIModelName()),
+						},
+					},
+					"spec": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortSpec"),
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortSpec", v1.ObjectMeta{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_PortList(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "PortList contains a list of Port.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"metadata": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref(v1.ListMeta{}.OpenAPIModelName()),
+						},
+					},
+					"items": {
+						SchemaProps: spec.SchemaProps{
+							Type: []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.Port"),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"items"},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.Port", v1.ListMeta{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_PortSpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "PortSpec is the realized network interface of a pod on a VPC.\n\nA Port is cluster-scoped and its name encodes the VPC and IP (<vpc>.<ip-with-dashes>), so creating it is an atomic claim on that IP within the VPC — etcd name uniqueness serializes concurrent allocators.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"vpc": {
+						SchemaProps: spec.SchemaProps{
+							Description: "VPC is the name of the VPC this port belongs to.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"ip": {
+						SchemaProps: spec.SchemaProps{
+							Description: "IP is the address allocated to the pod within the VPC CIDR.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"mac": {
+						SchemaProps: spec.SchemaProps{
+							Description: "MAC is the pod interface MAC address.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"node": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Node is the name of the node hosting the pod.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"nodeIP": {
+						SchemaProps: spec.SchemaProps{
+							Description: "NodeIP is the host IP of that node (the Geneve tunnel endpoint).",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"podNamespace": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PodNamespace and PodName identify the owning pod.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"podName": {
+						SchemaProps: spec.SchemaProps{
+							Type:   []string{"string"},
+							Format: "",
+						},
+					},
+				},
+				Required: []string{"vpc", "ip", "node", "nodeIP"},
+			},
+		},
 	}
 }
 

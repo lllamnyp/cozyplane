@@ -49,6 +49,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 	scheme.AddKnownTypes(SchemeGroupVersion,
 		&VPC{},
 		&VPCList{},
+		&Port{},
+		&PortList{},
 	)
 
 	return nil

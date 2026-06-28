@@ -28,6 +28,10 @@ type FakeSdnV1alpha1 struct {
 	*testing.Fake
 }
 
+func (c *FakeSdnV1alpha1) Ports() v1alpha1.PortInterface {
+	return newFakePorts(c)
+}
+
 func (c *FakeSdnV1alpha1) VPCs() v1alpha1.VPCInterface {
 	return newFakeVPCs(c)
 }

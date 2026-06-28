@@ -32,6 +32,10 @@ import (
 func ForKind(kind schema.GroupVersionKind) interface{} {
 	switch kind {
 	// Group=sdn.cozystack.io, Version=v1alpha1
+	case v1alpha1.SchemeGroupVersion.WithKind("Port"):
+		return &sdnv1alpha1.PortApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("PortSpec"):
+		return &sdnv1alpha1.PortSpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPC"):
 		return &sdnv1alpha1.VPCApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPCSpec"):

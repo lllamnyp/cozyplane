@@ -14,10 +14,18 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
-  # ...and tenant network ids from VPC objects.
+  # The plugin (using this SA) reads pod annotations to resolve VPC membership.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+  # Tenant network ids from VPC objects.
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcs"]
     verbs: ["get", "list", "watch"]
+  # Port claims (the plugin allocates/releases; the agent watches for remotes).
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["ports"]
+    verbs: ["get", "list", "watch", "create", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
