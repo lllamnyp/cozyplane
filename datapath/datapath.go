@@ -70,12 +70,12 @@ func (m *Manager) Load(vni uint32) error {
 
 // EnsureGeneve creates (if absent) and brings up the collect_metadata Geneve
 // device and records its ifindex in the config map.
-func (m *Manager) EnsureGeneve() error {
+func (m *Manager) EnsureGeneve(port uint16) error {
 	link, err := netlink.LinkByName(GeneveDevice)
 	if err != nil {
 		la := netlink.NewLinkAttrs()
 		la.Name = GeneveDevice
-		g := &netlink.Geneve{LinkAttrs: la, Dport: GenevePort, FlowBased: true}
+		g := &netlink.Geneve{LinkAttrs: la, Dport: port, FlowBased: true}
 		if err := netlink.LinkAdd(g); err != nil {
 			return fmt.Errorf("create geneve device: %w", err)
 		}

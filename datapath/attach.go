@@ -17,17 +17,30 @@ limitations under the License.
 package datapath
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 
 	"github.com/cilium/ebpf"
-	"github.com/vishvananda/netlink"
-	"golang.org/x/sys/unix"
+	"github.com/cilium/ebpf/link"
 )
 
-// OpenPinnedProgram loads the classifier program from its bpffs pin. The CNI
-// plugin uses this to attach the program to a freshly created host veth without
-// re-loading the whole collection.
+// We attach with tcx (BPF links), not classic clsact filters: tcx links are
+// independent kernel objects that coexist with other tcx users (notably Cilium,
+// whose tc reconciliation strips foreign *classic* tc filters but leaves tcx
+// links alone). The links are pinned so they survive the short-lived CNI plugin
+// process and agent restarts.
+
+func linkPinPath(ifindex int, ingress bool) string {
+	dir := "eg"
+	if ingress {
+		dir = "in"
+	}
+	return filepath.Join(PinRoot, "links", fmt.Sprintf("%s-%d", dir, ifindex))
+}
+
+// OpenPinnedProgram loads the classifier program from its bpffs pin.
 func OpenPinnedProgram() (*ebpf.Program, error) {
 	prog, err := ebpf.LoadPinnedProgram(filepath.Join(PinRoot, progPinName), nil)
 	if err != nil {
@@ -37,48 +50,46 @@ func OpenPinnedProgram() (*ebpf.Program, error) {
 }
 
 // AttachIngress attaches the classifier at the ingress of the given interface
-// (a pod's host-side veth) using a clsact qdisc + direct-action bpf filter.
-// Classic tc holds a reference on the program, so the attachment survives the
-// plugin process exiting and is removed automatically when the veth is deleted.
+// (a pod's host-side veth) via a pinned tcx link.
 func AttachIngress(ifindex int, prog *ebpf.Program) error {
-	return attachClsact(ifindex, prog, netlink.HANDLE_MIN_INGRESS)
+	return attachTCX(ifindex, prog, ebpf.AttachTCXIngress, true)
 }
 
 // AttachEgress attaches the classifier at the egress of the given interface
-// (the node uplink), so host-originated traffic to remote pod CIDRs is also
-// encapsulated.
+// (the node uplink) via a pinned tcx link.
 func AttachEgress(ifindex int, prog *ebpf.Program) error {
-	return attachClsact(ifindex, prog, netlink.HANDLE_MIN_EGRESS)
+	return attachTCX(ifindex, prog, ebpf.AttachTCXEgress, false)
 }
 
-func attachClsact(ifindex int, prog *ebpf.Program, parent uint32) error {
-	qdisc := &netlink.GenericQdisc{
-		QdiscAttrs: netlink.QdiscAttrs{
-			LinkIndex: ifindex,
-			Parent:    netlink.HANDLE_CLSACT,
-			Handle:    netlink.MakeHandle(0xffff, 0),
-		},
-		QdiscType: "clsact",
+func attachTCX(ifindex int, prog *ebpf.Program, attach ebpf.AttachType, ingress bool) error {
+	if err := os.MkdirAll(filepath.Join(PinRoot, "links"), 0o755); err != nil {
+		return err
 	}
-	if err := netlink.QdiscReplace(qdisc); err != nil {
-		return fmt.Errorf("add clsact qdisc: %w", err)
-	}
+	pin := linkPinPath(ifindex, ingress)
+	// Replace any stale link (e.g. from a previous agent instance).
+	_ = os.Remove(pin)
 
-	filter := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: ifindex,
-			Parent:    parent,
-			Handle:    netlink.MakeHandle(0, 1),
-			Protocol:  unix.ETH_P_ALL,
-			Priority:  1,
-		},
-		Fd:           prog.FD(),
-		Name:         "cozyplane_from_pod",
-		DirectAction: true,
+	l, err := link.AttachTCX(link.TCXOptions{
+		Interface: ifindex,
+		Program:   prog,
+		Attach:    attach,
+	})
+	if err != nil {
+		return fmt.Errorf("attach tcx (ifindex %d): %w", ifindex, err)
 	}
-	if err := netlink.FilterReplace(filter); err != nil {
-		return fmt.Errorf("add bpf filter: %w", err)
+	if err := l.Pin(pin); err != nil {
+		l.Close()
+		return fmt.Errorf("pin tcx link: %w", err)
 	}
+	// Close our handle; the pin keeps the link (and attachment) alive.
+	return l.Close()
+}
 
+// DetachVeth removes the pinned ingress link for an interface (used on CNI DEL).
+// Removing the pin drops the last reference, detaching the program.
+func DetachVeth(ifindex int) error {
+	if err := os.Remove(linkPinPath(ifindex, true)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	return nil
 }

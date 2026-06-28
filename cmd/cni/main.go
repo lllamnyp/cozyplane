@@ -447,6 +447,7 @@ func cmdDel(args *skel.CmdArgs) error {
 	// pod veth deleted below.
 	if hv, e := netlink.LinkByName(hostVethNameFor(args.ContainerID)); e == nil {
 		_ = datapath.DelPortNet(hv.Attrs().Index)
+		_ = datapath.DetachVeth(hv.Attrs().Index)
 	}
 
 	podNS, podName, podUID, _ := podIdentity(args)
