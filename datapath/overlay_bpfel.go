@@ -23,7 +23,9 @@ type overlayLpmKey struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
+	overlayMapNetworks          = "networks"
 	overlayMapParams            = "params"
+	overlayMapPorts             = "ports"
 	overlayMapRemotes           = "remotes"
 	overlayProgCozyplaneFromPod = "cozyplane_from_pod"
 )
@@ -77,8 +79,10 @@ type overlayProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type overlayMapSpecs struct {
-	Params  *ebpf.MapSpec `ebpf:"params"`
-	Remotes *ebpf.MapSpec `ebpf:"remotes"`
+	Networks *ebpf.MapSpec `ebpf:"networks"`
+	Params   *ebpf.MapSpec `ebpf:"params"`
+	Ports    *ebpf.MapSpec `ebpf:"ports"`
+	Remotes  *ebpf.MapSpec `ebpf:"remotes"`
 }
 
 // overlayVariableSpecs contains global variables before they are loaded into the kernel.
@@ -107,13 +111,17 @@ func (o *overlayObjects) Close() error {
 //
 // It can be passed to loadOverlayObjects or ebpf.CollectionSpec.LoadAndAssign.
 type overlayMaps struct {
-	Params  *ebpf.Map `ebpf:"params"`
-	Remotes *ebpf.Map `ebpf:"remotes"`
+	Networks *ebpf.Map `ebpf:"networks"`
+	Params   *ebpf.Map `ebpf:"params"`
+	Ports    *ebpf.Map `ebpf:"ports"`
+	Remotes  *ebpf.Map `ebpf:"remotes"`
 }
 
 func (m *overlayMaps) Close() error {
 	return _OverlayClose(
+		m.Networks,
 		m.Params,
+		m.Ports,
 		m.Remotes,
 	)
 }

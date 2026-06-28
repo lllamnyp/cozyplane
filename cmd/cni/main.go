@@ -141,7 +141,8 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return err
 	}
 
-	if err = configureHostVeth(hostVethName, podIP); err != nil {
+	// netID 0 = default/system network. VPC attachment sets this in Inc3.
+	if err = configureHostVeth(hostVethName, podIP, 0); err != nil {
 		return err
 	}
 
@@ -189,8 +190,9 @@ func configurePodIface(podIP net.IP) error {
 }
 
 // configureHostVeth brings up the host-side veth, enables proxy_arp and
-// forwarding, installs the /32 route to the pod, and attaches the classifier.
-func configureHostVeth(name string, podIP net.IP) error {
+// forwarding, installs the /32 route to the pod, attaches the classifier, and
+// records the pod's network id.
+func configureHostVeth(name string, podIP net.IP, netID uint32) error {
 	hv, err := netlink.LinkByName(name)
 	if err != nil {
 		return err
@@ -220,10 +222,20 @@ func configureHostVeth(name string, podIP net.IP) error {
 		return err
 	}
 	defer prog.Close()
-	return datapath.AttachIngress(hv.Attrs().Index, prog)
+	if err := datapath.AttachIngress(hv.Attrs().Index, prog); err != nil {
+		return err
+	}
+
+	return datapath.SetPortNet(hv.Attrs().Index, netID)
 }
 
 func cmdDel(args *skel.CmdArgs) error {
+	// Clear the ports map entry; the host veth (and its tc filter) is removed
+	// when the pod veth below is deleted.
+	if hv, e := netlink.LinkByName(hostVethNameFor(args.ContainerID)); e == nil {
+		_ = datapath.DelPortNet(hv.Attrs().Index)
+	}
+
 	state, err := datapath.LoadAgentState()
 	if err == nil {
 		if ipamData, e := ipamStdin(args.StdinData, state.PodCIDR); e == nil {

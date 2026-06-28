@@ -18,6 +18,7 @@ package datapath
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -153,6 +154,27 @@ func (m *Manager) SetRemote(podCIDR string, nodeIP net.IP) error {
 	return m.objs.Remotes.Put(key, binary.BigEndian.Uint32(ip4))
 }
 
+// SetNetwork maps a VPC CIDR to its network id in the networks map.
+func (m *Manager) SetNetwork(cidr string, id uint32) error {
+	key, err := lpmKey(cidr)
+	if err != nil {
+		return err
+	}
+	return m.objs.Networks.Put(key, id)
+}
+
+// DelNetwork removes a VPC CIDR from the networks map.
+func (m *Manager) DelNetwork(cidr string) error {
+	key, err := lpmKey(cidr)
+	if err != nil {
+		return err
+	}
+	if err := m.objs.Networks.Delete(key); err != nil && !isNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 // DelRemote removes a node's pod CIDR from the remotes map.
 func (m *Manager) DelRemote(podCIDR string) error {
 	key, err := lpmKey(podCIDR)
@@ -187,7 +209,9 @@ func lpmKey(cidr string) (overlayLpmKey, error) {
 	}, nil
 }
 
-func isNotExist(err error) bool { return err != nil && os.IsNotExist(err) }
+func isNotExist(err error) bool {
+	return err != nil && (errors.Is(err, ebpf.ErrKeyNotExist) || os.IsNotExist(err))
+}
 
 // WriteProcSys writes a /proc/sys value (path uses '/' separators, e.g.
 // "net/ipv4/conf/eth0/proxy_arp").
