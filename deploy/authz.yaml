@@ -34,11 +34,20 @@ spec:
   variables:
     - name: ref
       expression: object.spec.vpcRef
+    # vpcRef unchanged on UPDATE? Then this is a metadata/finalizer write (e.g.
+    # the controller's reap finalizer) and needs no export permission. Only a
+    # CREATE, or an UPDATE that retargets vpcRef, must satisfy the export check.
+    - name: refUnchanged
+      expression: >-
+        has(oldObject) &&
+        oldObject.spec.vpcRef.namespace == object.spec.vpcRef.namespace &&
+        oldObject.spec.vpcRef.name == object.spec.vpcRef.name
   validations:
     # The request's user must be allowed to `export` the referenced VPC, in the
     # VPC's own (owner) namespace. RBAC verbs `["*"]` match the custom `export`
     # verb, so cluster-admins and full namespace-admins pass automatically.
     - expression: >-
+        variables.refUnchanged ||
         authorizer.group('sdn.cozystack.io').resource('vpcs')
           .namespace(variables.ref.namespace).name(variables.ref.name)
           .check('export').allowed()

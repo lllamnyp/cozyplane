@@ -222,12 +222,32 @@ sharing escape hatch.
 
 ### Revocation
 
-The owner deletes the `VPCBinding` (they hold delete in the target namespace) →
-a controller reaps the `Port`s for `(namespace, vpc)` → agents reconcile local
-datapath and **sever** connectivity for the now-unauthorized pods. The pod keeps
-running, disconnected (NetworkPolicy-like). This requires agent-side
-reconciliation of local attachments against live Ports/bindings, not just the
-CNI `DEL` lifecycle path.
+The owner deletes the `VPCBinding` (they hold delete in the target namespace).
+A reap finalizer (`sdn.cozystack.io/reap-ports`) holds the binding until the
+`VPCBindingReconciler` deletes the `Port`s for `(namespace, vpc)` — *unless*
+another still-live binding in that namespace authorizes the same VPC, in which
+case the pods stay (reaping waits for the last grant to go).
+
+Deleting a Port drives the sever:
+
+- **Other nodes** drop the reaped pod's remote `/32` (their agents' Port-delete
+  handler), removing cross-node reachability.
+- **The pod's own node** severs the *live* local datapath without disturbing the
+  running pod: the agent reassigns the pod's `ports`-map entry to a reserved
+  `QuarantineNet` id, so `from_pod`/`to_pod` drop its traffic both ways via the
+  existing `srcnet != dstnet` isolation check; it removes the `locals` entry and
+  tears down the fabric↔vpc bridge. The pod keeps running, disconnected
+  (NetworkPolicy-like).
+
+The agent distinguishes revocation from ordinary pod deletion (where CNI `DEL`
+already cleaned up) by checking the owning pod still exists, isn't terminating,
+and matches the Port's recorded pod UID — so a stale delete for a name-reused pod
+can't cut off an unrelated one.
+
+Two known limitations of this iteration: **re-granting** (recreating the binding)
+does not restore a severed pod — it must be recreated; and a revocation that
+happens while the pod's node agent is **down** is not replayed on restart yet
+(no startup reconcile of local ports against live bindings).
 
 ### Observability (deferred — exact shape TBD)
 

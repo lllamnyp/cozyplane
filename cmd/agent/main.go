@@ -164,7 +164,7 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		log.Warn("sdn client init failed; VPC networks won't be programmed", "err", err)
 	} else {
 		watchVPCs(ctx, sdnClient, mgr, log)
-		watchPorts(ctx, sdnClient, mgr, nodeName, log)
+		watchPorts(ctx, sdnClient, client, mgr, nodeName, log)
 	}
 
 	// Datapath is up and remotes are syncing; expose the CNI to kubelet.
@@ -262,9 +262,11 @@ func watchVPCs(ctx context.Context, client sdnclientset.Interface, mgr *datapath
 }
 
 // watchPorts mirrors remote VPC ports (pods on other nodes) into the remotes
-// map as /32 routes to their node's Geneve endpoint. Best-effort, like watchVPCs.
-func watchPorts(ctx context.Context, client sdnclientset.Interface, mgr *datapath.Manager, selfName string, log *slog.Logger) {
-	factory := sdninformers.NewSharedInformerFactory(client, 0)
+// map as /32 routes to their node's Geneve endpoint, and severs a *local* pod's
+// datapath when its Port is reaped out from under it (revocation). Best-effort,
+// like watchVPCs.
+func watchPorts(ctx context.Context, sdn sdnclientset.Interface, core kubernetes.Interface, mgr *datapath.Manager, selfName string, log *slog.Logger) {
+	factory := sdninformers.NewSharedInformerFactory(sdn, 0)
 	informer := factory.Sdn().V1alpha1().Ports().Informer()
 
 	apply := func(obj any) {
@@ -283,8 +285,12 @@ func watchPorts(ctx context.Context, client sdnclientset.Interface, mgr *datapat
 		AddFunc:    apply,
 		UpdateFunc: func(_, newObj any) { apply(newObj) },
 		DeleteFunc: func(obj any) {
-			port, ok := obj.(*sdnv1alpha1.Port)
-			if !ok || port.Spec.Node == selfName || port.Spec.IP == "" {
+			port := portFromDelete(obj)
+			if port == nil || port.Spec.IP == "" {
+				return
+			}
+			if port.Spec.Node == selfName {
+				severLocalPort(ctx, core, port, log)
 				return
 			}
 			if err := mgr.DelRemote(port.Spec.IP + "/32"); err != nil {
@@ -294,6 +300,50 @@ func watchPorts(ctx context.Context, client sdnclientset.Interface, mgr *datapat
 	})
 
 	factory.Start(ctx.Done())
+}
+
+// portFromDelete extracts a Port from a delete event, unwrapping the
+// tombstone the informer may deliver if a delete was missed.
+func portFromDelete(obj any) *sdnv1alpha1.Port {
+	if port, ok := obj.(*sdnv1alpha1.Port); ok {
+		return port
+	}
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		if port, ok := tombstone.Obj.(*sdnv1alpha1.Port); ok {
+			return port
+		}
+	}
+	return nil
+}
+
+// severLocalPort cuts a still-running local pod off its VPC when its Port is
+// reaped (binding revoked), as opposed to ordinary pod deletion where CNI DEL
+// has already cleaned up. It only severs if the owning pod still exists, is not
+// being deleted, and is the same pod (UID) that claimed the Port — so a stale
+// delete for a name-reused pod can't cut off an unrelated one.
+func severLocalPort(ctx context.Context, core kubernetes.Interface, port *sdnv1alpha1.Port, log *slog.Logger) {
+	if port.Spec.PodNamespace == "" || port.Spec.PodName == "" {
+		return
+	}
+	pod, err := core.CoreV1().Pods(port.Spec.PodNamespace).Get(ctx, port.Spec.PodName, metav1.GetOptions{})
+	if err != nil {
+		return // gone or unreachable: ordinary deletion path handles cleanup
+	}
+	if pod.DeletionTimestamp != nil {
+		return // being deleted normally
+	}
+	if uid := port.Labels[sdnv1alpha1.LabelPodUID]; uid != "" && string(pod.UID) != uid {
+		return // a different pod reused the name; not the one this Port belonged to
+	}
+	severed, err := datapath.SeverLocal(net.ParseIP(port.Spec.IP), port.Spec.FabricIP)
+	if err != nil {
+		log.Error("sever local port", "port", port.Name, "err", err)
+		return
+	}
+	if severed {
+		log.Info("severed local port (VPC access revoked)",
+			"ip", port.Spec.IP, "pod", port.Spec.PodNamespace+"/"+port.Spec.PodName)
+	}
 }
 
 func writeCNIConf(name string, mtu int) error {

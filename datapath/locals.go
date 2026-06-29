@@ -44,6 +44,26 @@ func SetLocal(podIP net.IP, ifindex int, mac net.HardwareAddr) error {
 	return nil
 }
 
+// GetLocal returns the host-veth ifindex and pod MAC recorded for a local pod,
+// and whether an entry exists. Used by SeverLocal to find a live local pod's
+// datapath when its Port is reaped.
+func GetLocal(podIP net.IP) (ifindex int, mac net.HardwareAddr, found bool, err error) {
+	m, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "locals"), nil)
+	if err != nil {
+		return 0, nil, false, fmt.Errorf("open pinned locals map: %w", err)
+	}
+	defer m.Close()
+
+	var ep overlayEndpoint
+	if err := m.Lookup(localKey(podIP), &ep); err != nil {
+		if isNotExist(err) {
+			return 0, nil, false, nil
+		}
+		return 0, nil, false, fmt.Errorf("lookup local: %w", err)
+	}
+	return int(ep.Ifindex), net.HardwareAddr(ep.Mac[:]), true, nil
+}
+
 // DelLocal removes a pod from the locals map.
 func DelLocal(podIP net.IP) error {
 	m, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "locals"), nil)

@@ -50,3 +50,10 @@ const (
 
 // DefaultVNI is the VNI used for the default (flat) pod network in M0.
 const DefaultVNI uint32 = 1
+
+// QuarantineNet is a reserved network id assigned to a pod's ports-map entry to
+// sever it: no VPC CIDR is ever programmed into the networks map with this id,
+// so net_of() never returns it, and the from_pod/to_pod isolation check
+// (srcnet != dstnet) drops the pod's traffic in both directions while its hooks
+// stay attached. Used for live revocation (see SeverLocal).
+const QuarantineNet uint32 = 0xFFFFFFFF

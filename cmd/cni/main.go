@@ -50,14 +50,19 @@ import (
 )
 
 const (
-	contVethName      = "eth0"
-	ipamPlugin        = "host-local"
-	vpcAnnotation     = "sdn.cozystack.io/vpc"
-	labelVPC          = "sdn.cozystack.io/vpc"
-	labelVPCNamespace = "sdn.cozystack.io/vpc-namespace"
-	labelPodNS        = "sdn.cozystack.io/pod-namespace"
-	labelPodName      = "sdn.cozystack.io/pod-name"
-	labelPodUID       = "sdn.cozystack.io/pod-uid"
+	contVethName = "eth0"
+	ipamPlugin   = "host-local"
+)
+
+// Annotation and label keys come from the API package so the CNI (writer) and
+// the controller (reader/reaper) cannot drift.
+const (
+	vpcAnnotation     = sdnv1alpha1.AnnotationVPC
+	labelVPC          = sdnv1alpha1.LabelVPC
+	labelVPCNamespace = sdnv1alpha1.LabelVPCNamespace
+	labelPodNS        = sdnv1alpha1.LabelPodNamespace
+	labelPodName      = sdnv1alpha1.LabelPodName
+	labelPodUID       = sdnv1alpha1.LabelPodUID
 )
 
 // linkLocalGW is the on-link next hop installed in every pod, answered by the
