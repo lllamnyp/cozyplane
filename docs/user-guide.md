@@ -70,6 +70,19 @@ kubectl apply -f deploy/agent.yaml
 kubectl apply -f deploy/controller.yaml
 ```
 
+Or install everything as a Helm chart (the packaging used for Cozystack):
+
+```bash
+helm install cozyplane ./chart/cozyplane \
+  --namespace cozy-cozyplane --create-namespace
+# override e.g. the CNI conf precedence and MTU:
+#   --set cniConfName=00-cozyplane.conflist --set mtu=1450
+```
+
+See [chart/cozyplane/README.md](../chart/cozyplane/README.md) for the values.
+The raw `deploy/*.yaml` above are the same objects for a quick kind loop; the
+chart is the canonical packaging.
+
 Verify the base is healthy:
 
 ```bash
