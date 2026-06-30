@@ -1,7 +1,6 @@
-# Container image for all cozyplane components. The Dockerfile builds the agent,
-# the CNI plugin, and the sdn-controller into one image; the release pipeline
-# digest-pins this (e.g. ...:tag@sha256:...).
-image: ghcr.io/lllamnyp/cozyplane:dev
+# Container image for all cozyplane components (agent, CNI plugin, controller).
+# Digest-pinned (no floating tag); update on each published build.
+image: ghcr.io/lllamnyp/cozyplane@sha256:a9cefbd585283bbdadbeb4efce39720693dc228bf5bb00e6b54996953d3d9f87
 imagePullPolicy: IfNotPresent
 imagePullSecrets: []
 
