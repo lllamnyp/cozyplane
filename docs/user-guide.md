@@ -12,15 +12,22 @@ where it's headed.
   node's pod CIDR) carried over an eBPF Geneve overlay. Pods reach each other
   across nodes, the node reaches pods (so kubelet probes work), and Services
   keep working through your existing kube-proxy / Cilium-KPR.
-- **VPCs.** A pod attaches to a named `VPC` by annotation, in any namespace. Its
-  interface gets a (tenant) IP from the VPC's CIDR, while its `status.podIP` is a
-  separate **fabric** IP from the node pod CIDR — so the pod is first-class to
-  Kubernetes (kubelet probes work, Services/Endpoints resolve, controllers can
-  reach it on `status.podIP`) without ever seeing the node/management network.
-  Pods in the same VPC reach each other across nodes; the system/default network
-  can reach a VPC pod via its fabric IP (north-south). A VPC pod itself cannot
-  initiate to anything outside its VPC — the default network, the node, other
-  VPCs, the internet are all dropped.
+- **VPCs.** A `VPC` is **namespaced** — its namespace is its owner. A pod
+  attaches to a VPC by annotation, but attachment is **default-deny**: a
+  `VPCBinding` in the pod's namespace must grant use of that VPC first (even when
+  the pod and VPC share a namespace). Once attached, the pod's interface gets a
+  (tenant) IP from the VPC's CIDR, while its `status.podIP` is a separate
+  **fabric** IP from the node pod CIDR — so the pod is first-class to Kubernetes
+  (kubelet probes work, Services/Endpoints resolve, controllers can reach it on
+  `status.podIP`) without ever seeing the node/management network. Pods in the
+  same VPC reach each other across nodes; the system/default network can reach a
+  VPC pod via its fabric IP (north-south). A VPC pod itself cannot initiate to
+  anything outside its VPC — the default network, the node, other VPCs, the
+  internet are all dropped.
+- **Tenancy.** The VPC owner controls who may use it: a `VPCBinding` is created
+  by someone holding both `create vpcbindings` in the consumer namespace and the
+  `export` verb on the VPC. Deleting the binding **revokes** access and severs
+  the attached pods. See [control-plane.md §6](control-plane.md) for the model.
 
 ## Requirements
 
@@ -79,14 +86,15 @@ kubectl -n kube-system get pods -l k8s-app=kube-dns      # CoreDNS Ready
 
 ## Create a VPC
 
-A `VPC` is cluster-scoped. Give it a CIDR; the controller assigns a VNI and marks
-it `Ready`.
+A `VPC` is **namespaced** — create it in the owner tenant's namespace. Give it a
+CIDR; the controller assigns a globally-unique VNI and marks it `Ready`.
 
 ```yaml
 apiVersion: sdn.cozystack.io/v1alpha1
 kind: VPC
 metadata:
   name: tenant-a
+  namespace: team-a
 spec:
   cidrs: ["10.10.0.0/24"]   # IPv4, unique cluster-wide (see Limitations)
   mtu: 1450
@@ -94,22 +102,50 @@ spec:
 
 ```bash
 kubectl apply -f vpc.yaml
-kubectl get vpc tenant-a -o wide
+kubectl -n team-a get vpc tenant-a -o wide
 # NAME       VNI   PHASE
 # tenant-a   100   Ready
 ```
 
+## Authorize use with a VPCBinding
+
+Attachment is default-deny. Create a `VPCBinding` **in the namespace whose pods
+will attach** (the consumer namespace), pointing at the VPC. Even the owner
+attaching its own pods needs one — the VPC's namespace expresses *ownership*; a
+`VPCBinding` expresses *use*.
+
+```yaml
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: VPCBinding
+metadata:
+  name: tenant-a            # any name; one per (namespace, VPC) is typical
+  namespace: team-a         # the consumer namespace (here, same as the owner)
+spec:
+  vpcRef:
+    namespace: team-a       # the VPC's owner namespace
+    name: tenant-a
+```
+
+Creating it requires the `export` verb on the referenced VPC (enforced by a
+`ValidatingAdmissionPolicy`), so a tenant can't bind to a VPC it doesn't own.
+Bind the sample `cozyplane-vpc-owner` ClusterRole (`deploy/authz.yaml`) into a
+namespace to grant ownership there.
+
 ## Attach pods to the VPC
 
-Add the `sdn.cozystack.io/vpc` annotation. The namespace doesn't matter.
+Add the `sdn.cozystack.io/vpc` annotation. Its value is the VPC name (owner
+namespace defaults to the pod's namespace) or `<owner-ns>/<vpc>` to use a VPC
+owned by another namespace. A matching `VPCBinding` must exist in the pod's
+namespace or the pod fails to start (default-deny).
 
 ```yaml
 apiVersion: v1
 kind: Pod
 metadata:
   name: app-1
+  namespace: team-a
   annotations:
-    sdn.cozystack.io/vpc: tenant-a
+    sdn.cozystack.io/vpc: tenant-a          # or "team-a/tenant-a"
 spec:
   containers:
     - name: app
@@ -124,9 +160,13 @@ interface inside the netns carries the VPC IP. The `Port` shows both:
 kubectl get pod app-1 -o wide    # status.podIP is the fabric IP, e.g. 10.244.2.16
 kubectl exec app-1 -- ip -4 addr show eth0   # the VPC IP, e.g. 10.10.0.2/32
 kubectl get ports -o custom-columns=NAME:.metadata.name,VPCIP:.spec.ip,FABRIC:.spec.fabricIP
-# NAME                 VPCIP       FABRIC
-# tenant-a.10-10-0-2   10.10.0.2   10.244.2.16
+# NAME              VPCIP       FABRIC
+# v100.10-10-0-2    10.10.0.2   10.244.2.16
 ```
+
+> Ports are cluster-scoped and named `v<vni>.<ip-dashed>` — keyed by the
+> globally-unique VNI so the name stays unique across namespaces. The name *is*
+> the IP claim: creating it is atomic via etcd name-uniqueness.
 
 Create a second pod (`app-2`) the same way — ideally on another node — and:
 
@@ -144,6 +184,11 @@ works for traffic *into* them (Endpoints use the fabric IP).
 To remove a pod from the VPC, delete the pod; its `Port` (and IP) is released
 automatically.
 
+**Revoking access.** Deleting the `VPCBinding` reaps the `Port`s of the pods it
+authorized (unless another binding in that namespace still grants the VPC) and
+severs those pods' VPC connectivity — they keep running but are cut off, like a
+deny-all NetworkPolicy. Re-granting requires recreating the pod.
+
 ## Limitations (today)
 
 These are prototype constraints, not permanent:
@@ -157,8 +202,15 @@ These are prototype constraints, not permanent:
   VPC gateway (NAT/DNS/controlled doors) is future work.
 - **No network policy / security groups yet** within or across VPCs.
 - **IPv4 only.**
-- **VPC/Port are served as CRDs**, not yet the aggregated API server (the swap is
-  transparent to clients).
+- **Revocation is one-way:** deleting a `VPCBinding` severs attached pods, but
+  recreating the binding does not reattach a running pod — recreate the pod. A
+  revocation that lands while a node's agent is down isn't replayed on restart.
+- **No cross-tenant peering:** a `VPCBinding` is intra-domain (one principal with
+  authority on both ends); connecting two separately-owned VPCs (peering) is
+  future work.
+- **VPC/Port/VPCBinding are served as CRDs**, not yet the aggregated API server
+  (the swap is transparent to clients; the `/ports` observability subresource
+  needs it).
 
 ## Troubleshooting
 

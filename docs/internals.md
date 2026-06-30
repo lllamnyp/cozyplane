@@ -193,6 +193,12 @@ path.
 - `remotes` values are the remote node IP in **host byte order**, because
   `bpf_skb_set_tunnel_key`'s `remote_ipv4` is host-order (the kernel does
   `cpu_to_be32`). Filled with `binary.BigEndian.Uint32(ip4)`.
+- `locals` keys are the pod IP in **network byte order** too (the C side keys on
+  `ip->daddr`); see `datapath.localKey`.
+
+This byte-order contract is locked by `datapath/keys_test.go`, which asserts the
+keys marshal to the address in network order regardless of host endianness — so
+an accidental endianness flip fails the build, not just a packet at runtime.
 
 ## 4. Control flow
 
@@ -211,15 +217,21 @@ namespace/name from `CNI_ARGS`, then:
 - **default path** (`addDefault`): delegate IPAM to the upstream `host-local`
   plugin with the range injected from the node pod CIDR (published by the agent
   in `/run/cozyplane/agent.json`); create the veth; record net id `0`.
-- **VPC path** (`addVPC`): read the pod's `sdn.cozystack.io/vpc` annotation (via
-  the agent-written kubeconfig), `Get` the VPC (must be `Ready`), `claimIP`, then
-  create the veth with the VPC IP and the VPC's net id.
+- **VPC path** (`addVPC`): parse the pod's `sdn.cozystack.io/vpc` annotation —
+  `[<owner-ns>/]<vpc>`, owner namespace defaulting to the pod's (`parseVPCRef`) —
+  then **enforce default-deny** (`requireVPCBinding`): a `VPCBinding` in the
+  pod's namespace must reference that VPC, or ADD fails. Only then `Get` the VPC
+  (must be `Ready`), `claimIP`, and create the veth with the VPC IP and net id.
 
 `claimIP` is the IPAM design point: it lists the VPC's `Port`s, picks the lowest
-free address, and **creates a cluster-scoped `Port` named `<vpc>.<ip-dashed>`**.
-Because the name encodes the IP, etcd name-uniqueness makes the claim atomic —
-concurrent allocators on different nodes that pick the same IP collide on
-`AlreadyExists` and retry the next one. No server-side allocator is needed.
+free address starting at network+2 (`.0` network and `.1` gateway reserved), and
+**creates a cluster-scoped `Port` named `v<vni>.<ip-dashed>`**. The name is keyed
+by the globally-unique VNI so it stays unique even though VPC names are only
+unique per namespace; because the name encodes the IP, etcd name-uniqueness makes
+the claim atomic — concurrent allocators on different nodes that pick the same IP
+collide on `AlreadyExists` and retry the next one. No server-side allocator is
+needed. (`cmd/cni/main_test.go` locks the address selection, naming, labels, the
+retry, and the default-deny check.)
 
 Both paths finish in `setupVeth` → `configurePodIface` (pod side: `/32` address,
 link-local `169.254.1.1` default route) and `configureHostVeth` (host side:
@@ -240,13 +252,27 @@ The agent runs three informers, all best-effort except Nodes:
 - **VPCs** → `networks[vpc.cidr] = vpc.vni` when the VNI is assigned.
 - **Ports** → `remotes[port.ip/32] = port.nodeIP` for ports on other nodes. VPC
   pod reachability. (`Port.spec.nodeIP` is filled by the plugin from the agent
-  state, so no node-name→IP lookup is needed.)
+  state, so no node-name→IP lookup is needed.) On a **local** port's deletion
+  (its `spec.node` is this node), if the owning pod is still alive — same name,
+  same UID, not terminating — the agent treats it as a *revocation*, not ordinary
+  teardown, and severs the live datapath (`datapath.SeverLocal`): it reassigns
+  the pod's `ports` entry to `QuarantineNet` so `from_pod`/`to_pod` drop both
+  directions, drops the `locals` entry, and tears down the bridge.
 
 ### Controller
 
-`VPCReconciler` lists VPCs, assigns the lowest free VNI ≥ 100 to any VPC without
-one, and sets `status.phase = Ready`. (VNI selection is list-then-pick; a
-conflicting status update just requeues. Fine for the prototype.)
+`VPCReconciler` lists VPCs cluster-wide, assigns the lowest free VNI ≥ 100 to any
+VPC without one, and sets `status.phase = Ready`. (VNI selection is
+list-then-pick; a conflicting status update just requeues. Fine for the
+prototype.)
+
+`VPCBindingReconciler` holds each `VPCBinding` with a reap finalizer. On deletion
+it deletes the `Port`s for `(consumer-namespace, vpcRef)` — unless another live
+binding in that namespace still authorizes the same VPC — then removes the
+finalizer. Deleting the Ports is what drives the agents' sever above (and the
+remote-route cleanup on other nodes). (`*_controller_test.go` lock the VNI
+selection, the finalizer lifecycle, the reap, and the another-binding-keeps-alive
+rule.)
 
 ### Why the plugin needs a kubeconfig
 
