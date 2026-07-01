@@ -41,3 +41,32 @@ controller:
 # 'create vpcbindings' RBAC alone, with no cross-VPC export check).
 exportPolicy:
   enabled: true
+
+# Serve the sdn.cozystack.io API group from a real aggregated API server (backed
+# by a dedicated etcd) instead of CRDs. This is the design target — it enables
+# custom validation and subresources (e.g. the /ports observability subresource)
+# beyond CRD ergonomics. Requires cert-manager (for the serving certificate) and
+# a cluster that permits APIService aggregation. When false, the group is served
+# as CRDs (the lightweight path — no etcd/cert-manager needed).
+apiserver:
+  enabled: false
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+  etcd:
+    image: registry.k8s.io/etcd:3.5.16-0
+    # Storage for the dedicated etcd. The default is ephemeral (emptyDir): fine
+    # for evaluation, but use a persistentVolumeClaim volume source in production
+    # so the API objects survive a pod restart.
+    storage:
+      emptyDir: {}
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        memory: 256Mi
