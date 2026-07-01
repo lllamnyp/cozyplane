@@ -39,7 +39,7 @@ spec:
     # CREATE, or an UPDATE that retargets vpcRef, must satisfy the export check.
     - name: refUnchanged
       expression: >-
-        has(oldObject) &&
+        oldObject != null &&
         oldObject.spec.vpcRef.namespace == object.spec.vpcRef.namespace &&
         oldObject.spec.vpcRef.name == object.spec.vpcRef.name
   validations:
