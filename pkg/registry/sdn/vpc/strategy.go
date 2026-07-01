@@ -70,9 +70,17 @@ func (vpcStrategy) NamespaceScoped() bool {
 }
 
 func (vpcStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
+	// Status is owned by the controller via the /status subresource; a create
+	// never sets it.
+	vpc := obj.(*sdn.VPC)
+	vpc.Status = sdn.VPCStatus{}
 }
 
 func (vpcStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
+	// A spec update must not change status (that goes through /status).
+	newVPC := obj.(*sdn.VPC)
+	oldVPC := old.(*sdn.VPC)
+	newVPC.Status = oldVPC.Status
 }
 
 func (vpcStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
@@ -101,5 +109,30 @@ func (vpcStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) 
 
 // WarningsOnUpdate returns warnings for the given update.
 func (vpcStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
+}
+
+// vpcStatusStrategy is the update strategy for the /status subresource: it
+// updates status but preserves spec (the mirror image of vpcStrategy).
+type vpcStatusStrategy struct {
+	vpcStrategy
+}
+
+// NewStatusStrategy creates a strategy for the VPC status subresource.
+func NewStatusStrategy(strategy vpcStrategy) vpcStatusStrategy {
+	return vpcStatusStrategy{strategy}
+}
+
+func (vpcStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
+	newVPC := obj.(*sdn.VPC)
+	oldVPC := old.(*sdn.VPC)
+	newVPC.Spec = oldVPC.Spec
+}
+
+func (vpcStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+	return field.ErrorList{}
+}
+
+func (vpcStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
 	return nil
 }

@@ -21,7 +21,9 @@ import (
 	"github.com/lllamnyp/cozyplane/api/sdn/install"
 	sdnopenapi "github.com/lllamnyp/cozyplane/pkg/generated/sdn/openapi"
 	defaultregistry "github.com/lllamnyp/cozyplane/pkg/registry"
+	portstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/port"
 	vpcstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/vpc"
+	vpcbindingstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/vpcbinding"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -46,8 +48,16 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOptionsGetter genericregistry.RESTOptionsGetter) *genericapiserver.APIGroupInfo {
 	apiGroupInfo := genericapiserver.NewDefaultAPIGroupInfo(sdn.GroupName, scheme, metav1.ParameterCodec, codec)
 
+	vpcREST, vpcStatusREST, err := vpcstorage.NewREST(scheme, restOptionsGetter)
+	if err != nil {
+		panic(err)
+	}
+
 	v1alpha1storage := map[string]rest.Storage{}
-	v1alpha1storage["vpcs"] = defaultregistry.RESTInPeace(vpcstorage.NewREST(scheme, restOptionsGetter))
+	v1alpha1storage["vpcs"] = vpcREST
+	v1alpha1storage["vpcs/status"] = vpcStatusREST
+	v1alpha1storage["ports"] = defaultregistry.RESTInPeace(portstorage.NewREST(scheme, restOptionsGetter))
+	v1alpha1storage["vpcbindings"] = defaultregistry.RESTInPeace(vpcbindingstorage.NewREST(scheme, restOptionsGetter))
 	apiGroupInfo.VersionedResourcesStorageMap["v1alpha1"] = v1alpha1storage
 
 	return &apiGroupInfo
