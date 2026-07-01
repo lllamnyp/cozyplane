@@ -258,14 +258,26 @@ RBAC-filtered server-side over the cluster-scoped `Port` collection. Tenants get
 cluster-wide. CRDs can't carry custom subresources, so this lands with the
 aggregated apiserver.
 
-### What needs the aggregated apiserver vs what doesn't
+### Aggregated apiserver (built) vs CRDs
 
-Only the custom `/ports` subresource truly requires it. The object model
-(namespaced VPC, VPCBinding) and the **two-check gate** are deliverable on CRDs
-now: a `ValidatingWebhook` (or `ValidatingAdmissionPolicy` with a CEL
-`authorizer...check("export")`) can run the `export` SAR against the request's
-`userInfo`. So the authorization model can be built and proven without blocking
-on the apiserver lift, then folded into the apiserver's create strategy later.
+The `sdn.cozystack.io` group is served **either** as CRDs (lightweight default —
+no etcd/cert-manager) **or** by a real **aggregated API server**
+(`apiserver.enabled=true`): a dedicated etcd, a cert-manager serving cert, and an
+`APIService`. Both expose the same GVK, so the datapath clients (agent, CNI
+plugin, controller) are unaffected — the swap is transparent. The registries live
+in `pkg/registry/sdn/{vpc,port,vpcbinding}`; VPC carries a `/status` subresource
+so the controller's `Status().Update()` works unchanged; the Port name is the
+atomic IP claim (etcd name-uniqueness).
+
+Validated on a live cluster: after deleting the CRDs and registering the
+`APIService`, `kubectl`, the controller (VNI via `/status`), the CNI plugin (Port
+claim), and the `export` `ValidatingAdmissionPolicy` all work against the
+aggregated API, with a VPC pod attached end-to-end.
+
+Only the aggregated apiserver can host the custom `/ports` observability
+subresource and can fold the `export` SAR into the create strategy (today it runs
+as a VAP, which works in both modes). The two-check authorization gate itself is
+deliverable in either mode.
 
 ## 7. First milestone to build
 

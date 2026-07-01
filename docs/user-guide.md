@@ -221,9 +221,12 @@ These are prototype constraints, not permanent:
 - **No cross-tenant peering:** a `VPCBinding` is intra-domain (one principal with
   authority on both ends); connecting two separately-owned VPCs (peering) is
   future work.
-- **VPC/Port/VPCBinding are served as CRDs**, not yet the aggregated API server
-  (the swap is transparent to clients; the `/ports` observability subresource
-  needs it).
+- **The API can be served two ways** (same GVK, transparent to clients): as CRDs
+  (the default, lightweight — no etcd/cert-manager) or via the real **aggregated
+  API server** (`apiserver.enabled=true`; a dedicated etcd + cert-manager serving
+  cert), which is the design target and unlocks custom validation and
+  subresources (e.g. a future `/ports` observability subresource) beyond CRD
+  ergonomics.
 
 ## Troubleshooting
 
