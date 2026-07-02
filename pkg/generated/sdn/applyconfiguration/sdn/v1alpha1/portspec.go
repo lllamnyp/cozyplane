@@ -45,6 +45,9 @@ type PortSpecApplyConfiguration struct {
 	// PodNamespace and PodName identify the owning pod.
 	PodNamespace *string `json:"podNamespace,omitempty"`
 	PodName      *string `json:"podName,omitempty"`
+	// Gateway marks the VPC's gateway port (the .1 leg of the egress gateway
+	// pod); agents route off-VPC traffic to it.
+	Gateway *bool `json:"gateway,omitempty"`
 }
 
 // PortSpecApplyConfiguration constructs a declarative configuration of the PortSpec type for use with
@@ -114,5 +117,13 @@ func (b *PortSpecApplyConfiguration) WithPodNamespace(value string) *PortSpecApp
 // If called multiple times, the PodName field is set to the value of the last call.
 func (b *PortSpecApplyConfiguration) WithPodName(value string) *PortSpecApplyConfiguration {
 	b.PodName = &value
+	return b
+}
+
+// WithGateway sets the Gateway field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Gateway field is set to the value of the last call.
+func (b *PortSpecApplyConfiguration) WithGateway(value bool) *PortSpecApplyConfiguration {
+	b.Gateway = &value
 	return b
 }

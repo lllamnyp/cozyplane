@@ -32,6 +32,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -69,6 +71,7 @@ func main() {
 		vni         uint
 		cniConfName string
 		genevePort  uint
+		clusterCIDR string
 	)
 	flag.IntVar(&mtu, "mtu", 1450, "pod MTU (underlay MTU minus Geneve overhead)")
 	flag.UintVar(&vni, "vni", uint(datapath.DefaultVNI), "VNI for the default network")
@@ -76,6 +79,8 @@ func main() {
 		"filename for the CNI conflist in /etc/cni/net.d (lower sorts first, winning over other CNIs)")
 	flag.UintVar(&genevePort, "geneve-port", datapath.GenevePort,
 		"Geneve UDP destination port (use a non-default port to coexist with another overlay on 6081)")
+	flag.StringVar(&clusterCIDR, "cluster-cidr", "",
+		"cluster pod supernet; when set, pod traffic leaving it is masqueraded to the node address (pod egress to the outside)")
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
@@ -85,13 +90,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(nodeName, mtu, uint32(vni), cniConfName, uint16(genevePort), log); err != nil {
+	if err := run(nodeName, mtu, uint32(vni), cniConfName, uint16(genevePort), clusterCIDR, log); err != nil {
 		log.Error("agent failed", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort uint16, log *slog.Logger) error {
+func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort uint16, clusterCIDR string, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -118,6 +123,9 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	if err := mgr.EnsureGeneve(genevePort); err != nil {
 		return fmt.Errorf("ensure geneve: %w", err)
 	}
+	if err := mgr.AttachOverlay(); err != nil {
+		return fmt.Errorf("attach overlay hook: %w", err)
+	}
 	if err := datapath.EnsureForwardRules(); err != nil {
 		return fmt.Errorf("ensure forward rules: %w", err)
 	}
@@ -127,6 +135,11 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	uplink, err := mgr.AttachUplink()
 	if err != nil {
 		return fmt.Errorf("attach uplink: %w", err)
+	}
+	if clusterCIDR != "" {
+		if err := datapath.EnsureMasquerade(clusterCIDR, uplink); err != nil {
+			return fmt.Errorf("ensure masquerade: %w", err)
+		}
 	}
 	log.Info("datapath loaded", "vni", vni, "geneve", datapath.GeneveDevice, "uplink", uplink)
 
@@ -147,7 +160,13 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	if podCIDR == "" {
 		return fmt.Errorf("node %q has no spec.podCIDR (is --allocate-node-cidrs enabled?)", nodeName)
 	}
-	state := &datapath.AgentState{NodeName: nodeName, NodeIP: internalIP(self), PodCIDR: podCIDR, MTU: mtu}
+	state := &datapath.AgentState{
+		NodeName:  nodeName,
+		NodeIP:    internalIP(self),
+		PodCIDR:   podCIDR,
+		MTU:       mtu,
+		Namespace: os.Getenv("AGENT_NAMESPACE"), // gates gateway-attach to the system namespace
+	}
 	if err := state.Save(); err != nil {
 		return fmt.Errorf("publish agent state: %w", err)
 	}
@@ -171,6 +190,7 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		watchVPCs(factory, mgr, log)
 		watchPorts(ctx, factory, client, mgr, nodeName, log)
 		watchPeerings(ctx, factory, mgr, log)
+		watchGateways(ctx, factory, mgr, nodeName, log)
 		factory.Start(ctx.Done())
 	}
 
@@ -372,6 +392,123 @@ func watchPeerings(ctx context.Context, factory sdninformers.SharedInformerFacto
 			resync()
 		}
 	}()
+}
+
+// watchGateways keeps the gateways map equal to the set of gateway Ports
+// (spec.gateway), from this node's point of view: a local gateway is delivered
+// by redirect, a remote one by encapsulation to its node. Like watchPeerings,
+// every relevant event triggers a recompute diffed against the pinned map, so
+// a restarted agent prunes gateways that vanished while it was down.
+func watchGateways(ctx context.Context, factory sdninformers.SharedInformerFactory, mgr *datapath.Manager, selfName string, log *slog.Logger) {
+	ports := factory.Sdn().V1alpha1().Ports()
+
+	var mu sync.Mutex
+	resync := func() {
+		mu.Lock()
+		defer mu.Unlock()
+
+		all, err := ports.Lister().List(labels.Everything())
+		if err != nil {
+			log.Error("list ports", "err", err)
+			return
+		}
+		desired := desiredGateways(all, selfName)
+
+		current, err := mgr.Gateways()
+		if err != nil {
+			log.Error("read gateways map", "err", err)
+			return
+		}
+		for vni, gw := range desired {
+			// Put unconditionally: an existing entry may be stale (gateway
+			// moved nodes) and the write is idempotent.
+			if err := mgr.SetGateway(vni, gw.ip, gw.nodeIP); err != nil {
+				log.Error("set gateway", "vni", vni, "err", err)
+				continue
+			}
+			if !current[vni] {
+				log.Info("gateway set", "vni", vni, "ip", gw.ip, "nodeIP", gw.nodeIP)
+			}
+		}
+		for vni := range current {
+			if _, ok := desired[vni]; !ok {
+				if err := mgr.DelGateway(vni); err != nil {
+					log.Error("del gateway", "vni", vni, "err", err)
+					continue
+				}
+				log.Info("gateway removed", "vni", vni)
+			}
+		}
+	}
+
+	isGateway := func(obj any) bool {
+		port := portFromDelete(obj)
+		return port != nil && port.Spec.Gateway
+	}
+	_, _ = ports.Informer().AddEventHandler(cache.FilteringResourceEventHandler{
+		FilterFunc: isGateway,
+		Handler: cache.ResourceEventHandlerFuncs{
+			AddFunc:    func(any) { resync() },
+			UpdateFunc: func(_, newObj any) { resync() },
+			DeleteFunc: func(any) { resync() },
+		},
+	})
+
+	go func() {
+		if cache.WaitForCacheSync(ctx.Done(), ports.Informer().HasSynced) {
+			resync()
+		}
+	}()
+}
+
+type gatewayView struct {
+	ip     net.IP // the gateway's VPC-leg (.1) address
+	nodeIP net.IP // nil when the gateway runs on this node
+}
+
+// desiredGateways computes, for this node, the gateway entry per VNI from the
+// gateway Ports (the VNI comes from the Port name, v<vni>.<ip-dashed> — the
+// documented naming contract).
+func desiredGateways(ports []*sdnv1alpha1.Port, selfName string) map[uint32]gatewayView {
+	desired := map[uint32]gatewayView{}
+	for _, p := range ports {
+		if !p.Spec.Gateway || p.Spec.IP == "" {
+			continue
+		}
+		vni, ok := vniFromPortName(p.Name)
+		if !ok {
+			continue
+		}
+		ip := net.ParseIP(p.Spec.IP)
+		if ip == nil {
+			continue
+		}
+		gw := gatewayView{ip: ip}
+		if p.Spec.Node != selfName {
+			gw.nodeIP = net.ParseIP(p.Spec.NodeIP)
+			if gw.nodeIP == nil {
+				continue
+			}
+		}
+		desired[vni] = gw
+	}
+	return desired
+}
+
+// vniFromPortName parses the VNI out of a Port name (v<vni>.<ip-dashed>).
+func vniFromPortName(name string) (uint32, bool) {
+	if !strings.HasPrefix(name, "v") {
+		return 0, false
+	}
+	dot := strings.IndexByte(name, '.')
+	if dot <= 1 {
+		return 0, false
+	}
+	vni, err := strconv.ParseUint(name[1:dot], 10, 32)
+	if err != nil || vni == 0 {
+		return 0, false
+	}
+	return uint32(vni), true
 }
 
 // desiredPeerPairs computes the normalized (low, high) VNI pairs that should be

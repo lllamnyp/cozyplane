@@ -40,6 +40,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCBinding":       schema_cozyplane_api_sdn_v1alpha1_VPCBinding(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCBindingList":   schema_cozyplane_api_sdn_v1alpha1_VPCBindingList(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCBindingSpec":   schema_cozyplane_api_sdn_v1alpha1_VPCBindingSpec(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCEgress":        schema_cozyplane_api_sdn_v1alpha1_VPCEgress(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCList":          schema_cozyplane_api_sdn_v1alpha1_VPCList(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCPeering":       schema_cozyplane_api_sdn_v1alpha1_VPCPeering(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCPeeringList":   schema_cozyplane_api_sdn_v1alpha1_VPCPeeringList(ref),
@@ -282,6 +283,13 @@ func schema_cozyplane_api_sdn_v1alpha1_PortSpec(ref common.ReferenceCallback) co
 							Format: "",
 						},
 					},
+					"gateway": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Gateway marks the VPC's gateway port (the .1 leg of the egress gateway pod); agents route off-VPC traffic to it.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
 				},
 				Required: []string{"vpcRef", "ip", "node", "nodeIP"},
 			},
@@ -448,6 +456,26 @@ func schema_cozyplane_api_sdn_v1alpha1_VPCBindingSpec(ref common.ReferenceCallba
 		},
 		Dependencies: []string{
 			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCRef"},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_VPCEgress(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "VPCEgress is the egress configuration of a VPC.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"natGateway": {
+						SchemaProps: spec.SchemaProps{
+							Description: "NATGateway runs a per-VPC gateway pod that forwards off-VPC traffic to the outside world (masqueraded to the gateway's address) and to cluster DNS; other cluster-internal destinations stay denied.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+				},
+			},
+		},
 	}
 }
 
@@ -736,9 +764,17 @@ func schema_cozyplane_api_sdn_v1alpha1_VPCSpec(ref common.ReferenceCallback) com
 							Format:      "int32",
 						},
 					},
+					"egress": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Egress configures how workloads in this VPC reach destinations outside it. Absent means no egress: the VPC is a closed island for outbound traffic (inbound north-south via the fabric IP still works).",
+							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCEgress"),
+						},
+					},
 				},
 			},
 		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCEgress"},
 	}
 }
 

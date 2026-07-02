@@ -42,6 +42,56 @@ func vniTable(m map[string]uint32) func(namespace, name string) (uint32, bool) {
 	}
 }
 
+func gatewayPort(name, ip, node, nodeIP string, gateway bool) *sdnv1alpha1.Port {
+	return &sdnv1alpha1.Port{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec:       sdnv1alpha1.PortSpec{IP: ip, Node: node, NodeIP: nodeIP, Gateway: gateway},
+	}
+}
+
+// The gateways-map contract: one entry per VNI with a gateway Port, local
+// (nil nodeIP) when the Port is on this node, remote otherwise; non-gateway
+// Ports and unparsable names contribute nothing.
+func TestDesiredGateways(t *testing.T) {
+	ports := []*sdnv1alpha1.Port{
+		gatewayPort("v101.10-70-0-1", "10.70.0.1", "self", "10.4.0.1", true),
+		gatewayPort("v102.10-71-0-1", "10.71.0.1", "other", "10.4.0.2", true),
+		gatewayPort("v101.10-70-0-2", "10.70.0.2", "other", "10.4.0.2", false), // tenant port: ignored
+		gatewayPort("bogus", "10.72.0.1", "self", "10.4.0.1", true),            // unparsable name: ignored
+	}
+	got := desiredGateways(ports, "self")
+	if len(got) != 2 {
+		t.Fatalf("got %d gateways, want 2: %+v", len(got), got)
+	}
+	if gw := got[101]; gw.nodeIP != nil || gw.ip.String() != "10.70.0.1" {
+		t.Errorf("vni 101 = %+v, want local 10.70.0.1", gw)
+	}
+	if gw := got[102]; gw.nodeIP == nil || gw.nodeIP.String() != "10.4.0.2" {
+		t.Errorf("vni 102 = %+v, want remote via 10.4.0.2", gw)
+	}
+}
+
+func TestVNIFromPortName(t *testing.T) {
+	cases := []struct {
+		name string
+		vni  uint32
+		ok   bool
+	}{
+		{"v101.10-70-0-1", 101, true},
+		{"v1.10-244-0-5", 1, true},
+		{"bogus", 0, false},
+		{"v.10-70-0-1", 0, false},
+		{"vx.10-70-0-1", 0, false},
+		{"v0.10-70-0-1", 0, false},
+	}
+	for _, tc := range cases {
+		vni, ok := vniFromPortName(tc.name)
+		if vni != tc.vni || ok != tc.ok {
+			t.Errorf("vniFromPortName(%q) = (%d,%v), want (%d,%v)", tc.name, vni, ok, tc.vni, tc.ok)
+		}
+	}
+}
+
 // The datapath contract: a pair is programmed iff both halves exist, mutually
 // reference each other, and both VPCs have VNIs. Everything else stays out of
 // the peers map.

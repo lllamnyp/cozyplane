@@ -44,6 +44,10 @@ most likely to set:
 - `exportPolicy.enabled` — the VPCBinding export admission gate (needs k8s 1.30+).
 - `apiserver.enabled` — serve the API from the aggregated API server instead of
   CRDs (needs cert-manager).
+- `egress.*` — cluster networking facts (pod/service CIDRs, cluster DNS) that
+  drive node masquerade and the per-VPC egress gateways
+  (`VPC.spec.egress.natGateway`); add node/management networks to
+  `egress.internalCIDRs`.
 
 ## What gets installed
 

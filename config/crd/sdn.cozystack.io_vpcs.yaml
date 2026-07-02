@@ -60,6 +60,19 @@ spec:
                 items:
                   type: string
                 type: array
+              egress:
+                description: |-
+                  Egress configures how workloads in this VPC reach destinations outside
+                  it. Absent means no egress: the VPC is a closed island for outbound
+                  traffic (inbound north-south via the fabric IP still works).
+                properties:
+                  natGateway:
+                    description: |-
+                      NATGateway runs a per-VPC gateway pod that forwards off-VPC traffic to
+                      the outside world (masqueraded to the gateway's address) and to cluster
+                      DNS; other cluster-internal destinations stay denied.
+                    type: boolean
+                type: object
               mtu:
                 description: |-
                   MTU is the MTU advertised to ports in this VPC. Zero selects the

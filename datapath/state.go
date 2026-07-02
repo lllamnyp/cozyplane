@@ -34,6 +34,9 @@ type AgentState struct {
 	PodCIDR string `json:"podCIDR"`
 	// MTU is the pod MTU (underlay MTU minus Geneve overhead).
 	MTU int `json:"mtu"`
+	// Namespace is the agent's own (system) namespace. Gateway-attach
+	// (AnnotationGatewayFor) is honored only for pods in this namespace.
+	Namespace string `json:"namespace,omitempty"`
 }
 
 // Save atomically writes the agent state to AgentStateFile.

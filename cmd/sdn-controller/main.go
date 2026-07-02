@@ -53,6 +53,10 @@ func main() {
 		probeAddr            string
 		secureMetrics        bool
 		enableHTTP2          bool
+		gatewayImage         string
+		gatewayNamespace     string
+		internalCIDRs        string
+		clusterDNS           string
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
@@ -65,6 +69,14 @@ func main() {
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics server")
+	flag.StringVar(&gatewayImage, "gateway-image", "",
+		"cozyplane image for VPC egress gateway pods; empty disables gateway reconciliation")
+	flag.StringVar(&gatewayNamespace, "gateway-namespace", os.Getenv("POD_NAMESPACE"),
+		"system namespace for gateway Deployments (must match the agents' namespace; defaults to POD_NAMESPACE)")
+	flag.StringVar(&internalCIDRs, "internal-cidrs", "",
+		"comma-separated cluster-internal CIDRs gateways must not forward tenant traffic to (pod, service, node networks)")
+	flag.StringVar(&clusterDNS, "cluster-dns", "",
+		"cluster DNS ClusterIP gateways allow on :53")
 
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
@@ -124,6 +136,26 @@ func main() {
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "VPCPeering")
 		os.Exit(1)
+	}
+
+	if gatewayImage != "" {
+		if gatewayNamespace == "" {
+			setupLog.Error(nil, "--gateway-namespace (or POD_NAMESPACE) is required with --gateway-image")
+			os.Exit(1)
+		}
+		if err := (&sdncontroller.GatewayReconciler{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+			Config: sdncontroller.GatewayConfig{
+				Image:         gatewayImage,
+				Namespace:     gatewayNamespace,
+				InternalCIDRs: internalCIDRs,
+				ClusterDNS:    clusterDNS,
+			},
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "Gateway")
+			os.Exit(1)
+		}
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

@@ -89,12 +89,19 @@ spec:
         - name: agent
           image: ghcr.io/lllamnyp/cozyplane:dev
           imagePullPolicy: IfNotPresent
-          args: ["--mtu=1450"]
+          # --cluster-cidr enables node masquerade: pod traffic leaving the
+          # cluster is SNATed to the node (pods get an internet return path).
+          args: ["--mtu=1450", "--cluster-cidr=10.244.0.0/16"]
           env:
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # Gateway-attach is honored only for pods in the agent's namespace.
+            - name: AGENT_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           securityContext:
             privileged: true
           volumeMounts:

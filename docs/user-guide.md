@@ -23,7 +23,9 @@ where it's headed.
   same VPC reach each other across nodes; the system/default network can reach a
   VPC pod via its fabric IP (north-south). A VPC pod itself cannot initiate to
   anything outside its VPC — the default network, the node, other VPCs, the
-  internet are all dropped.
+  internet are all dropped — unless the owner opens a path: a `VPCPeering` to
+  another VPC, or `spec.egress.natGateway` for internet + DNS via a per-VPC
+  gateway.
 - **Tenancy.** The VPC owner controls who may use it: a `VPCBinding` is created
   by someone holding both `create vpcbindings` in the consumer namespace and the
   `export` verb on the VPC. Deleting the binding **revokes** access and severs
@@ -265,6 +267,46 @@ Notes:
 - Peering only makes traffic *admissible* between the two VPCs; it grants no
   rights on the peer VPC itself (no attach, no export).
 
+## Open a path to the outside (egress gateway)
+
+By default a VPC is a **closed island** for outbound traffic. The owner opts
+into egress on the VPC:
+
+```yaml
+spec:
+  cidrs: ["10.10.0.0/24"]
+  egress:
+    natGateway: true
+```
+
+The controller spawns a per-VPC **gateway pod** in the system namespace — a
+default-network pod with a second leg carrying the VPC's reserved `.1`
+address — and the datapath starts delivering the VPC's off-net traffic to it.
+The gateway forwards under a default-deny filter:
+
+- **Internet**: forwarded, masqueraded to the gateway's fabric address (a
+  stable per-VPC egress identity, one conntrack point).
+- **Cluster DNS on :53**: the one cluster-internal door, so tenant pods
+  resolve with their stock resolv.conf.
+- **Everything else cluster-internal** (pod, Service, node networks): dropped.
+  The tenant→system boundary holds through the gateway.
+
+```bash
+kubectl exec app-1 -- ping -c2 1.1.1.1          # works
+kubectl exec app-1 -- nslookup example.com       # resolves (via the gateway)
+kubectl exec app-1 -- wget -qO- http://<any-cluster-pod-ip>   # still blocked
+```
+
+Deleting `spec.egress` (or the VPC) tears the gateway down and the VPC closes
+again. The gateway needs the chart's `egress.*` values (cluster pod/service
+CIDRs, cluster DNS IP) to know what to deny — set `egress.internalCIDRs` to
+also cover your node/management networks.
+
+> **Node masquerade.** With `egress.clusterCIDR` set, the agents also install
+> the classic node masquerade rule, so *default-network* pods get an internet
+> return path too (pod CIDRs aren't routable outside the cluster). VPC pods
+> never use it directly — their egress path is always their gateway.
+
 ## Limitations (today)
 
 These are prototype constraints, not permanent:
@@ -272,10 +314,14 @@ These are prototype constraints, not permanent:
 - **VPC CIDRs must be unique cluster-wide** (and must not overlap the cluster pod
   CIDR). Overlapping per-tenant CIDRs need bridge "stage 2" (eBPF-keyed delivery
   by fabric IP); stage 1 keeps delivery IP-keyed.
-- **VPC pods cannot initiate egress** — no internet, no DNS, no reaching the
-  default network or non-peered VPCs. A VPC is a closed island for outbound
-  traffic; only inbound (north-south, via the fabric IP), same-VPC, and peered
-  VPC traffic work. A per-VPC gateway (NAT/DNS/controlled doors) is future work.
+- **VPC egress is all-or-nothing**: `spec.egress.natGateway` opens internet +
+  cluster DNS; there is no per-destination policy, no Service exposure into a
+  VPC, no metadata endpoint, and no floating/public IPs (ingress with source
+  preservation) yet. Without it a VPC remains a closed island for outbound
+  traffic (inbound north-south, same-VPC, and peered-VPC traffic still work).
+- **The gateway is a single pod per VPC** (Recreate strategy): a node failure
+  or image roll interrupts tenant egress until it reschedules; established
+  flows don't survive the move (conntrack is in the pod).
 - **No network policy / security groups yet** within or across VPCs; a
   `VPCPeering` opens the two VPCs to each other completely.
 - **IPv4 only.**

@@ -51,13 +51,17 @@ import (
 
 const (
 	contVethName = "eth0"
-	ipamPlugin   = "host-local"
+	// gwVethName is the gateway pod's second interface, carrying the VPC's
+	// reserved .1 address (gateway-attach).
+	gwVethName = "eth1"
+	ipamPlugin = "host-local"
 )
 
 // Annotation and label keys come from the API package so the CNI (writer) and
 // the controller (reader/reaper) cannot drift.
 const (
 	vpcAnnotation     = sdnv1alpha1.AnnotationVPC
+	gatewayAnnotation = sdnv1alpha1.AnnotationGatewayFor
 	labelVPC          = sdnv1alpha1.LabelVPC
 	labelVPCNamespace = sdnv1alpha1.LabelVPCNamespace
 	labelPodNS        = sdnv1alpha1.LabelPodNamespace
@@ -133,20 +137,35 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return err
 	}
 
-	// Resolve VPC membership from the pod annotation (best-effort: if the API
+	// Resolve VPC membership from the pod annotations (best-effort: if the API
 	// is unreachable, fall back to the default network).
-	vpcAnno := ""
+	vpcAnno, gwAnno := "", ""
 	if core, e := coreClient(); e == nil && podNS != "" && podName != "" {
 		if pod, e := core.CoreV1().Pods(podNS).Get(context.TODO(), podName, metav1.GetOptions{}); e == nil {
 			vpcAnno = pod.Annotations[vpcAnnotation]
+			gwAnno = pod.Annotations[gatewayAnnotation]
 		}
 	}
 
-	if vpcAnno == "" {
-		return addDefault(args, conf)
+	if vpcAnno != "" {
+		if gwAnno != "" {
+			return fmt.Errorf("%s and %s are mutually exclusive: a gateway pod lives on the default network", vpcAnnotation, gatewayAnnotation)
+		}
+		vpcNS, vpcName := parseVPCRef(vpcAnno, podNS)
+		return addVPC(args, conf, vpcNS, vpcName, podNS, podName, podUID)
 	}
-	vpcNS, vpcName := parseVPCRef(vpcAnno, podNS)
-	return addVPC(args, conf, vpcNS, vpcName, podNS, podName, podUID)
+	result, err := addDefault(args, conf)
+	if err != nil {
+		return err
+	}
+	if gwAnno != "" {
+		// A gateway pod is a default-network pod with a second leg into the VPC.
+		vpcNS, vpcName := parseVPCRef(gwAnno, podNS)
+		if err := addGatewayLeg(args, conf, vpcNS, vpcName, podNS, podName, podUID); err != nil {
+			return err
+		}
+	}
+	return types.PrintResult(result, conf.CNIVersion)
 }
 
 // parseVPCRef splits the vpc annotation value into (owner namespace, name). The
@@ -159,11 +178,13 @@ func parseVPCRef(anno, podNS string) (ns, name string) {
 	return podNS, anno
 }
 
-// addDefault attaches the pod to the default/system network with host-local IPAM.
-func addDefault(args *skel.CmdArgs, conf *NetConf) error {
+// addDefault attaches the pod to the default/system network with host-local
+// IPAM and returns the CNI result (the caller prints it — a gateway pod adds
+// its VPC leg first).
+func addDefault(args *skel.CmdArgs, conf *NetConf) (result *current.Result, err error) {
 	state, err := datapath.LoadAgentState()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	mtu := conf.MTU
 	if mtu == 0 {
@@ -172,11 +193,11 @@ func addDefault(args *skel.CmdArgs, conf *NetConf) error {
 
 	ipamData, err := ipamStdin(args.StdinData, state.PodCIDR)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	r, err := ipam.ExecAdd(ipamPlugin, ipamData)
 	if err != nil {
-		return fmt.Errorf("ipam add: %w", err)
+		return nil, fmt.Errorf("ipam add: %w", err)
 	}
 	defer func() {
 		if err != nil {
@@ -186,20 +207,20 @@ func addDefault(args *skel.CmdArgs, conf *NetConf) error {
 
 	ipamResult, err := current.NewResultFromResult(r)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(ipamResult.IPs) == 0 {
-		return fmt.Errorf("ipam returned no addresses")
+		return nil, fmt.Errorf("ipam returned no addresses")
 	}
 	podIP := ipamResult.IPs[0].Address.IP
 
-	result, err := setupVeth(args, conf.CNIVersion, podIP, mtu, 0)
+	result, err = setupVeth(args, conf.CNIVersion, podIP, mtu, 0)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	result.IPs = ipamResult.IPs
 	result.IPs[0].Interface = current.Int(0)
-	return types.PrintResult(result, conf.CNIVersion)
+	return result, nil
 }
 
 // addVPC attaches the pod to a VPC using the dual-address bridge: the pod's
@@ -293,6 +314,142 @@ func addVPC(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, p
 		Address:   net.IPNet{IP: fabricIP, Mask: net.CIDRMask(32, 32)},
 	}}
 	return types.PrintResult(result, conf.CNIVersion)
+}
+
+// addGatewayLeg gives a (default-network) gateway pod a second interface into
+// the VPC, carrying the VPC's reserved .1 address. Authorization is by
+// placement, not binding: the pod must live in the agent's own (system)
+// namespace — where only the cozyplane controller creates pods — and the VPC
+// owner must have opted in via spec.egress.natGateway. The .1 Port is claimed
+// like any other (atomic by name), marked spec.gateway so agents route off-VPC
+// traffic to it.
+func addGatewayLeg(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, podUID string) (err error) {
+	state, err := datapath.LoadAgentState()
+	if err != nil {
+		return err
+	}
+	if state.Namespace == "" || podNS != state.Namespace {
+		return fmt.Errorf("gateway-attach is only honored for pods in the system namespace %q, not %q", state.Namespace, podNS)
+	}
+
+	client, err := sdnClient()
+	if err != nil {
+		return fmt.Errorf("sdn client: %w", err)
+	}
+	vpc, err := client.SdnV1alpha1().VPCs(vpcNS).Get(context.TODO(), vpcName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get vpc %s/%s: %w", vpcNS, vpcName, err)
+	}
+	if vpc.Spec.Egress == nil || !vpc.Spec.Egress.NATGateway {
+		return fmt.Errorf("vpc %s/%s has no egress gateway enabled (spec.egress.natGateway)", vpcNS, vpcName)
+	}
+	if vpc.Status.VNI == 0 {
+		return fmt.Errorf("vpc %s/%s is not ready (no VNI assigned yet)", vpcNS, vpcName)
+	}
+	if len(vpc.Spec.CIDRs) == 0 {
+		return fmt.Errorf("vpc %s/%s has no CIDR", vpcNS, vpcName)
+	}
+	_, ipnet, err := net.ParseCIDR(vpc.Spec.CIDRs[0])
+	if err != nil {
+		return fmt.Errorf("parse vpc CIDR: %w", err)
+	}
+	gwIP := nextIP(cloneIP(ipnet.IP)) // the reserved .1
+
+	// Claim the gateway Port. AlreadyExists means another gateway pod still
+	// holds the .1 (e.g. its teardown hasn't run yet); kubelet retries ADD.
+	port := &sdnv1alpha1.Port{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: portName(vpc.Status.VNI, gwIP.String()),
+			Labels: map[string]string{
+				labelVPCNamespace: vpcNS,
+				labelVPC:          vpc.Name,
+				labelPodNS:        podNS,
+				labelPodName:      podName,
+				labelPodUID:       podUID,
+			},
+		},
+		Spec: sdnv1alpha1.PortSpec{
+			VPCRef:       sdnv1alpha1.VPCRef{Namespace: vpcNS, Name: vpc.Name},
+			IP:           gwIP.String(),
+			Node:         state.NodeName,
+			NodeIP:       state.NodeIP,
+			PodNamespace: podNS,
+			PodName:      podName,
+			Gateway:      true,
+		},
+	}
+	created, err := client.SdnV1alpha1().Ports().Create(context.TODO(), port, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("claim gateway port %s: %w", port.Name, err)
+	}
+	defer func() {
+		if err != nil {
+			_ = client.SdnV1alpha1().Ports().Delete(context.TODO(), created.Name, metav1.DeleteOptions{})
+		}
+	}()
+
+	mtu := conf.MTU
+	if mtu == 0 {
+		mtu = int(vpc.Spec.MTU)
+	}
+	if mtu == 0 {
+		mtu = state.MTU
+	}
+
+	hostNS, err := ns.GetCurrentNS()
+	if err != nil {
+		return fmt.Errorf("get host netns: %w", err)
+	}
+	defer hostNS.Close()
+
+	var hostVethName string
+	var podMAC net.HardwareAddr
+	if err = ns.WithNetNSPath(args.Netns, func(ns.NetNS) error {
+		hostVeth, _, e := ip.SetupVethWithName(gwVethName, gwHostVethNameFor(args.ContainerID), mtu, "", hostNS)
+		if e != nil {
+			return e
+		}
+		hostVethName = hostVeth.Name
+		link, e := netlink.LinkByName(gwVethName)
+		if e != nil {
+			return e
+		}
+		if e := netlink.AddrAdd(link, &netlink.Addr{IPNet: &net.IPNet{IP: gwIP, Mask: net.CIDRMask(32, 32)}}); e != nil {
+			return fmt.Errorf("add gateway address: %w", e)
+		}
+		if e := netlink.LinkSetUp(link); e != nil {
+			return e
+		}
+		podMAC = link.Attrs().HardwareAddr
+		// Route the whole VPC CIDR out this leg via the proxy-arp'd link-local
+		// hop (onlink: the hop needs no route of its own — eth0 already claims
+		// a 169.254.1.1/32 link route).
+		if e := netlink.RouteAdd(&netlink.Route{
+			LinkIndex: link.Attrs().Index,
+			Dst:       ipnet,
+			Gw:        linkLocalGW,
+			Flags:     int(netlink.FLAG_ONLINK),
+		}); e != nil {
+			return fmt.Errorf("add VPC route: %w", e)
+		}
+		// The gateway forwards between its legs.
+		for key, val := range map[string]string{
+			"net/ipv4/ip_forward":             "1",
+			"net/ipv4/conf/all/rp_filter":     "0",
+			"net/ipv4/conf/default/rp_filter": "0",
+		} {
+			if e := datapath.WriteProcSys(key, val); e != nil {
+				return fmt.Errorf("set %s in gateway netns: %w", key, e)
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// Host side is a normal VPC port, flagged as the gateway leg so the
+	// datapath blesses the off-VPC sources it forwards inward.
+	return configureHostVeth(hostVethName, gwIP, uint32(vpc.Status.VNI)|datapath.PortGatewayFlag, podMAC)
 }
 
 // requireVPCBinding implements default-deny attachment: a VPCBinding in the
@@ -515,11 +672,13 @@ func configureHostVeth(name string, podIP net.IP, netID uint32, podMAC net.Hardw
 }
 
 func cmdDel(args *skel.CmdArgs) error {
-	// Clear the ports map entry; the host veth (and its tc filter) goes with the
-	// pod veth deleted below.
-	if hv, e := netlink.LinkByName(hostVethNameFor(args.ContainerID)); e == nil {
-		_ = datapath.DelPortNet(hv.Attrs().Index)
-		_ = datapath.DetachVeth(hv.Attrs().Index)
+	// Clear the ports map entries; the host veths (and their tc filters) go
+	// with the pod veths deleted below.
+	for _, name := range []string{hostVethNameFor(args.ContainerID), gwHostVethNameFor(args.ContainerID)} {
+		if hv, e := netlink.LinkByName(name); e == nil {
+			_ = datapath.DelPortNet(hv.Attrs().Index)
+			_ = datapath.DetachVeth(hv.Attrs().Index)
+		}
 	}
 
 	podNS, podName, podUID, _ := podIdentity(args)
@@ -555,6 +714,14 @@ func cmdDel(args *skel.CmdArgs) error {
 		return nil
 	}
 	return ns.WithNetNSPath(args.Netns, func(ns.NetNS) error {
+		// Release the gateway leg first, if any (its locals entry too).
+		if addrs, e := ip.DelLinkByNameAddr(gwVethName); e == nil {
+			for _, a := range addrs {
+				if a.IP != nil {
+					_ = datapath.DelLocal(a.IP)
+				}
+			}
+		}
 		addrs, e := ip.DelLinkByNameAddr(contVethName)
 		if e == ip.ErrLinkNotFound {
 			return nil
@@ -577,6 +744,15 @@ func hostVethNameFor(containerID string) string {
 		id = id[:11]
 	}
 	return "cph" + id
+}
+
+// gwHostVethNameFor names the host side of a gateway pod's VPC leg.
+func gwHostVethNameFor(containerID string) string {
+	id := containerID
+	if len(id) > 11 {
+		id = id[:11]
+	}
+	return "cpg" + id
 }
 
 func cloneIP(in net.IP) net.IP {

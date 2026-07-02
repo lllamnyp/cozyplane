@@ -31,6 +31,14 @@ rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcpeerings/status"]
     verbs: ["get", "update", "patch"]
+  # Egress gateway Deployments (spec.egress.natGateway -> per-VPC gateway pod).
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+  # Severed-gateway heal: recreate a Ready gateway pod whose .1 Port is gone.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -69,7 +77,18 @@ spec:
           image: ghcr.io/lllamnyp/cozyplane:dev
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/sdn-controller"]
-          args: ["--leader-elect=false", "--metrics-bind-address=0", "--health-probe-bind-address=:8081"]
+          args:
+            - --leader-elect=false
+            - --metrics-bind-address=0
+            - --health-probe-bind-address=:8081
+            - --gateway-image=ghcr.io/lllamnyp/cozyplane:dev
+            - --internal-cidrs=10.244.0.0/16,10.96.0.0/16
+            - --cluster-dns=10.96.0.10
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           livenessProbe:
             httpGet: { path: /healthz, port: 8081 }
             initialDelaySeconds: 10

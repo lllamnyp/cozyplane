@@ -63,6 +63,11 @@ type PortSpec struct {
 	PodNamespace string `json:"podNamespace,omitempty"`
 	// +optional
 	PodName string `json:"podName,omitempty"`
+
+	// Gateway marks the VPC's gateway port (the .1 leg of the egress gateway
+	// pod); agents route off-VPC traffic to it.
+	// +optional
+	Gateway bool `json:"gateway,omitempty"`
 }
 
 // +genclient

@@ -24,6 +24,19 @@
 #define TC_ACT_SHOT 2
 #define LINK_LOCAL_GW 0xA9FE0101 // 169.254.1.1 (host order)
 
+// ports-map value layout: bit 31 flags a VPC egress-gateway leg; the low bits
+// are the network id (VNIs stay far below 2^23, see TUN_F_GATEWAY).
+#define PORT_F_GATEWAY (1u << 31)
+#define PORT_NET(v) ((v) & ~PORT_F_GATEWAY)
+
+// Gateway-forwarded traffic may carry an off-VPC source (the internet) into a
+// tenant pod, which the ingress anti-spoof check would otherwise drop. It is
+// blessed in-kernel only: same-node via skb->mark, cross-node via a flag bit
+// inside the 24-bit Geneve VNI (so the receiving node can re-mark after decap).
+// Tenants cannot forge either.
+#define GW_MARK        0x100000  // bit 20: clear of kube-proxy (0x4000/0x8000) and Cilium magic
+#define TUN_F_GATEWAY  (1 << 23) // top bit of the Geneve VNI; real VNIs are < 2^23
+
 // Shared Geneve MAC: the encap path rewrites the inner Ethernet destination to
 // it so cross-node frames are PACKET_HOST on arrival and the kernel forwards
 // them to the local pod (which then leaves via the pod veth -> to_pod).
@@ -106,6 +119,22 @@ static __always_inline int nets_allowed(__u32 src, __u32 dst)
 	return bpf_map_lookup_elem(&peers, &key) != NULL;
 }
 
+// A VPC's egress gateway, from the agent's own point of view.
+struct gw_entry {
+	__u32 gw_ip;   // the gateway's VPC-leg address (network byte order, locals key)
+	__u32 node_ip; // 0 if the gateway is on this node, else its node (host order)
+};
+
+// gateways: network id -> egress gateway. Off-VPC traffic from a pod in the
+// network is delivered to the gateway instead of being dropped.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u32);
+	__type(value, struct gw_entry);
+	__uint(max_entries, 1024);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} gateways SEC(".maps");
+
 #define CFG_GENEVE_IFINDEX 0
 #define CFG_VNI            1
 
@@ -161,21 +190,57 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 		return TC_ACT_OK;
 
 	__u32 ifindex = skb->ifindex;
-	__u32 srcnet = 0;
+	__u32 srcnet = 0, is_gw = 0;
 	__u32 *sp = bpf_map_lookup_elem(&ports, &ifindex);
-	if (sp)
-		srcnet = *sp;
+	if (sp) {
+		srcnet = PORT_NET(*sp);
+		is_gw = *sp & PORT_F_GATEWAY;
+	}
 	__u32 dstnet = net_of(&networks, ip->daddr);
 
-	// Isolation: same-network or explicitly peered traffic only (egress side).
-	if (!nets_allowed(srcnet, dstnet))
-		return TC_ACT_SHOT;
+	// Isolation: same-network or explicitly peered traffic only (egress side) —
+	// except a VPC pod's off-net traffic, which goes to the VPC's egress
+	// gateway when one exists. Fabric->VPC and unpeered cross-VPC still drop.
+	if (!nets_allowed(srcnet, dstnet)) {
+		if (!srcnet || dstnet)
+			return TC_ACT_SHOT;
+		struct gw_entry *g = bpf_map_lookup_elem(&gateways, &srcnet);
+		if (!g)
+			return TC_ACT_SHOT; // closed island: no gateway for this VPC
+		if (!g->node_ip) {
+			// Gateway on this node: redirect into its VPC leg (-> to_pod).
+			struct endpoint *gl = bpf_map_lookup_elem(&locals, &g->gw_ip);
+			if (!gl)
+				return TC_ACT_SHOT;
+			if (bpf_skb_store_bytes(skb, 0, gl->mac, sizeof(gl->mac), 0) < 0)
+				return TC_ACT_SHOT;
+			return bpf_redirect(gl->ifindex, 0);
+		}
+		// Remote gateway: encapsulate toward its node; from_overlay there
+		// hands the packet to the gateway's veth.
+		__u32 geneve = cfg(CFG_GENEVE_IFINDEX);
+		if (!geneve)
+			return TC_ACT_SHOT;
+		__u8 gmac[6] = OVERLAY_DMAC;
+		if (bpf_skb_store_bytes(skb, 0, gmac, sizeof(gmac), 0) < 0)
+			return TC_ACT_SHOT;
+		struct bpf_tunnel_key gkey = {};
+		gkey.tunnel_id = srcnet;
+		gkey.remote_ipv4 = g->node_ip;
+		if (bpf_skb_set_tunnel_key(skb, &gkey, sizeof(gkey), BPF_F_ZERO_CSUM_TX) < 0)
+			return TC_ACT_SHOT;
+		return bpf_redirect(geneve, 0);
+	}
 
 	// Same-node destination: redirect through the pod's veth egress (-> to_pod).
 	// No kernel-routing shortcut, so the destination's ingress hook still runs.
 	__u32 dip = ip->daddr;
 	struct endpoint *l = bpf_map_lookup_elem(&locals, &dip);
 	if (l) {
+		// A gateway forwarding into its VPC may carry an off-VPC source (the
+		// internet's reply); mark it so the destination's anti-spoof admits it.
+		if (is_gw)
+			skb->mark = GW_MARK;
 		if (bpf_skb_store_bytes(skb, 0, l->mac, sizeof(l->mac), 0) < 0)
 			return TC_ACT_SHOT;
 		return bpf_redirect(l->ifindex, 0);
@@ -196,6 +261,8 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 
 	struct bpf_tunnel_key tkey = {};
 	tkey.tunnel_id = srcnet ? srcnet : cfg(CFG_VNI);
+	if (is_gw)
+		tkey.tunnel_id |= TUN_F_GATEWAY; // re-marked by from_overlay after decap
 	tkey.remote_ipv4 = *node_ip;
 	if (bpf_skb_set_tunnel_key(skb, &tkey, sizeof(tkey), BPF_F_ZERO_CSUM_TX) < 0)
 		return TC_ACT_SHOT;
@@ -220,12 +287,57 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 	__u32 dstnet = 0;
 	__u32 *dp = bpf_map_lookup_elem(&ports, &ifindex);
 	if (dp)
-		dstnet = *dp;
+		dstnet = PORT_NET(*dp);
 	__u32 srcnet = net_of(&networks, ip->saddr);
 
 	// Isolation: same-network or explicitly peered traffic only (ingress side).
-	if (!nets_allowed(srcnet, dstnet))
-		return TC_ACT_SHOT;
+	// The exception is gateway-forwarded traffic into a VPC pod: its source is
+	// off-VPC (the internet, cluster DNS) so srcnet is 0, but it carries the
+	// in-kernel gateway mark that tenants cannot forge.
+	if (!nets_allowed(srcnet, dstnet)) {
+		if (!(srcnet == 0 && dstnet != 0 && skb->mark == GW_MARK))
+			return TC_ACT_SHOT;
+	}
 
 	return TC_ACT_OK;
+}
+
+// cozyplane_from_overlay: attached at the ingress of the Geneve device, where
+// packets arrive already decapsulated but with the tunnel key still readable.
+// Two gateway-related jobs; everything else passes to the kernel unchanged:
+//
+//  1. re-mark gateway-forwarded traffic (TUN_F_GATEWAY in the VNI) so the
+//     destination pod's to_pod anti-spoof admits it (skb->mark does not
+//     survive encapsulation, the VNI bit does);
+//  2. deliver tenant->outside traffic to a gateway hosted on THIS node: its
+//     destination is off-net, so the kernel has no /32 route for it — redirect
+//     it into the gateway's VPC leg (through the gateway's to_pod hook).
+SEC("tc")
+int cozyplane_from_overlay(struct __sk_buff *skb)
+{
+	struct bpf_tunnel_key tk;
+	if (bpf_skb_get_tunnel_key(skb, &tk, sizeof(tk), 0) < 0)
+		return TC_ACT_OK;
+
+	if (tk.tunnel_id & TUN_F_GATEWAY) {
+		skb->mark = GW_MARK; // survives kernel forwarding to the local veth
+		return TC_ACT_OK;    // dst is a VPC IP; the kernel's /32 route delivers
+	}
+
+	struct iphdr *ip;
+	if (parse_ipv4(skb, &ip) < 0)
+		return TC_ACT_OK;
+	if (net_of(&networks, ip->daddr))
+		return TC_ACT_OK; // in-VPC destination: kernel /32 delivery as usual
+
+	__u32 vni = (__u32)tk.tunnel_id;
+	struct gw_entry *g = bpf_map_lookup_elem(&gateways, &vni);
+	if (!g || g->node_ip)
+		return TC_ACT_OK; // no local gateway for this VNI (default net included)
+	struct endpoint *l = bpf_map_lookup_elem(&locals, &g->gw_ip);
+	if (!l)
+		return TC_ACT_OK;
+	if (bpf_skb_store_bytes(skb, 0, l->mac, sizeof(l->mac), 0) < 0)
+		return TC_ACT_SHOT;
+	return bpf_redirect(l->ifindex, 0);
 }

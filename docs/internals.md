@@ -50,7 +50,13 @@ cozyplane's job — kube-proxy or Cilium-KPR handles them, unchanged.
   the classifier. Two paths: default (host-local IPAM) and VPC (claim a `Port`).
 - **`sdn-controller`** (`cmd/sdn-controller`, controller-runtime Deployment).
   Assigns each `VPC` a unique network id (VNI) and marks it `Ready`; reaps
-  `Port`s on `VPCBinding` deletion; surfaces `VPCPeering` matched/ready status.
+  `Port`s on `VPCBinding` deletion; surfaces `VPCPeering` matched/ready status;
+  spawns per-VPC egress gateway Deployments for `spec.egress.natGateway`.
+- **`cozyplane-gateway`** (`cmd/gateway`, one privileged pod per egress-enabled
+  VPC). A default-network pod with a gateway-attached second leg; forwards the
+  VPC's off-net traffic (masqueraded) under a default-deny filter — internet
+  passes, cluster-internal CIDRs drop — and proxies cluster DNS (:53) through
+  its own sockets so ClusterIP translation applies.
 - **API** (`api/sdn`, group `sdn.cozystack.io/v1alpha1`): `VPC`, `VPCBinding`,
   `VPCPeering`, `Port`. Served as **CRDs** (`config/crd/`) or by the aggregated
   API server (`pkg/apiserver`, `cmd/apiserver`) — a transparent swap because the
@@ -67,9 +73,10 @@ maps and one program.
 |-----|------|-------------|-----------|
 | `remotes` | LPM trie | dst IP/CIDR → remote node IP | agent (Nodes + Ports) |
 | `networks` | LPM trie | VPC CIDR → network id | agent (VPCs) |
-| `ports` | hash | veth ifindex → network id | plugin (per pod) |
+| `ports` | hash | veth ifindex → network id (bit 31 = gateway leg) | plugin (per pod) |
 | `locals` | hash | pod IP → {veth ifindex, pod MAC} | plugin (per pod) |
 | `peers` | hash | {src net id, dst net id} → 1 | agent (VPCPeerings) |
+| `gateways` | hash | net id → {gateway .1 IP, node IP (0=local)} | agent (gateway Ports) |
 | `params` | array | `[0]`=Geneve ifindex, `[1]`=default VNI | agent |
 
 All are pinned under `/sys/fs/bpf/cozyplane/` (`LIBBPF_PIN_BY_NAME`) so the
@@ -91,9 +98,12 @@ pod's host-side veth** (a pod's egress) and at the **egress of the node uplink**
 
 1. exempt traffic to the link-local gateway `169.254.1.1` (replies to bridged
    node→pod traffic; the host stack/conntrack handles them);
-2. source net = `ports[skb->ifindex]` (absent ⇒ `0`); dest net = `networks[dst]`
-   (absent ⇒ `0`); **drop** if they differ *and* `peers[{src,dst}]` misses
-   (egress isolation; a `VPCPeering` writes both directions into `peers`);
+2. source net = `ports[skb->ifindex]` (absent ⇒ `0`; bit 31 flags a gateway
+   leg); dest net = `networks[dst]` (absent ⇒ `0`); if they differ and
+   `peers[{src,dst}]` misses: a VPC pod's off-net traffic (`srcnet≠0`,
+   `dstnet=0`) is handed to `gateways[srcnet]` — local gateway by redirect
+   into its VPC leg, remote by encap to its node — and everything else
+   (fabric→VPC, unpeered cross-VPC, no gateway) is **dropped**;
 3. if the destination is a **local pod** (`locals[dst]` hit): rewrite the dst MAC
    to the pod's MAC and `bpf_redirect` to its veth — same-node delivery *through*
    the destination's ingress hook, no kernel-routing shortcut;
@@ -109,9 +119,28 @@ pod's host-side veth**. Every delivery path leaves via the destination veth
 so this is the placement-independent point for ingress policy. For each packet:
 
 1. exempt source `169.254.1.1` (bridge/masqueraded node→pod traffic);
-2. dest net = `ports[skb->ifindex]`; source net = `networks[src]`; **drop** if
-   they differ and `peers[{src,dst}]` misses (ingress isolation); else
-   `TC_ACT_OK`.
+2. dest net = `ports[skb->ifindex]` (flag bit masked); source net =
+   `networks[src]`; **drop** if they differ and `peers[{src,dst}]` misses —
+   unless the packet carries the **gateway mark**: traffic a VPC's egress
+   gateway forwards inward has an off-VPC source (the internet, cluster DNS),
+   so `srcnet` is 0, but it was blessed in-kernel (see below) and tenants
+   cannot forge that. This keeps the anti-spoof property: an in-VPC pod
+   spoofing an external source is still dropped.
+
+**`cozyplane_from_overlay`** — attached at the **ingress of the Geneve
+device**, where packets arrive decapsulated but with the tunnel key readable.
+Gateway plumbing only; everything else passes through untouched:
+
+1. a `TUN_F_GATEWAY` bit in the VNI marks gateway-forwarded traffic — re-apply
+   the gateway mark (`skb->mark`) so the destination veth's `to_pod` admits it
+   (the mark itself doesn't survive encapsulation; the VNI bit does);
+2. an off-net destination arriving on a VPC's VNI is tenant→outside traffic
+   for a gateway hosted on **this** node: the kernel has no route for it, so
+   redirect it into the gateway's VPC leg (through the gateway's `to_pod`).
+
+The gateway mark is set in exactly two places — `from_pod` at a gateway leg
+(same-node delivery) and `from_overlay` (cross-node) — both in-kernel, so
+"came through the gateway" is unforgeable from inside any pod.
 
 Cross-node decapsulation itself is still done by the kernel Geneve device (see
 the two tricks below); the decapped packet is then routed out the destination
@@ -157,6 +186,22 @@ egress `from_pod` (srcnet 0 because the uplink isn't in `ports`) → `remotes` h
 are connected by a `VPCPeering`, in which case `peers[{src,dst}]` hits and the
 packet is delivered exactly like same-VPC traffic (native IPs, no NAT; `locals`
 redirect same-node, `remotes` encap cross-node).
+
+**Egress (VPC pod → 8.8.8.8, gateway on another node):** srcnet = VPC id,
+dstnet 0, peers miss → `gateways[srcnet]` hit → encap to the gateway's node
+(VNI = the VPC's) → `from_overlay` there sees an off-net dst on a VPC VNI →
+redirect into the gateway's VPC leg (through its `to_pod`: src is in-VPC,
+allowed) → the gateway pod's kernel forwards it: filter (internal CIDRs
+dropped, internet allowed), MASQUERADE to the gateway's fabric IP, out its
+default-network leg → node masquerade SNATs to the node → internet. DNS is the
+exception: queries to the cluster DNS ClusterIP are REDIRECTed to a proxy in
+the gateway, whose *own* sockets dial upstream — under socket-level
+kube-proxy-replacement, ClusterIPs are translated at connect(), never for
+packets merely forwarded through a pod. The reply
+unwinds the two conntracks, and the gateway sends `8.8.8.8 → tenant-IP` out
+its **VPC leg**: `from_pod` there is flagged (ports bit 31) so the packet gets
+the gateway mark (same-node) or the `TUN_F_GATEWAY` VNI bit (cross-node), and
+the tenant's `to_pod` admits the off-VPC source.
 
 **VPC, cross-node:** identical to the default walk, but srcnet/dstnet are the
 VPC's id and the tunnel VNI carries it; delivery still works by `/32` route
@@ -231,6 +276,15 @@ namespace/name from `CNI_ARGS`, then:
   then **enforce default-deny** (`requireVPCBinding`): a `VPCBinding` in the
   pod's namespace must reference that VPC, or ADD fails. Only then `Get` the VPC
   (must be `Ready`), `claimIP`, and create the veth with the VPC IP and net id.
+- **gateway path** (`addGatewayLeg`, on top of the default path): the
+  `sdn.cozystack.io/gateway-for` annotation gives the pod a *second* interface
+  (`eth1`) carrying the VPC's reserved `.1`. Authorization is by placement:
+  the pod must be in the agent's own namespace (published in the agent state —
+  only the cozyplane controller creates pods there) and the VPC must have
+  `spec.egress.natGateway`. The `.1` Port is claimed like any other, marked
+  `spec.gateway`; the leg gets the VPC CIDR routed via the proxy-arp'd
+  link-local hop (onlink), `ip_forward` is enabled in the netns, and the host
+  side is a normal VPC port with the gateway flag (ports bit 31).
 
 `claimIP` is the IPAM design point: it lists the VPC's `Port`s, picks the lowest
 free address starting at network+2 (`.0` network and `.1` gateway reserved), and
@@ -277,6 +331,15 @@ one informer factory):
   not keyed on the controller's status: severing must happen at watch latency
   even if status is stale, and the reciprocal grant's presence is the
   authorization.
+- **Gateway Ports** (`spec.gateway`) → the `gateways` map, same resync/diff
+  pattern: per VNI, the gateway's `.1` address plus its node (0 when local —
+  each agent programs its own view). The VNI is parsed from the Port name
+  (`v<vni>.…`, the documented naming contract).
+
+With `--cluster-cidr` set the agent also installs the classic node masquerade
+(`-s <clusterCIDR> ! -d <clusterCIDR> -j MASQUERADE`): pod CIDRs aren't
+routable outside the cluster, so without it no pod — including a gateway
+forwarding tenant traffic — has an internet return path.
 
 ### Controller
 
@@ -299,6 +362,15 @@ VPCs are Ready, surfaces `PeerMatched`/`VPCReady`/`PeerVPCReady` conditions and
 the peer's VNI, and reverts to `Pending` when either input goes away. It watches
 VPCPeerings (each half re-enqueues its reciprocal) and VPCs (each VPC re-enqueues
 the halves referencing it). No finalizer — deleting a half has nothing to reap.
+
+`GatewayReconciler` realizes `VPC.spec.egress.natGateway` as a per-VPC gateway
+Deployment (`cozyplane-gateway-<vni>`) in the system namespace: a privileged
+pod running `cozyplane-gateway` with the `gateway-for` annotation, Recreate
+strategy (the `.1` Port claim cannot roll). Deletion (egress disabled or VPC
+gone) finds Deployments by VPC labels — the VNI-derived name is unknowable
+after the VPC is deleted, and a cross-namespace ownerRef is not an option.
+Deployment events map back to their VPC, so a manually deleted gateway
+self-heals.
 
 ### Why the plugin needs a kubeconfig
 
@@ -323,19 +395,22 @@ datapath/                  Go wrapper around the eBPF datapath
   ports.go                 plugin-side access to the pinned `ports` map
   locals.go                plugin-side access to the pinned `locals` map
   peers.go                 agent-side access to the pinned `peers` map
+  gateways.go              agent-side `gateways` map + from_overlay attach
   firewall.go              the FORWARD ACCEPT rules (go-iptables)
   bpffs.go                 mount bpffs if absent (kind nodes)
   state.go                 AgentState published for the plugin (agent.json)
   kubeconfig.go            write the plugin kubeconfig from the SA token
   paths.go                 pin paths, device name, OverlayMAC, constants
 
-cmd/cni/main.go            CNI plugin (ADD/DEL/CHECK), default + VPC paths
-cmd/agent/main.go          node agent: datapath bring-up + Node/VPC/Port watches
+cmd/cni/main.go            CNI plugin (ADD/DEL/CHECK), default/VPC/gateway paths
+cmd/agent/main.go          node agent: datapath bring-up + sdn API watches
+cmd/gateway/main.go        per-VPC egress gateway (forward + filter + SNAT)
 cmd/sdn-controller/main.go controller-runtime manager
 cmd/apiserver/main.go      aggregated API server entrypoint (scaffolded)
 
 internal/controller/sdn/   VPCReconciler (VNI assignment), VPCBindingReconciler
-                           (revocation reap), VPCPeeringReconciler (status)
+                           (revocation reap), VPCPeeringReconciler (status),
+                           GatewayReconciler (egress gateway Deployments)
 internal/cmd/server/       aggregated apiserver options/wiring (start.go)
 internal/setup/            apiserver group registration + openapi merge
 
@@ -378,10 +453,11 @@ mostly future work. As built:
 
 - VPC CIDRs must be unique cluster-wide (overlap needs bridge stage 2 — see
   "The dual-address bridge").
-- VPC pods can't initiate egress (internet/DNS/default network/non-peered
-  VPCs); only inbound north-south (via the fabric IP), same-VPC, and peered-VPC
-  traffic work. No per-VPC gateway (NAT/DNS/controlled doors) yet, and no
-  policy/security groups — a peering opens the two VPCs completely.
+- VPC egress is opt-in and coarse: `spec.egress.natGateway` opens internet +
+  cluster DNS through a single per-VPC gateway pod; no per-destination policy,
+  Service exposure, metadata endpoint, or floating IPs (source-preserving
+  ingress) yet. No policy/security groups — a peering opens the two VPCs
+  completely.
 - IPv4 only; single CIDR per VPC; no VM live-migration plumbing.
 - The API is served as CRDs by default; the aggregated apiserver
   (`apiserver.enabled=true`) serves the same group with server-side validation

@@ -47,3 +47,22 @@ func EnsureForwardRules() error {
 
 	return nil
 }
+
+// EnsureMasquerade SNATs pod traffic leaving the cluster to this node's
+// address (the flannel-style rule): without it pods have no return path from
+// anything beyond the cluster, because pod CIDRs aren't routable outside.
+// clusterCIDR is the whole cluster pod supernet, and the rule is scoped to
+// the node uplink: a VPC gateway's reply carrying a cluster-CIDR source (e.g.
+// a conntrack-restored CoreDNS pod IP) toward a tenant VPC address is
+// *forwarded to a veth*, and must not be re-sourced on the way.
+func EnsureMasquerade(clusterCIDR, uplink string) error {
+	ipt, err := iptables.New()
+	if err != nil {
+		return fmt.Errorf("init iptables: %w", err)
+	}
+	spec := []string{"-s", clusterCIDR, "!", "-d", clusterCIDR, "-o", uplink, "-j", "MASQUERADE"}
+	if err := ipt.AppendUnique("nat", "POSTROUTING", spec...); err != nil {
+		return fmt.Errorf("append MASQUERADE rule: %w", err)
+	}
+	return nil
+}

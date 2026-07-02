@@ -66,6 +66,11 @@ spec:
                   FabricIP is the pod's status.podIP: a unique address from the node pod
                   CIDR, reachable on the default overlay, that the bridge DNATs to IP.
                 type: string
+              gateway:
+                description: |-
+                  Gateway marks the VPC's gateway port (the .1 leg of the egress gateway
+                  pod); agents route off-VPC traffic to it.
+                type: boolean
               ip:
                 description: |-
                   IP is the address allocated to the pod within the VPC CIDR (the tenant

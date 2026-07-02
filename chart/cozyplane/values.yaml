@@ -1,6 +1,6 @@
 # Container image for all cozyplane components (agent, CNI plugin, controller).
 # Digest-pinned (no floating tag); update on each published build.
-image: ghcr.io/lllamnyp/cozyplane@sha256:eab3168483bf8224f19e24ead65cfbc82bff43574f3d6c4ebc7be97e802aaeb6
+image: ghcr.io/lllamnyp/cozyplane@sha256:ecfdaba758d9a2404d4b96e3dfe01dd574e43f12dc5f159a6fee5592a537af60
 imagePullPolicy: IfNotPresent
 imagePullSecrets: []
 
@@ -15,6 +15,22 @@ genevePort: 6081
 # low prefix (e.g. "00-cozyplane.conflist") to win over a co-installed CNI such
 # as Cilium (which ships 05-cilium.conflist).
 cniConfName: "10-cozyplane.conflist"
+
+# Cluster networking facts for pod egress to the outside world. Not reliably
+# discoverable in-cluster, so declared here.
+egress:
+  # The cluster pod supernet. Enables node masquerade (pods get an internet
+  # return path) and is denied to VPC tenants at their gateways. Empty disables
+  # both.
+  clusterCIDR: "10.244.0.0/16"
+  # The Service CIDR, denied to VPC tenants at their gateways.
+  serviceCIDR: "10.96.0.0/16"
+  # Cluster DNS ClusterIP; the one cluster-internal door a VPC gateway opens
+  # (:53 only), so tenant pods resolve with a stock resolv.conf.
+  clusterDNS: "10.96.0.10"
+  # Additional cluster-internal networks VPC tenants must not reach through
+  # their gateways (e.g. the node/management network).
+  internalCIDRs: []
 
 agent:
   priorityClassName: system-node-critical

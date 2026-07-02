@@ -26,6 +26,13 @@ const (
 	// "<owner-ns>/<vpc>".
 	AnnotationVPC = "sdn.cozystack.io/vpc"
 
+	// AnnotationGatewayFor on a (default-network, system-namespace) pod makes
+	// it the egress gateway of a VPC: it gets a second interface carrying the
+	// VPC's reserved .1 address. Same value syntax as AnnotationVPC. Honored
+	// only for pods in the agent's own (system) namespace, and only when the
+	// VPC has spec.egress.natGateway enabled.
+	AnnotationGatewayFor = "sdn.cozystack.io/gateway-for"
+
 	// LabelVPC is the referenced VPC's name.
 	LabelVPC = "sdn.cozystack.io/vpc"
 	// LabelVPCNamespace is the referenced VPC's (owner) namespace.

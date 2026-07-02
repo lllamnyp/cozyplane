@@ -50,6 +50,18 @@ type VPCSpec struct {
 	// MTU is the MTU advertised to ports in this VPC. Zero selects the
 	// controller default.
 	MTU int32
+
+	// Egress configures how workloads in this VPC reach destinations outside
+	// it. Nil means no egress: the VPC is a closed island for outbound traffic.
+	Egress *VPCEgress
+}
+
+// VPCEgress is the egress configuration of a VPC.
+type VPCEgress struct {
+	// NATGateway runs a per-VPC gateway that forwards off-VPC traffic
+	// (masqueraded) to the outside world and cluster DNS, while everything
+	// else internal stays denied.
+	NATGateway bool
 }
 
 // VPCStatus is the observed state of a VPC.
@@ -200,6 +212,10 @@ type PortSpec struct {
 	NodeIP       string
 	PodNamespace string
 	PodName      string
+
+	// Gateway marks the VPC's gateway port (the .1 leg of the egress gateway
+	// pod); agents route off-VPC traffic to it.
+	Gateway bool
 }
 
 // +genclient

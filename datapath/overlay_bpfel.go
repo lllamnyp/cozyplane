@@ -20,6 +20,12 @@ type overlayEndpoint struct {
 	Pad     [2]uint8
 }
 
+type overlayGwEntry struct {
+	_      structs.HostLayout
+	GwIp   uint32
+	NodeIp uint32
+}
+
 type overlayLpmKey struct {
 	_         structs.HostLayout
 	Prefixlen uint32
@@ -36,14 +42,16 @@ type overlayPeerKey struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
-	overlayMapLocals            = "locals"
-	overlayMapNetworks          = "networks"
-	overlayMapParams            = "params"
-	overlayMapPeers             = "peers"
-	overlayMapPorts             = "ports"
-	overlayMapRemotes           = "remotes"
-	overlayProgCozyplaneFromPod = "cozyplane_from_pod"
-	overlayProgCozyplaneToPod   = "cozyplane_to_pod"
+	overlayMapGateways              = "gateways"
+	overlayMapLocals                = "locals"
+	overlayMapNetworks              = "networks"
+	overlayMapParams                = "params"
+	overlayMapPeers                 = "peers"
+	overlayMapPorts                 = "ports"
+	overlayMapRemotes               = "remotes"
+	overlayProgCozyplaneFromOverlay = "cozyplane_from_overlay"
+	overlayProgCozyplaneFromPod     = "cozyplane_from_pod"
+	overlayProgCozyplaneToPod       = "cozyplane_to_pod"
 )
 
 // loadOverlay returns the embedded CollectionSpec for overlay.
@@ -88,14 +96,16 @@ type overlaySpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type overlayProgramSpecs struct {
-	CozyplaneFromPod *ebpf.ProgramSpec `ebpf:"cozyplane_from_pod"`
-	CozyplaneToPod   *ebpf.ProgramSpec `ebpf:"cozyplane_to_pod"`
+	CozyplaneFromOverlay *ebpf.ProgramSpec `ebpf:"cozyplane_from_overlay"`
+	CozyplaneFromPod     *ebpf.ProgramSpec `ebpf:"cozyplane_from_pod"`
+	CozyplaneToPod       *ebpf.ProgramSpec `ebpf:"cozyplane_to_pod"`
 }
 
 // overlayMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type overlayMapSpecs struct {
+	Gateways *ebpf.MapSpec `ebpf:"gateways"`
 	Locals   *ebpf.MapSpec `ebpf:"locals"`
 	Networks *ebpf.MapSpec `ebpf:"networks"`
 	Params   *ebpf.MapSpec `ebpf:"params"`
@@ -130,6 +140,7 @@ func (o *overlayObjects) Close() error {
 //
 // It can be passed to loadOverlayObjects or ebpf.CollectionSpec.LoadAndAssign.
 type overlayMaps struct {
+	Gateways *ebpf.Map `ebpf:"gateways"`
 	Locals   *ebpf.Map `ebpf:"locals"`
 	Networks *ebpf.Map `ebpf:"networks"`
 	Params   *ebpf.Map `ebpf:"params"`
@@ -140,6 +151,7 @@ type overlayMaps struct {
 
 func (m *overlayMaps) Close() error {
 	return _OverlayClose(
+		m.Gateways,
 		m.Locals,
 		m.Networks,
 		m.Params,
@@ -159,12 +171,14 @@ type overlayVariables struct {
 //
 // It can be passed to loadOverlayObjects or ebpf.CollectionSpec.LoadAndAssign.
 type overlayPrograms struct {
-	CozyplaneFromPod *ebpf.Program `ebpf:"cozyplane_from_pod"`
-	CozyplaneToPod   *ebpf.Program `ebpf:"cozyplane_to_pod"`
+	CozyplaneFromOverlay *ebpf.Program `ebpf:"cozyplane_from_overlay"`
+	CozyplaneFromPod     *ebpf.Program `ebpf:"cozyplane_from_pod"`
+	CozyplaneToPod       *ebpf.Program `ebpf:"cozyplane_to_pod"`
 }
 
 func (p *overlayPrograms) Close() error {
 	return _OverlayClose(
+		p.CozyplaneFromOverlay,
 		p.CozyplaneFromPod,
 		p.CozyplaneToPod,
 	)

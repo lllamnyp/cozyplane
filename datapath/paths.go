@@ -51,6 +51,12 @@ const (
 // DefaultVNI is the VNI used for the default (flat) pod network in M0.
 const DefaultVNI uint32 = 1
 
+// PortGatewayFlag marks a ports-map entry as a VPC egress-gateway leg: the
+// datapath blesses traffic it forwards into the VPC (gateway mark) so the
+// destination's anti-spoof admits off-VPC sources arriving through it. Must
+// match PORT_F_GATEWAY in bpf/overlay.c.
+const PortGatewayFlag uint32 = 1 << 31
+
 // QuarantineNet is a reserved network id assigned to a pod's ports-map entry to
 // sever it: no VPC CIDR is ever programmed into the networks map with this id
 // (so net_of() never returns it) and no peering pair ever includes it (VNIs
