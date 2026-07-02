@@ -2,7 +2,9 @@
 
 # Build the cozyplane agent and CNI plugin. The compiled eBPF object is
 # committed and embedded via go:embed, so no clang is needed here.
-FROM golang:1.26 AS build
+# Pin the builder to the native build platform and cross-compile via GOARCH;
+# otherwise buildx runs the toolchain under QEMU for the arm64 leg (glacial).
+FROM --platform=$BUILDPLATFORM golang:1.26 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -15,7 +17,7 @@ RUN CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -trimpath -o /out/cozyplane-agen
     CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -trimpath -o /out/cozyplane-gateway ./cmd/gateway
 
 # Fetch the upstream host-local and loopback CNI plugins.
-FROM curlimages/curl:8.11.0 AS cni
+FROM --platform=$BUILDPLATFORM curlimages/curl:8.11.0 AS cni
 ARG TARGETARCH=amd64
 ARG CNI_PLUGINS_VERSION=v1.9.1
 RUN curl -sSL -o /tmp/cni.tgz \
