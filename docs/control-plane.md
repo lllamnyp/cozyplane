@@ -215,10 +215,42 @@ subtenant. A subtenant holds neither upward.
 
 `VPCBinding` is the **intra-domain** primitive (one principal with authority on
 both ends). Genuine **cross-tenant** connectivity — two separately-owned VPCs,
-each side independently consenting — is a future **`VPCPeering`** primitive, not
-a binding. Mirrors AWS: RAM/VPC sharing stays within accounts you control;
-cross-account is peering. Collapsing the two is how you accidentally build a
-sharing escape hatch.
+each side independently consenting — is **`VPCPeering`** (built), not a binding.
+Mirrors AWS: RAM/VPC sharing stays within accounts you control; cross-account is
+peering. Collapsing the two is how you accidentally build a sharing escape hatch.
+
+A peering is **two symmetric halves**: each owner creates a `VPCPeering` in its
+own namespace (`spec.vpcRef` = its VPC, name-only; `spec.peerRef` = the remote
+VPC), and the peering is live only while both halves exist and reference each
+other.
+
+- **Consent is reciprocity.** No verb is checked on the *remote* VPC and there
+  is no imperative accept step — an unmatched half just sits `Pending`, which
+  *is* the visible, declarative peering request. The AWS request/accept
+  handshake, without the workflow.
+- **Revocation is unilateral**: either owner deletes their half. There is no
+  finalizer and nothing to reap — no Ports were created; agents just remove the
+  datapath pair, and in-flight cross-VPC traffic starts dropping at watch
+  latency.
+- **The agents key the datapath on the halves' specs directly** (mutual match +
+  both VNIs), not on status — a stale `Ready` can't hold a revoked peering open.
+  The controller's status (`Pending`/`Ready`, `PeerMatched`/`VPCReady`/
+  `PeerVPCReady` conditions, `peerVNI`) is observability only.
+- **Specs are immutable** (enforced by the aggregated apiserver's update
+  strategy, and by a CEL transition rule in CRD mode): the refs pin the identity
+  the reciprocal half consented to; re-pointing means replacing the object,
+  which re-runs the handshake.
+- **Non-transitive by construction**: the datapath allows exact `(net, net)`
+  pairs, so a↔b plus b↔c never grants a↔c.
+- **Intra-domain peering is subsumed**: a parent tenant with authority over both
+  namespaces simply creates both halves; no second code path.
+- Peered traffic is routed **natively** (no NAT), so the two CIDRs must not
+  overlap — vacuously true today (VPC CIDRs are unique cluster-wide) and gated
+  by the controller's `Ready` once overlapping CIDRs land.
+
+Creating a half currently requires only `create vpcpeerings` in the owner
+namespace; a `peer` virtual verb on the local VPC (mirroring `export`) is
+deferred — see [#1](https://github.com/lllamnyp/cozyplane/issues/1).
 
 ### Revocation
 
@@ -234,10 +266,10 @@ Deleting a Port drives the sever:
   handler), removing cross-node reachability.
 - **The pod's own node** severs the *live* local datapath without disturbing the
   running pod: the agent reassigns the pod's `ports`-map entry to a reserved
-  `QuarantineNet` id, so `from_pod`/`to_pod` drop its traffic both ways via the
-  existing `srcnet != dstnet` isolation check; it removes the `locals` entry and
-  tears down the fabric↔vpc bridge. The pod keeps running, disconnected
-  (NetworkPolicy-like).
+  `QuarantineNet` id — never programmed into `networks` and never part of a
+  peering pair — so `from_pod`/`to_pod` drop its traffic both ways via the
+  existing isolation check; it removes the `locals` entry and tears down the
+  fabric↔vpc bridge. The pod keeps running, disconnected (NetworkPolicy-like).
 
 The agent distinguishes revocation from ordinary pod deletion (where CNI `DEL`
 already cleaned up) by checking the owning pod still exists, isn't terminating,

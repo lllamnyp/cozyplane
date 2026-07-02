@@ -86,6 +86,11 @@ type VPCRef struct {
 	Name      string
 }
 
+// LocalVPCRef references a VPC in the same namespace as the referring object.
+type LocalVPCRef struct {
+	Name string
+}
+
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // VPCBindingList is a list of VPCBinding objects.
@@ -115,6 +120,64 @@ type VPCBinding struct {
 	metav1.ObjectMeta
 
 	Spec VPCBindingSpec
+}
+
+// VPCPeeringPhase is the lifecycle phase of a VPCPeering.
+type VPCPeeringPhase string
+
+const (
+	// VPCPeeringPhasePending means the peering half exists but is not active
+	// (no reciprocal half, or a referenced VPC is not Ready).
+	VPCPeeringPhasePending VPCPeeringPhase = "Pending"
+	// VPCPeeringPhaseReady means the peering is matched by its reciprocal half
+	// and both VPCs are Ready; the datapath connects them.
+	VPCPeeringPhaseReady VPCPeeringPhase = "Ready"
+)
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// VPCPeeringList is a list of VPCPeering objects.
+type VPCPeeringList struct {
+	metav1.TypeMeta
+	metav1.ListMeta
+
+	Items []VPCPeering
+}
+
+// VPCPeeringSpec declares one half of a peering between two VPCs.
+type VPCPeeringSpec struct {
+	// VPCRef is the local VPC — it lives in the same namespace as this object.
+	VPCRef LocalVPCRef
+
+	// PeerRef is the remote VPC (owner namespace + name).
+	PeerRef VPCRef
+}
+
+// VPCPeeringStatus is the observed state of a VPCPeering.
+type VPCPeeringStatus struct {
+	// Phase is the current lifecycle phase of the peering.
+	Phase VPCPeeringPhase
+
+	// PeerVNI is the VNI of the peer VPC, once known.
+	PeerVNI int32
+
+	// Conditions represent the latest available observations.
+	Conditions []metav1.Condition
+}
+
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// VPCPeering is one half of a symmetric peering between two VPCs. Each owner
+// creates a half in its own namespace; the peering is live only while both
+// halves exist and reference each other — reciprocity is the consent, either
+// side revokes by deleting its half.
+type VPCPeering struct {
+	metav1.TypeMeta
+	metav1.ObjectMeta
+
+	Spec   VPCPeeringSpec
+	Status VPCPeeringStatus
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object

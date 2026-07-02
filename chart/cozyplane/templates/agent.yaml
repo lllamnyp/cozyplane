@@ -32,6 +32,11 @@ rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcbindings"]
     verbs: ["get", "list", "watch"]
+  # VPCPeering halves: the agent programs the peers map from mutually-matched
+  # specs (not status), so it only needs to observe them.
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpcpeerings"]
+    verbs: ["get", "list", "watch"]
   # Port claims (the plugin allocates/releases; the agent watches for remotes).
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["ports"]

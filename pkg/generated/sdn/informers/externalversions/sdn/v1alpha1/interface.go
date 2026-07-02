@@ -30,6 +30,8 @@ type Interface interface {
 	VPCs() VPCInformer
 	// VPCBindings returns a VPCBindingInformer.
 	VPCBindings() VPCBindingInformer
+	// VPCPeerings returns a VPCPeeringInformer.
+	VPCPeerings() VPCPeeringInformer
 }
 
 type version struct {
@@ -56,4 +58,9 @@ func (v *version) VPCs() VPCInformer {
 // VPCBindings returns a VPCBindingInformer.
 func (v *version) VPCBindings() VPCBindingInformer {
 	return &vPCBindingInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// VPCPeerings returns a VPCPeeringInformer.
+func (v *version) VPCPeerings() VPCPeeringInformer {
+	return &vPCPeeringInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }

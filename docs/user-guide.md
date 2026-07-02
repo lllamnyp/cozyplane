@@ -202,6 +202,69 @@ authorized (unless another binding in that namespace still grants the VPC) and
 severs those pods' VPC connectivity — they keep running but are cut off, like a
 deny-all NetworkPolicy. Re-granting requires recreating the pod.
 
+## Peer two VPCs
+
+A `VPCPeering` connects two VPCs — including two owned by different tenants —
+so their pods reach each other with **native addresses, no NAT** (the AWS
+VPC-peering model). It is made of **two symmetric halves**, one created by each
+owner in their own namespace; the peering is live only while both halves exist
+and reference each other:
+
+```yaml
+# created by team-a (owner of vpc-a)
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: VPCPeering
+metadata:
+  name: to-team-b
+  namespace: team-a
+spec:
+  vpcRef:
+    name: vpc-a              # the local VPC (this namespace)
+  peerRef:
+    namespace: team-b        # the remote VPC
+    name: vpc-b
+---
+# created by team-b (owner of vpc-b) — its existence IS the acceptance
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: VPCPeering
+metadata:
+  name: to-team-a
+  namespace: team-b
+spec:
+  vpcRef:
+    name: vpc-b
+  peerRef:
+    namespace: team-a
+    name: vpc-a
+```
+
+There is no accept workflow: **consent is reciprocity**. A lone half sits
+`Pending` — that is the visible peering request — and flips `Ready` when the
+matching half appears and both VPCs are Ready:
+
+```bash
+kubectl -n team-a get vpcpeering to-team-b
+# NAME        VPC     PEERNAMESPACE   PEER    PHASE
+# to-team-b   vpc-a   team-b          vpc-b   Ready
+kubectl exec -n team-a app-1 -- ping -c2 <vpc-b pod IP>   # works, native IPs
+```
+
+To revoke, **either** owner deletes their half — cross-VPC traffic drops
+immediately, and the surviving half returns to `Pending`. Recreating the
+deleted half re-activates the peering; unlike a `VPCBinding` revocation, no
+pods are severed from their *own* VPC.
+
+Notes:
+
+- The spec is immutable — re-pointing a peering means replacing the object,
+  which re-runs the two-sided handshake.
+- Peering is pairwise and **non-transitive**: a↔b plus b↔c does not connect
+  a and c.
+- The two CIDRs must not overlap (automatic today, since VPC CIDRs are unique
+  cluster-wide).
+- Peering only makes traffic *admissible* between the two VPCs; it grants no
+  rights on the peer VPC itself (no attach, no export).
+
 ## Limitations (today)
 
 These are prototype constraints, not permanent:
@@ -210,17 +273,18 @@ These are prototype constraints, not permanent:
   CIDR). Overlapping per-tenant CIDRs need bridge "stage 2" (eBPF-keyed delivery
   by fabric IP); stage 1 keeps delivery IP-keyed.
 - **VPC pods cannot initiate egress** — no internet, no DNS, no reaching the
-  default network or other VPCs. A VPC is a closed island for outbound traffic;
-  only inbound (north-south, via the fabric IP) and same-VPC traffic work. A per
-  VPC gateway (NAT/DNS/controlled doors) is future work.
-- **No network policy / security groups yet** within or across VPCs.
+  default network or non-peered VPCs. A VPC is a closed island for outbound
+  traffic; only inbound (north-south, via the fabric IP), same-VPC, and peered
+  VPC traffic work. A per-VPC gateway (NAT/DNS/controlled doors) is future work.
+- **No network policy / security groups yet** within or across VPCs; a
+  `VPCPeering` opens the two VPCs to each other completely.
 - **IPv4 only.**
 - **Revocation is one-way:** deleting a `VPCBinding` severs attached pods, but
   recreating the binding does not reattach a running pod — recreate the pod. A
   revocation that lands while a node's agent is down isn't replayed on restart.
-- **No cross-tenant peering:** a `VPCBinding` is intra-domain (one principal with
-  authority on both ends); connecting two separately-owned VPCs (peering) is
-  future work.
+  (`VPCPeering` revocation has neither problem: recreating a deleted half
+  re-activates the peering, and the agent recomputes peering state from a full
+  resync on every event, pruning stale pairs after a restart.)
 - **The API can be served two ways** (same GVK, transparent to clients): as CRDs
   (the default, lightweight — no etcd/cert-manager) or via the real **aggregated
   API server** (`apiserver.enabled=true`; a dedicated etcd + cert-manager serving

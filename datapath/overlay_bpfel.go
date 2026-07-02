@@ -26,6 +26,12 @@ type overlayLpmKey struct {
 	Addr      uint32
 }
 
+type overlayPeerKey struct {
+	_      structs.HostLayout
+	SrcNet uint32
+	DstNet uint32
+}
+
 // Names of all BPF objects in the ELF.
 //
 // Used for safe lookups in a Collection or CollectionSpec.
@@ -33,6 +39,7 @@ const (
 	overlayMapLocals            = "locals"
 	overlayMapNetworks          = "networks"
 	overlayMapParams            = "params"
+	overlayMapPeers             = "peers"
 	overlayMapPorts             = "ports"
 	overlayMapRemotes           = "remotes"
 	overlayProgCozyplaneFromPod = "cozyplane_from_pod"
@@ -92,6 +99,7 @@ type overlayMapSpecs struct {
 	Locals   *ebpf.MapSpec `ebpf:"locals"`
 	Networks *ebpf.MapSpec `ebpf:"networks"`
 	Params   *ebpf.MapSpec `ebpf:"params"`
+	Peers    *ebpf.MapSpec `ebpf:"peers"`
 	Ports    *ebpf.MapSpec `ebpf:"ports"`
 	Remotes  *ebpf.MapSpec `ebpf:"remotes"`
 }
@@ -125,6 +133,7 @@ type overlayMaps struct {
 	Locals   *ebpf.Map `ebpf:"locals"`
 	Networks *ebpf.Map `ebpf:"networks"`
 	Params   *ebpf.Map `ebpf:"params"`
+	Peers    *ebpf.Map `ebpf:"peers"`
 	Ports    *ebpf.Map `ebpf:"ports"`
 	Remotes  *ebpf.Map `ebpf:"remotes"`
 }
@@ -134,6 +143,7 @@ func (m *overlayMaps) Close() error {
 		m.Locals,
 		m.Networks,
 		m.Params,
+		m.Peers,
 		m.Ports,
 		m.Remotes,
 	)

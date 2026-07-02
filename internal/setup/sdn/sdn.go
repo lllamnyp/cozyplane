@@ -24,6 +24,7 @@ import (
 	portstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/port"
 	vpcstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/vpc"
 	vpcbindingstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/vpcbinding"
+	vpcpeeringstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/vpcpeering"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -52,12 +53,18 @@ func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOpt
 	if err != nil {
 		panic(err)
 	}
+	vpcPeeringREST, vpcPeeringStatusREST, err := vpcpeeringstorage.NewREST(scheme, restOptionsGetter)
+	if err != nil {
+		panic(err)
+	}
 
 	v1alpha1storage := map[string]rest.Storage{}
 	v1alpha1storage["vpcs"] = vpcREST
 	v1alpha1storage["vpcs/status"] = vpcStatusREST
 	v1alpha1storage["ports"] = defaultregistry.RESTInPeace(portstorage.NewREST(scheme, restOptionsGetter))
 	v1alpha1storage["vpcbindings"] = defaultregistry.RESTInPeace(vpcbindingstorage.NewREST(scheme, restOptionsGetter))
+	v1alpha1storage["vpcpeerings"] = vpcPeeringREST
+	v1alpha1storage["vpcpeerings/status"] = vpcPeeringStatusREST
 	apiGroupInfo.VersionedResourcesStorageMap["v1alpha1"] = v1alpha1storage
 
 	return &apiGroupInfo

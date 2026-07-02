@@ -40,6 +40,10 @@ func (c *FakeSdnV1alpha1) VPCBindings(namespace string) v1alpha1.VPCBindingInter
 	return newFakeVPCBindings(c, namespace)
 }
 
+func (c *FakeSdnV1alpha1) VPCPeerings(namespace string) v1alpha1.VPCPeeringInterface {
+	return newFakeVPCPeerings(c, namespace)
+}
+
 // RESTClient returns a RESTClient that is used to communicate
 // with API server by this client implementation.
 func (c *FakeSdnV1alpha1) RESTClient() rest.Interface {

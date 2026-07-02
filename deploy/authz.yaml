@@ -85,6 +85,15 @@ rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcbindings"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Peering halves live in the owner's namespace; creating one declares intent,
+  # deleting it revokes. Consent comes from the reciprocal half in the peer's
+  # namespace, so no verb on the *peer* VPC is needed.
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpcpeerings"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpcpeerings/status"]
+    verbs: ["get"]
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["ports"]
     verbs: ["get", "list", "watch"]

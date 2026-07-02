@@ -32,6 +32,8 @@ import (
 func ForKind(kind schema.GroupVersionKind) interface{} {
 	switch kind {
 	// Group=sdn.cozystack.io, Version=v1alpha1
+	case v1alpha1.SchemeGroupVersion.WithKind("LocalVPCRef"):
+		return &sdnv1alpha1.LocalVPCRefApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("Port"):
 		return &sdnv1alpha1.PortApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("PortSpec"):
@@ -42,6 +44,12 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &sdnv1alpha1.VPCBindingApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPCBindingSpec"):
 		return &sdnv1alpha1.VPCBindingSpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPCPeering"):
+		return &sdnv1alpha1.VPCPeeringApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPCPeeringSpec"):
+		return &sdnv1alpha1.VPCPeeringSpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPCPeeringStatus"):
+		return &sdnv1alpha1.VPCPeeringStatusApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPCRef"):
 		return &sdnv1alpha1.VPCRefApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPCSpec"):

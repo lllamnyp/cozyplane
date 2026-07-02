@@ -23,3 +23,5 @@ type PortExpansion interface{}
 type VPCExpansion interface{}
 
 type VPCBindingExpansion interface{}
+
+type VPCPeeringExpansion interface{}

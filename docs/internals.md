@@ -12,7 +12,8 @@ Every pod interface belongs to a **network**, identified by a small integer
 (≥100, also used as the Geneve VNI). All inter-node traffic rides a single
 per-node Geneve device; the datapath encapsulates a packet only when its
 destination is on another node, and drops it when source and destination
-networks differ. The default network uses the cluster pod CIDR (unique per node);
+networks differ (unless a `VPCPeering` explicitly connects the two). The
+default network uses the cluster pod CIDR (unique per node);
 VPCs use their own CIDRs (required unique cluster-wide for now). Services are not
 cozyplane's job — kube-proxy or Cilium-KPR handles them, unchanged.
 
@@ -41,16 +42,18 @@ cozyplane's job — kube-proxy or Cilium-KPR handles them, unchanged.
   sets sysctls and the FORWARD rule, attaches the classifier to the uplink, and
   publishes node state + a kubeconfig for the plugin. It then *watches* the API
   and keeps the maps in sync: `Node` → remote pod CIDRs, `VPC` → the networks
-  map, `Port` → remote VPC pod /32s. It depends only on the **core** API for the
-  default network, so it can bootstrap before the VPC API exists.
+  map, `Port` → remote VPC pod /32s, `VPCPeering` → the peers map. It depends
+  only on the **core** API for the default network, so it can bootstrap before
+  the VPC API exists.
 - **`cozyplane` CNI plugin** (`cmd/cni`, invoked by kubelet per pod). Sets up the
   pod's veth, allocates the IP, programs the per-veth network id, and attaches
   the classifier. Two paths: default (host-local IPAM) and VPC (claim a `Port`).
 - **`sdn-controller`** (`cmd/sdn-controller`, controller-runtime Deployment).
-  Assigns each `VPC` a unique network id (VNI) and marks it `Ready`.
-- **API** (`api/sdn`, group `sdn.cozystack.io/v1alpha1`): `VPC` and `Port`.
-  Served as **CRDs** today (`config/crd/`); the aggregated API server is
-  scaffolded (`pkg/apiserver`, `cmd/apiserver`) and is a drop-in swap because the
+  Assigns each `VPC` a unique network id (VNI) and marks it `Ready`; reaps
+  `Port`s on `VPCBinding` deletion; surfaces `VPCPeering` matched/ready status.
+- **API** (`api/sdn`, group `sdn.cozystack.io/v1alpha1`): `VPC`, `VPCBinding`,
+  `VPCPeering`, `Port`. Served as **CRDs** (`config/crd/`) or by the aggregated
+  API server (`pkg/apiserver`, `cmd/apiserver`) — a transparent swap because the
   group/version/kind and generated clients are identical.
 
 ## 3. The eBPF datapath
@@ -66,6 +69,7 @@ maps and one program.
 | `networks` | LPM trie | VPC CIDR → network id | agent (VPCs) |
 | `ports` | hash | veth ifindex → network id | plugin (per pod) |
 | `locals` | hash | pod IP → {veth ifindex, pod MAC} | plugin (per pod) |
+| `peers` | hash | {src net id, dst net id} → 1 | agent (VPCPeerings) |
 | `params` | array | `[0]`=Geneve ifindex, `[1]`=default VNI | agent |
 
 All are pinned under `/sys/fs/bpf/cozyplane/` (`LIBBPF_PIN_BY_NAME`) so the
@@ -88,7 +92,8 @@ pod's host-side veth** (a pod's egress) and at the **egress of the node uplink**
 1. exempt traffic to the link-local gateway `169.254.1.1` (replies to bridged
    node→pod traffic; the host stack/conntrack handles them);
 2. source net = `ports[skb->ifindex]` (absent ⇒ `0`); dest net = `networks[dst]`
-   (absent ⇒ `0`); **drop** if they differ (egress isolation);
+   (absent ⇒ `0`); **drop** if they differ *and* `peers[{src,dst}]` misses
+   (egress isolation; a `VPCPeering` writes both directions into `peers`);
 3. if the destination is a **local pod** (`locals[dst]` hit): rewrite the dst MAC
    to the pod's MAC and `bpf_redirect` to its veth — same-node delivery *through*
    the destination's ingress hook, no kernel-routing shortcut;
@@ -105,7 +110,8 @@ so this is the placement-independent point for ingress policy. For each packet:
 
 1. exempt source `169.254.1.1` (bridge/masqueraded node→pod traffic);
 2. dest net = `ports[skb->ifindex]`; source net = `networks[src]`; **drop** if
-   they differ (ingress isolation); else `TC_ACT_OK`.
+   they differ and `peers[{src,dst}]` misses (ingress isolation); else
+   `TC_ACT_OK`.
 
 Cross-node decapsulation itself is still done by the kernel Geneve device (see
 the two tricks below); the decapped packet is then routed out the destination
@@ -147,7 +153,10 @@ egress `from_pod` (srcnet 0 because the uplink isn't in `ports`) → `remotes` h
 → encapsulate. This is what makes Service return paths and apiserver→pod work.
 
 **Isolation (VPC pod → default pod):** srcnet = the VPC's id, dstnet = 0 → differ
-→ `TC_ACT_SHOT`. Same for default→VPC and VPC→other-VPC.
+→ `TC_ACT_SHOT`. Same for default→VPC and VPC→other-VPC — unless the two VPCs
+are connected by a `VPCPeering`, in which case `peers[{src,dst}]` hits and the
+packet is delivered exactly like same-VPC traffic (native IPs, no NAT; `locals`
+redirect same-node, `remotes` encap cross-node).
 
 **VPC, cross-node:** identical to the default walk, but srcnet/dstnet are the
 VPC's id and the tunnel VNI carries it; delivery still works by `/32` route
@@ -245,7 +254,8 @@ also removes the tc filter).
 
 ### Agent reconciliation
 
-The agent runs three informers, all best-effort except Nodes:
+The agent runs four informers, all best-effort except Nodes (the sdn ones share
+one informer factory):
 
 - **Nodes** → `remotes[node.podCIDR] = node.InternalIP` (skip self). Default
   network reachability.
@@ -258,6 +268,15 @@ The agent runs three informers, all best-effort except Nodes:
   teardown, and severs the live datapath (`datapath.SeverLocal`): it reassigns
   the pod's `ports` entry to `QuarantineNet` so `from_pod`/`to_pod` drop both
   directions, drops the `locals` entry, and tears down the bridge.
+- **VPCPeerings** → the `peers` map. Every peering or VPC event triggers a full
+  recompute (`desiredPeerPairs`): a VNI pair is programmed iff two halves
+  mutually reference each other and both VPCs have VNIs. The desired set is
+  diffed against the *pinned map itself* (not shadow state), so a restarted
+  agent prunes pairs whose peerings vanished while it was down; one
+  unconditional resync runs at cache sync for the same reason. Deliberately
+  not keyed on the controller's status: severing must happen at watch latency
+  even if status is stale, and the reciprocal grant's presence is the
+  authorization.
 
 ### Controller
 
@@ -273,6 +292,13 @@ finalizer. Deleting the Ports is what drives the agents' sever above (and the
 remote-route cleanup on other nodes). (`*_controller_test.go` lock the VNI
 selection, the finalizer lifecycle, the reap, and the another-binding-keeps-alive
 rule.)
+
+`VPCPeeringReconciler` is status-only (the agents program the datapath from the
+halves' specs): it marks a half `Ready` when a reciprocal half exists and both
+VPCs are Ready, surfaces `PeerMatched`/`VPCReady`/`PeerVPCReady` conditions and
+the peer's VNI, and reverts to `Pending` when either input goes away. It watches
+VPCPeerings (each half re-enqueues its reciprocal) and VPCs (each VPC re-enqueues
+the halves referencing it). No finalizer — deleting a half has nothing to reap.
 
 ### Why the plugin needs a kubeconfig
 
@@ -296,6 +322,7 @@ datapath/                  Go wrapper around the eBPF datapath
   attach.go                tcx link attach/detach (ingress/egress), pinned
   ports.go                 plugin-side access to the pinned `ports` map
   locals.go                plugin-side access to the pinned `locals` map
+  peers.go                 agent-side access to the pinned `peers` map
   firewall.go              the FORWARD ACCEPT rules (go-iptables)
   bpffs.go                 mount bpffs if absent (kind nodes)
   state.go                 AgentState published for the plugin (agent.json)
@@ -307,14 +334,15 @@ cmd/agent/main.go          node agent: datapath bring-up + Node/VPC/Port watches
 cmd/sdn-controller/main.go controller-runtime manager
 cmd/apiserver/main.go      aggregated API server entrypoint (scaffolded)
 
-internal/controller/sdn/   VPCReconciler (VNI assignment)
+internal/controller/sdn/   VPCReconciler (VNI assignment), VPCBindingReconciler
+                           (revocation reap), VPCPeeringReconciler (status)
 internal/cmd/server/       aggregated apiserver options/wiring (start.go)
 internal/setup/            apiserver group registration + openapi merge
 
 api/sdn/                    internal types + register + install
 api/sdn/v1alpha1/           versioned VPC/Port types (kubebuilder markers)
 pkg/apiserver/              apiserver framework (scheme, codecs, JSON codec)
-pkg/registry/               REST storage (vpc; aggregated-apiserver path)
+pkg/registry/               REST storage (vpc, vpcbinding, vpcpeering, port)
 pkg/generated/sdn/          generated clientset/informers/listers/openapi
 
 config/crd/                 generated CRDs (how VPC/Port are served today)
@@ -350,12 +378,14 @@ mostly future work. As built:
 
 - VPC CIDRs must be unique cluster-wide (overlap needs bridge stage 2 — see
   "The dual-address bridge").
-- VPC pods can't initiate egress (internet/DNS/default network/other VPCs); only
-  inbound north-south (via the fabric IP) and same-VPC traffic work. No per-VPC
-  gateway (NAT/DNS/controlled doors) yet, and no policy/security groups.
+- VPC pods can't initiate egress (internet/DNS/default network/non-peered
+  VPCs); only inbound north-south (via the fabric IP), same-VPC, and peered-VPC
+  traffic work. No per-VPC gateway (NAT/DNS/controlled doors) yet, and no
+  policy/security groups — a peering opens the two VPCs completely.
 - IPv4 only; single CIDR per VPC; no VM live-migration plumbing.
-- The API is CRD-backed; the aggregated apiserver (and its server-side atomic
-  IPAM/validation) is not yet deployed.
+- The API is served as CRDs by default; the aggregated apiserver
+  (`apiserver.enabled=true`) serves the same group with server-side validation
+  (e.g. VPCPeering spec immutability) in its strategies.
 - The plugin's kubeconfig token isn't refreshed; VNI allocation and Port IP
   selection are list-then-pick (atomic at the claim, but not high-concurrency
   optimized).

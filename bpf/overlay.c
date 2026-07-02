@@ -81,6 +81,31 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } locals SEC(".maps");
 
+// A directed (source net, destination net) pair of peered networks.
+struct peer_key {
+	__u32 src_net;
+	__u32 dst_net;
+};
+
+// peers: presence permits traffic from src_net to dst_net when the two differ.
+// The agent writes both directions of a peering, so lookups never normalize.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct peer_key);
+	__type(value, __u8);
+	__uint(max_entries, 4096);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} peers SEC(".maps");
+
+// nets_allowed: same network, or two networks connected by a VPC peering.
+static __always_inline int nets_allowed(__u32 src, __u32 dst)
+{
+	if (src == dst)
+		return 1;
+	struct peer_key key = { .src_net = src, .dst_net = dst };
+	return bpf_map_lookup_elem(&peers, &key) != NULL;
+}
+
 #define CFG_GENEVE_IFINDEX 0
 #define CFG_VNI            1
 
@@ -142,8 +167,8 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 		srcnet = *sp;
 	__u32 dstnet = net_of(&networks, ip->daddr);
 
-	// Isolation: only same-network traffic is permitted (egress side).
-	if (srcnet != dstnet)
+	// Isolation: same-network or explicitly peered traffic only (egress side).
+	if (!nets_allowed(srcnet, dstnet))
 		return TC_ACT_SHOT;
 
 	// Same-node destination: redirect through the pod's veth egress (-> to_pod).
@@ -198,8 +223,8 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 		dstnet = *dp;
 	__u32 srcnet = net_of(&networks, ip->saddr);
 
-	// Isolation: only same-network traffic may enter the pod (ingress side).
-	if (srcnet != dstnet)
+	// Isolation: same-network or explicitly peered traffic only (ingress side).
+	if (!nets_allowed(srcnet, dstnet))
 		return TC_ACT_SHOT;
 
 	return TC_ACT_OK;

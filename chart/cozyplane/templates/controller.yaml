@@ -27,6 +27,14 @@ rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["ports"]
     verbs: ["get", "list", "delete"]
+  # VPCPeerings: surface matched/ready in status (observability only; the
+  # agents key the datapath on the halves' specs).
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpcpeerings"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpcpeerings/status"]
+    verbs: ["get", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

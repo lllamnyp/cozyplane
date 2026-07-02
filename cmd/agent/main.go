@@ -32,10 +32,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -159,12 +161,17 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	}
 
 	// VPC watching is best-effort: the default network must work even before the
-	// sdn.cozystack.io API exists, so we don't block readiness on it.
+	// sdn.cozystack.io API exists, so we don't block readiness on it. One shared
+	// factory backs all sdn informers; it is started only after every handler is
+	// registered.
 	if sdnClient, err := sdnclientset.NewForConfig(cfg); err != nil {
 		log.Warn("sdn client init failed; VPC networks won't be programmed", "err", err)
 	} else {
-		watchVPCs(ctx, sdnClient, mgr, log)
-		watchPorts(ctx, sdnClient, client, mgr, nodeName, log)
+		factory := sdninformers.NewSharedInformerFactory(sdnClient, 0)
+		watchVPCs(factory, mgr, log)
+		watchPorts(ctx, factory, client, mgr, nodeName, log)
+		watchPeerings(ctx, factory, mgr, log)
+		factory.Start(ctx.Done())
 	}
 
 	// Datapath is up and remotes are syncing; expose the CNI to kubelet.
@@ -226,10 +233,9 @@ func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.
 }
 
 // watchVPCs mirrors VPC CIDR -> network id into the networks map. Best-effort:
-// it starts the informer without blocking on cache sync, so a missing sdn API
-// (during bootstrap) doesn't stall the agent.
-func watchVPCs(ctx context.Context, client sdnclientset.Interface, mgr *datapath.Manager, log *slog.Logger) {
-	factory := sdninformers.NewSharedInformerFactory(client, 0)
+// the caller starts the informer without blocking on cache sync, so a missing
+// sdn API (during bootstrap) doesn't stall the agent.
+func watchVPCs(factory sdninformers.SharedInformerFactory, mgr *datapath.Manager, log *slog.Logger) {
 	informer := factory.Sdn().V1alpha1().VPCs().Informer()
 
 	apply := func(obj any) {
@@ -257,16 +263,13 @@ func watchVPCs(ctx context.Context, client sdnclientset.Interface, mgr *datapath
 			}
 		},
 	})
-
-	factory.Start(ctx.Done())
 }
 
 // watchPorts mirrors remote VPC ports (pods on other nodes) into the remotes
 // map as /32 routes to their node's Geneve endpoint, and severs a *local* pod's
 // datapath when its Port is reaped out from under it (revocation). Best-effort,
 // like watchVPCs.
-func watchPorts(ctx context.Context, sdn sdnclientset.Interface, core kubernetes.Interface, mgr *datapath.Manager, selfName string, log *slog.Logger) {
-	factory := sdninformers.NewSharedInformerFactory(sdn, 0)
+func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory, core kubernetes.Interface, mgr *datapath.Manager, selfName string, log *slog.Logger) {
 	informer := factory.Sdn().V1alpha1().Ports().Informer()
 
 	apply := func(obj any) {
@@ -298,8 +301,109 @@ func watchPorts(ctx context.Context, sdn sdnclientset.Interface, core kubernetes
 			}
 		},
 	})
+}
 
-	factory.Start(ctx.Done())
+// watchPeerings keeps the peers map equal to the set of *live* peerings: pairs
+// of mutually-matched VPCPeering halves whose two VPCs both have VNIs. Every
+// event triggers a full recompute from the listers, diffed against the pinned
+// map itself — deliberately not keyed on the controller's status, so a
+// revocation (either half deleted) severs at watch latency even if status is
+// stale, and presence of the reciprocal grant remains the authorization.
+func watchPeerings(ctx context.Context, factory sdninformers.SharedInformerFactory, mgr *datapath.Manager, log *slog.Logger) {
+	peerings := factory.Sdn().V1alpha1().VPCPeerings()
+	vpcs := factory.Sdn().V1alpha1().VPCs()
+
+	var mu sync.Mutex
+	resync := func() {
+		mu.Lock()
+		defer mu.Unlock()
+
+		all, err := peerings.Lister().List(labels.Everything())
+		if err != nil {
+			log.Error("list vpcpeerings", "err", err)
+			return
+		}
+		vni := func(namespace, name string) (uint32, bool) {
+			vpc, err := vpcs.Lister().VPCs(namespace).Get(name)
+			if err != nil || vpc.Status.VNI == 0 {
+				return 0, false
+			}
+			return uint32(vpc.Status.VNI), true
+		}
+		desired := desiredPeerPairs(all, vni)
+
+		current, err := mgr.Peers()
+		if err != nil {
+			log.Error("read peers map", "err", err)
+			return
+		}
+		for pair := range desired {
+			if !current[pair] {
+				if err := mgr.SetPeer(pair[0], pair[1]); err != nil {
+					log.Error("set peer", "pair", pair, "err", err)
+					continue
+				}
+				log.Info("peer set", "vni-a", pair[0], "vni-b", pair[1])
+			}
+		}
+		for pair := range current {
+			if !desired[pair] {
+				if err := mgr.DelPeer(pair[0], pair[1]); err != nil {
+					log.Error("del peer", "pair", pair, "err", err)
+					continue
+				}
+				log.Info("peer removed", "vni-a", pair[0], "vni-b", pair[1])
+			}
+		}
+	}
+
+	onAny := cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(any) { resync() },
+		UpdateFunc: func(_, newObj any) { resync() },
+		DeleteFunc: func(any) { resync() },
+	}
+	_, _ = peerings.Informer().AddEventHandler(onAny)
+	_, _ = vpcs.Informer().AddEventHandler(onAny)
+
+	// One unconditional resync once the caches are synced: prunes pairs whose
+	// peerings were deleted while this agent was down (no event would fire).
+	go func() {
+		if cache.WaitForCacheSync(ctx.Done(), peerings.Informer().HasSynced, vpcs.Informer().HasSynced) {
+			resync()
+		}
+	}()
+}
+
+// desiredPeerPairs computes the normalized (low, high) VNI pairs that should be
+// programmed: one per pair of mutually-matched peering halves whose local and
+// peer VPCs both have assigned VNIs.
+func desiredPeerPairs(peerings []*sdnv1alpha1.VPCPeering, vni func(namespace, name string) (uint32, bool)) map[[2]uint32]bool {
+	desired := map[[2]uint32]bool{}
+	for _, p := range peerings {
+		a, ok := vni(p.Namespace, p.Spec.VPCRef.Name)
+		if !ok {
+			continue
+		}
+		b, ok := vni(p.Spec.PeerRef.Namespace, p.Spec.PeerRef.Name)
+		if !ok {
+			continue
+		}
+		matched := false
+		for _, q := range peerings {
+			if p != q && p.Matches(q) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		if a > b {
+			a, b = b, a
+		}
+		desired[[2]uint32{a, b}] = true
+	}
+	return desired
 }
 
 // portFromDelete extracts a Port from a delete event, unwrapping the

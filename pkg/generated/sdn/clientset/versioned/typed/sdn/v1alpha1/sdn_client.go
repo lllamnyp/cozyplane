@@ -31,6 +31,7 @@ type SdnV1alpha1Interface interface {
 	PortsGetter
 	VPCsGetter
 	VPCBindingsGetter
+	VPCPeeringsGetter
 }
 
 // SdnV1alpha1Client is used to interact with features provided by the sdn.cozystack.io group.
@@ -48,6 +49,10 @@ func (c *SdnV1alpha1Client) VPCs(namespace string) VPCInterface {
 
 func (c *SdnV1alpha1Client) VPCBindings(namespace string) VPCBindingInterface {
 	return newVPCBindings(c, namespace)
+}
+
+func (c *SdnV1alpha1Client) VPCPeerings(namespace string) VPCPeeringInterface {
+	return newVPCPeerings(c, namespace)
 }
 
 // NewForConfig creates a new SdnV1alpha1Client for the given config.
