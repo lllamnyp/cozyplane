@@ -311,9 +311,13 @@ also cover your node/management networks.
 
 These are prototype constraints, not permanent:
 
-- **VPC CIDRs must be unique cluster-wide** (and must not overlap the cluster pod
-  CIDR). Overlapping per-tenant CIDRs need bridge "stage 2" (eBPF-keyed delivery
-  by fabric IP); stage 1 keeps delivery IP-keyed.
+- **Overlapping VPC CIDRs are held `Pending` for now.** Overlap is the design
+  target (isolation is by overlay, not address space), but the stage-1 datapath
+  delivers by IP-keyed maps and kernel `/32` routes, so the controller withholds
+  the VNI from a VPC whose CIDR overlaps an already-Ready VPC or a cluster
+  network (a `CIDRAvailable` condition explains it). This gate disappears with
+  stage-2 (VNI-scoped) delivery. What is *permanent*: **overlapping VPCs can
+  never peer** — peered traffic is routed natively.
 - **VPC egress is all-or-nothing**: `spec.egress.natGateway` opens internet +
   cluster DNS; there is no per-destination policy, no Service exposure into a
   VPC, no metadata endpoint, and no floating/public IPs (ingress with source
@@ -326,11 +330,11 @@ These are prototype constraints, not permanent:
   `VPCPeering` opens the two VPCs to each other completely.
 - **IPv4 only.**
 - **Revocation is one-way:** deleting a `VPCBinding` severs attached pods, but
-  recreating the binding does not reattach a running pod — recreate the pod. A
-  revocation that lands while a node's agent is down isn't replayed on restart.
-  (`VPCPeering` revocation has neither problem: recreating a deleted half
-  re-activates the peering, and the agent recomputes peering state from a full
-  resync on every event, pruning stale pairs after a restart.)
+  recreating the binding does not reattach a running pod — recreate the pod.
+  (Revocation *is* replayed across agent outages: a sever finalizer holds each
+  reaped `Port` terminating until the node's agent acknowledges, and the
+  controller releases it if the node itself is gone. `VPCPeering` revocation is
+  simpler still: recreating a deleted half re-activates the peering.)
 - **The API can be served two ways** (same GVK, transparent to clients): as CRDs
   (the default, lightweight — no etcd/cert-manager) or via the real **aggregated
   API server** (`apiserver.enabled=true`; a dedicated etcd + cert-manager serving

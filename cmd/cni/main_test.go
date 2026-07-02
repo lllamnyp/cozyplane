@@ -121,6 +121,11 @@ func TestClaimIP_FirstAddressAndPortShape(t *testing.T) {
 			t.Errorf("label %q = %q, want %q", k, port.Labels[k], want)
 		}
 	}
+	// The sever finalizer is what makes revocation replayable: deletion waits
+	// for the node agent's acknowledgement.
+	if len(port.Finalizers) != 1 || port.Finalizers[0] != sdnv1alpha1.FinalizerSever {
+		t.Errorf("finalizers = %v, want [%s]", port.Finalizers, sdnv1alpha1.FinalizerSever)
+	}
 }
 
 func TestClaimIP_SkipsUsedAddresses(t *testing.T) {

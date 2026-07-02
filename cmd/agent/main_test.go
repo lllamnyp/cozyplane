@@ -34,11 +34,17 @@ func half(ns, name, localVPC, peerNS, peerVPC string) *sdnv1alpha1.VPCPeering {
 	}
 }
 
-// vniTable returns a vni lookup over "namespace/name" keys.
-func vniTable(m map[string]uint32) func(namespace, name string) (uint32, bool) {
-	return func(namespace, name string) (uint32, bool) {
-		v, ok := m[namespace+"/"+name]
-		return v, ok
+// vpcTable returns a VPC lookup over "namespace/name" keys.
+func vpcTable(m map[string]*sdnv1alpha1.VPC) func(namespace, name string) *sdnv1alpha1.VPC {
+	return func(namespace, name string) *sdnv1alpha1.VPC {
+		return m[namespace+"/"+name]
+	}
+}
+
+func vpcWith(vni int32, cidrs ...string) *sdnv1alpha1.VPC {
+	return &sdnv1alpha1.VPC{
+		Spec:   sdnv1alpha1.VPCSpec{CIDRs: cidrs},
+		Status: sdnv1alpha1.VPCStatus{VNI: vni},
 	}
 }
 
@@ -93,13 +99,15 @@ func TestVNIFromPortName(t *testing.T) {
 }
 
 // The datapath contract: a pair is programmed iff both halves exist, mutually
-// reference each other, and both VPCs have VNIs. Everything else stays out of
-// the peers map.
+// reference each other, both VPCs have VNIs, and their CIDRs are disjoint.
+// Everything else stays out of the peers map.
 func TestDesiredPeerPairs(t *testing.T) {
-	vnis := vniTable(map[string]uint32{
-		"team-a/vpc-a": 100,
-		"team-b/vpc-b": 101,
-		"team-c/vpc-c": 102,
+	vnis := vpcTable(map[string]*sdnv1alpha1.VPC{
+		"team-a/vpc-a": vpcWith(100, "10.10.0.0/24"),
+		"team-b/vpc-b": vpcWith(101, "10.20.0.0/24"),
+		"team-c/vpc-c": vpcWith(102, "10.30.0.0/24"),
+		// vpc-d overlaps vpc-a: the two may coexist, but never peer.
+		"team-d/vpc-d": vpcWith(103, "10.10.0.0/16"),
 	})
 
 	cases := []struct {
@@ -158,6 +166,14 @@ func TestDesiredPeerPairs(t *testing.T) {
 			},
 			// Pairwise, non-transitive: a<->b and b<->c, never a<->c.
 			want: map[[2]uint32]bool{{100, 101}: true, {101, 102}: true},
+		},
+		{
+			name: "overlapping CIDRs never peer, even mutually matched",
+			peerings: []*sdnv1alpha1.VPCPeering{
+				half("team-a", "to-d", "vpc-a", "team-d", "vpc-d"),
+				half("team-d", "to-a", "vpc-d", "team-a", "vpc-a"),
+			},
+			want: map[[2]uint32]bool{},
 		},
 	}
 

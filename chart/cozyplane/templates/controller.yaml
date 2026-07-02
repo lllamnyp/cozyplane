@@ -24,9 +24,14 @@ rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcbindings"]
     verbs: ["get", "list", "watch", "update", "patch"]
+  # Ports: reap on revocation; PortGC releases the sever finalizer when the
+  # port's node is gone (needs nodes read).
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["ports"]
-    verbs: ["get", "list", "delete"]
+    verbs: ["get", "list", "watch", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
   # VPCPeerings: surface matched/ready in status (observability only; the
   # agents key the datapath on the halves' specs).
   - apiGroups: ["sdn.cozystack.io"]

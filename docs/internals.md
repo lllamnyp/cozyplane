@@ -316,12 +316,16 @@ one informer factory):
 - **VPCs** → `networks[vpc.cidr] = vpc.vni` when the VNI is assigned.
 - **Ports** → `remotes[port.ip/32] = port.nodeIP` for ports on other nodes. VPC
   pod reachability. (`Port.spec.nodeIP` is filled by the plugin from the agent
-  state, so no node-name→IP lookup is needed.) On a **local** port's deletion
-  (its `spec.node` is this node), if the owning pod is still alive — same name,
-  same UID, not terminating — the agent treats it as a *revocation*, not ordinary
-  teardown, and severs the live datapath (`datapath.SeverLocal`): it reassigns
-  the pod's `ports` entry to `QuarantineNet` so `from_pod`/`to_pod` drop both
-  directions, drops the `locals` entry, and tears down the bridge.
+  state, so no node-name→IP lookup is needed.) A **local** port turning
+  *terminating* (the CNI creates every Port with the
+  `sdn.cozystack.io/sever` finalizer, so deletion pauses there) is the
+  revocation path: if the owning pod is still alive — same name, same UID, not
+  terminating — the agent severs the live datapath (`datapath.SeverLocal`): it
+  reassigns the pod's `ports` entry to `QuarantineNet` so `from_pod`/`to_pod`
+  drop both directions, drops the `locals` entry, and tears down the bridge.
+  Then it releases the finalizer, letting the deletion complete. Because the
+  Port stays terminating until acknowledged, a revocation that lands while the
+  agent is down replays from the informer's initial sync on restart.
 - **VPCPeerings** → the `peers` map. Every peering or VPC event triggers a full
   recompute (`desiredPeerPairs`): a VNI pair is programmed iff two halves
   mutually reference each other and both VPCs have VNIs. The desired set is
@@ -362,6 +366,10 @@ VPCs are Ready, surfaces `PeerMatched`/`VPCReady`/`PeerVPCReady` conditions and
 the peer's VNI, and reverts to `Pending` when either input goes away. It watches
 VPCPeerings (each half re-enqueues its reciprocal) and VPCs (each VPC re-enqueues
 the halves referencing it). No finalizer — deleting a half has nothing to reap.
+
+`PortGCReconciler` releases the sever finalizer from terminating Ports whose
+node no longer exists — the agent that would acknowledge is never coming back,
+and the workload died with its node.
 
 `GatewayReconciler` realizes `VPC.spec.egress.natGateway` as a per-VPC gateway
 Deployment (`cozyplane-gateway-<vni>`) in the system namespace: a privileged
@@ -451,8 +459,11 @@ hack/                       codegen scripts; Makefile drives generate/build
 The design (three planes, dual-address bridge, identity-based policy, etc.) is
 mostly future work. As built:
 
-- VPC CIDRs must be unique cluster-wide (overlap needs bridge stage 2 — see
-  "The dual-address bridge").
+- Overlapping VPC CIDRs are gated: the controller withholds the VNI (condition
+  `CIDRAvailable=False`) while a CIDR overlaps a Ready VPC or a reserved
+  cluster network, because stage-1 delivery is IP-keyed (see "The dual-address
+  bridge"). The gate is deleted at stage 2; only the peering-disjointness rule
+  is permanent.
 - VPC egress is opt-in and coarse: `spec.egress.natGateway` opens internet +
   cluster DNS through a single per-VPC gateway pod; no per-destination policy,
   Service exposure, metadata endpoint, or floating IPs (source-preserving

@@ -64,6 +64,11 @@ func (r *VPCPeeringReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	localVPC := r.getVPC(ctx, peering.Namespace, peering.Spec.VPCRef.Name)
 	peerVPC := r.getVPC(ctx, peering.Spec.PeerRef.Namespace, peering.Spec.PeerRef.Name)
 
+	// Peered traffic is routed natively: overlapping VPCs may coexist, but
+	// they can never peer. The agents enforce the same rule in the datapath.
+	disjoint := localVPC != nil && peerVPC != nil &&
+		!sdnv1alpha1.CIDRsOverlap(localVPC.Spec.CIDRs, peerVPC.Spec.CIDRs)
+
 	status := sdnv1alpha1.VPCPeeringStatus{Phase: sdnv1alpha1.VPCPeeringPhasePending}
 	setCondition(&status, sdnv1alpha1.VPCPeeringConditionMatched, matched != nil,
 		"ReciprocalHalf", "a VPCPeering in the peer namespace references this half's VPC")
@@ -71,10 +76,12 @@ func (r *VPCPeeringReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		"VPCReady", "the local VPC exists and has a VNI")
 	setCondition(&status, sdnv1alpha1.VPCPeeringConditionPeerVPCReady, vpcReady(peerVPC),
 		"PeerVPCReady", "the peer VPC exists and has a VNI")
+	setCondition(&status, sdnv1alpha1.VPCPeeringConditionDisjoint, disjoint,
+		"CIDRsDisjoint", "the two VPCs' CIDRs do not overlap")
 	if peerVPC != nil {
 		status.PeerVNI = peerVPC.Status.VNI
 	}
-	if matched != nil && vpcReady(localVPC) && vpcReady(peerVPC) {
+	if matched != nil && vpcReady(localVPC) && vpcReady(peerVPC) && disjoint {
 		status.Phase = sdnv1alpha1.VPCPeeringPhaseReady
 	}
 

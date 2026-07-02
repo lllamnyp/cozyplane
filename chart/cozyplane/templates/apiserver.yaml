@@ -84,7 +84,9 @@ subjects:
     name: cozyplane-apiserver
     namespace: {{ $ns }}
 ---
-# Dedicated etcd for the aggregated apiserver.
+{{- if not .Values.apiserver.etcd.operator.enabled }}
+# Built-in single-pod etcd (dev/evaluation; ephemeral by default). Production
+# uses the operator-managed EtcdCluster instead — see templates/etcd-cluster.yaml.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -138,6 +140,7 @@ spec:
     - port: 2379
       targetPort: 2379
       name: client
+{{- end }}
 ---
 # Self-signed CA + serving certificate (cert-manager).
 apiVersion: cert-manager.io/v1
@@ -231,7 +234,18 @@ spec:
           command: ["/usr/local/bin/cozyplane-apiserver"]
           args:
             - --serve-sdn
+            {{- if .Values.apiserver.etcd.operator.enabled }}
+            {{- $eps := list }}
+            {{- range $i := until (int .Values.apiserver.etcd.operator.replicas) }}
+            {{- $eps = append $eps (printf "https://cozyplane-etcd-%d.cozyplane-etcd-headless.%s.svc:2379" $i $ns) }}
+            {{- end }}
+            - --etcd-servers={{ join "," $eps }}
+            - --etcd-cafile=/etc/etcd-certs/ca.crt
+            - --etcd-certfile=/etc/etcd-certs/tls.crt
+            - --etcd-keyfile=/etc/etcd-certs/tls.key
+            {{- else }}
             - --etcd-servers=http://cozyplane-etcd.{{ $ns }}.svc:2379
+            {{- end }}
             - --secure-port=6443
             - --tls-cert-file=/etc/apiserver-certs/tls.crt
             - --tls-private-key-file=/etc/apiserver-certs/tls.key
@@ -253,10 +267,20 @@ spec:
             - name: certs
               mountPath: /etc/apiserver-certs
               readOnly: true
+            {{- if .Values.apiserver.etcd.operator.enabled }}
+            - name: etcd-client-certs
+              mountPath: /etc/etcd-certs
+              readOnly: true
+            {{- end }}
       volumes:
         - name: certs
           secret:
             secretName: cozyplane-apiserver-serving
+        {{- if .Values.apiserver.etcd.operator.enabled }}
+        - name: etcd-client-certs
+          secret:
+            secretName: cozyplane-etcd-client-tls
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service

@@ -41,6 +41,11 @@ const (
 	VPCPeeringConditionVPCReady = "VPCReady"
 	// VPCPeeringConditionPeerVPCReady is True when the peer VPC is Ready.
 	VPCPeeringConditionPeerVPCReady = "PeerVPCReady"
+	// VPCPeeringConditionDisjoint is True when the two VPCs' CIDRs do not
+	// overlap. Overlapping VPCs may coexist but can never peer: peered
+	// traffic is routed natively, and one address cannot mean two things on
+	// a shared path.
+	VPCPeeringConditionDisjoint = "CIDRsDisjoint"
 )
 
 // LocalVPCRef references a VPC in the same namespace as the referring object.

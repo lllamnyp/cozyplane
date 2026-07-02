@@ -43,4 +43,12 @@ const (
 	LabelPodName = "sdn.cozystack.io/pod-name"
 	// LabelPodUID is the attached pod's UID (stable across name reuse).
 	LabelPodUID = "sdn.cozystack.io/pod-uid"
+
+	// FinalizerSever holds a Port until the agent on its node has severed the
+	// live datapath (or confirmed there is nothing to sever). A revocation
+	// that lands while that agent is down therefore waits, still terminating,
+	// and is replayed when the agent comes back — the informer's initial sync
+	// delivers the terminating Port. The controller strips the finalizer when
+	// the Port's node no longer exists.
+	FinalizerSever = "sdn.cozystack.io/sever"
 )

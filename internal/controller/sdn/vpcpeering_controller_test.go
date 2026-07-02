@@ -30,6 +30,30 @@ import (
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
 )
 
+// Overlapping VPCs may coexist, but never peer: even a mutually-matched pair
+// stays Pending with CIDRsDisjoint=False.
+func TestVPCPeeringPendingWhenCIDRsOverlap(t *testing.T) {
+	a := nsVPCWithVNI("team-a", "vpc-a", 100)
+	a.Spec.CIDRs = []string{"10.10.0.0/24"}
+	b := nsVPCWithVNI("team-b", "vpc-b", 101)
+	b.Spec.CIDRs = []string{"10.10.0.0/16"} // contains vpc-a
+
+	c := peeringClient(t, a, b,
+		peeringHalf("team-a", "to-b", "vpc-a", "team-b", "vpc-b"),
+		peeringHalf("team-b", "to-a", "vpc-b", "team-a", "vpc-a"),
+	)
+	got := reconcilePeering(t, c, "team-a", "to-b")
+	if got.Status.Phase != sdnv1alpha1.VPCPeeringPhasePending {
+		t.Errorf("phase = %q, want Pending for overlapping CIDRs", got.Status.Phase)
+	}
+	if meta.IsStatusConditionTrue(got.Status.Conditions, sdnv1alpha1.VPCPeeringConditionDisjoint) {
+		t.Error("CIDRsDisjoint should be False for overlapping VPCs")
+	}
+	if !meta.IsStatusConditionTrue(got.Status.Conditions, sdnv1alpha1.VPCPeeringConditionMatched) {
+		t.Error("PeerMatched should still be True: the halves do match")
+	}
+}
+
 func peeringHalf(ns, name, localVPC, peerNS, peerVPC string) *sdnv1alpha1.VPCPeering {
 	return &sdnv1alpha1.VPCPeering{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},

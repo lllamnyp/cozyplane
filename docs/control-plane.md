@@ -276,10 +276,16 @@ already cleaned up) by checking the owning pod still exists, isn't terminating,
 and matches the Port's recorded pod UID — so a stale delete for a name-reused pod
 can't cut off an unrelated one.
 
-Two known limitations of this iteration: **re-granting** (recreating the binding)
-does not restore a severed pod — it must be recreated; and a revocation that
-happens while the pod's node agent is **down** is not replayed on restart yet
-(no startup reconcile of local ports against live bindings).
+Revocation is **replayable across agent outages** via a sever finalizer
+(`sdn.cozystack.io/sever`, set by the CNI at claim time): a reaped Port stays
+*terminating* until the agent on its node severs (or confirms there is nothing
+to sever) and releases the finalizer. An agent that was down finds the
+still-terminating Port in its informer's initial sync and acts then. A Port
+whose node no longer exists is released by the controller's Port GC — the
+workload died with its node.
+
+One known limitation of this iteration: **re-granting** (recreating the binding)
+does not restore a severed pod — it must be recreated.
 
 ### Observability (deferred — exact shape TBD)
 

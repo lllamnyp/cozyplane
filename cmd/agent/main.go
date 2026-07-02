@@ -32,12 +32,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
@@ -188,7 +190,7 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	} else {
 		factory := sdninformers.NewSharedInformerFactory(sdnClient, 0)
 		watchVPCs(factory, mgr, log)
-		watchPorts(ctx, factory, client, mgr, nodeName, log)
+		watchPorts(ctx, factory, sdnClient, client, mgr, nodeName, log)
 		watchPeerings(ctx, factory, mgr, log)
 		watchGateways(ctx, factory, mgr, nodeName, log)
 		factory.Start(ctx.Done())
@@ -289,12 +291,25 @@ func watchVPCs(factory sdninformers.SharedInformerFactory, mgr *datapath.Manager
 // map as /32 routes to their node's Geneve endpoint, and severs a *local* pod's
 // datapath when its Port is reaped out from under it (revocation). Best-effort,
 // like watchVPCs.
-func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory, core kubernetes.Interface, mgr *datapath.Manager, selfName string, log *slog.Logger) {
+func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory, sdn sdnclientset.Interface, core kubernetes.Interface, mgr *datapath.Manager, selfName string, log *slog.Logger) {
 	informer := factory.Sdn().V1alpha1().Ports().Informer()
 
 	apply := func(obj any) {
 		port, ok := obj.(*sdnv1alpha1.Port)
-		if !ok || port.Spec.Node == selfName || port.Spec.IP == "" || port.Spec.NodeIP == "" {
+		if !ok {
+			return
+		}
+		// A terminating local Port is a revocation in flight: sever the live
+		// pod (if any), then release the sever finalizer to acknowledge. The
+		// informer's initial sync delivers still-terminating Ports, so a
+		// revocation that landed while this agent was down replays here.
+		if port.DeletionTimestamp != nil {
+			if port.Spec.Node == selfName {
+				releaseSeveredPort(ctx, sdn, core, port, log)
+			}
+			return
+		}
+		if port.Spec.Node == selfName || port.Spec.IP == "" || port.Spec.NodeIP == "" {
 			return // local ports are reached directly; skip incomplete ones
 		}
 		if err := mgr.SetRemote(port.Spec.IP+"/32", net.ParseIP(port.Spec.NodeIP)); err != nil {
@@ -313,6 +328,8 @@ func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory,
 				return
 			}
 			if port.Spec.Node == selfName {
+				// Belt for Ports created before the sever finalizer existed;
+				// finalized Ports were already severed while terminating.
 				severLocalPort(ctx, core, port, log)
 				return
 			}
@@ -321,6 +338,42 @@ func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory,
 			}
 		},
 	})
+}
+
+// releaseSeveredPort handles a terminating Port on this node: sever the live
+// pod if the Port was reaped out from under it, then remove the sever
+// finalizer so the deletion completes. Idempotent — re-delivery is harmless.
+func releaseSeveredPort(ctx context.Context, sdn sdnclientset.Interface, core kubernetes.Interface, port *sdnv1alpha1.Port, log *slog.Logger) {
+	if !slices.Contains(port.Finalizers, sdnv1alpha1.FinalizerSever) {
+		return
+	}
+	severLocalPort(ctx, core, port, log)
+	for range 3 {
+		latest, err := sdn.SdnV1alpha1().Ports().Get(ctx, port.Name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return
+		}
+		if err != nil {
+			log.Error("get terminating port", "port", port.Name, "err", err)
+			return
+		}
+		trimmed := slices.DeleteFunc(slices.Clone(latest.Finalizers), func(f string) bool {
+			return f == sdnv1alpha1.FinalizerSever
+		})
+		if len(trimmed) == len(latest.Finalizers) {
+			return // already released
+		}
+		latest.Finalizers = trimmed
+		_, err = sdn.SdnV1alpha1().Ports().Update(ctx, latest, metav1.UpdateOptions{})
+		if err == nil {
+			log.Info("sever acknowledged; finalizer released", "port", port.Name)
+			return
+		}
+		if !apierrors.IsConflict(err) {
+			log.Error("release sever finalizer", "port", port.Name, "err", err)
+			return
+		}
+	}
 }
 
 // watchPeerings keeps the peers map equal to the set of *live* peerings: pairs
@@ -343,14 +396,14 @@ func watchPeerings(ctx context.Context, factory sdninformers.SharedInformerFacto
 			log.Error("list vpcpeerings", "err", err)
 			return
 		}
-		vni := func(namespace, name string) (uint32, bool) {
-			vpc, err := vpcs.Lister().VPCs(namespace).Get(name)
-			if err != nil || vpc.Status.VNI == 0 {
-				return 0, false
+		vpc := func(namespace, name string) *sdnv1alpha1.VPC {
+			v, err := vpcs.Lister().VPCs(namespace).Get(name)
+			if err != nil {
+				return nil
 			}
-			return uint32(vpc.Status.VNI), true
+			return v
 		}
-		desired := desiredPeerPairs(all, vni)
+		desired := desiredPeerPairs(all, vpc)
 
 		current, err := mgr.Peers()
 		if err != nil {
@@ -513,16 +566,18 @@ func vniFromPortName(name string) (uint32, bool) {
 
 // desiredPeerPairs computes the normalized (low, high) VNI pairs that should be
 // programmed: one per pair of mutually-matched peering halves whose local and
-// peer VPCs both have assigned VNIs.
-func desiredPeerPairs(peerings []*sdnv1alpha1.VPCPeering, vni func(namespace, name string) (uint32, bool)) map[[2]uint32]bool {
+// peer VPCs both have assigned VNIs and whose CIDRs are disjoint — peered
+// traffic is routed natively, so overlapping address spaces cannot be
+// connected (the one restriction overlap carries).
+func desiredPeerPairs(peerings []*sdnv1alpha1.VPCPeering, vpc func(namespace, name string) *sdnv1alpha1.VPC) map[[2]uint32]bool {
 	desired := map[[2]uint32]bool{}
 	for _, p := range peerings {
-		a, ok := vni(p.Namespace, p.Spec.VPCRef.Name)
-		if !ok {
+		va := vpc(p.Namespace, p.Spec.VPCRef.Name)
+		vb := vpc(p.Spec.PeerRef.Namespace, p.Spec.PeerRef.Name)
+		if va == nil || vb == nil || va.Status.VNI == 0 || vb.Status.VNI == 0 {
 			continue
 		}
-		b, ok := vni(p.Spec.PeerRef.Namespace, p.Spec.PeerRef.Name)
-		if !ok {
+		if sdnv1alpha1.CIDRsOverlap(va.Spec.CIDRs, vb.Spec.CIDRs) {
 			continue
 		}
 		matched := false
@@ -535,6 +590,7 @@ func desiredPeerPairs(peerings []*sdnv1alpha1.VPCPeering, vni func(namespace, na
 		if !matched {
 			continue
 		}
+		a, b := uint32(va.Status.VNI), uint32(vb.Status.VNI)
 		if a > b {
 			a, b = b, a
 		}

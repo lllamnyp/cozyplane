@@ -359,7 +359,8 @@ func addGatewayLeg(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, pod
 	// holds the .1 (e.g. its teardown hasn't run yet); kubelet retries ADD.
 	port := &sdnv1alpha1.Port{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: portName(vpc.Status.VNI, gwIP.String()),
+			Name:       portName(vpc.Status.VNI, gwIP.String()),
+			Finalizers: []string{sdnv1alpha1.FinalizerSever},
 			Labels: map[string]string{
 				labelVPCNamespace: vpcNS,
 				labelVPC:          vpc.Name,
@@ -503,6 +504,9 @@ func claimIP(client sdnclientset.Interface, vpc *sdnv1alpha1.VPC, vpcNS string, 
 		port := &sdnv1alpha1.Port{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: portName(vpc.Status.VNI, ipStr),
+				// The sever finalizer makes revocation replayable: deletion
+				// completes only after the port's node agent acknowledges.
+				Finalizers: []string{sdnv1alpha1.FinalizerSever},
 				Labels: map[string]string{
 					labelVPCNamespace: vpcNS,
 					labelVPC:          vpc.Name,
