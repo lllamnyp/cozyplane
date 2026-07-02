@@ -86,6 +86,8 @@ maps and one program.
 | `locals` | hash | {net id, pod IP} → {veth ifindex, pod MAC} | plugin (per pod) |
 | `peers` | hash | {src net id, dst net id} → 1 | agent (VPCPeerings) |
 | `gateways` | hash | net id → {gateway .1 IP, node IP (0=local)} | agent (gateway Ports) |
+| `bridges` | hash | fabric IP → {net id, VPC IP} | plugin (per VPC pod) |
+| `ct_fwd` / `ct_rev` | LRU hash | the bridge's L4 NAT connection table | datapath (in-band) |
 | `params` | array | `[0]`=Geneve ifindex, `[1]`=default VNI | agent |
 
 The scoped maps use a `{prefixlen, scope_net, addr}` LPM key: the scope net
@@ -240,35 +242,40 @@ the node pod CIDR (allocated by host-local, reachable cluster-wide over the
 default overlay), while its interface carries the **VPC** (tenant) IP. The fabric
 IP is a node-side handle, never configured inside the pod.
 
-The translation is kernel conntrack NAT (in `datapath/bridge.go`, a
-`COZYPLANE-BRIDGE` nat chain):
+The translation is **eBPF NAT** — no iptables, no fwmark, no policy routing.
+The datapath keeps its own small connection table (`ct_fwd`/`ct_rev`, LRU
+hashes) in place of kernel conntrack, and does the rewrites (checksum-correct)
+in the two universal hooks:
 
-- **node/Service → pod:** `PREROUTING`/`OUTPUT` DNAT `fabricIP → vpcIP`;
-  `POSTROUTING` SNAT the source `→ 169.254.1.1` (the gateway) for DNATed
-  connections. The pod sees traffic from its gateway and never learns the
-  node/fabric address.
-- **pod → reply:** the pod replies to `169.254.1.1`; `from_pod` exempts that
-  destination (so isolation doesn't drop it), and conntrack reverses the DNAT/SNAT
-  back to the original client.
+- **node/Service/pod → VPC pod:** `to_pod` looks up the packet's destination in
+  the pinned `bridges` map (`fabricIP → {net, vpcIP}`). On a hit it DNATs
+  `fabricIP → vpcIP` and masquerades the source to `169.254.1.1:gw_port` — a
+  masquerade port allocated by probing the reverse key with `BPF_NOEXIST`, so it
+  is unique per `{net, vpcIP, pod_port}`. The pod sees only the gateway and never
+  learns the node/fabric/client address.
+- **VPC pod → reply:** the pod replies to `169.254.1.1`; `from_pod` looks the
+  `gw_port` back up in `ct_rev`, restores `vpcIP → fabricIP` on the source and
+  `169.254.1.1 → client` on the destination, and delivers the reply on the
+  default network (`deliver_net0`).
+
+TCP and UDP; ICMP to a fabric IP is dropped (a follow-up).
 
 This gives the design's directional trust for free: the system/default network
 reaches a VPC pod via its fabric IP (north-south, allowed), but a VPC pod can't
-initiate outward (its egress to any non-VPC, non-gateway destination is dropped
-by the isolation rule). Because the fabric IP lives in the node pod CIDR, the
-existing default overlay carries it cross-node, so Services/Endpoints and
-remote-node access to VPC pods work unchanged.
+initiate outward (dropped by the isolation rule). Because the fabric IP lives in
+the node pod CIDR, the default overlay carries it cross-node, so
+Services/Endpoints and remote-node access work unchanged.
 
-**Per-pod delivery under overlapping CIDRs.** After `PREROUTING` DNATs
-`fabricIP → vpcIP`, the destination is the VPC IP — which two same-node pods in
-different VPCs may share, so a single main-table `vpcIP/32` route would be
-ambiguous. The **fabric IP is unique**, so the bridge derives a per-pod id from
-its offset within the node pod CIDR (deterministic, no allocator): a `mangle`
-rule marks the packet by its fabric IP *before* the DNAT (`--set-xmark
-offset<<16`, in fwmark bits that miss kube-proxy/Cilium), and an `ip rule`
-(priority `100+offset`, sorted **before** the main table so its default route
-can't shadow the mark) sends the marked packet to a per-pod table holding
-`vpcIP/32 dev <that pod's veth>`. The return is plain kernel conntrack. So the
-bridge, like the overlay, delivers by identity rather than by a shared address.
+**Delivery by identity, under overlapping CIDRs.** After the DNAT the
+destination is the VPC IP, which two same-node pods in different VPCs may share
+— so nothing routes by it. The **fabric IP is unique**, so it is what steers
+delivery: a plain `/32` route (`fabricIP → the pod's veth`, netlink) carries
+node-originated traffic (kubelet probes) to `to_pod`, and cross-node / same-node
+north-south is redirected straight into the pod's veth from `from_overlay` /
+`from_pod` (a `bridges` hit resolves the pod's MAC via `locals[{net, vpcIP}]`),
+bypassing the kernel FORWARD chain entirely. The NAT itself is keyed by
+`{net, vpcIP}`, so the two same-IP pods stay distinct. Like the overlay, the
+bridge delivers by identity, never by a shared address.
 
 ### Addressing / byte order (for maintainers)
 
@@ -438,7 +445,8 @@ datapath/                  Go wrapper around the eBPF datapath
   locals.go                plugin-side access to the pinned `locals` map
   peers.go                 agent-side access to the pinned `peers` map
   gateways.go              agent-side `gateways` map + from_overlay attach
-  firewall.go              the FORWARD ACCEPT rules (go-iptables)
+  bridge.go                fabric /32 route + the pinned `bridges` map
+  firewall.go              FORWARD ACCEPT + node masquerade (go-iptables)
   bpffs.go                 mount bpffs if absent (kind nodes)
   state.go                 AgentState published for the plugin (agent.json)
   kubeconfig.go            write the plugin kubeconfig from the SA token
@@ -495,6 +503,11 @@ mostly future work. As built:
 
 - Overlapping VPC CIDRs are supported (net-scoped delivery, above); only
   *peering* overlapping VPCs is refused.
+- The north-south bridge is eBPF NAT (its own `ct_fwd`/`ct_rev` table), TCP/UDP
+  only — ICMP to a fabric IP is dropped. The datapath is netfilter-free except
+  the agent's node masquerade and overlay FORWARD-ACCEPT (both non-NAT, both
+  candidates to move to eBPF) and the gateway pod's internal filter (in its own
+  netns).
 - VPC egress is opt-in and coarse: `spec.egress.natGateway` opens internet +
   cluster DNS through a single per-VPC gateway pod; no per-destination policy,
   Service exposure, metadata endpoint, or floating IPs (source-preserving
