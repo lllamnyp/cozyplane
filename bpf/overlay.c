@@ -31,6 +31,24 @@
 #define TC_ACT_SHOT 2
 #define LINK_LOCAL_GW 0xA9FE0101 // 169.254.1.1 (host order)
 
+#define IPPROTO_ICMP 1
+#define IPPROTO_TCP  6
+#define IPPROTO_UDP  17
+
+// Netfilter is entirely absent from the datapath: the fabric<->VPC bridge NAT
+// (north-south) is done here in eBPF with a small connection table, not
+// iptables. Packet offsets for an IPv4 frame with no IP options (ihl == 5).
+#define ETH_HLEN     14
+#define IP_HDR_OFF   ETH_HLEN
+#define IP_CSUM_OFF  (IP_HDR_OFF + 10)
+#define IP_SADDR_OFF (IP_HDR_OFF + 12)
+#define IP_DADDR_OFF (IP_HDR_OFF + 16)
+#define L4_OFF       (IP_HDR_OFF + 20)
+#define L4_SPORT_OFF (L4_OFF + 0)
+#define L4_DPORT_OFF (L4_OFF + 2)
+#define TCP_CSUM_OFF (L4_OFF + 16)
+#define UDP_CSUM_OFF (L4_OFF + 6)
+
 // ports-map value layout: bit 31 flags a VPC egress-gateway leg; the low bits
 // are the network id (VNIs stay far below 2^23, see TUN_F_GATEWAY).
 #define PORT_F_GATEWAY (1u << 31)
@@ -156,6 +174,69 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } gateways SEC(".maps");
 
+// bridges: fabric IP (unique, from the node pod CIDR — network byte order) ->
+// the pod's (network id, VPC IP). A plain /32 route sends the fabric IP to the
+// pod's veth; to_pod NATs it fabric->vpc and masquerades the client to the
+// gateway. Replaces the per-pod iptables DNAT + fwmark policy routing.
+struct bridge_ep {
+	__u32 net;
+	__u32 vpc_ip; // network byte order
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u32);
+	__type(value, struct bridge_ep);
+	__uint(max_entries, 65536);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} bridges SEC(".maps");
+
+// The bridge's own L4 connection table (no kernel conntrack). A north-south
+// connection is masqueraded to 169.254.1.1:gw_port; the pod's reply is reversed
+// by looking the gw_port back up. ct_fwd dedups retransmits to one gw_port.
+struct ct_fwd_key {
+	__u8 proto;
+	__u8 pad[3];
+	__u32 net;
+	__u32 client_ip; // network order
+	__u32 fabric_ip; // network order
+	__u16 client_port; // network order
+	__u16 pod_port;    // network order
+};
+
+struct ct_rev_key {
+	__u8 proto;
+	__u8 pad;
+	__u16 gw_port;  // network order (the masqueraded source port)
+	__u32 net;
+	__u32 vpc_ip;   // network order
+	__u16 pod_port; // network order
+	__u16 pad2;
+};
+
+struct ct_rev_val {
+	__u32 fabric_ip;   // network order
+	__u32 client_ip;   // network order
+	__u16 client_port; // network order
+	__u16 pad;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__type(key, struct ct_fwd_key);
+	__type(value, __u16);
+	__uint(max_entries, 262144);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} ct_fwd SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__type(key, struct ct_rev_key);
+	__type(value, struct ct_rev_val);
+	__uint(max_entries, 262144);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} ct_rev SEC(".maps");
+
 #define CFG_GENEVE_IFINDEX 0
 #define CFG_VNI            1
 
@@ -240,6 +321,165 @@ static __always_inline int encap(struct __sk_buff *skb, __u32 dstnet, __u32 node
 	return bpf_redirect(geneve, 0);
 }
 
+// ---- eBPF bridge NAT (north-south, no netfilter) -------------------------
+
+// l4_ports reads the source/destination ports of a TCP/UDP packet with no IP
+// options. For ICMP there are no ports, so the bridge only handles TCP/UDP.
+static __always_inline int l4_ports(struct __sk_buff *skb, __u16 *sport, __u16 *dport)
+{
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+	if (data + L4_OFF + 4 > data_end)
+		return -1;
+	__u16 *p = data + L4_OFF;
+	*sport = p[0];
+	*dport = p[1];
+	return 0;
+}
+
+static __always_inline __u32 l4_csum_off(__u8 proto)
+{
+	return proto == IPPROTO_TCP ? TCP_CSUM_OFF : UDP_CSUM_OFF;
+}
+
+// nat_addr rewrites an IPv4 address in the header (at addr_off) and fixes the
+// IP checksum and the L4 pseudo-header checksum. UDP with a zero checksum is
+// left "no checksum" via BPF_F_MARK_MANGLED_0.
+static __always_inline void nat_addr(struct __sk_buff *skb, __u8 proto, __u32 addr_off, __u32 old, __u32 new)
+{
+	__u64 flags = BPF_F_PSEUDO_HDR | 4;
+	if (proto == IPPROTO_UDP)
+		flags |= BPF_F_MARK_MANGLED_0;
+	bpf_l4_csum_replace(skb, l4_csum_off(proto), old, new, flags);
+	bpf_l3_csum_replace(skb, IP_CSUM_OFF, old, new, 4);
+	bpf_skb_store_bytes(skb, addr_off, &new, sizeof(new), 0);
+}
+
+// nat_port rewrites an L4 port (at port_off) and fixes the L4 checksum.
+static __always_inline void nat_port(struct __sk_buff *skb, __u8 proto, __u32 port_off, __u16 old, __u16 new)
+{
+	__u64 flags = 2;
+	if (proto == IPPROTO_UDP)
+		flags |= BPF_F_MARK_MANGLED_0;
+	bpf_l4_csum_replace(skb, l4_csum_off(proto), old, new, flags);
+	bpf_skb_store_bytes(skb, port_off, &new, sizeof(new), 0);
+}
+
+// alloc_gw_port picks a free masquerade port for a new north-south connection:
+// the reverse-lookup key {proto, gw_port, net, vpc_ip, pod_port} must be unique,
+// so probe (bounded) with BPF_NOEXIST — the insert that wins owns the port.
+static __always_inline __u16 alloc_gw_port(__u8 proto, __u32 net, __u32 vpc_ip, __u16 pod_port,
+					   __u32 fabric_ip, __u32 client_ip, __u16 client_port)
+{
+	__u32 base = bpf_get_prandom_u32();
+	struct ct_rev_val rv = {
+		.fabric_ip = fabric_ip,
+		.client_ip = client_ip,
+		.client_port = client_port,
+	};
+#pragma unroll
+	for (int i = 0; i < 16; i++) {
+		__u16 p = bpf_htons(1024 + ((base + i) % 64000));
+		struct ct_rev_key rk = {
+			.proto = proto,
+			.gw_port = p,
+			.net = net,
+			.vpc_ip = vpc_ip,
+			.pod_port = pod_port,
+		};
+		if (bpf_map_update_elem(&ct_rev, &rk, &rv, BPF_NOEXIST) == 0)
+			return p;
+	}
+	return 0;
+}
+
+// bridge_forward is the north-south DNAT+SNAT, done in to_pod when a packet's
+// destination is a fabric IP: fabric->VPC on the destination, client->gateway
+// (169.254.1.1:gw_port) on the source. The pod sees only the gateway.
+static __always_inline int bridge_forward(struct __sk_buff *skb, struct iphdr *ip, __u32 net, __u32 vpc_ip)
+{
+	if (ip->ihl != 5)
+		return TC_ACT_SHOT;
+	__u8 proto = ip->protocol;
+	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
+		return TC_ACT_SHOT; // bridge handles TCP/UDP; ICMP to a fabric IP is dropped
+	__u16 cport, pport;
+	if (l4_ports(skb, &cport, &pport) < 0)
+		return TC_ACT_SHOT;
+	__u32 client = ip->saddr, fabric = ip->daddr;
+
+	struct ct_fwd_key fk = {
+		.proto = proto,
+		.net = net,
+		.client_ip = client,
+		.fabric_ip = fabric,
+		.client_port = cport,
+		.pod_port = pport,
+	};
+	__u16 gw_port;
+	__u16 *have = bpf_map_lookup_elem(&ct_fwd, &fk);
+	if (have) {
+		gw_port = *have;
+	} else {
+		gw_port = alloc_gw_port(proto, net, vpc_ip, pport, fabric, client, cport);
+		if (!gw_port)
+			return TC_ACT_SHOT;
+		bpf_map_update_elem(&ct_fwd, &fk, &gw_port, BPF_ANY);
+	}
+
+	nat_addr(skb, proto, IP_DADDR_OFF, fabric, vpc_ip);
+	nat_addr(skb, proto, IP_SADDR_OFF, client, bpf_htonl(LINK_LOCAL_GW));
+	nat_port(skb, proto, L4_SPORT_OFF, cport, gw_port);
+	return TC_ACT_OK; // delivered to the pod (src is now the gateway)
+}
+
+// deliver_net0 sends a (default-network) packet to `dst`: same-node redirect,
+// cross-node encap, or hand off to the kernel (local node / off-cluster). Used
+// for a bridge reply after it has been un-NATed to fabric->client.
+static __always_inline int deliver_net0(struct __sk_buff *skb, __u32 dst)
+{
+	struct endpoint *l = local_of(0, dst);
+	if (l)
+		return deliver_local(skb, l);
+	__u32 *node_ip = remote_of(0, dst);
+	if (node_ip)
+		return encap(skb, 0, *node_ip, 0);
+	return TC_ACT_OK;
+}
+
+// bridge_reverse is the reply un-NAT, done in from_pod when a VPC pod replies to
+// the gateway (169.254.1.1): look the masquerade port back up, restore
+// vpc->fabric on the source and gateway->client on the destination, then
+// deliver the reply on the default network.
+static __always_inline int bridge_reverse(struct __sk_buff *skb, struct iphdr *ip, __u32 net)
+{
+	if (ip->ihl != 5)
+		return TC_ACT_OK;
+	__u8 proto = ip->protocol;
+	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
+		return TC_ACT_OK;
+	__u16 pport, gw_port;
+	if (l4_ports(skb, &pport, &gw_port) < 0)
+		return TC_ACT_OK;
+
+	struct ct_rev_key rk = {
+		.proto = proto,
+		.gw_port = gw_port,
+		.net = net,
+		.vpc_ip = ip->saddr,
+		.pod_port = pport,
+	};
+	struct ct_rev_val *rv = bpf_map_lookup_elem(&ct_rev, &rk);
+	if (!rv)
+		return TC_ACT_OK; // no state: the kernel has no route for the gateway, drops it
+
+	__u32 vpc_ip = ip->saddr;
+	nat_addr(skb, proto, IP_SADDR_OFF, vpc_ip, rv->fabric_ip);
+	nat_addr(skb, proto, IP_DADDR_OFF, bpf_htonl(LINK_LOCAL_GW), rv->client_ip);
+	nat_port(skb, proto, L4_DPORT_OFF, gw_port, rv->client_port);
+	return deliver_net0(skb, rv->client_ip);
+}
+
 // cozyplane_from_pod: source-side hook (pod egress). Enforces isolation, then
 // delivers: same-node via redirect, cross-node via encap, off-VPC via gateway.
 SEC("tc")
@@ -249,11 +489,6 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	if (parse_ipv4(skb, &ip) < 0)
 		return TC_ACT_OK;
 
-	// Replies to masqueraded node->pod (bridge) traffic go to the gateway; the
-	// host stack/conntrack handles them.
-	if (ip->daddr == bpf_htonl(LINK_LOCAL_GW))
-		return TC_ACT_OK;
-
 	__u32 ifindex = skb->ifindex;
 	__u32 srcnet = 0, is_gw = 0;
 	__u32 *sp = bpf_map_lookup_elem(&ports, &ifindex);
@@ -261,6 +496,11 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 		srcnet = PORT_NET(*sp);
 		is_gw = *sp & PORT_F_GATEWAY;
 	}
+
+	// A VPC pod's reply to the gateway (169.254.1.1) is the return half of the
+	// north-south bridge: un-NAT it and deliver on the default network.
+	if (ip->daddr == bpf_htonl(LINK_LOCAL_GW))
+		return bridge_reverse(skb, ip, srcnet);
 	// The destination's network, resolved within the source's scope: its own
 	// CIDR or a peer's. Overlapping CIDRs in other VPCs are invisible here.
 	__u32 dstnet = net_of(&networks, srcnet, ip->daddr);
@@ -300,7 +540,17 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	if (node_ip)
 		return encap(skb, dstnet, *node_ip, is_gw);
 
-	return TC_ACT_OK; // off-cluster / node / fabric-bridge: kernel handles it
+	// Same-node north-south: a default-network packet to a local VPC pod's
+	// fabric IP. Redirect into the pod's veth (to_pod does the DNAT), bypassing
+	// the kernel FORWARD chain so no netfilter accept rule is needed.
+	struct bridge_ep *be = bpf_map_lookup_elem(&bridges, &ip->daddr);
+	if (be) {
+		struct endpoint *l = local_of(be->net, be->vpc_ip);
+		if (l)
+			return deliver_local(skb, l);
+	}
+
+	return TC_ACT_OK; // off-cluster / node: kernel handles it
 }
 
 // cozyplane_to_pod: destination-side hook (pod ingress). Every delivery path
@@ -313,7 +563,16 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 	if (parse_ipv4(skb, &ip) < 0)
 		return TC_ACT_OK;
 
-	// node->pod bridge traffic is masqueraded from the gateway; allow it.
+	// The forward half of the north-south bridge: a packet whose destination is
+	// a fabric IP (routed here by the pod's /32) is DNATed to the VPC IP and its
+	// client masqueraded to the gateway, then delivered — no isolation check
+	// (this IS the sanctioned north-south path). Fabric IPs are unique, so the
+	// lookup is unambiguous even under overlapping VPC CIDRs.
+	struct bridge_ep *be = bpf_map_lookup_elem(&bridges, &ip->daddr);
+	if (be)
+		return bridge_forward(skb, ip, be->net, be->vpc_ip);
+
+	// A masqueraded reply already carries the gateway source; allow it.
 	if (ip->saddr == bpf_htonl(LINK_LOCAL_GW))
 		return TC_ACT_OK;
 
@@ -352,14 +611,24 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 	if (bpf_skb_get_tunnel_key(skb, &tk, sizeof(tk), 0) < 0)
 		return TC_ACT_OK;
 
-	__u32 gw = tk.tunnel_id & TUN_F_GATEWAY;
-	__u32 vni = (__u32)tk.tunnel_id & ~TUN_F_GATEWAY;
-	if (vni == cfg(CFG_VNI))
-		return TC_ACT_OK; // default network: kernel routes (fabric bridge etc.)
-
 	struct iphdr *ip;
 	if (parse_ipv4(skb, &ip) < 0)
 		return TC_ACT_OK;
+
+	__u32 gw = tk.tunnel_id & TUN_F_GATEWAY;
+	__u32 vni = (__u32)tk.tunnel_id & ~TUN_F_GATEWAY;
+	if (vni == cfg(CFG_VNI)) {
+		// Default network. A cross-node north-south packet to a local VPC pod's
+		// fabric IP is delivered to its veth here (to_pod does the DNAT),
+		// bypassing the kernel FORWARD chain; everything else the kernel routes.
+		struct bridge_ep *be = bpf_map_lookup_elem(&bridges, &ip->daddr);
+		if (be) {
+			struct endpoint *l = local_of(be->net, be->vpc_ip);
+			if (l)
+				return deliver_local(skb, l);
+		}
+		return TC_ACT_OK;
+	}
 
 	// A local pod in this VPC (intra-VPC, peered, or a gateway->tenant reply).
 	struct endpoint *ep = local_of(vni, ip->daddr);

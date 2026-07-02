@@ -13,6 +13,42 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type overlayBridgeEp struct {
+	_     structs.HostLayout
+	Net   uint32
+	VpcIp uint32
+}
+
+type overlayCtFwdKey struct {
+	_          structs.HostLayout
+	Proto      uint8
+	Pad        [3]uint8
+	Net        uint32
+	ClientIp   uint32
+	FabricIp   uint32
+	ClientPort uint16
+	PodPort    uint16
+}
+
+type overlayCtRevKey struct {
+	_       structs.HostLayout
+	Proto   uint8
+	Pad     uint8
+	GwPort  uint16
+	Net     uint32
+	VpcIp   uint32
+	PodPort uint16
+	Pad2    uint16
+}
+
+type overlayCtRevVal struct {
+	_          structs.HostLayout
+	FabricIp   uint32
+	ClientIp   uint32
+	ClientPort uint16
+	Pad        uint16
+}
+
 type overlayEndpoint struct {
 	_       structs.HostLayout
 	Ifindex uint32
@@ -49,6 +85,9 @@ type overlayPeerKey struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
+	overlayMapBridges               = "bridges"
+	overlayMapCtFwd                 = "ct_fwd"
+	overlayMapCtRev                 = "ct_rev"
 	overlayMapGateways              = "gateways"
 	overlayMapLocals                = "locals"
 	overlayMapNetworks              = "networks"
@@ -112,6 +151,9 @@ type overlayProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type overlayMapSpecs struct {
+	Bridges  *ebpf.MapSpec `ebpf:"bridges"`
+	CtFwd    *ebpf.MapSpec `ebpf:"ct_fwd"`
+	CtRev    *ebpf.MapSpec `ebpf:"ct_rev"`
 	Gateways *ebpf.MapSpec `ebpf:"gateways"`
 	Locals   *ebpf.MapSpec `ebpf:"locals"`
 	Networks *ebpf.MapSpec `ebpf:"networks"`
@@ -147,6 +189,9 @@ func (o *overlayObjects) Close() error {
 //
 // It can be passed to loadOverlayObjects or ebpf.CollectionSpec.LoadAndAssign.
 type overlayMaps struct {
+	Bridges  *ebpf.Map `ebpf:"bridges"`
+	CtFwd    *ebpf.Map `ebpf:"ct_fwd"`
+	CtRev    *ebpf.Map `ebpf:"ct_rev"`
 	Gateways *ebpf.Map `ebpf:"gateways"`
 	Locals   *ebpf.Map `ebpf:"locals"`
 	Networks *ebpf.Map `ebpf:"networks"`
@@ -158,6 +203,9 @@ type overlayMaps struct {
 
 func (m *overlayMaps) Close() error {
 	return _OverlayClose(
+		m.Bridges,
+		m.CtFwd,
+		m.CtRev,
 		m.Gateways,
 		m.Locals,
 		m.Networks,

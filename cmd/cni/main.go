@@ -304,9 +304,9 @@ func addVPC(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, p
 		return err
 	}
 
-	// Bridge: fabric IP -> VPC IP, source masqueraded to the gateway. The pod
-	// CIDR gives the bridge the fabric IP's offset for its per-pod route.
-	if err = datapath.AddBridge(fabricIP.String(), vpcIP.String(), hostVethNameFor(args.ContainerID), state.PodCIDR); err != nil {
+	// Bridge: route the (unique) fabric IP to this veth and publish the
+	// fabric -> {net, VPC IP} mapping; the eBPF datapath does the NAT.
+	if err = datapath.AddBridge(fabricIP.String(), vpcIP.String(), hostVethNameFor(args.ContainerID), uint32(vpc.Status.VNI)); err != nil {
 		return err
 	}
 
@@ -718,7 +718,7 @@ func cmdDel(args *skel.CmdArgs) error {
 					_ = datapath.DelLocal(net_, net.ParseIP(p.Spec.IP))
 				}
 				if p.Spec.FabricIP != "" {
-					_ = datapath.DelBridge(p.Spec.FabricIP, p.Spec.IP, hostVethNameFor(args.ContainerID), podCIDR)
+					_ = datapath.DelBridge(p.Spec.FabricIP, hostVethNameFor(args.ContainerID))
 				}
 				_ = client.SdnV1alpha1().Ports().Delete(context.TODO(), p.Name, metav1.DeleteOptions{})
 			}

@@ -39,7 +39,7 @@ import (
 //
 // Re-granting access requires the pod to be recreated; SeverLocal does not
 // reverse on its own.
-func SeverLocal(net_ uint32, vpcIP net.IP, fabricIP, podCIDR string) (bool, error) {
+func SeverLocal(net_ uint32, vpcIP net.IP, fabricIP string) (bool, error) {
 	ifindex, _, found, err := GetLocal(net_, vpcIP)
 	if err != nil {
 		return false, err
@@ -56,7 +56,7 @@ func SeverLocal(net_ uint32, vpcIP net.IP, fabricIP, podCIDR string) (bool, erro
 	}
 	if fabricIP != "" {
 		if link, e := netlink.LinkByIndex(ifindex); e == nil {
-			_ = DelBridge(fabricIP, vpcIP.String(), link.Attrs().Name, podCIDR)
+			_ = DelBridge(fabricIP, link.Attrs().Name)
 		}
 	}
 	return true, nil
