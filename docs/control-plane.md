@@ -245,8 +245,9 @@ other.
 - **Intra-domain peering is subsumed**: a parent tenant with authority over both
   namespaces simply creates both halves; no second code path.
 - Peered traffic is routed **natively** (no NAT), so the two CIDRs must not
-  overlap — vacuously true today (VPC CIDRs are unique cluster-wide) and gated
-  by the controller's `Ready` once overlapping CIDRs land.
+  overlap — enforced by the agent (it won't program a peering whose VPCs'
+  CIDRs overlap) and surfaced as the `CIDRsDisjoint` condition. Overlapping
+  VPCs otherwise coexist fine (net-scoped delivery); they just can't peer.
 
 Creating a half currently requires only `create vpcpeerings` in the owner
 namespace; a `peer` virtual verb on the local VPC (mirroring `export`) is

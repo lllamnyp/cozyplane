@@ -37,22 +37,31 @@ func networkOrder(t *testing.T, key uint32) [4]byte {
 	return buf
 }
 
-func TestLocalKeyIsNetworkOrder(t *testing.T) {
+func TestLocalKeyIsNetworkOrderAndScoped(t *testing.T) {
 	ip := net.ParseIP("10.20.30.40")
-	got := networkOrder(t, localKey(ip))
+	key := localKey(101, ip)
+	if key.Net != 101 {
+		t.Fatalf("localKey net = %d, want 101", key.Net)
+	}
+	got := networkOrder(t, key.Ip)
 	want := [4]byte{10, 20, 30, 40}
 	if got != want {
-		t.Fatalf("localKey(%s) marshals to %v, want network order %v", ip, got, want)
+		t.Fatalf("localKey(%s) IP marshals to %v, want network order %v", ip, got, want)
 	}
 }
 
-func TestLpmKeyNetworkOrderAndPrefix(t *testing.T) {
-	key, err := lpmKey("10.20.30.0/24")
+func TestLpmKeyNetworkOrderPrefixAndScope(t *testing.T) {
+	key, err := lpmKey(101, "10.20.30.0/24")
 	if err != nil {
 		t.Fatalf("lpmKey: %v", err)
 	}
-	if key.Prefixlen != 24 {
-		t.Fatalf("prefixlen = %d, want 24", key.Prefixlen)
+	// The scope net occupies the leading 32 key bits, so a /24 CIDR has
+	// prefixlen 32 + 24 and lookups never cross scopes.
+	if key.Prefixlen != 32+24 {
+		t.Fatalf("prefixlen = %d, want %d", key.Prefixlen, 32+24)
+	}
+	if key.ScopeNet != 101 {
+		t.Fatalf("scope = %d, want 101", key.ScopeNet)
 	}
 	got := networkOrder(t, key.Addr)
 	want := [4]byte{10, 20, 30, 0}
@@ -63,7 +72,7 @@ func TestLpmKeyNetworkOrderAndPrefix(t *testing.T) {
 
 func TestLpmKeyRejectsNonIPv4AndGarbage(t *testing.T) {
 	for _, cidr := range []string{"2001:db8::/64", "not-a-cidr", "10.0.0.0/33"} {
-		if _, err := lpmKey(cidr); err == nil {
+		if _, err := lpmKey(0, cidr); err == nil {
 			t.Errorf("lpmKey(%q) = nil error, want error", cidr)
 		}
 	}

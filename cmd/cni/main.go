@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	"github.com/containernetworking/cni/pkg/skel"
@@ -303,8 +304,9 @@ func addVPC(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, p
 		return err
 	}
 
-	// Bridge: fabric IP -> VPC IP, source masqueraded to the gateway.
-	if err = datapath.AddBridge(fabricIP.String(), vpcIP.String(), hostVethNameFor(args.ContainerID)); err != nil {
+	// Bridge: fabric IP -> VPC IP, source masqueraded to the gateway. The pod
+	// CIDR gives the bridge the fabric IP's offset for its per-pod route.
+	if err = datapath.AddBridge(fabricIP.String(), vpcIP.String(), hostVethNameFor(args.ContainerID), state.PodCIDR); err != nil {
 		return err
 	}
 
@@ -639,12 +641,19 @@ func configureHostVeth(name string, podIP net.IP, netID uint32, podMAC net.Hardw
 			return err
 		}
 	}
-	if err := netlink.RouteAdd(&netlink.Route{
-		LinkIndex: hv.Attrs().Index,
-		Scope:     netlink.SCOPE_LINK,
-		Dst:       &net.IPNet{IP: podIP, Mask: net.CIDRMask(32, 32)},
-	}); err != nil {
-		return fmt.Errorf("add pod /32 route: %w", err)
+	// A default-network pod has a unique IP, reached by the host through this
+	// main-table /32. VPC pods are delivered by eBPF (same-node redirect,
+	// cross-node from_overlay) or, north-south, by the bridge's per-pod table —
+	// never by a main-table VPC-IP route, which would collide under overlapping
+	// CIDRs. So install the main-table route only for the default network.
+	if netID == 0 {
+		if err := netlink.RouteAdd(&netlink.Route{
+			LinkIndex: hv.Attrs().Index,
+			Scope:     netlink.SCOPE_LINK,
+			Dst:       &net.IPNet{IP: podIP, Mask: net.CIDRMask(32, 32)},
+		}); err != nil {
+			return fmt.Errorf("add pod /32 route: %w", err)
+		}
 	}
 
 	idx := hv.Attrs().Index
@@ -670,9 +679,9 @@ func configureHostVeth(name string, podIP net.IP, netID uint32, podMAC net.Hardw
 	if err := datapath.SetPortNet(idx, netID); err != nil {
 		return err
 	}
-	// Record the local endpoint so same-node traffic to this pod is delivered by
-	// eBPF redirect (through to_pod), not a kernel-routing shortcut.
-	return datapath.SetLocal(podIP, idx, podMAC)
+	// Record the local endpoint (keyed by network id, so overlapping VPCs stay
+	// distinct) for eBPF-redirect delivery through to_pod.
+	return datapath.SetLocal(datapath.PortNet(netID), podIP, idx, podMAC)
 }
 
 func cmdDel(args *skel.CmdArgs) error {
@@ -686,6 +695,10 @@ func cmdDel(args *skel.CmdArgs) error {
 	}
 
 	podNS, podName, podUID, _ := podIdentity(args)
+	podCIDR := ""
+	if state, e := datapath.LoadAgentState(); e == nil {
+		podCIDR = state.PodCIDR
+	}
 
 	// Release a VPC Port if this pod had one. Prefer the pod UID (unique, never
 	// reused) so a stale DEL can't delete a newer pod's Port that reuses a name.
@@ -699,8 +712,13 @@ func cmdDel(args *skel.CmdArgs) error {
 		}); e == nil {
 			for i := range list.Items {
 				p := &list.Items[i]
+				// The VPC/gateway-leg local entry is keyed by (net id, VPC IP);
+				// net id is the VNI encoded in the Port name.
+				if net_, ok := netFromPortName(p.Name); ok {
+					_ = datapath.DelLocal(net_, net.ParseIP(p.Spec.IP))
+				}
 				if p.Spec.FabricIP != "" {
-					_ = datapath.DelBridge(p.Spec.FabricIP, p.Spec.IP, hostVethNameFor(args.ContainerID))
+					_ = datapath.DelBridge(p.Spec.FabricIP, p.Spec.IP, hostVethNameFor(args.ContainerID), podCIDR)
 				}
 				_ = client.SdnV1alpha1().Ports().Delete(context.TODO(), p.Name, metav1.DeleteOptions{})
 			}
@@ -708,8 +726,8 @@ func cmdDel(args *skel.CmdArgs) error {
 	}
 
 	// Release default-network IPAM (no-op for VPC pods, which use no host-local).
-	if state, e := datapath.LoadAgentState(); e == nil {
-		if ipamData, e := ipamStdin(args.StdinData, state.PodCIDR); e == nil {
+	if podCIDR != "" {
+		if ipamData, e := ipamStdin(args.StdinData, podCIDR); e == nil {
 			_ = ipam.ExecDel(ipamPlugin, ipamData)
 		}
 	}
@@ -718,26 +736,39 @@ func cmdDel(args *skel.CmdArgs) error {
 		return nil
 	}
 	return ns.WithNetNSPath(args.Netns, func(ns.NetNS) error {
-		// Release the gateway leg first, if any (its locals entry too).
-		if addrs, e := ip.DelLinkByNameAddr(gwVethName); e == nil {
-			for _, a := range addrs {
-				if a.IP != nil {
-					_ = datapath.DelLocal(a.IP)
-				}
-			}
-		}
+		// The gateway leg's VPC-IP local entry was cleared above via its Port.
+		_, _ = ip.DelLinkByNameAddr(gwVethName)
 		addrs, e := ip.DelLinkByNameAddr(contVethName)
 		if e == ip.ErrLinkNotFound {
 			return nil
 		}
-		// Release the locals entry for the pod's address(es).
+		// Release the default-network local entry (net 0). VPC/gateway addrs
+		// live under their VNI scope and were cleared via their Ports; a net-0
+		// delete of a VPC IP is a harmless miss.
 		for _, a := range addrs {
 			if a.IP != nil {
-				_ = datapath.DelLocal(a.IP)
+				_ = datapath.DelLocal(0, a.IP)
 			}
 		}
 		return e
 	})
+}
+
+// netFromPortName parses the VNI (network id) out of a Port name
+// (v<vni>.<ip-dashed>). The name encodes the VNI by construction.
+func netFromPortName(name string) (uint32, bool) {
+	if len(name) < 2 || name[0] != 'v' {
+		return 0, false
+	}
+	dot := strings.IndexByte(name, '.')
+	if dot <= 1 {
+		return 0, false
+	}
+	vni, err := strconv.ParseUint(name[1:dot], 10, 32)
+	if err != nil || vni == 0 {
+		return 0, false
+	}
+	return uint32(vni), true
 }
 
 func cmdCheck(args *skel.CmdArgs) error { return nil }

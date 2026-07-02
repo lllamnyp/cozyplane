@@ -26,10 +26,11 @@ import (
 )
 
 // SetLocal records a local pod (its host-veth ifindex and pod-interface MAC) in
-// the locals map, so same-node traffic to it is delivered by eBPF redirect
-// (through the to_pod hook) rather than a kernel-routing shortcut. Used by the
-// CNI plugin via the pinned map.
-func SetLocal(podIP net.IP, ifindex int, mac net.HardwareAddr) error {
+// the locals map, keyed by (network id, pod IP) so overlapping VPCs that host
+// the same IP stay distinct. Same-node and post-decap traffic is delivered by
+// eBPF redirect (through the to_pod hook), not a kernel-routing shortcut. Used
+// by the CNI plugin via the pinned map.
+func SetLocal(net_ uint32, podIP net.IP, ifindex int, mac net.HardwareAddr) error {
 	m, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "locals"), nil)
 	if err != nil {
 		return fmt.Errorf("open pinned locals map: %w", err)
@@ -38,16 +39,16 @@ func SetLocal(podIP net.IP, ifindex int, mac net.HardwareAddr) error {
 
 	ep := overlayEndpoint{Ifindex: uint32(ifindex)}
 	copy(ep.Mac[:], mac)
-	if err := m.Put(localKey(podIP), &ep); err != nil {
+	if err := m.Put(localKey(net_, podIP), &ep); err != nil {
 		return fmt.Errorf("set local: %w", err)
 	}
 	return nil
 }
 
-// GetLocal returns the host-veth ifindex and pod MAC recorded for a local pod,
-// and whether an entry exists. Used by SeverLocal to find a live local pod's
-// datapath when its Port is reaped.
-func GetLocal(podIP net.IP) (ifindex int, mac net.HardwareAddr, found bool, err error) {
+// GetLocal returns the host-veth ifindex and pod MAC recorded for a local pod
+// in a network, and whether an entry exists. Used by SeverLocal to find a live
+// local pod's datapath when its Port is reaped.
+func GetLocal(net_ uint32, podIP net.IP) (ifindex int, mac net.HardwareAddr, found bool, err error) {
 	m, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "locals"), nil)
 	if err != nil {
 		return 0, nil, false, fmt.Errorf("open pinned locals map: %w", err)
@@ -55,7 +56,7 @@ func GetLocal(podIP net.IP) (ifindex int, mac net.HardwareAddr, found bool, err 
 	defer m.Close()
 
 	var ep overlayEndpoint
-	if err := m.Lookup(localKey(podIP), &ep); err != nil {
+	if err := m.Lookup(localKey(net_, podIP), &ep); err != nil {
 		if isNotExist(err) {
 			return 0, nil, false, nil
 		}
@@ -65,21 +66,21 @@ func GetLocal(podIP net.IP) (ifindex int, mac net.HardwareAddr, found bool, err 
 }
 
 // DelLocal removes a pod from the locals map.
-func DelLocal(podIP net.IP) error {
+func DelLocal(net_ uint32, podIP net.IP) error {
 	m, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "locals"), nil)
 	if err != nil {
 		return fmt.Errorf("open pinned locals map: %w", err)
 	}
 	defer m.Close()
 
-	if err := m.Delete(localKey(podIP)); err != nil && !isNotExist(err) {
+	if err := m.Delete(localKey(net_, podIP)); err != nil && !isNotExist(err) {
 		return fmt.Errorf("del local: %w", err)
 	}
 	return nil
 }
 
-// localKey lays the IPv4 address out so its bytes match ip->daddr in the eBPF
-// program (network order in memory; little-endian-decoded on this host).
-func localKey(ip net.IP) uint32 {
-	return binary.LittleEndian.Uint32(ip.To4())
+// localKey builds the (network id, IP) key. The IP is laid out so its bytes
+// match ip->daddr in the eBPF program (network order in memory).
+func localKey(net_ uint32, ip net.IP) overlayLocalKey {
+	return overlayLocalKey{Net: net_, Ip: binary.LittleEndian.Uint32(ip.To4())}
 }

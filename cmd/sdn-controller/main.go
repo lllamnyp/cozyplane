@@ -20,7 +20,6 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
-	"strings"
 
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
@@ -115,19 +114,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The gateway's internal-CIDR list doubles as the stage-1 reserved set: a
-	// VPC may not overlap cluster networks until VNI-scoped delivery lands.
-	var reservedCIDRs []string
-	for _, c := range strings.Split(internalCIDRs, ",") {
-		if c = strings.TrimSpace(c); c != "" {
-			reservedCIDRs = append(reservedCIDRs, c)
-		}
-	}
-
 	if err := (&sdncontroller.VPCReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		ReservedCIDRs: reservedCIDRs,
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "VPC")
 		os.Exit(1)

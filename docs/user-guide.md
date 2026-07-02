@@ -111,7 +111,7 @@ metadata:
   name: tenant-a
   namespace: team-a
 spec:
-  cidrs: ["10.10.0.0/24"]   # IPv4, unique cluster-wide (see Limitations)
+  cidrs: ["10.10.0.0/24"]   # IPv4; may overlap other VPCs (see Limitations)
   mtu: 1450
 ```
 
@@ -311,13 +311,13 @@ also cover your node/management networks.
 
 These are prototype constraints, not permanent:
 
-- **Overlapping VPC CIDRs are held `Pending` for now.** Overlap is the design
-  target (isolation is by overlay, not address space), but the stage-1 datapath
-  delivers by IP-keyed maps and kernel `/32` routes, so the controller withholds
-  the VNI from a VPC whose CIDR overlaps an already-Ready VPC or a cluster
-  network (a `CIDRAvailable` condition explains it). This gate disappears with
-  stage-2 (VNI-scoped) delivery. What is *permanent*: **overlapping VPCs can
-  never peer** — peered traffic is routed natively.
+- **Overlapping VPC CIDRs are supported.** Two tenants may both use
+  `10.0.0.0/24` (or any range, including the cluster pod CIDR): everything is
+  delivered by (network id, IP), so identical VPC IPs in different VPCs stay
+  distinct — same node or across nodes, and for north-south too. The one
+  restriction: **overlapping VPCs cannot peer** (peered traffic is routed
+  natively, so a shared address would be ambiguous); a `VPCPeering` between them
+  stays `Pending` with `CIDRsDisjoint=False`.
 - **VPC egress is all-or-nothing**: `spec.egress.natGateway` opens internet +
   cluster DNS; there is no per-destination policy, no Service exposure into a
   VPC, no metadata endpoint, and no floating/public IPs (ingress with source

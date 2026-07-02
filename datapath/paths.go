@@ -57,6 +57,10 @@ const DefaultVNI uint32 = 1
 // match PORT_F_GATEWAY in bpf/overlay.c.
 const PortGatewayFlag uint32 = 1 << 31
 
+// PortNet strips the gateway flag from a ports-map value, yielding the network
+// id (the locals/remotes scope). Mirrors PORT_NET in bpf/overlay.c.
+func PortNet(v uint32) uint32 { return v &^ PortGatewayFlag }
+
 // QuarantineNet is a reserved network id assigned to a pod's ports-map entry to
 // sever it: no VPC CIDR is ever programmed into the networks map with this id
 // (so net_of() never returns it) and no peering pair ever includes it (VNIs

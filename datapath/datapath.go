@@ -23,6 +23,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
@@ -145,9 +146,12 @@ func defaultRouteLink() (int, string, error) {
 	return 0, "", fmt.Errorf("no default route found")
 }
 
-// SetRemote installs (or replaces) a route to another node's pod CIDR.
-func (m *Manager) SetRemote(podCIDR string, nodeIP net.IP) error {
-	key, err := lpmKey(podCIDR)
+// SetRemote installs (or replaces) a route to a remote endpoint within a
+// network scope: a node pod CIDR (scope 0, the default network) or a VPC pod
+// /32 (scope = VNI). Overlapping VPCs never collide because the scope is part
+// of the key.
+func (m *Manager) SetRemote(scope uint32, cidr string, nodeIP net.IP) error {
+	key, err := lpmKey(scope, cidr)
 	if err != nil {
 		return err
 	}
@@ -159,18 +163,20 @@ func (m *Manager) SetRemote(podCIDR string, nodeIP net.IP) error {
 	return m.objs.Remotes.Put(key, binary.BigEndian.Uint32(ip4))
 }
 
-// SetNetwork maps a VPC CIDR to its network id in the networks map.
-func (m *Manager) SetNetwork(cidr string, id uint32) error {
-	key, err := lpmKey(cidr)
+// SetNetwork maps a CIDR, as seen from a scope network, to a destination net
+// id. A VPC's own CIDR is stored at its own scope; a peering stores each side's
+// CIDR under the other's scope.
+func (m *Manager) SetNetwork(scope uint32, cidr string, id uint32) error {
+	key, err := lpmKey(scope, cidr)
 	if err != nil {
 		return err
 	}
 	return m.objs.Networks.Put(key, id)
 }
 
-// DelNetwork removes a VPC CIDR from the networks map.
-func (m *Manager) DelNetwork(cidr string) error {
-	key, err := lpmKey(cidr)
+// DelNetwork removes a (scope, CIDR) entry from the networks map.
+func (m *Manager) DelNetwork(scope uint32, cidr string) error {
+	key, err := lpmKey(scope, cidr)
 	if err != nil {
 		return err
 	}
@@ -180,9 +186,61 @@ func (m *Manager) DelNetwork(cidr string) error {
 	return nil
 }
 
-// DelRemote removes a node's pod CIDR from the remotes map.
-func (m *Manager) DelRemote(podCIDR string) error {
-	key, err := lpmKey(podCIDR)
+// PeerNet is a peering delivery entry: within Scope, CIDR resolves to Net (the
+// peer's network id), so from_pod/to_pod can find and admit peered traffic.
+type PeerNet struct {
+	Scope uint32
+	CIDR  string
+	Net   uint32
+}
+
+// SyncPeerNetworks makes the networks map's cross-scope (peer) entries exactly
+// `desired`, leaving own-CIDR entries untouched. A peer entry is identifiable
+// because its value differs from its scope (an own entry maps a VPC's CIDR to
+// its own id); enumerating the pinned map lets a restarted agent prune
+// peerings deleted while it was down. Mirrors the diff-against-pinned-map
+// pattern used for the peers and gateways maps.
+func (m *Manager) SyncPeerNetworks(desired []PeerNet) error {
+	want := map[overlayLpmKey]uint32{}
+	for _, d := range desired {
+		key, err := lpmKey(d.Scope, d.CIDR)
+		if err != nil {
+			return err
+		}
+		want[key] = d.Net
+	}
+
+	var key overlayLpmKey
+	var val uint32
+	var stale []overlayLpmKey
+	it := m.objs.Networks.Iterate()
+	for it.Next(&key, &val) {
+		if val == key.ScopeNet {
+			continue // own-CIDR entry, not ours to touch
+		}
+		if _, ok := want[key]; !ok {
+			stale = append(stale, key)
+		}
+	}
+	if err := it.Err(); err != nil {
+		return fmt.Errorf("iterate networks: %w", err)
+	}
+	for _, k := range stale {
+		if err := m.objs.Networks.Delete(k); err != nil && !isNotExist(err) {
+			return err
+		}
+	}
+	for k, v := range want {
+		if err := m.objs.Networks.Put(k, v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DelRemote removes a (scope, CIDR) entry from the remotes map.
+func (m *Manager) DelRemote(scope uint32, cidr string) error {
+	key, err := lpmKey(scope, cidr)
 	if err != nil {
 		return err
 	}
@@ -195,10 +253,13 @@ func (m *Manager) DelRemote(podCIDR string) error {
 // Close releases the loaded objects (pins persist).
 func (m *Manager) Close() error { return m.objs.Close() }
 
-// lpmKey builds the LPM-trie key for a pod CIDR. The address is laid out in
-// network byte order in memory (LPM matches MSB-first); on a little-endian host
-// that means the uint32 field decodes the network bytes little-endian.
-func lpmKey(cidr string) (overlayLpmKey, error) {
+// lpmKey builds the scoped LPM-trie key for a CIDR within a network. The
+// address is laid out in network byte order in memory (LPM matches MSB-first);
+// on a little-endian host that means the uint32 field decodes the network bytes
+// little-endian. The scope net occupies the leading 32 key bits (always fully
+// specified: prefixlen = 32 + CIDR ones), so lookups never cross scopes and
+// overlapping CIDRs in different networks stay distinct.
+func lpmKey(scope uint32, cidr string) (overlayLpmKey, error) {
 	_, ipnet, err := net.ParseCIDR(cidr)
 	if err != nil {
 		return overlayLpmKey{}, fmt.Errorf("parse CIDR %q: %w", cidr, err)
@@ -209,13 +270,20 @@ func lpmKey(cidr string) (overlayLpmKey, error) {
 	}
 	ones, _ := ipnet.Mask.Size()
 	return overlayLpmKey{
-		Prefixlen: uint32(ones),
+		Prefixlen: uint32(32 + ones),
+		ScopeNet:  scope,
 		Addr:      binary.LittleEndian.Uint32(ip4),
 	}, nil
 }
 
 func isNotExist(err error) bool {
-	return err != nil && (errors.Is(err, ebpf.ErrKeyNotExist) || os.IsNotExist(err))
+	return err != nil && (errors.Is(err, ebpf.ErrKeyNotExist) || os.IsNotExist(err) || errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ESRCH))
+}
+
+// isExist reports whether err is an "already exists" error (e.g. re-adding an
+// ip rule that survived a previous CNI ADD).
+func isExist(err error) bool {
+	return err != nil && errors.Is(err, syscall.EEXIST)
 }
 
 // WriteProcSys writes a /proc/sys value (path uses '/' separators, e.g.

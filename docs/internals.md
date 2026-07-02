@@ -12,10 +12,19 @@ Every pod interface belongs to a **network**, identified by a small integer
 (≥100, also used as the Geneve VNI). All inter-node traffic rides a single
 per-node Geneve device; the datapath encapsulates a packet only when its
 destination is on another node, and drops it when source and destination
-networks differ (unless a `VPCPeering` explicitly connects the two). The
-default network uses the cluster pod CIDR (unique per node);
-VPCs use their own CIDRs (required unique cluster-wide for now). Services are not
-cozyplane's job — kube-proxy or Cilium-KPR handles them, unchanged.
+networks differ (unless a `VPCPeering` explicitly connects the two). Services
+are not cozyplane's job — kube-proxy or Cilium-KPR handles them, unchanged.
+
+**VPC CIDRs may overlap freely** — two tenants can both use `10.0.0.0/24`, even
+the cluster pod CIDR. Everything a tenant addresses is keyed by **(network id,
+IP)**, never by IP alone: the `locals`, `remotes`, and `networks` maps carry a
+network scope, and cross-node overlay traffic is decapsulated and delivered by
+an eBPF program that demuxes on the Geneve VNI (the kernel cannot route two
+identical VPC IPs). The default/system network keeps unique cluster-pod-CIDR
+addresses and stays on the kernel-routed path, so only genuine VPC overlay
+traffic takes the eBPF delivery path. The one rule overlap carries: two VPCs
+with overlapping CIDRs cannot **peer** (peered traffic is routed natively, so a
+shared address would be ambiguous).
 
 ## 2. Components
 
@@ -71,13 +80,22 @@ maps and one program.
 
 | Map | Type | Key → Value | Written by |
 |-----|------|-------------|-----------|
-| `remotes` | LPM trie | dst IP/CIDR → remote node IP | agent (Nodes + Ports) |
-| `networks` | LPM trie | VPC CIDR → network id | agent (VPCs) |
+| `remotes` | LPM trie | {scope net, dst IP/CIDR} → remote node IP | agent (Nodes + Ports) |
+| `networks` | LPM trie | {scope net, CIDR} → dst net id | agent (VPCs + VPCPeerings) |
 | `ports` | hash | veth ifindex → network id (bit 31 = gateway leg) | plugin (per pod) |
-| `locals` | hash | pod IP → {veth ifindex, pod MAC} | plugin (per pod) |
+| `locals` | hash | {net id, pod IP} → {veth ifindex, pod MAC} | plugin (per pod) |
 | `peers` | hash | {src net id, dst net id} → 1 | agent (VPCPeerings) |
 | `gateways` | hash | net id → {gateway .1 IP, node IP (0=local)} | agent (gateway Ports) |
 | `params` | array | `[0]`=Geneve ifindex, `[1]`=default VNI | agent |
+
+The scoped maps use a `{prefixlen, scope_net, addr}` LPM key: the scope net
+occupies the leading 32 bits (always fully specified), so a lookup never
+crosses scopes. `networks` doubles as delivery *and* isolation resolution — a
+VPC's own CIDR maps to itself at its own scope (`{Nx, Cx} → Nx`); a peering
+adds each side's CIDR under the other's scope (`{Nx, Cy} → Ny`), so
+`from_pod`/`to_pod` resolve the peer's net and the peers-map verdict admits it.
+A peer entry is recognizable (value ≠ scope), which lets the agent prune stale
+ones after a restart.
 
 All are pinned under `/sys/fs/bpf/cozyplane/` (`LIBBPF_PIN_BY_NAME`) so the
 short-lived plugin and the long-running agent share the same map instances.
@@ -172,20 +190,32 @@ overlay traffic is accepted before that drop.
 ### Packet walks
 
 **Default network, cross-node (pod A on N1 → pod B on N2):** A sends → host veth
-ingress → `from_pod` (srcnet 0, dstnet 0, allowed) → `remotes` hit (B's node) →
-inner MAC rewritten, tunnel key {vni=1, N2}, redirect to Geneve → out the uplink
-as Geneve/UDP 6081 → N2 receives, kernel decaps (frame addressed to N2's Geneve
-MAC) → routes to B via B's `/32` → B. Reply retraces it.
+ingress → `from_pod` (srcnet 0, dstnet 0, allowed) → `remotes` hit at scope 0
+(B's node) → inner MAC rewritten, tunnel key {vni=1, N2}, redirect to Geneve →
+out the uplink as Geneve/UDP 6081 → N2 receives, kernel decaps (frame addressed
+to N2's Geneve MAC), `from_overlay` sees the default VNI and passes it to the
+kernel → routes to B via B's `/32` → B. Reply retraces it.
 
 **Node → remote pod:** host stack routes the packet out the uplink → uplink
 egress `from_pod` (srcnet 0 because the uplink isn't in `ports`) → `remotes` hit
 → encapsulate. This is what makes Service return paths and apiserver→pod work.
 
-**Isolation (VPC pod → default pod):** srcnet = the VPC's id, dstnet = 0 → differ
-→ `TC_ACT_SHOT`. Same for default→VPC and VPC→other-VPC — unless the two VPCs
-are connected by a `VPCPeering`, in which case `peers[{src,dst}]` hits and the
-packet is delivered exactly like same-VPC traffic (native IPs, no NAT; `locals`
-redirect same-node, `remotes` encap cross-node).
+**Isolation (VPC pod → default pod):** srcnet = the VPC's id; `net_of(networks,
+srcnet, dst)` misses (the default network's addresses aren't in the VPC's scope)
+→ dstnet 0 → off-net → drop (or the gateway, if one exists). Same for
+VPC→other-VPC. A `VPCPeering` is the exception: it adds the peer's CIDR to each
+side's scope, so `net_of` resolves the peer's net, `peers[{src,dst}]` admits it,
+and the packet is delivered exactly like same-VPC traffic (native IPs, no NAT;
+`locals[{dstnet,dst}]` redirect same-node, `remotes[{dstnet,dst}]` encap
+cross-node). Overlapping CIDRs make this ambiguous, so they can't peer.
+
+**VPC, cross-node under overlapping CIDRs (A in VPC-X → B in VPC-X, another VPC-Y
+pod shares B's IP):** A → `from_pod` resolves dstnet = X (B is in X's scope) →
+`remotes[{X, B-ip}]` hit → encap with **tunnel_id = X** → B's node. There
+`from_overlay` reads VNI X, looks up `locals[{X, B-ip}]`, and redirects into B's
+veth — *not* the kernel's `/32` route, which couldn't tell B from the VPC-Y pod
+sharing the IP. The VPC-Y pod is reached only under tunnel_id Y. Same-node, A's
+`from_pod` uses `locals[{X, B-ip}]` directly.
 
 **Egress (VPC pod → 8.8.8.8, gateway on another node):** srcnet = VPC id,
 dstnet 0, peers miss → `gateways[srcnet]` hit → encap to the gateway's node
@@ -202,10 +232,6 @@ unwinds the two conntracks, and the gateway sends `8.8.8.8 → tenant-IP` out
 its **VPC leg**: `from_pod` there is flagged (ports bit 31) so the packet gets
 the gateway mark (same-node) or the `TUN_F_GATEWAY` VNI bit (cross-node), and
 the tenant's `to_pod` admits the off-VPC source.
-
-**VPC, cross-node:** identical to the default walk, but srcnet/dstnet are the
-VPC's id and the tunnel VNI carries it; delivery still works by `/32` route
-because VPC CIDRs are unique cluster-wide today.
 
 ### The dual-address bridge (VPC pods)
 
@@ -232,23 +258,31 @@ by the isolation rule). Because the fabric IP lives in the node pod CIDR, the
 existing default overlay carries it cross-node, so Services/Endpoints and
 remote-node access to VPC pods work unchanged.
 
-"Stage 1" (built) requires VPC CIDRs unique cluster-wide, because delivery to the
-pod after DNAT is by the VPC IP's `/32` route. Overlapping CIDRs ("stage 2") need
-eBPF-keyed-by-fabric-IP delivery plus BPF conntrack, replacing the kernel-NAT
-path.
+**Per-pod delivery under overlapping CIDRs.** After `PREROUTING` DNATs
+`fabricIP → vpcIP`, the destination is the VPC IP — which two same-node pods in
+different VPCs may share, so a single main-table `vpcIP/32` route would be
+ambiguous. The **fabric IP is unique**, so the bridge derives a per-pod id from
+its offset within the node pod CIDR (deterministic, no allocator): a `mangle`
+rule marks the packet by its fabric IP *before* the DNAT (`--set-xmark
+offset<<16`, in fwmark bits that miss kube-proxy/Cilium), and an `ip rule`
+(priority `100+offset`, sorted **before** the main table so its default route
+can't shadow the mark) sends the marked packet to a per-pod table holding
+`vpcIP/32 dev <that pod's veth>`. The return is plain kernel conntrack. So the
+bridge, like the overlay, delivers by identity rather than by a shared address.
 
 ### Addressing / byte order (for maintainers)
 
-- `remotes` / `networks` LPM keys are `{prefixlen uint32, addr uint32}` with
-  `addr` in **network byte order** (LPM matches MSB-first). In Go the field is
+- `remotes` / `networks` LPM keys are `{prefixlen, scope_net, addr}` with
+  `addr` in **network byte order** (LPM matches MSB-first) and `scope_net` an
+  opaque net id matched for equality in the leading 32 bits. In Go `addr` is
   filled with `binary.LittleEndian.Uint32(ip4)` so its native-endian marshaling
   lands the bytes in network order; the C side uses `ip->daddr` directly. See
   `datapath.lpmKey`.
 - `remotes` values are the remote node IP in **host byte order**, because
   `bpf_skb_set_tunnel_key`'s `remote_ipv4` is host-order (the kernel does
   `cpu_to_be32`). Filled with `binary.BigEndian.Uint32(ip4)`.
-- `locals` keys are the pod IP in **network byte order** too (the C side keys on
-  `ip->daddr`); see `datapath.localKey`.
+- `locals` keys are `{net id, pod IP}`, the IP in **network byte order** too
+  (the C side keys on `ip->daddr`); see `datapath.localKey`.
 
 This byte-order contract is locked by `datapath/keys_test.go`, which asserts the
 keys marshal to the address in network order regardless of host endianness — so
@@ -459,11 +493,8 @@ hack/                       codegen scripts; Makefile drives generate/build
 The design (three planes, dual-address bridge, identity-based policy, etc.) is
 mostly future work. As built:
 
-- Overlapping VPC CIDRs are gated: the controller withholds the VNI (condition
-  `CIDRAvailable=False`) while a CIDR overlaps a Ready VPC or a reserved
-  cluster network, because stage-1 delivery is IP-keyed (see "The dual-address
-  bridge"). The gate is deleted at stage 2; only the peering-disjointness rule
-  is permanent.
+- Overlapping VPC CIDRs are supported (net-scoped delivery, above); only
+  *peering* overlapping VPCs is refused.
 - VPC egress is opt-in and coarse: `spec.egress.natGateway` opens internet +
   cluster DNS through a single per-VPC gateway pod; no per-destination policy,
   Service exposure, metadata endpoint, or floating IPs (source-preserving

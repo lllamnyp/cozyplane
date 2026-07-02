@@ -190,7 +190,7 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	} else {
 		factory := sdninformers.NewSharedInformerFactory(sdnClient, 0)
 		watchVPCs(factory, mgr, log)
-		watchPorts(ctx, factory, sdnClient, client, mgr, nodeName, log)
+		watchPorts(ctx, factory, sdnClient, client, mgr, nodeName, podCIDR, log)
 		watchPeerings(ctx, factory, mgr, log)
 		watchGateways(ctx, factory, mgr, nodeName, log)
 		factory.Start(ctx.Done())
@@ -223,7 +223,8 @@ func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.
 			log.Warn("node has no InternalIP", "node", node.Name)
 			return
 		}
-		if err := mgr.SetRemote(node.Spec.PodCIDR, net.ParseIP(ip)); err != nil {
+		// Node pod CIDRs are the default network (scope 0).
+		if err := mgr.SetRemote(0, node.Spec.PodCIDR, net.ParseIP(ip)); err != nil {
 			log.Error("set remote", "node", node.Name, "err", err)
 			return
 		}
@@ -238,7 +239,7 @@ func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.
 			if !ok || node.Name == selfName || node.Spec.PodCIDR == "" {
 				return
 			}
-			if err := mgr.DelRemote(node.Spec.PodCIDR); err != nil {
+			if err := mgr.DelRemote(0, node.Spec.PodCIDR); err != nil {
 				log.Error("del remote", "node", node.Name, "err", err)
 			}
 		},
@@ -265,7 +266,9 @@ func watchVPCs(factory sdninformers.SharedInformerFactory, mgr *datapath.Manager
 		if !ok || vpc.Status.VNI == 0 || len(vpc.Spec.CIDRs) == 0 {
 			return
 		}
-		if err := mgr.SetNetwork(vpc.Spec.CIDRs[0], uint32(vpc.Status.VNI)); err != nil {
+		vni := uint32(vpc.Status.VNI)
+		// A VPC's own CIDR resolves to itself within its own scope (scope==net).
+		if err := mgr.SetNetwork(vni, vpc.Spec.CIDRs[0], vni); err != nil {
 			log.Error("set network", "vpc", vpc.Name, "err", err)
 			return
 		}
@@ -277,10 +280,10 @@ func watchVPCs(factory sdninformers.SharedInformerFactory, mgr *datapath.Manager
 		UpdateFunc: func(_, newObj any) { apply(newObj) },
 		DeleteFunc: func(obj any) {
 			vpc, ok := obj.(*sdnv1alpha1.VPC)
-			if !ok || len(vpc.Spec.CIDRs) == 0 {
+			if !ok || vpc.Status.VNI == 0 || len(vpc.Spec.CIDRs) == 0 {
 				return
 			}
-			if err := mgr.DelNetwork(vpc.Spec.CIDRs[0]); err != nil {
+			if err := mgr.DelNetwork(uint32(vpc.Status.VNI), vpc.Spec.CIDRs[0]); err != nil {
 				log.Error("del network", "vpc", vpc.Name, "err", err)
 			}
 		},
@@ -291,7 +294,7 @@ func watchVPCs(factory sdninformers.SharedInformerFactory, mgr *datapath.Manager
 // map as /32 routes to their node's Geneve endpoint, and severs a *local* pod's
 // datapath when its Port is reaped out from under it (revocation). Best-effort,
 // like watchVPCs.
-func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory, sdn sdnclientset.Interface, core kubernetes.Interface, mgr *datapath.Manager, selfName string, log *slog.Logger) {
+func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory, sdn sdnclientset.Interface, core kubernetes.Interface, mgr *datapath.Manager, selfName, podCIDR string, log *slog.Logger) {
 	informer := factory.Sdn().V1alpha1().Ports().Informer()
 
 	apply := func(obj any) {
@@ -305,14 +308,20 @@ func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory,
 		// revocation that landed while this agent was down replays here.
 		if port.DeletionTimestamp != nil {
 			if port.Spec.Node == selfName {
-				releaseSeveredPort(ctx, sdn, core, port, log)
+				releaseSeveredPort(ctx, sdn, core, port, podCIDR, log)
 			}
 			return
 		}
 		if port.Spec.Node == selfName || port.Spec.IP == "" || port.Spec.NodeIP == "" {
 			return // local ports are reached directly; skip incomplete ones
 		}
-		if err := mgr.SetRemote(port.Spec.IP+"/32", net.ParseIP(port.Spec.NodeIP)); err != nil {
+		net_, ok := vniFromPortName(port.Name)
+		if !ok {
+			return
+		}
+		// Remote VPC pods are reached within their VPC's scope, so overlapping
+		// CIDRs on different nodes never collide.
+		if err := mgr.SetRemote(net_, port.Spec.IP+"/32", net.ParseIP(port.Spec.NodeIP)); err != nil {
 			log.Error("set remote port", "port", port.Name, "err", err)
 			return
 		}
@@ -327,13 +336,17 @@ func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory,
 			if port == nil || port.Spec.IP == "" {
 				return
 			}
+			net_, ok := vniFromPortName(port.Name)
+			if !ok {
+				return
+			}
 			if port.Spec.Node == selfName {
 				// Belt for Ports created before the sever finalizer existed;
 				// finalized Ports were already severed while terminating.
-				severLocalPort(ctx, core, port, log)
+				severLocalPort(ctx, core, port, podCIDR, log)
 				return
 			}
-			if err := mgr.DelRemote(port.Spec.IP + "/32"); err != nil {
+			if err := mgr.DelRemote(net_, port.Spec.IP+"/32"); err != nil {
 				log.Error("del remote port", "port", port.Name, "err", err)
 			}
 		},
@@ -343,11 +356,11 @@ func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory,
 // releaseSeveredPort handles a terminating Port on this node: sever the live
 // pod if the Port was reaped out from under it, then remove the sever
 // finalizer so the deletion completes. Idempotent — re-delivery is harmless.
-func releaseSeveredPort(ctx context.Context, sdn sdnclientset.Interface, core kubernetes.Interface, port *sdnv1alpha1.Port, log *slog.Logger) {
+func releaseSeveredPort(ctx context.Context, sdn sdnclientset.Interface, core kubernetes.Interface, port *sdnv1alpha1.Port, podCIDR string, log *slog.Logger) {
 	if !slices.Contains(port.Finalizers, sdnv1alpha1.FinalizerSever) {
 		return
 	}
-	severLocalPort(ctx, core, port, log)
+	severLocalPort(ctx, core, port, podCIDR, log)
 	for range 3 {
 		latest, err := sdn.SdnV1alpha1().Ports().Get(ctx, port.Name, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
@@ -403,7 +416,19 @@ func watchPeerings(ctx context.Context, factory sdninformers.SharedInformerFacto
 			}
 			return v
 		}
-		desired := desiredPeerPairs(all, vpc)
+		links := desiredPeerLinks(all, vpc)
+
+		// A live peering programs two datapath facts: the peers-map verdict
+		// (may these two nets talk) and the networks delivery entries (each
+		// side's CIDR resolves to the other from its own scope).
+		desired := map[[2]uint32]bool{}
+		var peerNets []datapath.PeerNet
+		for _, l := range links {
+			desired[[2]uint32{l.a, l.b}] = true
+			peerNets = append(peerNets,
+				datapath.PeerNet{Scope: l.a, CIDR: l.cidrB, Net: l.b},
+				datapath.PeerNet{Scope: l.b, CIDR: l.cidrA, Net: l.a})
+		}
 
 		current, err := mgr.Peers()
 		if err != nil {
@@ -427,6 +452,9 @@ func watchPeerings(ctx context.Context, factory sdninformers.SharedInformerFacto
 				}
 				log.Info("peer removed", "vni-a", pair[0], "vni-b", pair[1])
 			}
+		}
+		if err := mgr.SyncPeerNetworks(peerNets); err != nil {
+			log.Error("sync peer networks", "err", err)
 		}
 	}
 
@@ -564,17 +592,27 @@ func vniFromPortName(name string) (uint32, bool) {
 	return uint32(vni), true
 }
 
-// desiredPeerPairs computes the normalized (low, high) VNI pairs that should be
-// programmed: one per pair of mutually-matched peering halves whose local and
-// peer VPCs both have assigned VNIs and whose CIDRs are disjoint — peered
-// traffic is routed natively, so overlapping address spaces cannot be
-// connected (the one restriction overlap carries).
-func desiredPeerPairs(peerings []*sdnv1alpha1.VPCPeering, vpc func(namespace, name string) *sdnv1alpha1.VPC) map[[2]uint32]bool {
-	desired := map[[2]uint32]bool{}
+// peerLink is a live peering between two VPCs, normalized so a < b, carrying
+// each side's VNI and first CIDR (for the networks delivery entries).
+type peerLink struct {
+	a, b         uint32
+	cidrA, cidrB string
+}
+
+// desiredPeerLinks computes the live peerings: one per pair of mutually-matched
+// halves whose local and peer VPCs both have assigned VNIs and whose CIDRs are
+// disjoint — peered traffic is routed natively, so overlapping address spaces
+// cannot be connected (the one restriction overlap carries).
+func desiredPeerLinks(peerings []*sdnv1alpha1.VPCPeering, vpc func(namespace, name string) *sdnv1alpha1.VPC) []peerLink {
+	seen := map[[2]uint32]bool{}
+	var out []peerLink
 	for _, p := range peerings {
 		va := vpc(p.Namespace, p.Spec.VPCRef.Name)
 		vb := vpc(p.Spec.PeerRef.Namespace, p.Spec.PeerRef.Name)
 		if va == nil || vb == nil || va.Status.VNI == 0 || vb.Status.VNI == 0 {
+			continue
+		}
+		if len(va.Spec.CIDRs) == 0 || len(vb.Spec.CIDRs) == 0 {
 			continue
 		}
 		if sdnv1alpha1.CIDRsOverlap(va.Spec.CIDRs, vb.Spec.CIDRs) {
@@ -591,12 +629,18 @@ func desiredPeerPairs(peerings []*sdnv1alpha1.VPCPeering, vpc func(namespace, na
 			continue
 		}
 		a, b := uint32(va.Status.VNI), uint32(vb.Status.VNI)
+		ca, cb := va.Spec.CIDRs[0], vb.Spec.CIDRs[0]
 		if a > b {
 			a, b = b, a
+			ca, cb = cb, ca
 		}
-		desired[[2]uint32{a, b}] = true
+		if seen[[2]uint32{a, b}] {
+			continue
+		}
+		seen[[2]uint32{a, b}] = true
+		out = append(out, peerLink{a: a, b: b, cidrA: ca, cidrB: cb})
 	}
-	return desired
+	return out
 }
 
 // portFromDelete extracts a Port from a delete event, unwrapping the
@@ -618,8 +662,12 @@ func portFromDelete(obj any) *sdnv1alpha1.Port {
 // has already cleaned up. It only severs if the owning pod still exists, is not
 // being deleted, and is the same pod (UID) that claimed the Port — so a stale
 // delete for a name-reused pod can't cut off an unrelated one.
-func severLocalPort(ctx context.Context, core kubernetes.Interface, port *sdnv1alpha1.Port, log *slog.Logger) {
+func severLocalPort(ctx context.Context, core kubernetes.Interface, port *sdnv1alpha1.Port, podCIDR string, log *slog.Logger) {
 	if port.Spec.PodNamespace == "" || port.Spec.PodName == "" {
+		return
+	}
+	net_, ok := vniFromPortName(port.Name)
+	if !ok {
 		return
 	}
 	pod, err := core.CoreV1().Pods(port.Spec.PodNamespace).Get(ctx, port.Spec.PodName, metav1.GetOptions{})
@@ -632,7 +680,7 @@ func severLocalPort(ctx context.Context, core kubernetes.Interface, port *sdnv1a
 	if uid := port.Labels[sdnv1alpha1.LabelPodUID]; uid != "" && string(pod.UID) != uid {
 		return // a different pod reused the name; not the one this Port belonged to
 	}
-	severed, err := datapath.SeverLocal(net.ParseIP(port.Spec.IP), port.Spec.FabricIP)
+	severed, err := datapath.SeverLocal(net_, net.ParseIP(port.Spec.IP), port.Spec.FabricIP, podCIDR)
 	if err != nil {
 		log.Error("sever local port", "port", port.Name, "err", err)
 		return

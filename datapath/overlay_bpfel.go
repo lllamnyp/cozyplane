@@ -26,9 +26,16 @@ type overlayGwEntry struct {
 	NodeIp uint32
 }
 
+type overlayLocalKey struct {
+	_   structs.HostLayout
+	Net uint32
+	Ip  uint32
+}
+
 type overlayLpmKey struct {
 	_         structs.HostLayout
 	Prefixlen uint32
+	ScopeNet  uint32
 	Addr      uint32
 }
 

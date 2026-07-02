@@ -46,60 +46,39 @@ func vpcWithVNI(name string, vni int32) *sdnv1alpha1.VPC {
 	}
 }
 
-// INTERIM stage-1 gate: a VPC whose CIDR overlaps an already-Ready VPC (or a
-// reserved cluster CIDR) is held Pending without a VNI — the stage-1 datapath
-// delivers by IP, so a shared address would cross tenants. The gate lifts the
-// moment the conflict goes away, and the whole check is deleted at stage 2.
-func TestVPCCIDRConflictGate(t *testing.T) {
+// Overlapping VPC CIDRs coexist: both get a VNI and go Ready (isolation is by
+// overlay, not address space — stage 2). Only *peering* them is refused,
+// elsewhere.
+func TestVPCsWithOverlappingCIDRsBothReady(t *testing.T) {
 	first := &sdnv1alpha1.VPC{
 		ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "team-a"},
-		Spec:       sdnv1alpha1.VPCSpec{CIDRs: []string{"10.10.0.0/24"}},
+		Spec:       sdnv1alpha1.VPCSpec{CIDRs: []string{"10.0.0.0/24"}},
 		Status:     sdnv1alpha1.VPCStatus{VNI: 100, Phase: sdnv1alpha1.VPCPhaseReady},
 	}
 	second := &sdnv1alpha1.VPC{
 		ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: "team-b"},
-		Spec:       sdnv1alpha1.VPCSpec{CIDRs: []string{"10.10.0.0/16"}}, // overlaps first
-	}
-	reserved := &sdnv1alpha1.VPC{
-		ObjectMeta: metav1.ObjectMeta{Name: "reserved", Namespace: "team-c"},
-		Spec:       sdnv1alpha1.VPCSpec{CIDRs: []string{"10.244.1.0/24"}}, // inside the cluster CIDR
+		Spec:       sdnv1alpha1.VPCSpec{CIDRs: []string{"10.0.0.0/24"}}, // identical CIDR
 	}
 	scheme := testScheme(t)
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(first, second, reserved).
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(first, second).
 		WithStatusSubresource(&sdnv1alpha1.VPC{}).Build()
-	r := &VPCReconciler{Client: c, Scheme: scheme, ReservedCIDRs: []string{"10.244.0.0/16"}}
+	r := &VPCReconciler{Client: c, Scheme: scheme}
 	ctx := context.Background()
 
-	for _, tc := range []struct{ ns, name string }{{"team-b", "second"}, {"team-c", "reserved"}} {
-		key := types.NamespacedName{Namespace: tc.ns, Name: tc.name}
-		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
-			t.Fatalf("reconcile %s: %v", tc.name, err)
-		}
-		got := &sdnv1alpha1.VPC{}
-		if err := c.Get(ctx, key, got); err != nil {
-			t.Fatalf("get: %v", err)
-		}
-		if got.Status.VNI != 0 || got.Status.Phase == sdnv1alpha1.VPCPhaseReady {
-			t.Errorf("%s: expected no VNI and not Ready while conflicting, got vni=%d phase=%q",
-				tc.name, got.Status.VNI, got.Status.Phase)
-		}
-	}
-
-	// The conflicting VPC goes away; the gate lifts on the next reconcile.
-	if err := c.Delete(ctx, first); err != nil {
-		t.Fatalf("delete first: %v", err)
-	}
 	key := types.NamespacedName{Namespace: "team-b", Name: "second"}
 	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
-		t.Fatalf("reconcile after delete: %v", err)
+		t.Fatalf("reconcile: %v", err)
 	}
 	got := &sdnv1alpha1.VPC{}
 	if err := c.Get(ctx, key, got); err != nil {
 		t.Fatalf("get: %v", err)
 	}
 	if got.Status.VNI == 0 || got.Status.Phase != sdnv1alpha1.VPCPhaseReady {
-		t.Errorf("expected Ready with a VNI once the conflict is gone, got vni=%d phase=%q",
+		t.Errorf("a VPC overlapping another should still be Ready with a VNI, got vni=%d phase=%q",
 			got.Status.VNI, got.Status.Phase)
+	}
+	if got.Status.VNI == first.Status.VNI {
+		t.Errorf("overlapping VPCs must get distinct VNIs, both got %d", got.Status.VNI)
 	}
 }
 

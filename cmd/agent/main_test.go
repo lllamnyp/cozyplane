@@ -179,7 +179,11 @@ func TestDesiredPeerPairs(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := desiredPeerPairs(tc.peerings, vnis)
+			links := desiredPeerLinks(tc.peerings, vnis)
+			got := map[[2]uint32]bool{}
+			for _, l := range links {
+				got[[2]uint32{l.a, l.b}] = true
+			}
 			if len(got) != len(tc.want) {
 				t.Fatalf("got %v, want %v", got, tc.want)
 			}
@@ -189,5 +193,26 @@ func TestDesiredPeerPairs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A live peering also programs delivery entries (each side's CIDR resolves to
+// the other from its own scope) — the datapath fact that makes peered pods
+// findable under net-scoped delivery.
+func TestDesiredPeerLinksCarryCIDRs(t *testing.T) {
+	vnis := vpcTable(map[string]*sdnv1alpha1.VPC{
+		"team-a/vpc-a": vpcWith(100, "10.10.0.0/24"),
+		"team-b/vpc-b": vpcWith(101, "10.20.0.0/24"),
+	})
+	links := desiredPeerLinks([]*sdnv1alpha1.VPCPeering{
+		half("team-a", "to-b", "vpc-a", "team-b", "vpc-b"),
+		half("team-b", "to-a", "vpc-b", "team-a", "vpc-a"),
+	}, vnis)
+	if len(links) != 1 {
+		t.Fatalf("got %d links, want 1: %+v", len(links), links)
+	}
+	l := links[0]
+	if l.a != 100 || l.b != 101 || l.cidrA != "10.10.0.0/24" || l.cidrB != "10.20.0.0/24" {
+		t.Errorf("link = %+v, want {100 101 10.10.0.0/24 10.20.0.0/24}", l)
 	}
 }
