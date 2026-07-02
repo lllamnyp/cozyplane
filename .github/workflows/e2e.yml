@@ -1,0 +1,35 @@
+name: e2e
+
+# The datapath e2e (test/e2e.sh) stands up a kind cluster, installs cozyplane,
+# and drives the behaviour matrix: default network, VPC isolation/default-deny,
+# overlapping-CIDR delivery, the north-south eBPF NAT bridge, peering, per-VPC
+# egress, and revocation. It needs the tc/eBPF datapath live on real veths, so
+# it runs manually (or on a schedule) rather than gating every PR — nested-kind
+# eBPF is too environment-sensitive to block merges on.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'  # Mondays 06:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: install kind
+        run: go install sigs.k8s.io/kind@v0.27.0
+
+      - name: build image
+        run: docker build -t ghcr.io/lllamnyp/cozyplane:e2e .
+
+      - name: run e2e
+        run: IMAGE=ghcr.io/lllamnyp/cozyplane:e2e IMAGE_PREBUILT=1 bash test/e2e.sh

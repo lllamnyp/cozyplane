@@ -1,0 +1,80 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l $(git ls-files '*.go' | grep -v '/vendor/'))
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+      - name: codegen drift
+        run: |
+          make generate
+          if ! git diff --exit-code; then
+            echo "Generated code is stale — run 'make generate' and commit the result." >&2
+            exit 1
+          fi
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: helm lint (both serving modes)
+        run: |
+          helm lint chart/cozyplane
+          helm template chart/cozyplane --set apiserver.enabled=true >/dev/null
+          helm template chart/cozyplane --set apiserver.enabled=true \
+            --set apiserver.etcd.operator.enabled=true >/dev/null
+
+  # The compiled eBPF object (datapath/overlay_bpfel.*) is committed and embedded
+  # via go:embed. Regenerate it from the runner's kernel BTF and flag drift. The
+  # exact object bytes are clang-version sensitive, so this is informational
+  # (non-blocking): what it reliably guards is the generated Go bindings
+  # (map/struct layout), which must match bpf/overlay.c.
+  ebpf:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: install clang + bpftool
+        run: sudo apt-get update && sudo apt-get install -y clang llvm linux-tools-common linux-tools-generic
+      - name: generate vmlinux.h from runner BTF
+        run: |
+          test -f /sys/kernel/btf/vmlinux
+          bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h
+      - name: go generate ./datapath
+        run: go generate ./datapath
+      - name: flag bindings drift
+        run: |
+          if ! git diff --exit-code datapath/overlay_bpfel.go; then
+            echo "::warning::eBPF Go bindings differ from bpf/overlay.c — run 'go generate ./datapath' and commit."
+          fi
