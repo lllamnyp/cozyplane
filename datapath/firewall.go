@@ -48,21 +48,44 @@ func EnsureForwardRules() error {
 	return nil
 }
 
+// masqChain holds the node masquerade policy.
+const masqChain = "COZYPLANE-MASQ"
+
 // EnsureMasquerade SNATs pod traffic leaving the cluster to this node's
 // address (the flannel-style rule): without it pods have no return path from
 // anything beyond the cluster, because pod CIDRs aren't routable outside.
-// clusterCIDR is the whole cluster pod supernet, and the rule is scoped to
-// the node uplink: a VPC gateway's reply carrying a cluster-CIDR source (e.g.
-// a conntrack-restored CoreDNS pod IP) toward a tenant VPC address is
-// *forwarded to a veth*, and must not be re-sourced on the way.
-func EnsureMasquerade(clusterCIDR, uplink string) error {
+//
+// The rule must NOT be scoped to a single uplink (nodes may be multi-homed —
+// e.g. internet via eth0, the node subnet via eth1) but must exclude every
+// cozyplane-owned egress interface: a packet leaving via a pod veth or the
+// Geneve device is a *delivery into the overlay* (e.g. a VPC gateway's reply
+// carrying a cluster-CIDR source toward a tenant address) and must not be
+// re-sourced on the way.
+func EnsureMasquerade(clusterCIDR string) error {
 	ipt, err := iptables.New()
 	if err != nil {
 		return fmt.Errorf("init iptables: %w", err)
 	}
-	spec := []string{"-s", clusterCIDR, "!", "-d", clusterCIDR, "-o", uplink, "-j", "MASQUERADE"}
+	if exists, err := ipt.ChainExists("nat", masqChain); err != nil {
+		return fmt.Errorf("check %s chain: %w", masqChain, err)
+	} else if !exists {
+		if err := ipt.NewChain("nat", masqChain); err != nil {
+			return fmt.Errorf("create %s chain: %w", masqChain, err)
+		}
+	}
+	for _, spec := range [][]string{
+		{"-o", GeneveDevice, "-j", "RETURN"},
+		{"-o", "cph+", "-j", "RETURN"}, // pod veths
+		{"-o", "cpg+", "-j", "RETURN"}, // gateway VPC-leg veths
+		{"-j", "MASQUERADE"},
+	} {
+		if err := ipt.AppendUnique("nat", masqChain, spec...); err != nil {
+			return fmt.Errorf("append %s rule %v: %w", masqChain, spec, err)
+		}
+	}
+	spec := []string{"-s", clusterCIDR, "!", "-d", clusterCIDR, "-j", masqChain}
 	if err := ipt.AppendUnique("nat", "POSTROUTING", spec...); err != nil {
-		return fmt.Errorf("append MASQUERADE rule: %w", err)
+		return fmt.Errorf("append MASQUERADE jump: %w", err)
 	}
 	return nil
 }

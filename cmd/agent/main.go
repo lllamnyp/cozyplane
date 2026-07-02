@@ -134,14 +134,14 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	if err := datapath.EnsureBridgeChain(); err != nil {
 		return fmt.Errorf("ensure bridge chain: %w", err)
 	}
+	if clusterCIDR != "" {
+		if err := datapath.EnsureMasquerade(clusterCIDR); err != nil {
+			return fmt.Errorf("ensure masquerade: %w", err)
+		}
+	}
 	uplink, err := mgr.AttachUplink()
 	if err != nil {
 		return fmt.Errorf("attach uplink: %w", err)
-	}
-	if clusterCIDR != "" {
-		if err := datapath.EnsureMasquerade(clusterCIDR, uplink); err != nil {
-			return fmt.Errorf("ensure masquerade: %w", err)
-		}
 	}
 	log.Info("datapath loaded", "vni", vni, "geneve", datapath.GeneveDevice, "uplink", uplink)
 
