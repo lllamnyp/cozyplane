@@ -288,16 +288,21 @@ the client-masquerade removed, so the tenant sees the *real* caller. The pieces:
 
 - **`floating` map** (`publicIP → {net, vpcIP}`), programmed by the agent — the
   external-facing sibling of `bridges`.
-- **Advertisement from the target pod's own node.** The agent on whatever node
-  currently hosts the target's Port makes the node answer ARP for `publicIP` by
-  assigning it as a `/32` on the uplink (L2 mode; BGP later). Proxy-ARP (a pneigh
-  entry) does *not* work here: a floating IP is drawn from an L2 the node is
-  already on, so the kernel treats the address as same-link and never proxies it —
-  the classic MetalLB-L2 problem. Assigning the `/32` makes the kernel answer for
-  it as a local address; `from_uplink` still intercepts inbound at tc ingress
-  before any local delivery. So `client → publicIP` always arrives where the pod
-  already is: floating ingress is always *local*, never cross-node, and the
-  address follows the pod on reschedule.
+- **Advertisement in `from_uplink` itself.** The address is announced with no
+  host-side state at all: `from_uplink`, already at the uplink ingress, answers
+  ARP for it. On an ARP *request* whose target is a `floating` key with a live
+  local pod, it rewrites the frame into a *reply* in place (sender = the node's
+  uplink MAC + the floating IP, target = the requester) and reflects it back out
+  the uplink. The `floating` map *is* the advertisement — programming it is
+  enough; there is no `ip addr`, no route, no proxy-ARP. (Proxy-ARP was a dead
+  end: a floating IP is drawn from an L2 the node already sits on, so the kernel
+  treats it as same-link and never proxies it — the MetalLB-L2 problem. Assigning
+  a local `/32` worked but made the reply a martian source; answering in eBPF
+  avoids both.) Because a node only answers for a floating IP whose target pod is
+  *local*, `client → publicIP` always arrives where the pod already is: floating
+  ingress is always *local*, never cross-node, and the address follows the pod on
+  reschedule. (L2 today; BGP later. A pod moving nodes relies on the client's ARP
+  cache expiring — a gratuitous ARP on move is a later refinement.)
 - **An uplink-ingress hook** (`from_uplink`). A tc program at the node uplink's
   ingress catches `client → publicIP` and `bpf_redirect`s it into the target's
   veth by identity (`locals[{net, vpcIP}]` — the pod is local by construction).

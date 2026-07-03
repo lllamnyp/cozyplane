@@ -26,10 +26,32 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-#define ETH_P_IP 0x0800
+#define ETH_P_IP  0x0800
+#define ETH_P_ARP 0x0806
+#define ARPOP_REQUEST 1
+#define ARPOP_REPLY   2
 #define TC_ACT_OK 0
 #define TC_ACT_SHOT 2
 #define LINK_LOCAL_GW 0xA9FE0101 // 169.254.1.1 (host order)
+
+// ARP over Ethernet/IPv4 (the 28-byte payload after the Ethernet header).
+struct arp_eth {
+	__be16 htype;
+	__be16 ptype;
+	__u8   hlen;
+	__u8   plen;
+	__be16 op;
+	__u8   sha[6]; // sender hardware address
+	__be32 sip;    // sender IP
+	__u8   tha[6]; // target hardware address
+	__be32 tip;    // target IP
+} __attribute__((packed));
+
+// A 6-byte MAC in an 8-byte cell (the node uplink's, for the ARP responder).
+struct cozy_mac {
+	__u8 addr[6];
+	__u8 pad[2];
+};
 
 #define IPPROTO_ICMP 1
 #define IPPROTO_TCP  6
@@ -291,6 +313,16 @@ struct {
 	__uint(max_entries, 4);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } params SEC(".maps");
+
+// uplink_mac holds the node uplink's MAC (index 0), so from_uplink can put it in
+// the floating-IP ARP replies it crafts. Written by the agent at attach time.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, struct cozy_mac);
+	__uint(max_entries, 1);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} uplink_mac SEC(".maps");
 
 static __always_inline __u32 cfg(__u32 idx)
 {
@@ -785,16 +817,67 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 	return TC_ACT_OK;
 }
 
+// floating_arp answers ARP for a floating IP whose target pod is local: it is
+// how the address is advertised, with no host-side /32 or proxy_arp. An ARP
+// request for such an IP is rewritten in place into a reply — sender = this
+// node's uplink MAC + the floating IP, target = the requester — and reflected
+// back out the uplink. Returns a TC action when handled, or FLOAT_MISS to let
+// the caller fall through (not an ARP request for one of our floating IPs).
+static __always_inline int floating_arp(struct __sk_buff *skb)
+{
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+	struct ethhdr *eth = data;
+	if ((void *)(eth + 1) > data_end)
+		return FLOAT_MISS;
+	struct arp_eth *arp = (void *)(eth + 1);
+	if ((void *)(arp + 1) > data_end)
+		return FLOAT_MISS;
+	if (arp->op != bpf_htons(ARPOP_REQUEST))
+		return FLOAT_MISS;
+
+	struct bridge_ep *fe = bpf_map_lookup_elem(&floating, &arp->tip);
+	if (!fe)
+		return FLOAT_MISS;
+	if (!local_of(fe->net, fe->vpc_ip))
+		return FLOAT_MISS; // not our pod (shouldn't be programmed here otherwise)
+
+	__u32 zero = 0;
+	struct cozy_mac *node = bpf_map_lookup_elem(&uplink_mac, &zero);
+	if (!node)
+		return FLOAT_MISS;
+
+	__u8 req_mac[6];
+	__builtin_memcpy(req_mac, arp->sha, 6);
+	__be32 req_ip = arp->sip;
+	__be32 fip = arp->tip;
+
+	arp->op = bpf_htons(ARPOP_REPLY);
+	__builtin_memcpy(arp->sha, node->addr, 6);
+	arp->sip = fip;
+	__builtin_memcpy(arp->tha, req_mac, 6);
+	arp->tip = req_ip;
+	__builtin_memcpy(eth->h_dest, req_mac, 6);
+	__builtin_memcpy(eth->h_source, node->addr, 6);
+
+	return bpf_redirect(skb->ifindex, 0); // back out the uplink to the requester
+}
+
 // cozyplane_from_uplink: attached at the node uplink's ingress. It is the only
-// entry point for off-cluster ingress. A packet destined to a floating IP
-// advertised from this node is redirected into the target pod's veth, where
-// to_pod's floating_forward DNATs public->VPC (source-preserving); everything
-// else — overlay traffic, node traffic — is left to the kernel untouched, at the
-// cost of one hash lookup. The target is always local: a floating IP is
-// advertised only from the node hosting its pod.
+// entry point for off-cluster ingress, and it also advertises floating IPs by
+// answering ARP for them (floating_arp). A packet destined to a floating IP with
+// a live local pod is redirected into that pod's veth, where to_pod's
+// floating_forward DNATs public->VPC (source-preserving); everything else —
+// overlay traffic, node traffic — is left to the kernel untouched, at the cost of
+// one hash lookup. The target is always local: a floating IP is advertised only
+// from the node hosting its pod.
 SEC("tc")
 int cozyplane_from_uplink(struct __sk_buff *skb)
 {
+	int arp = floating_arp(skb);
+	if (arp != FLOAT_MISS)
+		return arp;
+
 	struct iphdr *ip;
 	if (parse_ipv4(skb, &ip) < 0)
 		return TC_ACT_OK;

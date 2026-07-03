@@ -144,7 +144,28 @@ func (m *Manager) AttachUplinkIngress() (string, error) {
 	if err := m.objs.Params.Put(cfgUplinkIfindex, uint32(idx)); err != nil {
 		return "", fmt.Errorf("set uplink ifindex: %w", err)
 	}
+	// from_uplink answers ARP for floating IPs with this MAC (the advertisement).
+	link, err := netlink.LinkByIndex(idx)
+	if err != nil {
+		return "", fmt.Errorf("lookup uplink %d: %w", idx, err)
+	}
+	if err := m.setUplinkMAC(link.Attrs().HardwareAddr); err != nil {
+		return "", err
+	}
 	return name, nil
+}
+
+// setUplinkMAC records the uplink's MAC for the floating-IP ARP responder.
+func (m *Manager) setUplinkMAC(mac net.HardwareAddr) error {
+	if len(mac) != 6 {
+		return fmt.Errorf("uplink MAC %q is not 6 bytes", mac)
+	}
+	var v overlayCozyMac
+	copy(v.Addr[:], mac)
+	if err := m.objs.UplinkMac.Put(uint32(0), &v); err != nil {
+		return fmt.Errorf("set uplink mac: %w", err)
+	}
+	return nil
 }
 
 // defaultRouteLink returns the ifindex and name of the IPv4 default-route link.

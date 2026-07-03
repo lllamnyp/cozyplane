@@ -195,7 +195,7 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		watchPorts(ctx, factory, sdnClient, client, mgr, nodeName, log)
 		watchPeerings(ctx, factory, mgr, log)
 		watchGateways(ctx, factory, mgr, nodeName, log)
-		watchFloatingIPs(ctx, factory, mgr, uplink, nodeName, log)
+		watchFloatingIPs(ctx, factory, mgr, nodeName, log)
 		factory.Start(ctx.Done())
 	}
 
@@ -586,7 +586,7 @@ func desiredGateways(ports []*sdnv1alpha1.Port, selfName string) map[uint32]gate
 // pinned map on every relevant event, so a restarted agent prunes floating IPs
 // whose FloatingIP or target Port vanished while it was down. Advertising only
 // from the target's node keeps ingress local (DVR).
-func watchFloatingIPs(ctx context.Context, factory sdninformers.SharedInformerFactory, mgr *datapath.Manager, uplink, selfName string, log *slog.Logger) {
+func watchFloatingIPs(ctx context.Context, factory sdninformers.SharedInformerFactory, mgr *datapath.Manager, selfName string, log *slog.Logger) {
 	fips := factory.Sdn().V1alpha1().FloatingIPs()
 	ports := factory.Sdn().V1alpha1().Ports()
 
@@ -614,12 +614,11 @@ func watchFloatingIPs(ctx context.Context, factory sdninformers.SharedInformerFa
 		}
 		for pub, v := range desired {
 			// Put unconditionally: an existing entry may be stale (target moved).
+			// Programming the map both delivers and advertises (from_uplink
+			// answers ARP for it); there is no separate host-side advertise step.
 			if err := mgr.SetFloating(pub, v.vpcIP, v.vni); err != nil {
 				log.Error("set floating", "public", pub, "err", err)
 				continue
-			}
-			if err := datapath.AdvertiseFloating(pub, uplink); err != nil {
-				log.Error("advertise floating", "public", pub, "err", err)
 			}
 			if !current[pub] {
 				log.Info("floating set", "public", pub, "target", v.vpcIP, "vni", v.vni)
@@ -631,7 +630,6 @@ func watchFloatingIPs(ctx context.Context, factory sdninformers.SharedInformerFa
 					log.Error("del floating", "public", pub, "err", err)
 					continue
 				}
-				_ = datapath.UnadvertiseFloating(pub, uplink)
 				log.Info("floating removed", "public", pub)
 			}
 		}
