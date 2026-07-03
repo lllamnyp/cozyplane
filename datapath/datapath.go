@@ -305,16 +305,65 @@ func lpmKey(scope uint32, cidr string) (overlayLpmKey, error) {
 	if err != nil {
 		return overlayLpmKey{}, fmt.Errorf("parse CIDR %q: %w", cidr, err)
 	}
-	ip4 := ipnet.IP.To4()
-	if ip4 == nil {
-		return overlayLpmKey{}, fmt.Errorf("CIDR %q is not IPv4", cidr)
+	addr, err := addr128(ipnet.IP)
+	if err != nil {
+		return overlayLpmKey{}, err
 	}
 	ones, _ := ipnet.Mask.Size()
+	// A v4 CIDR sits under the /96 NAT64 prefix, so its match length includes
+	// those 96 leading bits; a v6 CIDR uses its own length. The 32-bit scope net
+	// always leads the key (fully specified), so lookups never cross scopes.
+	off := uint32(0)
+	if ipnet.IP.To4() != nil {
+		off = 96
+	}
 	return overlayLpmKey{
-		Prefixlen: uint32(32 + ones),
+		Prefixlen: 32 + off + uint32(ones),
 		ScopeNet:  scope,
-		Addr:      binary.LittleEndian.Uint32(ip4),
+		Addr:      addr,
 	}, nil
+}
+
+// addr128 maps an IP to the 16-byte, network-order form the datapath keys on: a
+// v6 address as-is, a v4 address in its RFC 6052 (NAT64) form 64:ff9b::a.b.c.d —
+// a routable v6 address, so a future cross-family translator matches these
+// entries. Must stay in lockstep with v4_to_128 in bpf/overlay.c.
+func addr128(ip net.IP) (overlayAddr128, error) {
+	var a overlayAddr128
+	if v4 := ip.To4(); v4 != nil {
+		a.B[1], a.B[2], a.B[3] = 0x64, 0xff, 0x9b // 64:ff9b::/96
+		copy(a.B[12:], v4)
+		return a, nil
+	}
+	if v6 := ip.To16(); v6 != nil {
+		copy(a.B[:], v6)
+		return a, nil
+	}
+	return a, fmt.Errorf("invalid IP %q", ip)
+}
+
+// addr128Str parses an IP string into its 16-byte map form.
+func addr128Str(s string) (overlayAddr128, error) {
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return overlayAddr128{}, fmt.Errorf("invalid IP %q", s)
+	}
+	return addr128(ip)
+}
+
+// addr128ToIP renders a 16-byte map address back to an IP: a 64:ff9b::/96 NAT64
+// address unwraps to its embedded v4, anything else is the v6 as-is.
+func addr128ToIP(a overlayAddr128) net.IP {
+	nat64 := a.B[1] == 0x64 && a.B[2] == 0xff && a.B[3] == 0x9b
+	for i := 4; i < 12 && nat64; i++ {
+		nat64 = a.B[i] == 0
+	}
+	if nat64 && a.B[0] == 0 {
+		return net.IP(a.B[12:16]).To4()
+	}
+	ip := make(net.IP, 16)
+	copy(ip, a.B[:])
+	return ip
 }
 
 func isNotExist(err error) bool {

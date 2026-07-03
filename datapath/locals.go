@@ -17,7 +17,6 @@ limitations under the License.
 package datapath
 
 import (
-	"encoding/binary"
 	"fmt"
 	"net"
 	"path/filepath"
@@ -39,7 +38,11 @@ func SetLocal(net_ uint32, podIP net.IP, ifindex int, mac net.HardwareAddr) erro
 
 	ep := overlayEndpoint{Ifindex: uint32(ifindex)}
 	copy(ep.Mac[:], mac)
-	if err := m.Put(localKey(net_, podIP), &ep); err != nil {
+	key, err := localKey(net_, podIP)
+	if err != nil {
+		return err
+	}
+	if err := m.Put(key, &ep); err != nil {
 		return fmt.Errorf("set local: %w", err)
 	}
 	return nil
@@ -55,8 +58,12 @@ func GetLocal(net_ uint32, podIP net.IP) (ifindex int, mac net.HardwareAddr, fou
 	}
 	defer m.Close()
 
+	key, err := localKey(net_, podIP)
+	if err != nil {
+		return 0, nil, false, err
+	}
 	var ep overlayEndpoint
-	if err := m.Lookup(localKey(net_, podIP), &ep); err != nil {
+	if err := m.Lookup(key, &ep); err != nil {
 		if isNotExist(err) {
 			return 0, nil, false, nil
 		}
@@ -73,14 +80,22 @@ func DelLocal(net_ uint32, podIP net.IP) error {
 	}
 	defer m.Close()
 
-	if err := m.Delete(localKey(net_, podIP)); err != nil && !isNotExist(err) {
+	key, err := localKey(net_, podIP)
+	if err != nil {
+		return err
+	}
+	if err := m.Delete(key); err != nil && !isNotExist(err) {
 		return fmt.Errorf("del local: %w", err)
 	}
 	return nil
 }
 
-// localKey builds the (network id, IP) key. The IP is laid out so its bytes
-// match ip->daddr in the eBPF program (network order in memory).
-func localKey(net_ uint32, ip net.IP) overlayLocalKey {
-	return overlayLocalKey{Net: net_, Ip: binary.LittleEndian.Uint32(ip.To4())}
+// localKey builds the (network id, IP) key. The IP is in the 16-byte NAT64-mapped
+// form the eBPF program keys on (network order in memory).
+func localKey(net_ uint32, ip net.IP) (overlayLocalKey, error) {
+	a, err := addr128(ip)
+	if err != nil {
+		return overlayLocalKey{}, err
+	}
+	return overlayLocalKey{Net: net_, Ip: a}, nil
 }

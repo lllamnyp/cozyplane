@@ -96,19 +96,50 @@ struct cozy_mac {
 
 char __license[] SEC("license") = "GPL";
 
+// A 128-bit address in network byte order. IPv4 is stored in its RFC 6052
+// (NAT64) form 64:ff9b::a.b.c.d — a routable v6 address, so a future cross-family
+// translator's 64:ff9b::v4 matches these map entries. (Well-known prefix for now;
+// a network-specific prefix is a later config knob behind NAT64_PREFIX.) All map
+// addresses are this type; the hooks map each packet's v4 or v6 addresses into it.
+struct addr128 {
+	__u8 b[16];
+};
+
+// The NAT64 well-known prefix 64:ff9b::/96, as the leading 12 bytes.
+#define NAT64_PREFIX { 0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0 }
+
+// v4_to_128 writes a v4 address (network order, as in the packet) into its
+// NAT64-mapped 128-bit form.
+static __always_inline void v4_to_128(struct addr128 *a, __u32 v4)
+{
+	__u8 pfx[12] = NAT64_PREFIX;
+	__builtin_memcpy(a->b, pfx, 12);
+	__builtin_memcpy(&a->b[12], &v4, 4);
+}
+
+// v4_of_128 reads the v4 address out of a NAT64-mapped 128-bit address (network
+// order). Used only where the family is known to be v4.
+static __always_inline __u32 v4_of_128(const struct addr128 *a)
+{
+	__u32 v4;
+	__builtin_memcpy(&v4, &a->b[12], 4);
+	return v4;
+}
+
 // Scoped LPM key: {network id, address}. Entries always fully specify the
 // network id (prefixlen >= 32), so a lookup only ever matches within its own
-// scope — the same address in two networks resolves independently.
+// scope — the same address in two networks resolves independently. The address
+// is 128-bit, so a fully-specified v4 entry has prefixlen 32 + 128 = 160.
 struct lpm_key {
 	__u32 prefixlen;
 	__u32 scope_net;
-	__u32 addr;
+	struct addr128 addr;
 };
 
 // A local pod, keyed by (network id, IP): overlapping VPCs may host the same IP.
 struct local_key {
 	__u32 net;
-	__u32 ip;
+	struct addr128 ip;
 };
 
 // A local pod endpoint: its host-side veth ifindex and pod-interface MAC.
@@ -186,8 +217,9 @@ static __always_inline int nets_allowed(__u32 src, __u32 dst)
 
 // A VPC's egress gateway, from the agent's own point of view.
 struct gw_entry {
-	__u32 gw_ip;   // the gateway's VPC-leg address (network byte order)
-	__u32 node_ip; // 0 if the gateway is on this node, else its node (host order)
+	struct addr128 gw_ip; // the gateway's VPC-leg address (network byte order)
+	__u32 node_ip;        // 0 if the gateway is on this node, else its node (host order)
+	__u32 pad;
 };
 
 // gateways: network id -> egress gateway. Off-VPC traffic from a pod in the
@@ -206,12 +238,13 @@ struct {
 // gateway. Replaces the per-pod iptables DNAT + fwmark policy routing.
 struct bridge_ep {
 	__u32 net;
-	__u32 vpc_ip; // network byte order
+	__u32 pad;
+	struct addr128 vpc_ip; // network byte order
 };
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, __u32);
+	__type(key, struct addr128);
 	__type(value, struct bridge_ep);
 	__uint(max_entries, 65536);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
@@ -226,7 +259,7 @@ struct {
 // the same address inbound and outbound, no masquerade, no gateway, no conntrack.
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, __u32);
+	__type(key, struct addr128);
 	__type(value, struct bridge_ep);
 	__uint(max_entries, 65536);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
@@ -239,7 +272,7 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, struct local_key);
-	__type(value, __u32); // publicIP, network order
+	__type(value, struct addr128); // publicIP, network order
 	__uint(max_entries, 65536);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } floating_egress SEC(".maps");
@@ -264,8 +297,8 @@ struct ct_fwd_key {
 	__u8 proto;
 	__u8 pad[3];
 	__u32 net;
-	__u32 client_ip; // network order
-	__u32 fabric_ip; // network order
+	struct addr128 client_ip; // network order
+	struct addr128 fabric_ip; // network order
 	__u16 client_port; // network order
 	__u16 pod_port;    // network order
 };
@@ -275,14 +308,14 @@ struct ct_rev_key {
 	__u8 pad;
 	__u16 gw_port;  // network order (the masqueraded source port)
 	__u32 net;
-	__u32 vpc_ip;   // network order
+	struct addr128 vpc_ip; // network order
 	__u16 pod_port; // network order
 	__u16 pad2;
 };
 
 struct ct_rev_val {
-	__u32 fabric_ip;   // network order
-	__u32 client_ip;   // network order
+	struct addr128 fabric_ip; // network order
+	struct addr128 client_ip; // network order
 	__u16 client_port; // network order
 	__u16 pad;
 };
@@ -335,26 +368,51 @@ static __always_inline __u32 cfg(__u32 idx)
 	return v ? *v : 0;
 }
 
+// A fully-specified scoped LPM lookup: 32 scope bits + 128 address bits.
+#define LPM_FULL 160
+
 // net_of resolves an address to a network id *as seen from* a scope network:
 // the destination's net from the source's scope (from_pod), or the source's
 // net from the destination's scope (to_pod). Absent => 0 (default/off-net).
-static __always_inline __u32 net_of(void *map, __u32 scope, __u32 addr)
+static __always_inline __u32 net_of(void *map, __u32 scope, struct addr128 addr)
 {
-	struct lpm_key key = { .prefixlen = 64, .scope_net = scope, .addr = addr };
+	struct lpm_key key = { .prefixlen = LPM_FULL, .scope_net = scope, .addr = addr };
 	__u32 *id = bpf_map_lookup_elem(map, &key);
 	return id ? *id : 0;
 }
 
-static __always_inline __u32 *remote_of(__u32 scope, __u32 addr)
+static __always_inline __u32 *remote_of(__u32 scope, struct addr128 addr)
 {
-	struct lpm_key key = { .prefixlen = 64, .scope_net = scope, .addr = addr };
+	struct lpm_key key = { .prefixlen = LPM_FULL, .scope_net = scope, .addr = addr };
 	return bpf_map_lookup_elem(&remotes, &key);
 }
 
-static __always_inline struct endpoint *local_of(__u32 net, __u32 ip)
+static __always_inline struct endpoint *local_of(__u32 net, struct addr128 ip)
 {
 	struct local_key key = { .net = net, .ip = ip };
 	return bpf_map_lookup_elem(&locals, &key);
+}
+
+static __always_inline int is_internal(struct addr128 addr)
+{
+	struct lpm_key key = { .prefixlen = LPM_FULL, .scope_net = 0, .addr = addr };
+	return bpf_map_lookup_elem(&internal, &key) != NULL;
+}
+
+static __always_inline struct bridge_ep *bridge_of(struct addr128 fabric)
+{
+	return bpf_map_lookup_elem(&bridges, &fabric);
+}
+
+static __always_inline struct bridge_ep *float_of(struct addr128 pub)
+{
+	return bpf_map_lookup_elem(&floating, &pub);
+}
+
+static __always_inline struct addr128 *floating_egress_of(__u32 net, struct addr128 vpc_ip)
+{
+	struct local_key key = { .net = net, .ip = vpc_ip };
+	return bpf_map_lookup_elem(&floating_egress, &key);
 }
 
 static __always_inline int parse_ipv4(struct __sk_buff *skb, struct iphdr **ip)
@@ -476,8 +534,8 @@ static __always_inline void nat_icmp_id(struct __sk_buff *skb, __u16 old, __u16 
 // alloc_gw_port picks a free masquerade port for a new north-south connection:
 // the reverse-lookup key {proto, gw_port, net, vpc_ip, pod_port} must be unique,
 // so probe (bounded) with BPF_NOEXIST — the insert that wins owns the port.
-static __always_inline __u16 alloc_gw_port(__u8 proto, __u32 net, __u32 vpc_ip, __u16 pod_port,
-					   __u32 fabric_ip, __u32 client_ip, __u16 client_port)
+static __always_inline __u16 alloc_gw_port(__u8 proto, __u32 net, struct addr128 vpc_ip, __u16 pod_port,
+					   struct addr128 fabric_ip, struct addr128 client_ip, __u16 client_port)
 {
 	__u32 base = bpf_get_prandom_u32();
 	struct ct_rev_val rv = {
@@ -506,7 +564,7 @@ static __always_inline __u16 alloc_gw_port(__u8 proto, __u32 net, __u32 vpc_ip, 
 // the gateway, and its id rewritten to a unique gw_id so replies demux (the
 // client is hidden, so id is the only distinguishing field). Only echo requests
 // cross; ICMP errors are dropped (PMTU is a follow-up).
-static __always_inline int bridge_forward_icmp(struct __sk_buff *skb, struct iphdr *ip, __u32 net, __u32 vpc_ip)
+static __always_inline int bridge_forward_icmp(struct __sk_buff *skb, struct iphdr *ip, __u32 net, struct addr128 vpc_ip)
 {
 	__u8 type;
 	__u16 id;
@@ -515,12 +573,15 @@ static __always_inline int bridge_forward_icmp(struct __sk_buff *skb, struct iph
 	if (type != ICMP_ECHO_REQUEST)
 		return TC_ACT_SHOT;
 	__u32 client = ip->saddr, fabric = ip->daddr;
+	struct addr128 client128, fabric128;
+	v4_to_128(&client128, client);
+	v4_to_128(&fabric128, fabric);
 
 	struct ct_fwd_key fk = {
 		.proto = IPPROTO_ICMP,
 		.net = net,
-		.client_ip = client,
-		.fabric_ip = fabric,
+		.client_ip = client128,
+		.fabric_ip = fabric128,
 		.client_port = id,
 	};
 	__u16 gw_id;
@@ -528,13 +589,13 @@ static __always_inline int bridge_forward_icmp(struct __sk_buff *skb, struct iph
 	if (have) {
 		gw_id = *have;
 	} else {
-		gw_id = alloc_gw_port(IPPROTO_ICMP, net, vpc_ip, 0, fabric, client, id);
+		gw_id = alloc_gw_port(IPPROTO_ICMP, net, vpc_ip, 0, fabric128, client128, id);
 		if (!gw_id)
 			return TC_ACT_SHOT;
 		bpf_map_update_elem(&ct_fwd, &fk, &gw_id, BPF_ANY);
 	}
 
-	nat_addr(skb, IPPROTO_ICMP, IP_DADDR_OFF, fabric, vpc_ip);
+	nat_addr(skb, IPPROTO_ICMP, IP_DADDR_OFF, fabric, v4_of_128(&vpc_ip));
 	nat_addr(skb, IPPROTO_ICMP, IP_SADDR_OFF, client, bpf_htonl(LINK_LOCAL_GW));
 	nat_icmp_id(skb, id, gw_id);
 	return TC_ACT_OK;
@@ -543,7 +604,7 @@ static __always_inline int bridge_forward_icmp(struct __sk_buff *skb, struct iph
 // bridge_forward is the north-south DNAT+SNAT, done in to_pod when a packet's
 // destination is a fabric IP: fabric->VPC on the destination, client->gateway
 // (169.254.1.1:gw_port) on the source. The pod sees only the gateway.
-static __always_inline int bridge_forward(struct __sk_buff *skb, struct iphdr *ip, __u32 net, __u32 vpc_ip)
+static __always_inline int bridge_forward(struct __sk_buff *skb, struct iphdr *ip, __u32 net, struct addr128 vpc_ip)
 {
 	if (ip->ihl != 5)
 		return TC_ACT_SHOT;
@@ -556,12 +617,15 @@ static __always_inline int bridge_forward(struct __sk_buff *skb, struct iphdr *i
 	if (l4_ports(skb, &cport, &pport) < 0)
 		return TC_ACT_SHOT;
 	__u32 client = ip->saddr, fabric = ip->daddr;
+	struct addr128 client128, fabric128;
+	v4_to_128(&client128, client);
+	v4_to_128(&fabric128, fabric);
 
 	struct ct_fwd_key fk = {
 		.proto = proto,
 		.net = net,
-		.client_ip = client,
-		.fabric_ip = fabric,
+		.client_ip = client128,
+		.fabric_ip = fabric128,
 		.client_port = cport,
 		.pod_port = pport,
 	};
@@ -570,13 +634,13 @@ static __always_inline int bridge_forward(struct __sk_buff *skb, struct iphdr *i
 	if (have) {
 		gw_port = *have;
 	} else {
-		gw_port = alloc_gw_port(proto, net, vpc_ip, pport, fabric, client, cport);
+		gw_port = alloc_gw_port(proto, net, vpc_ip, pport, fabric128, client128, cport);
 		if (!gw_port)
 			return TC_ACT_SHOT;
 		bpf_map_update_elem(&ct_fwd, &fk, &gw_port, BPF_ANY);
 	}
 
-	nat_addr(skb, proto, IP_DADDR_OFF, fabric, vpc_ip);
+	nat_addr(skb, proto, IP_DADDR_OFF, fabric, v4_of_128(&vpc_ip));
 	nat_addr(skb, proto, IP_SADDR_OFF, client, bpf_htonl(LINK_LOCAL_GW));
 	nat_port(skb, proto, L4_SPORT_OFF, cport, gw_port);
 	return TC_ACT_OK; // delivered to the pod (src is now the gateway)
@@ -585,7 +649,7 @@ static __always_inline int bridge_forward(struct __sk_buff *skb, struct iphdr *i
 // deliver_net0 sends a (default-network) packet to `dst`: same-node redirect,
 // cross-node encap, or hand off to the kernel (local node / off-cluster). Used
 // for a bridge reply after it has been un-NATed to fabric->client.
-static __always_inline int deliver_net0(struct __sk_buff *skb, __u32 dst)
+static __always_inline int deliver_net0(struct __sk_buff *skb, struct addr128 dst)
 {
 	struct endpoint *l = local_of(0, dst);
 	if (l)
@@ -612,20 +676,21 @@ static __always_inline int bridge_reverse_icmp(struct __sk_buff *skb, struct iph
 		return TC_ACT_OK;
 	if (type != ICMP_ECHO_REPLY)
 		return TC_ACT_OK;
+	struct addr128 vpc128;
+	v4_to_128(&vpc128, ip->saddr);
 
 	struct ct_rev_key rk = {
 		.proto = IPPROTO_ICMP,
 		.gw_port = gw_id,
 		.net = net,
-		.vpc_ip = ip->saddr,
+		.vpc_ip = vpc128,
 	};
 	struct ct_rev_val *rv = bpf_map_lookup_elem(&ct_rev, &rk);
 	if (!rv)
 		return TC_ACT_OK;
 
-	__u32 vpc_ip = ip->saddr;
-	nat_addr(skb, IPPROTO_ICMP, IP_SADDR_OFF, vpc_ip, rv->fabric_ip);
-	nat_addr(skb, IPPROTO_ICMP, IP_DADDR_OFF, bpf_htonl(LINK_LOCAL_GW), rv->client_ip);
+	nat_addr(skb, IPPROTO_ICMP, IP_SADDR_OFF, ip->saddr, v4_of_128(&rv->fabric_ip));
+	nat_addr(skb, IPPROTO_ICMP, IP_DADDR_OFF, bpf_htonl(LINK_LOCAL_GW), v4_of_128(&rv->client_ip));
 	nat_icmp_id(skb, gw_id, rv->client_port);
 	return deliver_net0(skb, rv->client_ip);
 }
@@ -642,38 +707,24 @@ static __always_inline int bridge_reverse(struct __sk_buff *skb, struct iphdr *i
 	__u16 pport, gw_port;
 	if (l4_ports(skb, &pport, &gw_port) < 0)
 		return TC_ACT_OK;
+	struct addr128 vpc128;
+	v4_to_128(&vpc128, ip->saddr);
 
 	struct ct_rev_key rk = {
 		.proto = proto,
 		.gw_port = gw_port,
 		.net = net,
-		.vpc_ip = ip->saddr,
+		.vpc_ip = vpc128,
 		.pod_port = pport,
 	};
 	struct ct_rev_val *rv = bpf_map_lookup_elem(&ct_rev, &rk);
 	if (!rv)
 		return TC_ACT_OK; // no state: the kernel has no route for the gateway, drops it
 
-	__u32 vpc_ip = ip->saddr;
-	nat_addr(skb, proto, IP_SADDR_OFF, vpc_ip, rv->fabric_ip);
-	nat_addr(skb, proto, IP_DADDR_OFF, bpf_htonl(LINK_LOCAL_GW), rv->client_ip);
+	nat_addr(skb, proto, IP_SADDR_OFF, ip->saddr, v4_of_128(&rv->fabric_ip));
+	nat_addr(skb, proto, IP_DADDR_OFF, bpf_htonl(LINK_LOCAL_GW), v4_of_128(&rv->client_ip));
 	nat_port(skb, proto, L4_DPORT_OFF, gw_port, rv->client_port);
 	return deliver_net0(skb, rv->client_ip);
-}
-
-// floating_egress_of returns the public IP a floating pod egresses from, or NULL
-// when (net, vpc_ip) has no floating IP.
-static __always_inline __u32 *floating_egress_of(__u32 net, __u32 vpc_ip)
-{
-	struct local_key key = { .net = net, .ip = vpc_ip };
-	return bpf_map_lookup_elem(&floating_egress, &key);
-}
-
-// is_internal reports whether an address falls in a cluster-internal CIDR.
-static __always_inline int is_internal(__u32 addr)
-{
-	struct lpm_key key = { .prefixlen = 64, .scope_net = 0, .addr = addr };
-	return bpf_map_lookup_elem(&internal, &key) != NULL;
 }
 
 // floating_forward is the inbound half of a floating IP, done in to_pod when a
@@ -682,7 +733,7 @@ static __always_inline int is_internal(__u32 addr)
 // north-south, like bridge_forward — the isolation check below does not run.
 // TCP, UDP, and ICMP echo (request or reply — a reply is the return half of the
 // pod's own outbound ping); other ICMP is dropped.
-static __always_inline int floating_forward(struct __sk_buff *skb, struct iphdr *ip, __u32 net, __u32 vpc_ip)
+static __always_inline int floating_forward(struct __sk_buff *skb, struct iphdr *ip, __u32 net, struct addr128 vpc_ip)
 {
 	if (ip->ihl != 5)
 		return TC_ACT_SHOT;
@@ -697,7 +748,7 @@ static __always_inline int floating_forward(struct __sk_buff *skb, struct iphdr 
 	} else if (proto != IPPROTO_TCP && proto != IPPROTO_UDP) {
 		return TC_ACT_SHOT;
 	}
-	nat_addr(skb, proto, IP_DADDR_OFF, ip->daddr, vpc_ip);
+	nat_addr(skb, proto, IP_DADDR_OFF, ip->daddr, v4_of_128(&vpc_ip));
 	return TC_ACT_OK; // delivered to the pod, the real client still its source
 }
 
@@ -721,15 +772,18 @@ static __always_inline int floating_egress_snat(struct __sk_buff *skb, struct ip
 	__u8 proto = ip->protocol;
 	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP && proto != IPPROTO_ICMP)
 		return FLOAT_MISS;
-	__u32 *public_ip = floating_egress_of(net, ip->saddr);
+	struct addr128 src128, dst128;
+	v4_to_128(&src128, ip->saddr);
+	v4_to_128(&dst128, ip->daddr);
+	struct addr128 *public_ip = floating_egress_of(net, src128);
 	if (!public_ip)
 		return FLOAT_MISS;
-	if (is_internal(ip->daddr))
+	if (is_internal(dst128))
 		return FLOAT_MISS; // internal: let the gateway proxy DNS / deny the rest
 	__u32 uplink = cfg(CFG_UPLINK_IFINDEX);
 	if (!uplink)
 		return FLOAT_MISS;
-	nat_addr(skb, proto, IP_SADDR_OFF, ip->saddr, *public_ip);
+	nat_addr(skb, proto, IP_SADDR_OFF, ip->saddr, v4_of_128(public_ip));
 	return bpf_redirect_neigh(uplink, NULL, 0, 0);
 }
 
@@ -754,9 +808,11 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	// north-south bridge: un-NAT it and deliver on the default network.
 	if (ip->daddr == bpf_htonl(LINK_LOCAL_GW))
 		return bridge_reverse(skb, ip, srcnet);
+	struct addr128 d128;
+	v4_to_128(&d128, ip->daddr);
 	// The destination's network, resolved within the source's scope: its own
 	// CIDR or a peer's. Overlapping CIDRs in other VPCs are invisible here.
-	__u32 dstnet = net_of(&networks, srcnet, ip->daddr);
+	__u32 dstnet = net_of(&networks, srcnet, d128);
 
 	// Off-net traffic from a floating pod egresses from its public IP (both its
 	// replies and the connections it originates): SNAT VPC->public and redirect
@@ -794,7 +850,7 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	}
 
 	// Same-node destination: redirect through the pod's veth egress (-> to_pod).
-	struct endpoint *l = local_of(dstnet, ip->daddr);
+	struct endpoint *l = local_of(dstnet, d128);
 	if (l) {
 		// A gateway forwarding into its VPC may carry an off-VPC source (the
 		// internet's reply); mark it so the destination's anti-spoof admits it.
@@ -804,14 +860,14 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	}
 
 	// Remote destination in the same network (or a peer): encapsulate.
-	__u32 *node_ip = remote_of(dstnet, ip->daddr);
+	__u32 *node_ip = remote_of(dstnet, d128);
 	if (node_ip)
 		return encap(skb, dstnet, *node_ip, is_gw);
 
 	// Same-node north-south: a default-network packet to a local VPC pod's
 	// fabric IP. Redirect into the pod's veth (to_pod does the DNAT), bypassing
 	// the kernel FORWARD chain so no netfilter accept rule is needed.
-	struct bridge_ep *be = bpf_map_lookup_elem(&bridges, &ip->daddr);
+	struct bridge_ep *be = bridge_of(d128);
 	if (be) {
 		struct endpoint *l = local_of(be->net, be->vpc_ip);
 		if (l)
@@ -836,13 +892,17 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 	// client masqueraded to the gateway, then delivered — no isolation check
 	// (this IS the sanctioned north-south path). Fabric IPs are unique, so the
 	// lookup is unambiguous even under overlapping VPC CIDRs.
-	struct bridge_ep *be = bpf_map_lookup_elem(&bridges, &ip->daddr);
+	struct addr128 d128, s128;
+	v4_to_128(&d128, ip->daddr);
+	v4_to_128(&s128, ip->saddr);
+
+	struct bridge_ep *be = bridge_of(d128);
 	if (be)
 		return bridge_forward(skb, ip, be->net, be->vpc_ip);
 
 	// A floating IP: DNAT public->VPC, preserving the external client's source.
 	// Also sanctioned north-south (no isolation check follows).
-	struct bridge_ep *fe = bpf_map_lookup_elem(&floating, &ip->daddr);
+	struct bridge_ep *fe = float_of(d128);
 	if (fe)
 		return floating_forward(skb, ip, fe->net, fe->vpc_ip);
 
@@ -857,7 +917,7 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 		dstnet = PORT_NET(*dp);
 	// Recover the source's network from the destination's scope (symmetric to
 	// from_pod): its own CIDR or a peer's under this pod's network.
-	__u32 srcnet = net_of(&networks, dstnet, ip->saddr);
+	__u32 srcnet = net_of(&networks, dstnet, s128);
 
 	// Isolation: same-network or explicitly peered traffic only (ingress side).
 	// The exception is gateway-forwarded traffic into a VPC pod: its source is
@@ -891,11 +951,13 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 
 	__u32 gw = tk.tunnel_id & TUN_F_GATEWAY;
 	__u32 vni = (__u32)tk.tunnel_id & ~TUN_F_GATEWAY;
+	struct addr128 d128;
+	v4_to_128(&d128, ip->daddr);
 	if (vni == cfg(CFG_VNI)) {
 		// Default network. A cross-node north-south packet to a local VPC pod's
 		// fabric IP is delivered to its veth here (to_pod does the DNAT),
 		// bypassing the kernel FORWARD chain; everything else the kernel routes.
-		struct bridge_ep *be = bpf_map_lookup_elem(&bridges, &ip->daddr);
+		struct bridge_ep *be = bridge_of(d128);
 		if (be) {
 			struct endpoint *l = local_of(be->net, be->vpc_ip);
 			if (l)
@@ -905,7 +967,7 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 	}
 
 	// A local pod in this VPC (intra-VPC, peered, or a gateway->tenant reply).
-	struct endpoint *ep = local_of(vni, ip->daddr);
+	struct endpoint *ep = local_of(vni, d128);
 	if (ep) {
 		if (gw)
 			skb->mark = GW_MARK;
@@ -941,7 +1003,10 @@ static __always_inline int floating_arp(struct __sk_buff *skb)
 	if (arp->op != bpf_htons(ARPOP_REQUEST))
 		return FLOAT_MISS;
 
-	struct bridge_ep *fe = bpf_map_lookup_elem(&floating, &arp->tip);
+	// ARP is v4-only (v6 floating IPs advertise via NDP, a later phase).
+	struct addr128 tip128;
+	v4_to_128(&tip128, arp->tip);
+	struct bridge_ep *fe = float_of(tip128);
 	if (!fe)
 		return FLOAT_MISS;
 	if (!local_of(fe->net, fe->vpc_ip))
@@ -987,7 +1052,9 @@ int cozyplane_from_uplink(struct __sk_buff *skb)
 	if (parse_ipv4(skb, &ip) < 0)
 		return TC_ACT_OK;
 
-	struct bridge_ep *fe = bpf_map_lookup_elem(&floating, &ip->daddr);
+	struct addr128 d128;
+	v4_to_128(&d128, ip->daddr);
+	struct bridge_ep *fe = float_of(d128);
 	if (!fe)
 		return TC_ACT_OK;
 	struct endpoint *l = local_of(fe->net, fe->vpc_ip);

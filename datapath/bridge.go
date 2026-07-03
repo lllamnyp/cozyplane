@@ -17,7 +17,6 @@ limitations under the License.
 package datapath
 
 import (
-	"encoding/binary"
 	"fmt"
 	"net"
 	"path/filepath"
@@ -124,13 +123,16 @@ func setBridge(fabricIP, vpcIP string, net_ uint32) error {
 	}
 	defer m.Close()
 
-	fip := net.ParseIP(fabricIP).To4()
-	vip := net.ParseIP(vpcIP).To4()
-	if fip == nil || vip == nil {
-		return fmt.Errorf("fabric %q / vpc %q not IPv4", fabricIP, vpcIP)
+	fip, err := addr128Str(fabricIP)
+	if err != nil {
+		return fmt.Errorf("fabric IP: %w", err)
 	}
-	ep := overlayBridgeEp{Net: net_, VpcIp: binary.LittleEndian.Uint32(vip)}
-	if err := m.Put(binary.LittleEndian.Uint32(fip), &ep); err != nil {
+	vip, err := addr128Str(vpcIP)
+	if err != nil {
+		return fmt.Errorf("vpc IP: %w", err)
+	}
+	ep := overlayBridgeEp{Net: net_, VpcIp: vip}
+	if err := m.Put(fip, &ep); err != nil {
 		return fmt.Errorf("set bridge: %w", err)
 	}
 	return nil
@@ -144,11 +146,11 @@ func delBridge(fabricIP string) error {
 	}
 	defer m.Close()
 
-	fip := net.ParseIP(fabricIP).To4()
-	if fip == nil {
-		return fmt.Errorf("fabric IP %q is not IPv4", fabricIP)
+	fip, err := addr128Str(fabricIP)
+	if err != nil {
+		return fmt.Errorf("fabric IP: %w", err)
 	}
-	if err := m.Delete(binary.LittleEndian.Uint32(fip)); err != nil && !isNotExist(err) {
+	if err := m.Delete(fip); err != nil && !isNotExist(err) {
 		return fmt.Errorf("del bridge: %w", err)
 	}
 	return nil

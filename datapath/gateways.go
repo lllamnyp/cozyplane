@@ -26,11 +26,11 @@ import (
 // nodeIP is nil when the gateway runs on this node (delivery by local
 // redirect), else the node hosting it (delivery by encapsulation).
 func (m *Manager) SetGateway(vni uint32, gwIP net.IP, nodeIP net.IP) error {
-	gw4 := gwIP.To4()
-	if gw4 == nil {
-		return fmt.Errorf("gateway IP %q is not IPv4", gwIP)
+	gw, err := addr128(gwIP)
+	if err != nil {
+		return fmt.Errorf("gateway IP: %w", err)
 	}
-	e := overlayGwEntry{GwIp: binary.LittleEndian.Uint32(gw4)} // locals-key byte order
+	e := overlayGwEntry{GwIp: gw}
 	if nodeIP != nil {
 		n4 := nodeIP.To4()
 		if n4 == nil {

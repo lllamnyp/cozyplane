@@ -13,10 +13,16 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type overlayAddr128 struct {
+	_ structs.HostLayout
+	B [16]uint8
+}
+
 type overlayBridgeEp struct {
 	_     structs.HostLayout
 	Net   uint32
-	VpcIp uint32
+	Pad   uint32
+	VpcIp overlayAddr128
 }
 
 type overlayCozyMac struct {
@@ -30,8 +36,8 @@ type overlayCtFwdKey struct {
 	Proto      uint8
 	Pad        [3]uint8
 	Net        uint32
-	ClientIp   uint32
-	FabricIp   uint32
+	ClientIp   overlayAddr128
+	FabricIp   overlayAddr128
 	ClientPort uint16
 	PodPort    uint16
 }
@@ -42,15 +48,15 @@ type overlayCtRevKey struct {
 	Pad     uint8
 	GwPort  uint16
 	Net     uint32
-	VpcIp   uint32
+	VpcIp   overlayAddr128
 	PodPort uint16
 	Pad2    uint16
 }
 
 type overlayCtRevVal struct {
 	_          structs.HostLayout
-	FabricIp   uint32
-	ClientIp   uint32
+	FabricIp   overlayAddr128
+	ClientIp   overlayAddr128
 	ClientPort uint16
 	Pad        uint16
 }
@@ -64,21 +70,22 @@ type overlayEndpoint struct {
 
 type overlayGwEntry struct {
 	_      structs.HostLayout
-	GwIp   uint32
+	GwIp   overlayAddr128
 	NodeIp uint32
+	Pad    uint32
 }
 
 type overlayLocalKey struct {
 	_   structs.HostLayout
 	Net uint32
-	Ip  uint32
+	Ip  overlayAddr128
 }
 
 type overlayLpmKey struct {
 	_         structs.HostLayout
 	Prefixlen uint32
 	ScopeNet  uint32
-	Addr      uint32
+	Addr      overlayAddr128
 }
 
 type overlayPeerKey struct {

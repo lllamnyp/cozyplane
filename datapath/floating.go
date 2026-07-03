@@ -17,9 +17,7 @@ limitations under the License.
 package datapath
 
 import (
-	"encoding/binary"
 	"fmt"
-	"net"
 )
 
 // A floating IP is the north-south bridge turned outward: a routable public
@@ -35,17 +33,18 @@ import (
 // for the pod's outbound SNAT. net is the target pod's network id (its VNI). No
 // conntrack — the datapath is stateless in both directions.
 func (m *Manager) SetFloating(publicIP, vpcIP string, net_ uint32) error {
-	pip := net.ParseIP(publicIP).To4()
-	vip := net.ParseIP(vpcIP).To4()
-	if pip == nil || vip == nil {
-		return fmt.Errorf("public %q / vpc %q not IPv4", publicIP, vpcIP)
+	pub, err := addr128Str(publicIP)
+	if err != nil {
+		return fmt.Errorf("public IP: %w", err)
 	}
-	pub := binary.LittleEndian.Uint32(pip)
-	vpc := binary.LittleEndian.Uint32(vip)
-	if err := m.objs.Floating.Put(pub, &overlayBridgeEp{Net: net_, VpcIp: vpc}); err != nil {
+	vpc, err := addr128Str(vpcIP)
+	if err != nil {
+		return fmt.Errorf("vpc IP: %w", err)
+	}
+	if err := m.objs.Floating.Put(&pub, &overlayBridgeEp{Net: net_, VpcIp: vpc}); err != nil {
 		return fmt.Errorf("set floating %s: %w", publicIP, err)
 	}
-	if err := m.objs.FloatingEgress.Put(&overlayLocalKey{Net: net_, Ip: vpc}, pub); err != nil {
+	if err := m.objs.FloatingEgress.Put(&overlayLocalKey{Net: net_, Ip: vpc}, &pub); err != nil {
 		return fmt.Errorf("set floating egress %s: %w", publicIP, err)
 	}
 	return nil
@@ -55,16 +54,15 @@ func (m *Manager) SetFloating(publicIP, vpcIP string, net_ uint32) error {
 // (idempotent). The reverse entry is keyed by {net, VPC IP}, recovered from the
 // forward entry.
 func (m *Manager) DelFloating(publicIP string) error {
-	pip := net.ParseIP(publicIP).To4()
-	if pip == nil {
-		return fmt.Errorf("public IP %q is not IPv4", publicIP)
+	pub, err := addr128Str(publicIP)
+	if err != nil {
+		return fmt.Errorf("public IP: %w", err)
 	}
-	pub := binary.LittleEndian.Uint32(pip)
 	var ep overlayBridgeEp
-	if err := m.objs.Floating.Lookup(pub, &ep); err == nil {
+	if err := m.objs.Floating.Lookup(&pub, &ep); err == nil {
 		_ = m.objs.FloatingEgress.Delete(&overlayLocalKey{Net: ep.Net, Ip: ep.VpcIp})
 	}
-	if err := m.objs.Floating.Delete(pub); err != nil && !isNotExist(err) {
+	if err := m.objs.Floating.Delete(&pub); err != nil && !isNotExist(err) {
 		return fmt.Errorf("del floating %s: %w", publicIP, err)
 	}
 	return nil
@@ -92,13 +90,11 @@ func (m *Manager) SetInternal(cidrs []string) error {
 // while it was down.
 func (m *Manager) Floatings() (map[string]bool, error) {
 	out := map[string]bool{}
-	var key uint32
+	var key overlayAddr128
 	var ep overlayBridgeEp
 	it := m.objs.Floating.Iterate()
 	for it.Next(&key, &ep) {
-		b := make([]byte, 4)
-		binary.LittleEndian.PutUint32(b, key)
-		out[net.IP(b).String()] = true
+		out[addr128ToIP(key).String()] = true
 	}
 	return out, it.Err()
 }
