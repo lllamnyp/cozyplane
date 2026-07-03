@@ -70,6 +70,10 @@ struct cozy_mac {
 #define L4_DPORT_OFF (L4_OFF + 2)
 #define TCP_CSUM_OFF (L4_OFF + 16)
 #define UDP_CSUM_OFF (L4_OFF + 6)
+#define ICMP_CSUM_OFF (L4_OFF + 2)
+#define ICMP_ID_OFF   (L4_OFF + 4)
+#define ICMP_ECHO_REPLY   0
+#define ICMP_ECHO_REQUEST 8
 
 // ports-map value layout: bit 31 flags a VPC egress-gateway leg; the low bits
 // are the network id (VNIs stay far below 2^23, see TUN_F_GATEWAY).
@@ -420,13 +424,16 @@ static __always_inline __u32 l4_csum_off(__u8 proto)
 
 // nat_addr rewrites an IPv4 address in the header (at addr_off) and fixes the
 // IP checksum and the L4 pseudo-header checksum. UDP with a zero checksum is
-// left "no checksum" via BPF_F_MARK_MANGLED_0.
+// left "no checksum" via BPF_F_MARK_MANGLED_0. ICMP is special: its checksum
+// does not cover the IP header, so an address change touches only the IP csum.
 static __always_inline void nat_addr(struct __sk_buff *skb, __u8 proto, __u32 addr_off, __u32 old, __u32 new)
 {
-	__u64 flags = BPF_F_PSEUDO_HDR | 4;
-	if (proto == IPPROTO_UDP)
-		flags |= BPF_F_MARK_MANGLED_0;
-	bpf_l4_csum_replace(skb, l4_csum_off(proto), old, new, flags);
+	if (proto != IPPROTO_ICMP) {
+		__u64 flags = BPF_F_PSEUDO_HDR | 4;
+		if (proto == IPPROTO_UDP)
+			flags |= BPF_F_MARK_MANGLED_0;
+		bpf_l4_csum_replace(skb, l4_csum_off(proto), old, new, flags);
+	}
 	bpf_l3_csum_replace(skb, IP_CSUM_OFF, old, new, 4);
 	bpf_skb_store_bytes(skb, addr_off, &new, sizeof(new), 0);
 }
@@ -439,6 +446,30 @@ static __always_inline void nat_port(struct __sk_buff *skb, __u8 proto, __u32 po
 		flags |= BPF_F_MARK_MANGLED_0;
 	bpf_l4_csum_replace(skb, l4_csum_off(proto), old, new, flags);
 	bpf_skb_store_bytes(skb, port_off, &new, sizeof(new), 0);
+}
+
+// icmp_echo reads an ICMP echo message's type and identifier (IPv4, no options).
+// The identifier is what the bridge/floating conntrack keys on in place of an L4
+// port. Returns -1 if the packet is too short to hold the 8-byte ICMP header.
+static __always_inline int icmp_echo(struct __sk_buff *skb, __u8 *type, __u16 *id)
+{
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+	if (data + L4_OFF + 8 > data_end)
+		return -1;
+	__u8 *t = data + L4_OFF;
+	__u16 *idp = data + ICMP_ID_OFF;
+	*type = *t;
+	*id = *idp;
+	return 0;
+}
+
+// nat_icmp_id rewrites the ICMP echo identifier and fixes the ICMP checksum
+// (which has no pseudo-header — a plain 2-byte incremental update).
+static __always_inline void nat_icmp_id(struct __sk_buff *skb, __u16 old, __u16 new)
+{
+	bpf_l4_csum_replace(skb, ICMP_CSUM_OFF, old, new, 2);
+	bpf_skb_store_bytes(skb, ICMP_ID_OFF, &new, sizeof(new), 0);
 }
 
 // alloc_gw_port picks a free masquerade port for a new north-south connection:
@@ -469,6 +500,45 @@ static __always_inline __u16 alloc_gw_port(__u8 proto, __u32 net, __u32 vpc_ip, 
 	return 0;
 }
 
+// bridge_forward_icmp is the ICMP-echo forward half: the echo identifier stands
+// in for the L4 port. A request is DNATed fabric->VPC, its client masqueraded to
+// the gateway, and its id rewritten to a unique gw_id so replies demux (the
+// client is hidden, so id is the only distinguishing field). Only echo requests
+// cross; ICMP errors are dropped (PMTU is a follow-up).
+static __always_inline int bridge_forward_icmp(struct __sk_buff *skb, struct iphdr *ip, __u32 net, __u32 vpc_ip)
+{
+	__u8 type;
+	__u16 id;
+	if (icmp_echo(skb, &type, &id) < 0)
+		return TC_ACT_SHOT;
+	if (type != ICMP_ECHO_REQUEST)
+		return TC_ACT_SHOT;
+	__u32 client = ip->saddr, fabric = ip->daddr;
+
+	struct ct_fwd_key fk = {
+		.proto = IPPROTO_ICMP,
+		.net = net,
+		.client_ip = client,
+		.fabric_ip = fabric,
+		.client_port = id,
+	};
+	__u16 gw_id;
+	__u16 *have = bpf_map_lookup_elem(&ct_fwd, &fk);
+	if (have) {
+		gw_id = *have;
+	} else {
+		gw_id = alloc_gw_port(IPPROTO_ICMP, net, vpc_ip, 0, fabric, client, id);
+		if (!gw_id)
+			return TC_ACT_SHOT;
+		bpf_map_update_elem(&ct_fwd, &fk, &gw_id, BPF_ANY);
+	}
+
+	nat_addr(skb, IPPROTO_ICMP, IP_DADDR_OFF, fabric, vpc_ip);
+	nat_addr(skb, IPPROTO_ICMP, IP_SADDR_OFF, client, bpf_htonl(LINK_LOCAL_GW));
+	nat_icmp_id(skb, id, gw_id);
+	return TC_ACT_OK;
+}
+
 // bridge_forward is the north-south DNAT+SNAT, done in to_pod when a packet's
 // destination is a fabric IP: fabric->VPC on the destination, client->gateway
 // (169.254.1.1:gw_port) on the source. The pod sees only the gateway.
@@ -477,8 +547,10 @@ static __always_inline int bridge_forward(struct __sk_buff *skb, struct iphdr *i
 	if (ip->ihl != 5)
 		return TC_ACT_SHOT;
 	__u8 proto = ip->protocol;
+	if (proto == IPPROTO_ICMP)
+		return bridge_forward_icmp(skb, ip, net, vpc_ip);
 	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
-		return TC_ACT_SHOT; // bridge handles TCP/UDP; ICMP to a fabric IP is dropped
+		return TC_ACT_SHOT; // bridge handles TCP/UDP/ICMP-echo; other ICMP is dropped
 	__u16 cport, pport;
 	if (l4_ports(skb, &cport, &pport) < 0)
 		return TC_ACT_SHOT;
@@ -527,11 +599,43 @@ static __always_inline int deliver_net0(struct __sk_buff *skb, __u32 dst)
 // the gateway (169.254.1.1): look the masquerade port back up, restore
 // vpc->fabric on the source and gateway->client on the destination, then
 // deliver the reply on the default network.
+// bridge_reverse_icmp is the ICMP-echo reverse half: an echo reply the pod sends
+// to the gateway carries the gw_id in its identifier; look it up, restore
+// vpc->fabric and gateway->client, and rewrite the id back to the client's
+// original before delivering on the default network.
+static __always_inline int bridge_reverse_icmp(struct __sk_buff *skb, struct iphdr *ip, __u32 net)
+{
+	__u8 type;
+	__u16 gw_id;
+	if (icmp_echo(skb, &type, &gw_id) < 0)
+		return TC_ACT_OK;
+	if (type != ICMP_ECHO_REPLY)
+		return TC_ACT_OK;
+
+	struct ct_rev_key rk = {
+		.proto = IPPROTO_ICMP,
+		.gw_port = gw_id,
+		.net = net,
+		.vpc_ip = ip->saddr,
+	};
+	struct ct_rev_val *rv = bpf_map_lookup_elem(&ct_rev, &rk);
+	if (!rv)
+		return TC_ACT_OK;
+
+	__u32 vpc_ip = ip->saddr;
+	nat_addr(skb, IPPROTO_ICMP, IP_SADDR_OFF, vpc_ip, rv->fabric_ip);
+	nat_addr(skb, IPPROTO_ICMP, IP_DADDR_OFF, bpf_htonl(LINK_LOCAL_GW), rv->client_ip);
+	nat_icmp_id(skb, gw_id, rv->client_port);
+	return deliver_net0(skb, rv->client_ip);
+}
+
 static __always_inline int bridge_reverse(struct __sk_buff *skb, struct iphdr *ip, __u32 net)
 {
 	if (ip->ihl != 5)
 		return TC_ACT_OK;
 	__u8 proto = ip->protocol;
+	if (proto == IPPROTO_ICMP)
+		return bridge_reverse_icmp(skb, ip, net);
 	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
 		return TC_ACT_OK;
 	__u16 pport, gw_port;
@@ -561,13 +665,42 @@ static __always_inline int bridge_reverse(struct __sk_buff *skb, struct iphdr *i
 // destination while KEEPING the external client as the source (no masquerade),
 // record the connection so the reply can be reversed, and deliver. Sanctioned
 // north-south, like bridge_forward — the isolation check below does not run.
+// floating_forward_icmp DNATs a floating-IP echo request public->VPC, keeping the
+// real client source (unlike the bridge it does not masquerade, so the client IP
+// itself demuxes replies and the id is left untouched). The connection is
+// recorded so from_pod can reverse the reply.
+static __always_inline int floating_forward_icmp(struct __sk_buff *skb, struct iphdr *ip, __u32 net, __u32 vpc_ip)
+{
+	__u8 type;
+	__u16 id;
+	if (icmp_echo(skb, &type, &id) < 0)
+		return TC_ACT_SHOT;
+	if (type != ICMP_ECHO_REQUEST)
+		return TC_ACT_SHOT;
+	__u32 public_ip = ip->daddr;
+
+	struct float_ct_key k = {
+		.proto = IPPROTO_ICMP,
+		.net = net,
+		.vpc_ip = vpc_ip,
+		.client_ip = ip->saddr,
+		.client_port = id,
+	};
+	bpf_map_update_elem(&float_ct, &k, &public_ip, BPF_ANY);
+
+	nat_addr(skb, IPPROTO_ICMP, IP_DADDR_OFF, public_ip, vpc_ip);
+	return TC_ACT_OK;
+}
+
 static __always_inline int floating_forward(struct __sk_buff *skb, struct iphdr *ip, __u32 net, __u32 vpc_ip)
 {
 	if (ip->ihl != 5)
 		return TC_ACT_SHOT;
 	__u8 proto = ip->protocol;
+	if (proto == IPPROTO_ICMP)
+		return floating_forward_icmp(skb, ip, net, vpc_ip);
 	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
-		return TC_ACT_SHOT; // TCP/UDP only; ICMP to a floating IP is dropped (a follow-up)
+		return TC_ACT_SHOT; // TCP/UDP/ICMP-echo; other ICMP to a floating IP is dropped
 	__u16 cport, pport;
 	if (l4_ports(skb, &cport, &pport) < 0)
 		return TC_ACT_SHOT;
@@ -597,11 +730,43 @@ static __always_inline int floating_forward(struct __sk_buff *skb, struct iphdr 
 // bypasses that (and rp_filter and the FORWARD chain) and fills the L2 header
 // from the client's neighbour entry. No match => FLOAT_MISS: not a floating
 // reply, fall through to the normal egress path.
+// floating_reverse_icmp reverses a floating-IP echo reply: match the connection
+// (the preserved client IP + id), SNAT source VPC->public, and redirect it out
+// the uplink. No id rewrite — the pod echoed the client's original id.
+static __always_inline int floating_reverse_icmp(struct __sk_buff *skb, struct iphdr *ip, __u32 net)
+{
+	__u8 type;
+	__u16 id;
+	if (icmp_echo(skb, &type, &id) < 0)
+		return FLOAT_MISS;
+	if (type != ICMP_ECHO_REPLY)
+		return FLOAT_MISS;
+
+	struct float_ct_key k = {
+		.proto = IPPROTO_ICMP,
+		.net = net,
+		.vpc_ip = ip->saddr,
+		.client_ip = ip->daddr,
+		.client_port = id,
+	};
+	__u32 *public_ip = bpf_map_lookup_elem(&float_ct, &k);
+	if (!public_ip)
+		return FLOAT_MISS;
+
+	__u32 uplink = cfg(CFG_UPLINK_IFINDEX);
+	if (!uplink)
+		return FLOAT_MISS;
+	nat_addr(skb, IPPROTO_ICMP, IP_SADDR_OFF, ip->saddr, *public_ip);
+	return bpf_redirect_neigh(uplink, NULL, 0, 0);
+}
+
 static __always_inline int floating_reverse(struct __sk_buff *skb, struct iphdr *ip, __u32 net)
 {
 	if (ip->ihl != 5)
 		return FLOAT_MISS;
 	__u8 proto = ip->protocol;
+	if (proto == IPPROTO_ICMP)
+		return floating_reverse_icmp(skb, ip, net);
 	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
 		return FLOAT_MISS;
 	__u16 pport, cport;

@@ -258,7 +258,15 @@ in the two universal hooks:
   `169.254.1.1 → client` on the destination, and delivers the reply on the
   default network (`deliver_net0`).
 
-TCP and UDP; ICMP to a fabric IP is dropped (a follow-up).
+TCP, UDP, and **ICMP echo** (ping). ICMP has no L4 ports, so the echo
+**identifier** plays the part of the port: a request masquerades its id to a
+unique `gw_id` (via the same `ct_rev` allocation as `gw_port`) and the reply
+restores it. Two checksum wrinkles distinguish ICMP from TCP/UDP: an address
+rewrite fixes only the **IP** checksum (ICMP's checksum, unlike TCP/UDP's, does
+not cover the IP header), and the id rewrite fixes only the **ICMP** checksum.
+ICMP *error* messages (fragmentation-needed / PMTU, unreachable, TTL-exceeded)
+embed the original packet and are not NAT'd yet — still a follow-up, so
+PMTU discovery through the bridge does not work.
 
 This gives the design's directional trust for free: the system/default network
 reaches a VPC pod via its fabric IP (north-south, allowed), but a VPC pod can't
@@ -576,11 +584,12 @@ mostly future work. As built:
 
 - Overlapping VPC CIDRs are supported (net-scoped delivery, above); only
   *peering* overlapping VPCs is refused.
-- The north-south bridge is eBPF NAT (its own `ct_fwd`/`ct_rev` table), TCP/UDP
-  only — ICMP to a fabric IP is dropped. The datapath is netfilter-free except
-  the agent's node masquerade and overlay FORWARD-ACCEPT (both non-NAT, both
-  candidates to move to eBPF) and the gateway pod's internal filter (in its own
-  netns).
+- The north-south bridge is eBPF NAT (its own `ct_fwd`/`ct_rev` table): TCP, UDP,
+  and ICMP echo (ping), for both fabric IPs and floating IPs. ICMP *error*
+  messages are not NAT'd yet, so PMTU discovery through the bridge is broken (a
+  follow-up). The datapath is netfilter-free except the agent's node masquerade
+  and overlay FORWARD-ACCEPT (both non-NAT, both candidates to move to eBPF) and
+  the gateway pod's internal filter (in its own netns).
 - VPC egress is opt-in and coarse: `spec.egress.natGateway` opens internet +
   cluster DNS through a single per-VPC gateway pod; no per-destination policy,
   Service exposure, or metadata endpoint yet. **Floating IPs** (source-preserving

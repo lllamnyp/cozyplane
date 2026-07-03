@@ -143,6 +143,8 @@ echo "[north-south bridge to same-node same-IP pods]"
 check "cli -> a1.fabric  ($(fabric a1))"  "a1"  bash -c "$K exec cli -- wget -qO- -T4 http://$(fabric a1)/  2>/dev/null"
 check "cli -> bw1.fabric ($(fabric bw1))" "bw1" bash -c "$K exec cli -- wget -qO- -T4 http://$(fabric bw1)/ 2>/dev/null"
 check "cli -> a2.fabric  ($(fabric a2))"  "a2"  bash -c "$K exec cli -- wget -qO- -T4 http://$(fabric a2)/  2>/dev/null"
+# ICMP echo through the bridge (the id stands in for the L4 port).
+check_ok "cli -> a1.fabric ping (north-south ICMP)" $K exec cli -- ping -c2 -W3 "$(fabric a1)"
 
 echo "[isolation]"
 check_fail "cli(default) -> VPC IP 10.0.0.2 directly" bash -c "$K exec cli -- wget -qO- -T3 http://10.0.0.2/ 2>/dev/null | grep -q ."
@@ -202,6 +204,9 @@ check "a1-fip Ready with $FIP" "Ready" $K -n team-a get floatingip a1-fip -o jso
 extget() { docker run --rm --network kind curlimages/curl:8.11.0 -s -m3 "$1" 2>/dev/null; }
 got=""; for _ in $(seq 1 12); do got=$(extget "http://$FIP/" | tr -d '[:space:]'); [ "$got" = "a1" ] && break; sleep 2; done
 [ "$got" = "a1" ] && pass "external client -> $FIP reaches a1" || fail "external client -> $FIP reaches a1 (got '$got')"
+# ICMP echo through the floating IP (external ping, source-preserving).
+gotp=""; for _ in $(seq 1 8); do docker run --rm --network kind busybox:1.36 ping -c1 -W2 "$FIP" >/dev/null 2>&1 && { gotp=ok; break; }; sleep 2; done
+[ "$gotp" = ok ] && pass "external client ping -> $FIP (floating ICMP)" || fail "external client ping -> $FIP (floating ICMP)"
 
 echo "[revocation]"
 $K -n team-a delete vpcbinding vpc-a >/dev/null
