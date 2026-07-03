@@ -334,7 +334,7 @@ func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory,
 		}
 		// Remote VPC pods are reached within their VPC's scope, so overlapping
 		// CIDRs on different nodes never collide.
-		if err := mgr.SetRemote(net_, port.Spec.IP+"/32", net.ParseIP(port.Spec.NodeIP)); err != nil {
+		if err := mgr.SetRemote(net_, hostCIDR(port.Spec.IP), net.ParseIP(port.Spec.NodeIP)); err != nil {
 			log.Error("set remote port", "port", port.Name, "err", err)
 			return
 		}
@@ -359,7 +359,7 @@ func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory,
 				severLocalPort(ctx, core, port, log)
 				return
 			}
-			if err := mgr.DelRemote(net_, port.Spec.IP+"/32"); err != nil {
+			if err := mgr.DelRemote(net_, hostCIDR(port.Spec.IP)); err != nil {
 				log.Error("del remote port", "port", port.Name, "err", err)
 			}
 		},
@@ -700,6 +700,17 @@ func desiredFloating(fips []*sdnv1alpha1.FloatingIP, ports []*sdnv1alpha1.Port, 
 		out[f.Status.Address] = floatingView{vpcIP: f.Spec.Target, vni: vni}
 	}
 	return out
+}
+
+// hostCIDR appends the host-route prefix length for a bare IP: /32 for IPv4,
+// /128 for IPv6. A remote VPC pod is a single host in the remotes trie, so the
+// prefix must match the address width (a v6 IP with /32 would match a whole
+// block, not the host).
+func hostCIDR(ip string) string {
+	if p := net.ParseIP(ip); p != nil && p.To4() == nil {
+		return ip + "/128"
+	}
+	return ip + "/32"
 }
 
 // splitCIDRs parses a comma-separated CIDR list, dropping blanks.

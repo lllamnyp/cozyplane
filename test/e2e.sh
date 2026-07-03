@@ -104,18 +104,27 @@ $K create ns team-a >/dev/null 2>&1; $K create ns team-b >/dev/null 2>&1
 vpc team-a vpc-a 10.0.0.0/24; binding team-a vpc-a
 vpc team-b vpc-b 10.0.0.0/24; binding team-b vpc-b
 vpc team-a vpc-c 10.1.0.0/24; binding team-a vpc-c
+# IPv6 VPCs (disjoint), same tenant as a v4 VPC -> mixed-family multi-tenancy in
+# one cluster/one map set. v6 rides the v4 Geneve underlay (v6-inner/v4-outer).
+vpc team-a vpc6a fd00:a::/64; binding team-a vpc6a
+vpc team-a vpc6b fd00:b::/64; binding team-a vpc6b
 # Colliding pods: a1 (vpc-a) and bw1 (vpc-b) both land .2 on the same node.
 idpod team-a a1  "$W"  vpc-a
 idpod team-a a2  "$W2" vpc-a
 idpod team-b bw1 "$W"  vpc-b
 idpod team-b bw2 "$W"  vpc-b
 idpod team-a c1  "$W2" vpc-c
+# v6 pods: v6a1/v6a2 in vpc6a on different nodes (cross-node overlay), v6b1 in
+# vpc6b (isolation, then peering).
+idpod team-a v6a1 "$W"  vpc6a
+idpod team-a v6a2 "$W2" vpc6a
+idpod team-a v6b1 "$W2" vpc6b
 $K run cli --image=busybox:1.36 --restart=Never --command -- sleep 3600 >/dev/null 2>&1
 # A pod annotated for vpc-a but in a namespace with NO binding -> default-deny.
 $K create ns team-x >/dev/null 2>&1
 idpod team-x nobind "$W" team-a/vpc-a
 
-for p in a1 a2 c1; do $K -n team-a wait --for=condition=Ready pod/$p --timeout=120s >/dev/null; done
+for p in a1 a2 c1 v6a1 v6a2 v6b1; do $K -n team-a wait --for=condition=Ready pod/$p --timeout=120s >/dev/null; done
 for p in bw1 bw2; do $K -n team-b wait --for=condition=Ready pod/$p --timeout=120s >/dev/null; done
 $K wait --for=condition=Ready pod/cli --timeout=120s >/dev/null
 
@@ -170,6 +179,30 @@ sleep 5
 check "a1(vpc-a) -> c1(vpc-c, peered disjoint)" "c1" httpid team-a a1 "$(vpcip c1)"
 check "overlapping a<->b peering stays Pending" "Pending" \
   $K -n team-a get vpcpeering a-to-b -o jsonpath='{.status.phase}'
+
+echo "[IPv6 VPC overlay: intra-VPC cross-node, isolation, peering]"
+V6A2=$(vpcip v6a2); V6B1=$(vpcip v6b1)
+# Intra-VPC across nodes: proves v6 inner over the v4 Geneve underlay (encap +
+# from_overlay delivery on the 128-bit maps).
+check "v6a1 -> v6a2 (v6 intra-VPC, cross-node overlay)" "v6a2" httpid team-a v6a1 "[$V6A2]"
+# Isolation: a different v6 VPC is unreachable until peered (same check the v4
+# path makes, now on native v6 addresses).
+check_fail "v6a1(vpc6a) -> v6b1(vpc6b) blocked (cross-VPC v6 isolation)" \
+  bash -c "$K -n team-a exec v6a1 -- wget -qO- -T3 http://[$V6B1]/ 2>/dev/null | grep -q ."
+# Peering two disjoint v6 VPCs opens the path both ways (peers map is family-agnostic).
+$K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: VPCPeering
+metadata: {name: v6a-to-v6b, namespace: team-a}
+spec: {vpcRef: {name: vpc6a}, peerRef: {namespace: team-a, name: vpc6b}}
+---
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: VPCPeering
+metadata: {name: v6b-to-v6a, namespace: team-a}
+spec: {vpcRef: {name: vpc6b}, peerRef: {namespace: team-a, name: vpc6a}}
+EOF
+sleep 5
+check "v6a1(vpc6a) -> v6b1(vpc6b) after peering (v6 peering)" "v6b1" httpid team-a v6a1 "[$V6B1]"
 
 echo "[egress via per-VPC gateway]"
 $K -n team-a patch vpc vpc-a --type=merge -p '{"spec":{"egress":{"natGateway":true}}}' >/dev/null

@@ -27,10 +27,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
@@ -40,6 +42,7 @@ import (
 	"github.com/containernetworking/plugins/pkg/ipam"
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -71,8 +74,31 @@ const (
 )
 
 // linkLocalGW is the on-link next hop installed in every pod, answered by the
-// host-side veth via proxy_arp (Calico-style point-to-point veth).
-var linkLocalGW = net.IPv4(169, 254, 1, 1)
+// host-side veth via proxy_arp (Calico-style point-to-point veth). linkLocalGWv6
+// is its IPv6 counterpart for v6 VPC pods, answered via proxy_ndp.
+var (
+	linkLocalGW   = net.IPv4(169, 254, 1, 1)
+	linkLocalGWv6 = net.ParseIP("fe80::1")
+)
+
+// isV6 reports whether ip is an IPv6 address (not a v4 or v4-in-v6).
+func isV6(ip net.IP) bool { return ip.To4() == nil }
+
+// hostMask returns the host-route mask for ip's family (/32 or /128).
+func hostMask(ip net.IP) net.IPMask {
+	if isV6(ip) {
+		return net.CIDRMask(128, 128)
+	}
+	return net.CIDRMask(32, 32)
+}
+
+// podGateway returns the on-link next hop for a pod IP of ip's family.
+func podGateway(ip net.IP) net.IP {
+	if isV6(ip) {
+		return linkLocalGWv6
+	}
+	return linkLocalGW
+}
 
 // NetConf is the plugin configuration.
 type NetConf struct {
@@ -305,9 +331,14 @@ func addVPC(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, p
 	}
 
 	// Bridge: route the (unique) fabric IP to this veth and publish the
-	// fabric -> {net, VPC IP} mapping; the eBPF datapath does the NAT.
-	if err = datapath.AddBridge(fabricIP.String(), vpcIP.String(), hostVethNameFor(args.ContainerID), uint32(vpc.Status.VNI)); err != nil {
-		return err
+	// fabric -> {net, VPC IP} mapping; the eBPF datapath does the NAT. The bridge
+	// is v4-only (its NAT rewrites IPv4 headers), so a v6 VPC pod skips it — v6
+	// north-south is a later phase. Such a pod still gets a v4 fabric IP as its
+	// identity/podIP, just no node->pod bridge until the v6 fabric bridge lands.
+	if !isV6(vpcIP) {
+		if err = datapath.AddBridge(fabricIP.String(), vpcIP.String(), hostVethNameFor(args.ContainerID), uint32(vpc.Status.VNI)); err != nil {
+			return err
+		}
 	}
 
 	// Report the fabric IP as status.podIP.
@@ -541,8 +572,14 @@ func claimIP(client sdnclientset.Interface, vpc *sdnv1alpha1.VPC, vpcNS string, 
 	return nil, nil, fmt.Errorf("no free address in VPC %q (%s)", vpc.Name, vpc.Spec.CIDRs[0])
 }
 
+// portName builds the cluster-scoped Port name v<vni>.<ip-escaped>. Both the v4
+// dot and the v6 colon are invalid in a Kubernetes object name, so both are
+// escaped to '-' (e.g. 10.0.0.2 -> v5.10-0-0-2, fd00:10::2 -> v5.fd00-10--2).
+// Only the VNI is parsed back out (netFromPortName); the address is carried in
+// the Port spec, so the escaping need not be reversible, only unique per VNI.
 func portName(vni int32, ip string) string {
-	return fmt.Sprintf("v%d.%s", vni, strings.ReplaceAll(ip, ".", "-"))
+	esc := strings.NewReplacer(".", "-", ":", "-").Replace(ip)
+	return fmt.Sprintf("v%d.%s", vni, esc)
 }
 
 // setupVeth creates the pod veth, configures the pod-side address and routes,
@@ -600,21 +637,34 @@ func configurePodIface(podIP net.IP) (net.HardwareAddr, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := netlink.AddrAdd(link, &netlink.Addr{IPNet: &net.IPNet{IP: podIP, Mask: net.CIDRMask(32, 32)}}); err != nil {
+	gw := podGateway(podIP)
+	addr := &netlink.Addr{IPNet: &net.IPNet{IP: podIP, Mask: hostMask(podIP)}}
+	if isV6(podIP) {
+		// Ensure v6 is on inside the pod netns, and skip DAD on the /128: it is a
+		// point-to-point veth with no possible duplicate, and DAD would leave the
+		// address "tentative" (unusable) for ~1s, racing the pod's first packet.
+		_ = datapath.WriteProcSys(fmt.Sprintf("net/ipv6/conf/%s/disable_ipv6", contVethName), "0")
+		addr.Flags = unix.IFA_F_NODAD
+	}
+	if err := netlink.AddrAdd(link, addr); err != nil {
 		return nil, fmt.Errorf("add pod address: %w", err)
 	}
 	if err := netlink.LinkSetUp(link); err != nil {
 		return nil, err
 	}
 	mac := link.Attrs().HardwareAddr
+	// A link-scope route to the gateway (its /32 or /128) makes it on-link, then a
+	// default route through it. The gateway is never assigned anywhere; the host
+	// veth answers for it (proxy_arp for v4, proxy_ndp for v6), Calico-style.
 	if err := netlink.RouteAdd(&netlink.Route{
 		LinkIndex: link.Attrs().Index,
 		Scope:     netlink.SCOPE_LINK,
-		Dst:       &net.IPNet{IP: linkLocalGW, Mask: net.CIDRMask(32, 32)},
+		Dst:       &net.IPNet{IP: gw, Mask: hostMask(gw)},
 	}); err != nil {
 		return nil, fmt.Errorf("add gateway route: %w", err)
 	}
-	if err := netlink.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Gw: linkLocalGW}); err != nil {
+	// A v6 default route through a link-local next hop must name the link.
+	if err := netlink.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Gw: gw}); err != nil {
 		return nil, fmt.Errorf("add default route: %w", err)
 	}
 	return mac, nil
@@ -632,17 +682,34 @@ func configureHostVeth(name string, podIP net.IP, netID uint32, podMAC net.Hardw
 	if err := netlink.LinkSetUp(hv); err != nil {
 		return err
 	}
-	for key, val := range map[string]string{
+	sysctls := map[string]string{
 		fmt.Sprintf("net/ipv4/conf/%s/proxy_arp", name):  "1",
 		fmt.Sprintf("net/ipv4/conf/%s/forwarding", name): "1",
 		fmt.Sprintf("net/ipv4/conf/%s/rp_filter", name):  "0",
-	} {
+	}
+	if isV6(podIP) {
+		// Enable v6 on the host veth so it can own the gateway address below.
+		sysctls[fmt.Sprintf("net/ipv6/conf/%s/disable_ipv6", name)] = "0"
+	}
+	for key, val := range sysctls {
 		if err := datapath.WriteProcSys(key, val); err != nil {
 			return err
 		}
 	}
+	// Give the host veth the pod's on-link gateway (fe80::1) so it answers the
+	// pod's NDP natively. Linux NDP *proxy* (proxy_ndp) does not cover link-local
+	// targets, so — unlike v4's proxy_arp for 169.254.1.1 — we assign the address
+	// outright. It is a distinct link per veth pair, so fe80::1 never collides.
+	if isV6(podIP) {
+		if err := netlink.AddrAdd(hv, &netlink.Addr{
+			IPNet: &net.IPNet{IP: linkLocalGWv6, Mask: net.CIDRMask(64, 64)},
+			Flags: unix.IFA_F_NODAD,
+		}); err != nil && !isExist(err) {
+			return fmt.Errorf("add v6 gateway address on host veth: %w", err)
+		}
+	}
 	// A default-network pod has a unique IP, reached by the host through this
-	// main-table /32. VPC pods are delivered by eBPF (same-node redirect,
+	// main-table host route. VPC pods are delivered by eBPF (same-node redirect,
 	// cross-node from_overlay) or, north-south, by the bridge's per-pod table —
 	// never by a main-table VPC-IP route, which would collide under overlapping
 	// CIDRs. So install the main-table route only for the default network.
@@ -650,9 +717,9 @@ func configureHostVeth(name string, podIP net.IP, netID uint32, podMAC net.Hardw
 		if err := netlink.RouteAdd(&netlink.Route{
 			LinkIndex: hv.Attrs().Index,
 			Scope:     netlink.SCOPE_LINK,
-			Dst:       &net.IPNet{IP: podIP, Mask: net.CIDRMask(32, 32)},
+			Dst:       &net.IPNet{IP: podIP, Mask: hostMask(podIP)},
 		}); err != nil {
-			return fmt.Errorf("add pod /32 route: %w", err)
+			return fmt.Errorf("add pod host route: %w", err)
 		}
 	}
 
@@ -796,9 +863,24 @@ func cloneIP(in net.IP) net.IP {
 	return out
 }
 
-// nextIP returns the IP after ip (IPv4), incrementing in place on a copy.
+// isExist reports whether err is an "already exists" error (e.g. re-adding a
+// proxy neighbour that survived a previous CNI ADD).
+func isExist(err error) bool {
+	return err != nil && errors.Is(err, syscall.EEXIST)
+}
+
+// nextIP returns the IP after ip, incrementing in place on a copy. It works in
+// the address's own width — 4 bytes for v4, 16 for v6 — so IPAM walks a v6 CIDR
+// the same way it walks a v4 one.
 func nextIP(ip net.IP) net.IP {
-	out := cloneIP(ip.To4())
+	// Pick the native width first: To4() is non-nil only for v4. Cloning must
+	// happen after the family choice — cloneIP(nil) yields a length-0 slice, not
+	// nil, so a `cloneIP(To4())==nil` guard would wrongly keep the empty v4 form.
+	base := ip.To4()
+	if base == nil {
+		base = ip.To16()
+	}
+	out := cloneIP(base)
 	for i := len(out) - 1; i >= 0; i-- {
 		out[i]++
 		if out[i] != 0 {

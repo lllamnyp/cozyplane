@@ -58,9 +58,13 @@ func TestParseVPCRef(t *testing.T) {
 
 func TestPortName(t *testing.T) {
 	// Names are keyed by the globally-unique VNI so they stay unique across
-	// namespaces; dots in the IP become dashes (DNS-1123 object name).
+	// namespaces; the IP's separators (v4 dots, v6 colons) become dashes so the
+	// name is a valid DNS-1123 object name.
 	if got := portName(100, "10.10.0.2"); got != "v100.10-10-0-2" {
 		t.Fatalf("portName = %q, want v100.10-10-0-2", got)
+	}
+	if got := portName(100, "fd00:a::2"); got != "v100.fd00-a--2" {
+		t.Fatalf("portName v6 = %q, want v100.fd00-a--2", got)
 	}
 }
 
@@ -69,6 +73,11 @@ func TestNextIP(t *testing.T) {
 		{"10.0.0.1", "10.0.0.2"},
 		{"10.0.0.255", "10.0.1.0"},
 		{"10.0.255.255", "10.1.0.0"},
+		// v6 must increment in the full 16-byte width, not collapse to an empty
+		// address (the To4()-first bug: cloneIP(nil) is length-0, not nil).
+		{"fd00:a::1", "fd00:a::2"},
+		{"fd00:a::ffff", "fd00:a::1:0"},
+		{"2001:db8::", "2001:db8::1"},
 	}
 	for _, c := range cases {
 		if got := nextIP(net.ParseIP(c.in)).String(); got != c.want {
@@ -125,6 +134,29 @@ func TestClaimIP_FirstAddressAndPortShape(t *testing.T) {
 	// for the node agent's acknowledgement.
 	if len(port.Finalizers) != 1 || port.Finalizers[0] != sdnv1alpha1.FinalizerSever {
 		t.Errorf("finalizers = %v, want [%s]", port.Finalizers, sdnv1alpha1.FinalizerSever)
+	}
+}
+
+func TestClaimIP_IPv6(t *testing.T) {
+	// A v6 VPC CIDR must allocate natively: network+2 in the full 16-byte width,
+	// a v6-safe Port name, and the v6 address (not a truncated/empty one) in spec.
+	client := sdnfake.NewSimpleClientset()
+	vpc := newVPC("team-a", "tenant6", 200, "fd00:a::/64")
+	state := &datapath.AgentState{NodeName: "node1", NodeIP: "192.0.2.1"}
+
+	ip, port, err := claimIP(client, vpc, "team-a", state, "10.244.0.5", "team-a", "app6", "uid-6")
+	if err != nil {
+		t.Fatalf("claimIP v6: %v", err)
+	}
+	if ip.String() != "fd00:a::2" {
+		t.Fatalf("first v6 IP = %s, want fd00:a::2", ip)
+	}
+	if port.Name != "v200.fd00-a--2" {
+		t.Errorf("port name = %q, want v200.fd00-a--2", port.Name)
+	}
+	// The fabric IP stays v4 (from the node pod CIDR underlay) even for a v6 pod.
+	if port.Spec.IP != "fd00:a::2" || port.Spec.FabricIP != "10.244.0.5" {
+		t.Errorf("port spec ip/fabric = %q/%q", port.Spec.IP, port.Spec.FabricIP)
 	}
 }
 
