@@ -140,6 +140,10 @@ func (m *Manager) AttachUplinkIngress() (string, error) {
 	if err := AttachIngress(idx, m.objs.CozyplaneFromUplink); err != nil {
 		return "", err
 	}
+	// from_pod redirects floating-IP replies out this interface (redirect_neigh).
+	if err := m.objs.Params.Put(cfgUplinkIfindex, uint32(idx)); err != nil {
+		return "", fmt.Errorf("set uplink ifindex: %w", err)
+	}
 	return name, nil
 }
 

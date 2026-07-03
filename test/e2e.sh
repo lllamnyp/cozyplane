@@ -175,6 +175,34 @@ $K -n kube-system wait --for=condition=Ready pod -l app=cozyplane-gateway --time
 check "a1(vpc-a, egress on) -> internet 1.1.1.1" "" bash -c "$K -n team-a exec a1 -- ping -c2 -W3 1.1.1.1 >/dev/null 2>&1 && echo"
 check_fail "bw1(vpc-b, no egress) -> internet 1.1.1.1" bash -c "$K -n team-b exec bw1 -- ping -c1 -W2 1.1.1.1 >/dev/null 2>&1"
 
+echo "[floating IP: external ingress, source-preserving]"
+# Bind a public IP to a1's VPC IP; an off-cluster client (a container on the
+# kind L2, off the overlay) must reach a1 through it. Exercises from_uplink ->
+# to_pod floating DNAT -> pod, the source-preserving reply, and ARP advertisement
+# from a1's node. The public IP is drawn from the kind subnet's high /24 (kind's
+# DHCP allocates low), so the client resolves it by ARP on the shared bridge.
+KNET=$(docker network inspect kind -f '{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null)
+KPFX=$(echo "${KNET:-172.18.0.0/16}" | cut -d. -f1-2)
+FIP="${KPFX}.240.10"
+A1IP=$(vpcip a1)
+$K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: ExternalPool
+metadata: {name: e2e-pub}
+spec: {cidrs: ["${KPFX}.240.0/24"], advertisement: L2}
+---
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: FloatingIP
+metadata: {name: a1-fip, namespace: team-a}
+spec: {vpcRef: {name: vpc-a}, target: "$A1IP", address: "$FIP"}
+EOF
+$K -n team-a wait --for=jsonpath='{.status.phase}'=Ready floatingip/a1-fip --timeout=30s >/dev/null 2>&1
+check "a1-fip Ready with $FIP" "Ready" $K -n team-a get floatingip a1-fip -o jsonpath='{.status.phase}'
+# External client: a throwaway container on the kind network, not a cluster node.
+extget() { docker run --rm --network kind curlimages/curl:8.11.0 -s -m3 "$1" 2>/dev/null; }
+got=""; for _ in $(seq 1 12); do got=$(extget "http://$FIP/" | tr -d '[:space:]'); [ "$got" = "a1" ] && break; sleep 2; done
+[ "$got" = "a1" ] && pass "external client -> $FIP reaches a1" || fail "external client -> $FIP reaches a1 (got '$got')"
+
 echo "[revocation]"
 $K -n team-a delete vpcbinding vpc-a >/dev/null
 sleep 6

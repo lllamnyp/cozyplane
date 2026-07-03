@@ -46,6 +46,7 @@ const (
 	// config map indices — must match bpf/overlay.c.
 	cfgGeneveIfindex = uint32(0)
 	cfgVNI           = uint32(1)
+	cfgUplinkIfindex = uint32(2)
 )
 
 // DefaultVNI is the VNI used for the default (flat) pod network in M0.

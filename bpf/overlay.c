@@ -278,6 +278,11 @@ struct {
 
 #define CFG_GENEVE_IFINDEX 0
 #define CFG_VNI            1
+#define CFG_UPLINK_IFINDEX 2
+
+// floating_reverse returns this when the packet is not a floating-IP reply, so
+// the caller falls through to the normal egress path.
+#define FLOAT_MISS -1
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -552,19 +557,24 @@ static __always_inline int floating_forward(struct __sk_buff *skb, struct iphdr 
 
 // floating_reverse is the reply half, done in from_pod when a VPC pod replies to
 // the external client of one of its floating IPs. If a float_ct entry matches,
-// SNAT the source VPC IP -> publicIP and report handled (1); the caller lets the
-// kernel route it out the uplink. No match => 0: not a floating reply, fall
-// through to the normal egress path.
+// SNAT the source VPC IP -> publicIP and redirect the reply out the uplink with
+// kernel neighbour resolution for the client, returning the redirect action. The
+// redirect is essential: the reply's source is now the public IP, which is
+// advertised as a local /32 on the uplink, so the normal RX path would drop it
+// as a martian source (local IP arriving on the pod veth). redirect_neigh
+// bypasses that (and rp_filter and the FORWARD chain) and fills the L2 header
+// from the client's neighbour entry. No match => FLOAT_MISS: not a floating
+// reply, fall through to the normal egress path.
 static __always_inline int floating_reverse(struct __sk_buff *skb, struct iphdr *ip, __u32 net)
 {
 	if (ip->ihl != 5)
-		return 0;
+		return FLOAT_MISS;
 	__u8 proto = ip->protocol;
 	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
-		return 0;
+		return FLOAT_MISS;
 	__u16 pport, cport;
 	if (l4_ports(skb, &pport, &cport) < 0)
-		return 0;
+		return FLOAT_MISS;
 
 	struct float_ct_key k = {
 		.proto = proto,
@@ -576,10 +586,13 @@ static __always_inline int floating_reverse(struct __sk_buff *skb, struct iphdr 
 	};
 	__u32 *public_ip = bpf_map_lookup_elem(&float_ct, &k);
 	if (!public_ip)
-		return 0;
+		return FLOAT_MISS;
 
+	__u32 uplink = cfg(CFG_UPLINK_IFINDEX);
+	if (!uplink)
+		return FLOAT_MISS;
 	nat_addr(skb, proto, IP_SADDR_OFF, ip->saddr, *public_ip);
-	return 1;
+	return bpf_redirect_neigh(uplink, NULL, 0, 0);
 }
 
 // cozyplane_from_pod: source-side hook (pod egress). Enforces isolation, then
@@ -609,11 +622,19 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 
 	// A VPC pod replying to the external client of one of its floating IPs: the
 	// destination is off-net (dstnet 0) but a float_ct match reverses the
-	// source-preserving NAT (VPC IP -> publicIP); the kernel then routes it out
-	// the uplink. Checked before isolation, which would send it to the gateway
-	// or drop it.
-	if (srcnet && !dstnet && floating_reverse(skb, ip, srcnet))
-		return TC_ACT_OK;
+	// source-preserving NAT (VPC IP -> publicIP) and redirects the reply out the
+	// uplink. Checked before isolation, which would send it to the gateway or
+	// drop it.
+	if (srcnet && !dstnet) {
+		int fr = floating_reverse(skb, ip, srcnet);
+		if (fr != FLOAT_MISS)
+			return fr;
+		// The miss path leaves the packet untouched, but floating_reverse's
+		// inlined body writes the packet on its hit path, so the verifier treats
+		// `ip` as invalidated here — re-derive it.
+		if (parse_ipv4(skb, &ip) < 0)
+			return TC_ACT_OK;
+	}
 
 	// Isolation: same-network or explicitly peered traffic only (egress side) —
 	// except a VPC pod's off-net traffic, which goes to the VPC's egress

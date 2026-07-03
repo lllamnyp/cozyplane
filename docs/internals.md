@@ -289,8 +289,13 @@ the client-masquerade removed, so the tenant sees the *real* caller. The pieces:
 - **`floating` map** (`publicIP → {net, vpcIP}`), programmed by the agent — the
   external-facing sibling of `bridges`.
 - **Advertisement from the target pod's own node.** The agent on whatever node
-  currently hosts the target's Port answers ARP/NDP for `publicIP` on the uplink
-  (L2 mode; BGP later). So `client → publicIP` always arrives where the pod
+  currently hosts the target's Port makes the node answer ARP for `publicIP` by
+  assigning it as a `/32` on the uplink (L2 mode; BGP later). Proxy-ARP (a pneigh
+  entry) does *not* work here: a floating IP is drawn from an L2 the node is
+  already on, so the kernel treats the address as same-link and never proxies it —
+  the classic MetalLB-L2 problem. Assigning the `/32` makes the kernel answer for
+  it as a local address; `from_uplink` still intercepts inbound at tc ingress
+  before any local delivery. So `client → publicIP` always arrives where the pod
   already is: floating ingress is always *local*, never cross-node, and the
   address follows the pod on reschedule.
 - **An uplink-ingress hook** (`from_uplink`). A tc program at the node uplink's
@@ -307,19 +312,23 @@ the client-masquerade removed, so the tenant sees the *real* caller. The pieces:
 - **Reply through `from_pod`.** The pod replies `vpcIP → client` via its
   `169.254.1.1` default route — which every pod has unconditionally
   (`configurePodIface`), gateway or not. `from_pod` (already on every veth) finds
-  the source-preserving ct, SNATs `vpcIP → publicIP`, and lets it route out the
-  uplink. `publicIP` is outside the cluster pod CIDR, so the node masquerade rule
-  (`-s <clusterCIDR> …`) does not touch it — the reply reaches the client sourced
-  from the floating address. (This is why a pool must be a routable range disjoint
-  from the pod CIDR.)
+  the source-preserving ct, SNATs `vpcIP → publicIP`, and **`bpf_redirect_neigh`s
+  it out the uplink** (kernel neighbour resolution for the external client). The
+  redirect is not optional: because `publicIP` is advertised as a local `/32`, the
+  normal RX path would drop the reply as a *martian source* (a local address
+  arriving on the pod veth), and it would also face `rp_filter` and the FORWARD
+  chain. `redirect_neigh` bypasses all three and fills the L2 header from the
+  client's neighbour entry — the same "don't route, deliver by identity" move the
+  rest of the datapath makes. (A pool must still be a routable range disjoint from
+  the pod CIDR so the client and the switch fabric can reach it.)
 
 **Inbound walk (external client → floatingIP → tenant pod B in VPC-X):**
 `client → floatingIP` arrives at B's node (its agent answered ARP) → `from_uplink`
 redirects it into B's veth (`locals[{X, B-ip}]`) → `to_pod`'s `floating_forward`
 DNATs it to `client → B-ip`, keeping the client source, and stamps the ct → B
 replies `B-ip → client` toward `169.254.1.1` → `from_pod` matches the ct, rewrites
-the source `B-ip → floatingIP`, and it routes out the uplink to the client,
-unmasqueraded.
+the source `B-ip → floatingIP`, and `redirect_neigh`s it out the uplink to the
+client, unmasqueraded.
 
 **Why the conntrack, and how EIP egress drops in later.** The 1:1 map is a static
 bijection, so reversing a reply needs no state in principle — but *unconditionally*

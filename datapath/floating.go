@@ -76,45 +76,49 @@ func (m *Manager) Floatings() (map[string]bool, error) {
 	return out, it.Err()
 }
 
-// AdvertiseFloating answers ARP for a public IP on the uplink so the physical
-// fabric delivers it to this node — a per-address proxy neighbour (NTF_PROXY),
-// which responds for exactly this IP and needs no global proxy_arp. Idempotent.
+// AdvertiseFloating makes this node answer ARP for a public IP by assigning it
+// as a /32 on the uplink. Proxy-ARP (pneigh) is unusable here: floating IPs are
+// drawn from an L2 the node is already on, so the kernel treats the address as
+// same-link and never proxies it. Assigning the /32 makes the kernel answer ARP
+// for it as a local address; from_uplink still intercepts inbound packets at tc
+// ingress before any local delivery, and replies leave via redirect_neigh (which
+// sidesteps the martian-source check the local /32 would otherwise trigger).
+// Idempotent.
 func AdvertiseFloating(publicIP, uplink string) error {
-	neigh, err := floatingProxyNeigh(publicIP, uplink)
+	link, err := netlink.LinkByName(uplink)
+	if err != nil {
+		return fmt.Errorf("lookup uplink %s: %w", uplink, err)
+	}
+	addr, err := floatingAddr(publicIP)
 	if err != nil {
 		return err
 	}
-	if err := netlink.NeighAdd(neigh); err != nil && !isExist(err) {
+	if err := netlink.AddrReplace(link, addr); err != nil {
 		return fmt.Errorf("advertise floating %s on %s: %w", publicIP, uplink, err)
 	}
 	return nil
 }
 
-// UnadvertiseFloating removes the proxy-ARP entry for a public IP (idempotent).
+// UnadvertiseFloating removes the /32 for a public IP from the uplink (idempotent).
 func UnadvertiseFloating(publicIP, uplink string) error {
-	neigh, err := floatingProxyNeigh(publicIP, uplink)
+	link, err := netlink.LinkByName(uplink)
+	if err != nil {
+		return nil // uplink gone; the address went with it
+	}
+	addr, err := floatingAddr(publicIP)
 	if err != nil {
 		return err
 	}
-	if err := netlink.NeighDel(neigh); err != nil && !isNotExist(err) {
+	if err := netlink.AddrDel(link, addr); err != nil && !isNotExist(err) {
 		return fmt.Errorf("unadvertise floating %s on %s: %w", publicIP, uplink, err)
 	}
 	return nil
 }
 
-func floatingProxyNeigh(publicIP, uplink string) (*netlink.Neigh, error) {
-	link, err := netlink.LinkByName(uplink)
-	if err != nil {
-		return nil, fmt.Errorf("lookup uplink %s: %w", uplink, err)
-	}
+func floatingAddr(publicIP string) (*netlink.Addr, error) {
 	ip := net.ParseIP(publicIP).To4()
 	if ip == nil {
 		return nil, fmt.Errorf("public IP %q is not IPv4", publicIP)
 	}
-	return &netlink.Neigh{
-		LinkIndex: link.Attrs().Index,
-		Family:    netlink.FAMILY_V4,
-		Flags:     netlink.NTF_PROXY,
-		IP:        ip,
-	}, nil
+	return &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}}, nil
 }
