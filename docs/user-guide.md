@@ -313,8 +313,11 @@ An egress gateway gets a VPC *out*; a **floating IP** gets one workload *in* —
 externally-routable address, reachable from outside the cluster, mapped 1:1 to a
 tenant IP, with the caller's **real source address preserved**. Unlike a Service
 `type=LoadBalancer` (one VIP over many backends), a floating IP points at a single
-workload. It needs no egress gateway — the address maps straight to the tenant IP
-in the eBPF datapath.
+workload. It is a **true public IP**: the workload also *egresses the internet
+from it*, so its outbound source address equals the public IP it is reached on
+(what external allow-listing needs). Cluster-internal traffic (its own VPC, cluster
+DNS) is unaffected — only internet egress takes the public IP. It needs no egress
+gateway; the address maps straight to the tenant IP in the eBPF datapath.
 
 An operator defines a pool of routable addresses once, cluster-wide:
 
