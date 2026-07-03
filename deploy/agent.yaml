@@ -37,6 +37,11 @@ rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["ports"]
     verbs: ["get", "list", "watch", "create", "update", "delete"]
+  # FloatingIPs: the agent programs the floating map and advertises the address
+  # for those whose target Port is on this node.
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["floatingips"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
