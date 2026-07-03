@@ -146,6 +146,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := (&sdncontroller.FloatingIPReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "FloatingIP")
+		os.Exit(1)
+	}
+
 	if gatewayImage != "" {
 		if gatewayNamespace == "" {
 			setupLog.Error(nil, "--gateway-namespace (or POD_NAMESPACE) is required with --gateway-image")

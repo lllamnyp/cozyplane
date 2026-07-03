@@ -33,6 +33,21 @@ const (
 	FloatingIPPhaseReady FloatingIPPhase = "Ready"
 )
 
+// Condition types surfaced in FloatingIP status.
+const (
+	// FloatingIPConditionPoolResolved is True when the referenced (or default)
+	// ExternalPool exists and could be selected.
+	FloatingIPConditionPoolResolved = "PoolResolved"
+	// FloatingIPConditionAddressAssigned is True when an address has been
+	// allocated from the pool to this binding.
+	FloatingIPConditionAddressAssigned = "AddressAssigned"
+	// FloatingIPConditionGatewayEnabled is True when the target VPC has an
+	// egress gateway enabled — the anchor a floating IP is realized on. A
+	// FloatingIP never enables the gateway itself (it does not own the VPC); it
+	// stays Pending until the VPC owner turns spec.egress.natGateway on.
+	FloatingIPConditionGatewayEnabled = "GatewayEnabled"
+)
+
 // FloatingIPSpec binds one externally-routable address 1:1 to a workload inside
 // a VPC. The address is reachable bidirectionally: inbound connections DNAT to
 // the target, and the target's egress is SNATed from the floating address.
