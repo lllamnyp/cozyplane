@@ -277,6 +277,53 @@ bypassing the kernel FORWARD chain entirely. The NAT itself is keyed by
 `{net, vpcIP}`, so the two same-IP pods stay distinct. Like the overlay, the
 bridge delivers by identity, never by a shared address.
 
+### Floating IPs (external north-south)
+
+The dual-address bridge above is *internal* north-south: a fabric IP reachable
+from the cluster's default overlay. A **floating IP** extends that to *external*
+north-south — a routable public address, reachable from off-cluster, bound 1:1
+to a tenant IP — and it rides the per-VPC egress gateway rather than the eBPF
+bridge. Two owners, two domains:
+
+- **The gateway pod owns the NAT**, in its own netns, where the tenant IP is
+  unambiguous even under overlapping CIDRs. For each `FloatingIP` bound to its
+  VPC it programs two rules beside its existing egress MASQUERADE:
+  - `PREROUTING -d <floatingIP> -j DNAT --to <tenantIP>` — inbound. Conntrack
+    reverses it automatically, so a reply `tenantIP → client` leaves as
+    `floatingIP → client` with no second rule.
+  - `POSTROUTING -s <tenantIP> -o <fabric-leg> -j SNAT --to <floatingIP>` —
+    egress *from* the floating IP (Elastic-IP semantics), ordered before the
+    shared masquerade so a workload with a floating IP uses it in both
+    directions while its VPC-mates still share the gateway address.
+- **The node agent owns delivery + advertisement**, on the host. On the node
+  running the VPC's gateway it installs a `/32` route pushing `<floatingIP>` into
+  the gateway pod's netns (the host side of the gateway's fabric veth) and
+  answers ARP/NDP for it on the uplink, so the physical fabric steers the address
+  to this node (L2 mode; BGP later).
+
+**Inbound walk (external client → floatingIP → tenant pod B in VPC-X):** the
+fabric delivers `client → floatingIP` to the gateway's node (it answered ARP) →
+the node's `/32` route pushes it into the gateway netns → `PREROUTING` DNATs it
+to `client → B-ip` → routing sends it out the gateway's **VPC leg**, where
+`from_pod` (ports bit 31) marks it gateway-forwarded (same-node mark, or the
+`TUN_F_GATEWAY` VNI bit cross-node) → delivered to B by identity
+(`locals[{X,B-ip}]` same-node, `remotes[{X,B-ip}]` Geneve cross-node) → B's
+`to_pod` admits the off-VPC source because the gateway mark is set. B's reply
+retraces it: off-VPC → `gateways[X]` → the gateway, where conntrack un-DNATs
+`B-ip → client` back to `floatingIP → client`.
+
+**Escaping node masquerade.** The reply leaves the gateway's fabric leg sourced
+from `floatingIP`, a public address *outside* the cluster pod CIDR — so the node
+masquerade rule (`-s <clusterCIDR> ...`) does not match it and the source is
+preserved to the client. This is why a pool must be drawn from a routable range
+disjoint from the pod CIDR.
+
+**Realization note.** This is the centralized (Neutron non-DVR) datapath: every
+floating-IP flow funnels through the one gateway pod, sharing its failure domain
+with egress conntrack. The `FloatingIP` API says nothing about this — a later
+distributed DNAT at the ingress node (once the eBPF Service datapath exists) can
+replace it with no API change.
+
 ### Addressing / byte order (for maintainers)
 
 - `remotes` / `networks` LPM keys are `{prefixlen, scope_net, addr}` with
@@ -510,9 +557,10 @@ mostly future work. As built:
   netns).
 - VPC egress is opt-in and coarse: `spec.egress.natGateway` opens internet +
   cluster DNS through a single per-VPC gateway pod; no per-destination policy,
-  Service exposure, metadata endpoint, or floating IPs (source-preserving
-  ingress) yet. No policy/security groups — a peering opens the two VPCs
-  completely.
+  Service exposure, or metadata endpoint yet. **Floating IPs** (source-preserving
+  public ingress) have an API and allocation; their gateway 1:1 NAT and address
+  advertisement are landing (see "Floating IPs" in §3). No policy/security groups
+  — a peering opens the two VPCs completely.
 - IPv4 only; single CIDR per VPC; no VM live-migration plumbing.
 - The API is served as CRDs by default; the aggregated apiserver
   (`apiserver.enabled=true`) serves the same group with server-side validation
