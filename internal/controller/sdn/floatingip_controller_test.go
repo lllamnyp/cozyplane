@@ -37,16 +37,17 @@ func pool(name string, cidrs ...string) *sdnv1alpha1.ExternalPool {
 	}
 }
 
-func gwVPC(ns, name string, gateway bool) *sdnv1alpha1.VPC {
-	vpc := &sdnv1alpha1.VPC{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-		Spec:       sdnv1alpha1.VPCSpec{CIDRs: []string{"10.0.0.0/24"}},
-		Status:     sdnv1alpha1.VPCStatus{VNI: 100, Phase: sdnv1alpha1.VPCPhaseReady},
+// livePort is a Port realizing a tenant IP in a VPC on a node — i.e. a running
+// pod holds that IP, which is the FloatingIP liveness gate.
+func livePort(vpcNS, vpc, ip, node string) *sdnv1alpha1.Port {
+	return &sdnv1alpha1.Port{
+		ObjectMeta: metav1.ObjectMeta{Name: "port-" + ip},
+		Spec: sdnv1alpha1.PortSpec{
+			VPCRef: sdnv1alpha1.VPCRef{Namespace: vpcNS, Name: vpc},
+			IP:     ip,
+			Node:   node,
+		},
 	}
-	if gateway {
-		vpc.Spec.Egress = &sdnv1alpha1.VPCEgress{NATGateway: true}
-	}
-	return vpc
 }
 
 func floatingIP(ns, name, vpc, target string) *sdnv1alpha1.FloatingIP {
@@ -82,46 +83,36 @@ func reconcileFIP(t *testing.T, c client.Client, ns, name string) *sdnv1alpha1.F
 	return got
 }
 
-// The whole point of the gateway decision: a FloatingIP whose target VPC has no
-// gateway gets an address reserved but stays Pending with GatewayEnabled=False.
-// The controller must not enable the gateway itself.
-func TestFloatingIPPendingWithoutGateway(t *testing.T) {
+// A FloatingIP whose target IP has no running pod reserves its address but stays
+// Pending with TargetLive=False — there is no node to advertise from, so the
+// address is held, not black-holed.
+func TestFloatingIPPendingWithoutLiveTarget(t *testing.T) {
 	c := fipClient(t,
 		pool("public", "203.0.113.0/29"),
-		gwVPC("team-a", "vpc-a", false),
 		floatingIP("team-a", "web", "vpc-a", "10.0.0.5"),
-	)
+	) // no Port realizes 10.0.0.5
 
 	got := reconcileFIP(t, c, "team-a", "web")
 	if got.Status.Phase != sdnv1alpha1.FloatingIPPhasePending {
-		t.Errorf("phase = %q, want Pending without a gateway", got.Status.Phase)
+		t.Errorf("phase = %q, want Pending without a live target", got.Status.Phase)
 	}
-	if meta.IsStatusConditionTrue(got.Status.Conditions, sdnv1alpha1.FloatingIPConditionGatewayEnabled) {
-		t.Error("GatewayEnabled should be False when the VPC has no egress gateway")
+	if meta.IsStatusConditionTrue(got.Status.Conditions, sdnv1alpha1.FloatingIPConditionTargetLive) {
+		t.Error("TargetLive should be False when no pod holds the target IP")
 	}
 	if !meta.IsStatusConditionTrue(got.Status.Conditions, sdnv1alpha1.FloatingIPConditionAddressAssigned) {
-		t.Error("AddressAssigned should be True: allocation is independent of the gateway")
+		t.Error("AddressAssigned should be True: allocation is independent of the target")
 	}
 	if got.Status.Address == "" {
-		t.Error("an address should be reserved even while Pending on the gateway")
-	}
-
-	// The controller must never turn the gateway on behind the owner's back.
-	vpc := &sdnv1alpha1.VPC{}
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: "vpc-a"}, vpc); err != nil {
-		t.Fatalf("get vpc: %v", err)
-	}
-	if vpc.Spec.Egress != nil {
-		t.Error("reconcile must not mutate the target VPC's egress config")
+		t.Error("an address should be reserved even while Pending on the target")
 	}
 }
 
-// With the gateway enabled, an address assigned, and the pool resolved, the
+// With a live target Port, an address assigned, and the pool resolved, the
 // FloatingIP is Ready.
-func TestFloatingIPReadyWithGateway(t *testing.T) {
+func TestFloatingIPReadyWithLiveTarget(t *testing.T) {
 	c := fipClient(t,
 		pool("public", "203.0.113.0/29"),
-		gwVPC("team-a", "vpc-a", true),
+		livePort("team-a", "vpc-a", "10.0.0.5", "node-1"),
 		floatingIP("team-a", "web", "vpc-a", "10.0.0.5"),
 	)
 
@@ -134,10 +125,28 @@ func TestFloatingIPReadyWithGateway(t *testing.T) {
 	}
 }
 
+// A Port in a different VPC that happens to share the target IP does not satisfy
+// liveness — delivery is net-scoped, so the match must be VPC + IP.
+func TestFloatingIPPendingWhenPortIsInAnotherVPC(t *testing.T) {
+	c := fipClient(t,
+		pool("public", "203.0.113.0/29"),
+		livePort("team-a", "vpc-other", "10.0.0.5", "node-1"), // same IP, wrong VPC
+		floatingIP("team-a", "web", "vpc-a", "10.0.0.5"),
+	)
+
+	got := reconcileFIP(t, c, "team-a", "web")
+	if meta.IsStatusConditionTrue(got.Status.Conditions, sdnv1alpha1.FloatingIPConditionTargetLive) {
+		t.Error("TargetLive should be False: the Port is in a different VPC")
+	}
+	if got.Status.Phase != sdnv1alpha1.FloatingIPPhasePending {
+		t.Errorf("phase = %q, want Pending", got.Status.Phase)
+	}
+}
+
 // No pool → Pending, PoolResolved=False, no address.
 func TestFloatingIPPendingWithoutPool(t *testing.T) {
 	c := fipClient(t,
-		gwVPC("team-a", "vpc-a", true),
+		livePort("team-a", "vpc-a", "10.0.0.5", "node-1"),
 		floatingIP("team-a", "web", "vpc-a", "10.0.0.5"),
 	)
 
@@ -157,7 +166,6 @@ func TestFloatingIPPendingWithoutPool(t *testing.T) {
 func TestFloatingIPAllocatesDistinctAddresses(t *testing.T) {
 	c := fipClient(t,
 		pool("public", "203.0.113.0/29"),
-		gwVPC("team-a", "vpc-a", true),
 		floatingIP("team-a", "web", "vpc-a", "10.0.0.5"),
 		floatingIP("team-a", "api", "vpc-a", "10.0.0.6"),
 	)
@@ -178,7 +186,6 @@ func TestFloatingIPHonorsRequestedAddress(t *testing.T) {
 	fip.Spec.Address = "203.0.113.4"
 	c := fipClient(t,
 		pool("public", "203.0.113.0/29"),
-		gwVPC("team-a", "vpc-a", true),
 		fip,
 	)
 
@@ -194,7 +201,6 @@ func TestFloatingIPPendingWhenRequestedAddressOutOfRange(t *testing.T) {
 	fip.Spec.Address = "198.51.100.9" // not in the pool
 	c := fipClient(t,
 		pool("public", "203.0.113.0/29"),
-		gwVPC("team-a", "vpc-a", true),
 		fip,
 	)
 
@@ -211,7 +217,6 @@ func TestFloatingIPPendingWhenRequestedAddressOutOfRange(t *testing.T) {
 func TestFloatingIPAddressIsSticky(t *testing.T) {
 	c := fipClient(t,
 		pool("public", "203.0.113.0/29"),
-		gwVPC("team-a", "vpc-a", true),
 		floatingIP("team-a", "web", "vpc-a", "10.0.0.5"),
 	)
 

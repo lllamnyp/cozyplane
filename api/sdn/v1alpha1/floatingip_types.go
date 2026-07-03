@@ -41,11 +41,11 @@ const (
 	// FloatingIPConditionAddressAssigned is True when an address has been
 	// allocated from the pool to this binding.
 	FloatingIPConditionAddressAssigned = "AddressAssigned"
-	// FloatingIPConditionGatewayEnabled is True when the target VPC has an
-	// egress gateway enabled — the anchor a floating IP is realized on. A
-	// FloatingIP never enables the gateway itself (it does not own the VPC); it
-	// stays Pending until the VPC owner turns spec.egress.natGateway on.
-	FloatingIPConditionGatewayEnabled = "GatewayEnabled"
+	// FloatingIPConditionTargetLive is True when the target tenant IP belongs to
+	// a live Port — a running pod on some node. That node is where the address is
+	// advertised from and delivered to, so without a live target the address is
+	// reserved but not announced (the binding stays Pending).
+	FloatingIPConditionTargetLive = "TargetLive"
 )
 
 // FloatingIPSpec binds one externally-routable address 1:1 to a workload inside

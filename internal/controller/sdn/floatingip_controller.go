@@ -35,11 +35,13 @@ import (
 )
 
 // FloatingIPReconciler allocates an externally-routable address from an
-// ExternalPool to a FloatingIP and surfaces readiness in its status. It
-// deliberately does not touch the target VPC: a FloatingIP does not own the
-// VPC, so it never enables the gateway on the owner's behalf. If the target
-// VPC has no egress gateway, the binding stays Pending with GatewayEnabled=False
-// until the VPC owner turns it on.
+// ExternalPool to a FloatingIP and surfaces readiness in its status. The address
+// is reserved permanently, but the binding is Ready — and, downstream, the
+// address advertised and programmed — only while the target tenant IP belongs to
+// a live Port (a running pod). Without a live target there is no node to
+// advertise from, so the address stays reserved but silent (TargetLive=False)
+// rather than black-holing traffic. A FloatingIP needs no egress gateway: the
+// datapath maps the address straight to the tenant IP in the eBPF bridge.
 //
 // Allocation reads committed allocations from other FloatingIPs' status; leader
 // election serializes the writer, so a plain list-and-pick is race-free. A
@@ -53,7 +55,7 @@ type FloatingIPReconciler struct {
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=floatingips,verbs=get;list;watch
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=floatingips/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=externalpools,verbs=get;list;watch
-// +kubebuilder:rbac:groups=sdn.cozystack.io,resources=vpcs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=sdn.cozystack.io,resources=ports,verbs=get;list;watch
 
 // Reconcile allocates an address and computes the FloatingIP's phase/conditions.
 func (r *FloatingIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -66,10 +68,10 @@ func (r *FloatingIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	pool := r.resolvePool(ctx, fip)
 
-	// The gateway is the anchor a floating IP is realized on. We only observe
-	// whether the VPC owner has enabled it — we never enable it ourselves.
-	vpc := r.getVPC(ctx, fip.Namespace, fip.Spec.VPCRef.Name)
-	gatewayEnabled := vpc != nil && vpc.Spec.Egress != nil && vpc.Spec.Egress.NATGateway
+	// The address is advertised from, and delivered to, the node hosting the
+	// target's Port. A live Port means a running pod holds the target IP — so it
+	// is the readiness gate. We never touch the VPC or a gateway.
+	targetLive := r.targetHasLivePort(ctx, fip)
 
 	status := sdnv1alpha1.FloatingIPStatus{
 		Phase:   sdnv1alpha1.FloatingIPPhasePending,
@@ -93,10 +95,10 @@ func (r *FloatingIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		"PoolResolved", "the referenced (or single default) ExternalPool exists")
 	setFIPCondition(&status, sdnv1alpha1.FloatingIPConditionAddressAssigned, addressAssigned,
 		"AddressAssigned", "an address was allocated from the pool")
-	setFIPCondition(&status, sdnv1alpha1.FloatingIPConditionGatewayEnabled, gatewayEnabled,
-		"GatewayEnabled", "the target VPC has spec.egress.natGateway enabled")
+	setFIPCondition(&status, sdnv1alpha1.FloatingIPConditionTargetLive, targetLive,
+		"TargetLive", "the target tenant IP belongs to a running pod's Port")
 
-	if pool != nil && addressAssigned && gatewayEnabled {
+	if pool != nil && addressAssigned && targetLive {
 		status.Phase = sdnv1alpha1.FloatingIPPhaseReady
 	}
 
@@ -181,12 +183,25 @@ func (r *FloatingIPReconciler) usedAddresses(ctx context.Context, self *sdnv1alp
 	return used, nil
 }
 
-func (r *FloatingIPReconciler) getVPC(ctx context.Context, namespace, name string) *sdnv1alpha1.VPC {
-	vpc := &sdnv1alpha1.VPC{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, vpc); err != nil {
-		return nil
+// targetHasLivePort reports whether a Port realizes the FloatingIP's target IP
+// in its VPC — i.e. a running pod holds that tenant IP on some node. Ports are
+// cluster-scoped; their VPCRef namespace is the VPC owner's, which for a
+// FloatingIP's local vpcRef is the FloatingIP's own namespace.
+func (r *FloatingIPReconciler) targetHasLivePort(ctx context.Context, fip *sdnv1alpha1.FloatingIP) bool {
+	var list sdnv1alpha1.PortList
+	if err := r.List(ctx, &list); err != nil {
+		return false
 	}
-	return vpc
+	for i := range list.Items {
+		p := &list.Items[i]
+		if p.Spec.VPCRef.Namespace == fip.Namespace &&
+			p.Spec.VPCRef.Name == fip.Spec.VPCRef.Name &&
+			p.Spec.IP == fip.Spec.Target &&
+			p.Spec.Node != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // addrInCIDRs reports whether ip parses and falls within any of the CIDRs.
@@ -246,33 +261,36 @@ func fipStatusEqual(a, b sdnv1alpha1.FloatingIPStatus) bool {
 }
 
 // SetupWithManager registers the reconciler. A FloatingIP must re-reconcile when
-// its target VPC changes (gateway toggled), when any ExternalPool changes (pool
-// CIDRs), and when another FloatingIP changes (an address may have freed up).
+// a Port appears or disappears for its target IP (the liveness gate), when any
+// ExternalPool changes (pool CIDRs), and when another FloatingIP changes (an
+// address may have freed up).
 func (r *FloatingIPReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&sdnv1alpha1.FloatingIP{}).
-		Watches(&sdnv1alpha1.VPC{}, handler.EnqueueRequestsFromMapFunc(r.mapVPCToFloatingIPs)).
+		Watches(&sdnv1alpha1.Port{}, handler.EnqueueRequestsFromMapFunc(r.mapPortToFloatingIPs)).
 		Watches(&sdnv1alpha1.ExternalPool{}, handler.EnqueueRequestsFromMapFunc(r.mapPoolToFloatingIPs)).
 		Watches(&sdnv1alpha1.FloatingIP{}, handler.EnqueueRequestsFromMapFunc(r.mapToPendingFloatingIPs)).
 		Named("floatingip").
 		Complete(r)
 }
 
-// mapVPCToFloatingIPs enqueues FloatingIPs in the changed VPC's namespace that
-// target it (their gateway gate depends on the VPC's egress config).
-func (r *FloatingIPReconciler) mapVPCToFloatingIPs(ctx context.Context, obj client.Object) []ctrl.Request {
-	vpc, ok := obj.(*sdnv1alpha1.VPC)
+// mapPortToFloatingIPs enqueues FloatingIPs whose target IP matches the changed
+// Port's VPC and IP — their liveness gate turns on/off with the Port.
+func (r *FloatingIPReconciler) mapPortToFloatingIPs(ctx context.Context, obj client.Object) []ctrl.Request {
+	port, ok := obj.(*sdnv1alpha1.Port)
 	if !ok {
 		return nil
 	}
+	// A local vpcRef resolves in the VPC owner's namespace, which is the Port's
+	// VPCRef namespace.
 	var list sdnv1alpha1.FloatingIPList
-	if err := r.List(ctx, &list, client.InNamespace(vpc.Namespace)); err != nil {
+	if err := r.List(ctx, &list, client.InNamespace(port.Spec.VPCRef.Namespace)); err != nil {
 		return nil
 	}
 	var reqs []ctrl.Request
 	for i := range list.Items {
 		f := &list.Items[i]
-		if f.Spec.VPCRef.Name == vpc.Name {
+		if f.Spec.VPCRef.Name == port.Spec.VPCRef.Name && f.Spec.Target == port.Spec.IP {
 			reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: f.Namespace, Name: f.Name}})
 		}
 	}
