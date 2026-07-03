@@ -18,6 +18,10 @@ limitations under the License.
 
 package v1alpha1
 
+type ExternalPoolExpansion interface{}
+
+type FloatingIPExpansion interface{}
+
 type PortExpansion interface{}
 
 type VPCExpansion interface{}

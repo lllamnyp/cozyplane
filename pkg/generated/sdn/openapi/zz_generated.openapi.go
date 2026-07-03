@@ -32,77 +32,480 @@ import (
 
 func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenAPIDefinition {
 	return map[string]common.OpenAPIDefinition{
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalVPCRef":      schema_cozyplane_api_sdn_v1alpha1_LocalVPCRef(ref),
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.Port":             schema_cozyplane_api_sdn_v1alpha1_Port(ref),
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortList":         schema_cozyplane_api_sdn_v1alpha1_PortList(ref),
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortSpec":         schema_cozyplane_api_sdn_v1alpha1_PortSpec(ref),
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPC":              schema_cozyplane_api_sdn_v1alpha1_VPC(ref),
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCBinding":       schema_cozyplane_api_sdn_v1alpha1_VPCBinding(ref),
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCBindingList":   schema_cozyplane_api_sdn_v1alpha1_VPCBindingList(ref),
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCBindingSpec":   schema_cozyplane_api_sdn_v1alpha1_VPCBindingSpec(ref),
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCEgress":        schema_cozyplane_api_sdn_v1alpha1_VPCEgress(ref),
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCList":          schema_cozyplane_api_sdn_v1alpha1_VPCList(ref),
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCPeering":       schema_cozyplane_api_sdn_v1alpha1_VPCPeering(ref),
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCPeeringList":   schema_cozyplane_api_sdn_v1alpha1_VPCPeeringList(ref),
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCPeeringSpec":   schema_cozyplane_api_sdn_v1alpha1_VPCPeeringSpec(ref),
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCPeeringStatus": schema_cozyplane_api_sdn_v1alpha1_VPCPeeringStatus(ref),
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCRef":           schema_cozyplane_api_sdn_v1alpha1_VPCRef(ref),
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCSpec":          schema_cozyplane_api_sdn_v1alpha1_VPCSpec(ref),
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCStatus":        schema_cozyplane_api_sdn_v1alpha1_VPCStatus(ref),
-		resource.Quantity{}.OpenAPIModelName():                            schema_apimachinery_pkg_api_resource_Quantity(ref),
-		v1.APIGroup{}.OpenAPIModelName():                                  schema_pkg_apis_meta_v1_APIGroup(ref),
-		v1.APIGroupList{}.OpenAPIModelName():                              schema_pkg_apis_meta_v1_APIGroupList(ref),
-		v1.APIResource{}.OpenAPIModelName():                               schema_pkg_apis_meta_v1_APIResource(ref),
-		v1.APIResourceList{}.OpenAPIModelName():                           schema_pkg_apis_meta_v1_APIResourceList(ref),
-		v1.APIVersions{}.OpenAPIModelName():                               schema_pkg_apis_meta_v1_APIVersions(ref),
-		v1.ApplyOptions{}.OpenAPIModelName():                              schema_pkg_apis_meta_v1_ApplyOptions(ref),
-		v1.Condition{}.OpenAPIModelName():                                 schema_pkg_apis_meta_v1_Condition(ref),
-		v1.CreateOptions{}.OpenAPIModelName():                             schema_pkg_apis_meta_v1_CreateOptions(ref),
-		v1.DeleteOptions{}.OpenAPIModelName():                             schema_pkg_apis_meta_v1_DeleteOptions(ref),
-		v1.Duration{}.OpenAPIModelName():                                  schema_pkg_apis_meta_v1_Duration(ref),
-		v1.FieldSelectorRequirement{}.OpenAPIModelName():                  schema_pkg_apis_meta_v1_FieldSelectorRequirement(ref),
-		v1.FieldsV1{}.OpenAPIModelName():                                  schema_pkg_apis_meta_v1_FieldsV1(ref),
-		v1.GetOptions{}.OpenAPIModelName():                                schema_pkg_apis_meta_v1_GetOptions(ref),
-		v1.GroupKind{}.OpenAPIModelName():                                 schema_pkg_apis_meta_v1_GroupKind(ref),
-		v1.GroupResource{}.OpenAPIModelName():                             schema_pkg_apis_meta_v1_GroupResource(ref),
-		v1.GroupVersion{}.OpenAPIModelName():                              schema_pkg_apis_meta_v1_GroupVersion(ref),
-		v1.GroupVersionForDiscovery{}.OpenAPIModelName():                  schema_pkg_apis_meta_v1_GroupVersionForDiscovery(ref),
-		v1.GroupVersionKind{}.OpenAPIModelName():                          schema_pkg_apis_meta_v1_GroupVersionKind(ref),
-		v1.GroupVersionResource{}.OpenAPIModelName():                      schema_pkg_apis_meta_v1_GroupVersionResource(ref),
-		v1.InternalEvent{}.OpenAPIModelName():                             schema_pkg_apis_meta_v1_InternalEvent(ref),
-		v1.LabelSelector{}.OpenAPIModelName():                             schema_pkg_apis_meta_v1_LabelSelector(ref),
-		v1.LabelSelectorRequirement{}.OpenAPIModelName():                  schema_pkg_apis_meta_v1_LabelSelectorRequirement(ref),
-		v1.List{}.OpenAPIModelName():                                      schema_pkg_apis_meta_v1_List(ref),
-		v1.ListMeta{}.OpenAPIModelName():                                  schema_pkg_apis_meta_v1_ListMeta(ref),
-		v1.ListOptions{}.OpenAPIModelName():                               schema_pkg_apis_meta_v1_ListOptions(ref),
-		v1.ManagedFieldsEntry{}.OpenAPIModelName():                        schema_pkg_apis_meta_v1_ManagedFieldsEntry(ref),
-		v1.MicroTime{}.OpenAPIModelName():                                 schema_pkg_apis_meta_v1_MicroTime(ref),
-		v1.ObjectMeta{}.OpenAPIModelName():                                schema_pkg_apis_meta_v1_ObjectMeta(ref),
-		v1.OwnerReference{}.OpenAPIModelName():                            schema_pkg_apis_meta_v1_OwnerReference(ref),
-		v1.PartialObjectMetadata{}.OpenAPIModelName():                     schema_pkg_apis_meta_v1_PartialObjectMetadata(ref),
-		v1.PartialObjectMetadataList{}.OpenAPIModelName():                 schema_pkg_apis_meta_v1_PartialObjectMetadataList(ref),
-		v1.Patch{}.OpenAPIModelName():                                     schema_pkg_apis_meta_v1_Patch(ref),
-		v1.PatchOptions{}.OpenAPIModelName():                              schema_pkg_apis_meta_v1_PatchOptions(ref),
-		v1.Preconditions{}.OpenAPIModelName():                             schema_pkg_apis_meta_v1_Preconditions(ref),
-		v1.RootPaths{}.OpenAPIModelName():                                 schema_pkg_apis_meta_v1_RootPaths(ref),
-		v1.ServerAddressByClientCIDR{}.OpenAPIModelName():                 schema_pkg_apis_meta_v1_ServerAddressByClientCIDR(ref),
-		v1.Status{}.OpenAPIModelName():                                    schema_pkg_apis_meta_v1_Status(ref),
-		v1.StatusCause{}.OpenAPIModelName():                               schema_pkg_apis_meta_v1_StatusCause(ref),
-		v1.StatusDetails{}.OpenAPIModelName():                             schema_pkg_apis_meta_v1_StatusDetails(ref),
-		v1.Table{}.OpenAPIModelName():                                     schema_pkg_apis_meta_v1_Table(ref),
-		v1.TableColumnDefinition{}.OpenAPIModelName():                     schema_pkg_apis_meta_v1_TableColumnDefinition(ref),
-		v1.TableOptions{}.OpenAPIModelName():                              schema_pkg_apis_meta_v1_TableOptions(ref),
-		v1.TableRow{}.OpenAPIModelName():                                  schema_pkg_apis_meta_v1_TableRow(ref),
-		v1.TableRowCondition{}.OpenAPIModelName():                         schema_pkg_apis_meta_v1_TableRowCondition(ref),
-		v1.Time{}.OpenAPIModelName():                                      schema_pkg_apis_meta_v1_Time(ref),
-		v1.Timestamp{}.OpenAPIModelName():                                 schema_pkg_apis_meta_v1_Timestamp(ref),
-		v1.TypeMeta{}.OpenAPIModelName():                                  schema_pkg_apis_meta_v1_TypeMeta(ref),
-		v1.UpdateOptions{}.OpenAPIModelName():                             schema_pkg_apis_meta_v1_UpdateOptions(ref),
-		v1.WatchEvent{}.OpenAPIModelName():                                schema_pkg_apis_meta_v1_WatchEvent(ref),
-		runtime.RawExtension{}.OpenAPIModelName():                         schema_k8sio_apimachinery_pkg_runtime_RawExtension(ref),
-		runtime.TypeMeta{}.OpenAPIModelName():                             schema_k8sio_apimachinery_pkg_runtime_TypeMeta(ref),
-		runtime.Unknown{}.OpenAPIModelName():                              schema_k8sio_apimachinery_pkg_runtime_Unknown(ref),
-		version.Info{}.OpenAPIModelName():                                 schema_k8sio_apimachinery_pkg_version_Info(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPool":       schema_cozyplane_api_sdn_v1alpha1_ExternalPool(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolList":   schema_cozyplane_api_sdn_v1alpha1_ExternalPoolList(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolRef":    schema_cozyplane_api_sdn_v1alpha1_ExternalPoolRef(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolSpec":   schema_cozyplane_api_sdn_v1alpha1_ExternalPoolSpec(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolStatus": schema_cozyplane_api_sdn_v1alpha1_ExternalPoolStatus(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.FloatingIP":         schema_cozyplane_api_sdn_v1alpha1_FloatingIP(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.FloatingIPList":     schema_cozyplane_api_sdn_v1alpha1_FloatingIPList(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.FloatingIPSpec":     schema_cozyplane_api_sdn_v1alpha1_FloatingIPSpec(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.FloatingIPStatus":   schema_cozyplane_api_sdn_v1alpha1_FloatingIPStatus(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalVPCRef":        schema_cozyplane_api_sdn_v1alpha1_LocalVPCRef(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.Port":               schema_cozyplane_api_sdn_v1alpha1_Port(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortList":           schema_cozyplane_api_sdn_v1alpha1_PortList(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortSpec":           schema_cozyplane_api_sdn_v1alpha1_PortSpec(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPC":                schema_cozyplane_api_sdn_v1alpha1_VPC(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCBinding":         schema_cozyplane_api_sdn_v1alpha1_VPCBinding(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCBindingList":     schema_cozyplane_api_sdn_v1alpha1_VPCBindingList(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCBindingSpec":     schema_cozyplane_api_sdn_v1alpha1_VPCBindingSpec(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCEgress":          schema_cozyplane_api_sdn_v1alpha1_VPCEgress(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCList":            schema_cozyplane_api_sdn_v1alpha1_VPCList(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCPeering":         schema_cozyplane_api_sdn_v1alpha1_VPCPeering(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCPeeringList":     schema_cozyplane_api_sdn_v1alpha1_VPCPeeringList(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCPeeringSpec":     schema_cozyplane_api_sdn_v1alpha1_VPCPeeringSpec(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCPeeringStatus":   schema_cozyplane_api_sdn_v1alpha1_VPCPeeringStatus(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCRef":             schema_cozyplane_api_sdn_v1alpha1_VPCRef(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCSpec":            schema_cozyplane_api_sdn_v1alpha1_VPCSpec(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCStatus":          schema_cozyplane_api_sdn_v1alpha1_VPCStatus(ref),
+		resource.Quantity{}.OpenAPIModelName():                              schema_apimachinery_pkg_api_resource_Quantity(ref),
+		v1.APIGroup{}.OpenAPIModelName():                                    schema_pkg_apis_meta_v1_APIGroup(ref),
+		v1.APIGroupList{}.OpenAPIModelName():                                schema_pkg_apis_meta_v1_APIGroupList(ref),
+		v1.APIResource{}.OpenAPIModelName():                                 schema_pkg_apis_meta_v1_APIResource(ref),
+		v1.APIResourceList{}.OpenAPIModelName():                             schema_pkg_apis_meta_v1_APIResourceList(ref),
+		v1.APIVersions{}.OpenAPIModelName():                                 schema_pkg_apis_meta_v1_APIVersions(ref),
+		v1.ApplyOptions{}.OpenAPIModelName():                                schema_pkg_apis_meta_v1_ApplyOptions(ref),
+		v1.Condition{}.OpenAPIModelName():                                   schema_pkg_apis_meta_v1_Condition(ref),
+		v1.CreateOptions{}.OpenAPIModelName():                               schema_pkg_apis_meta_v1_CreateOptions(ref),
+		v1.DeleteOptions{}.OpenAPIModelName():                               schema_pkg_apis_meta_v1_DeleteOptions(ref),
+		v1.Duration{}.OpenAPIModelName():                                    schema_pkg_apis_meta_v1_Duration(ref),
+		v1.FieldSelectorRequirement{}.OpenAPIModelName():                    schema_pkg_apis_meta_v1_FieldSelectorRequirement(ref),
+		v1.FieldsV1{}.OpenAPIModelName():                                    schema_pkg_apis_meta_v1_FieldsV1(ref),
+		v1.GetOptions{}.OpenAPIModelName():                                  schema_pkg_apis_meta_v1_GetOptions(ref),
+		v1.GroupKind{}.OpenAPIModelName():                                   schema_pkg_apis_meta_v1_GroupKind(ref),
+		v1.GroupResource{}.OpenAPIModelName():                               schema_pkg_apis_meta_v1_GroupResource(ref),
+		v1.GroupVersion{}.OpenAPIModelName():                                schema_pkg_apis_meta_v1_GroupVersion(ref),
+		v1.GroupVersionForDiscovery{}.OpenAPIModelName():                    schema_pkg_apis_meta_v1_GroupVersionForDiscovery(ref),
+		v1.GroupVersionKind{}.OpenAPIModelName():                            schema_pkg_apis_meta_v1_GroupVersionKind(ref),
+		v1.GroupVersionResource{}.OpenAPIModelName():                        schema_pkg_apis_meta_v1_GroupVersionResource(ref),
+		v1.InternalEvent{}.OpenAPIModelName():                               schema_pkg_apis_meta_v1_InternalEvent(ref),
+		v1.LabelSelector{}.OpenAPIModelName():                               schema_pkg_apis_meta_v1_LabelSelector(ref),
+		v1.LabelSelectorRequirement{}.OpenAPIModelName():                    schema_pkg_apis_meta_v1_LabelSelectorRequirement(ref),
+		v1.List{}.OpenAPIModelName():                                        schema_pkg_apis_meta_v1_List(ref),
+		v1.ListMeta{}.OpenAPIModelName():                                    schema_pkg_apis_meta_v1_ListMeta(ref),
+		v1.ListOptions{}.OpenAPIModelName():                                 schema_pkg_apis_meta_v1_ListOptions(ref),
+		v1.ManagedFieldsEntry{}.OpenAPIModelName():                          schema_pkg_apis_meta_v1_ManagedFieldsEntry(ref),
+		v1.MicroTime{}.OpenAPIModelName():                                   schema_pkg_apis_meta_v1_MicroTime(ref),
+		v1.ObjectMeta{}.OpenAPIModelName():                                  schema_pkg_apis_meta_v1_ObjectMeta(ref),
+		v1.OwnerReference{}.OpenAPIModelName():                              schema_pkg_apis_meta_v1_OwnerReference(ref),
+		v1.PartialObjectMetadata{}.OpenAPIModelName():                       schema_pkg_apis_meta_v1_PartialObjectMetadata(ref),
+		v1.PartialObjectMetadataList{}.OpenAPIModelName():                   schema_pkg_apis_meta_v1_PartialObjectMetadataList(ref),
+		v1.Patch{}.OpenAPIModelName():                                       schema_pkg_apis_meta_v1_Patch(ref),
+		v1.PatchOptions{}.OpenAPIModelName():                                schema_pkg_apis_meta_v1_PatchOptions(ref),
+		v1.Preconditions{}.OpenAPIModelName():                               schema_pkg_apis_meta_v1_Preconditions(ref),
+		v1.RootPaths{}.OpenAPIModelName():                                   schema_pkg_apis_meta_v1_RootPaths(ref),
+		v1.ServerAddressByClientCIDR{}.OpenAPIModelName():                   schema_pkg_apis_meta_v1_ServerAddressByClientCIDR(ref),
+		v1.Status{}.OpenAPIModelName():                                      schema_pkg_apis_meta_v1_Status(ref),
+		v1.StatusCause{}.OpenAPIModelName():                                 schema_pkg_apis_meta_v1_StatusCause(ref),
+		v1.StatusDetails{}.OpenAPIModelName():                               schema_pkg_apis_meta_v1_StatusDetails(ref),
+		v1.Table{}.OpenAPIModelName():                                       schema_pkg_apis_meta_v1_Table(ref),
+		v1.TableColumnDefinition{}.OpenAPIModelName():                       schema_pkg_apis_meta_v1_TableColumnDefinition(ref),
+		v1.TableOptions{}.OpenAPIModelName():                                schema_pkg_apis_meta_v1_TableOptions(ref),
+		v1.TableRow{}.OpenAPIModelName():                                    schema_pkg_apis_meta_v1_TableRow(ref),
+		v1.TableRowCondition{}.OpenAPIModelName():                           schema_pkg_apis_meta_v1_TableRowCondition(ref),
+		v1.Time{}.OpenAPIModelName():                                        schema_pkg_apis_meta_v1_Time(ref),
+		v1.Timestamp{}.OpenAPIModelName():                                   schema_pkg_apis_meta_v1_Timestamp(ref),
+		v1.TypeMeta{}.OpenAPIModelName():                                    schema_pkg_apis_meta_v1_TypeMeta(ref),
+		v1.UpdateOptions{}.OpenAPIModelName():                               schema_pkg_apis_meta_v1_UpdateOptions(ref),
+		v1.WatchEvent{}.OpenAPIModelName():                                  schema_pkg_apis_meta_v1_WatchEvent(ref),
+		runtime.RawExtension{}.OpenAPIModelName():                           schema_k8sio_apimachinery_pkg_runtime_RawExtension(ref),
+		runtime.TypeMeta{}.OpenAPIModelName():                               schema_k8sio_apimachinery_pkg_runtime_TypeMeta(ref),
+		runtime.Unknown{}.OpenAPIModelName():                                schema_k8sio_apimachinery_pkg_runtime_Unknown(ref),
+		version.Info{}.OpenAPIModelName():                                   schema_k8sio_apimachinery_pkg_version_Info(ref),
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_ExternalPool(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "ExternalPool is a cluster-scoped, admin-defined range of externally-routable addresses. FloatingIPs claim addresses from a pool; a pool is the equivalent of MetalLB's IPAddressPool.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"metadata": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref(v1.ObjectMeta{}.OpenAPIModelName()),
+						},
+					},
+					"spec": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolSpec"),
+						},
+					},
+					"status": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolStatus"),
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolSpec", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolStatus", v1.ObjectMeta{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_ExternalPoolList(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "ExternalPoolList contains a list of ExternalPool.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"metadata": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref(v1.ListMeta{}.OpenAPIModelName()),
+						},
+					},
+					"items": {
+						SchemaProps: spec.SchemaProps{
+							Type: []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPool"),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"items"},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPool", v1.ListMeta{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_ExternalPoolRef(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "ExternalPoolRef references an ExternalPool by name (pools are cluster-scoped).",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"name": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Name is the ExternalPool name.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_ExternalPoolSpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "ExternalPoolSpec is the specification of a pool of externally-routable addresses that FloatingIPs are allocated from.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"cidrs": {
+						SchemaProps: spec.SchemaProps{
+							Description: "CIDRs are the address ranges the pool hands out.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: "",
+										Type:    []string{"string"},
+										Format:  "",
+									},
+								},
+							},
+						},
+					},
+					"advertisement": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Advertisement is how in-use addresses are announced to the physical network. Empty selects the controller default (L2).",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_ExternalPoolStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "ExternalPoolStatus is the observed state of an ExternalPool.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"allocated": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Allocated is the number of addresses currently bound to FloatingIPs.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"available": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Available is the number of addresses still free in the pool.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"conditions": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"type",
+								},
+								"x-kubernetes-list-type": "map",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "Conditions represent the latest available observations.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref(v1.Condition{}.OpenAPIModelName()),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			v1.Condition{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_FloatingIP(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "FloatingIP binds an externally-routable address from an ExternalPool to a single workload inside a VPC (the OpenStack floating-IP model). It is the bidirectional counterpart to the egress-only NAT gateway.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"metadata": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref(v1.ObjectMeta{}.OpenAPIModelName()),
+						},
+					},
+					"spec": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.FloatingIPSpec"),
+						},
+					},
+					"status": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.FloatingIPStatus"),
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.FloatingIPSpec", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.FloatingIPStatus", v1.ObjectMeta{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_FloatingIPList(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "FloatingIPList contains a list of FloatingIP.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"metadata": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref(v1.ListMeta{}.OpenAPIModelName()),
+						},
+					},
+					"items": {
+						SchemaProps: spec.SchemaProps{
+							Type: []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.FloatingIP"),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"items"},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.FloatingIP", v1.ListMeta{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_FloatingIPSpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "FloatingIPSpec binds one externally-routable address 1:1 to a workload inside a VPC. The address is reachable bidirectionally: inbound connections DNAT to the target, and the target's egress is SNATed from the floating address.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"vpcRef": {
+						SchemaProps: spec.SchemaProps{
+							Description: "VPCRef is the VPC the target lives in — it is in the same namespace as this object.",
+							Default:     map[string]interface{}{},
+							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalVPCRef"),
+						},
+					},
+					"target": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Target is the tenant IP within the VPC that the floating address binds to.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"poolRef": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PoolRef selects the ExternalPool to allocate from. Empty selects the default pool.",
+							Default:     map[string]interface{}{},
+							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolRef"),
+						},
+					},
+					"address": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Address optionally requests a specific address from the pool; empty lets the controller pick a free one.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"vpcRef", "target"},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolRef", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalVPCRef"},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_FloatingIPStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "FloatingIPStatus is the observed state of a FloatingIP.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"address": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Address is the externally-routable address assigned to this binding.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"phase": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Phase is the current lifecycle phase of the FloatingIP.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"conditions": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"type",
+								},
+								"x-kubernetes-list-type": "map",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "Conditions represent the latest available observations.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref(v1.Condition{}.OpenAPIModelName()),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			v1.Condition{}.OpenAPIModelName()},
 	}
 }
 

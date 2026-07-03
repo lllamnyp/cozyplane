@@ -37,6 +37,96 @@ func init() {
 // RegisterConversions adds conversion functions to the given scheme.
 // Public to allow building arbitrary schemes.
 func RegisterConversions(s *runtime.Scheme) error {
+	if err := s.AddGeneratedConversionFunc((*ExternalPool)(nil), (*sdn.ExternalPool)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_ExternalPool_To_sdn_ExternalPool(a.(*ExternalPool), b.(*sdn.ExternalPool), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.ExternalPool)(nil), (*ExternalPool)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_ExternalPool_To_v1alpha1_ExternalPool(a.(*sdn.ExternalPool), b.(*ExternalPool), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*ExternalPoolList)(nil), (*sdn.ExternalPoolList)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_ExternalPoolList_To_sdn_ExternalPoolList(a.(*ExternalPoolList), b.(*sdn.ExternalPoolList), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.ExternalPoolList)(nil), (*ExternalPoolList)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_ExternalPoolList_To_v1alpha1_ExternalPoolList(a.(*sdn.ExternalPoolList), b.(*ExternalPoolList), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*ExternalPoolRef)(nil), (*sdn.ExternalPoolRef)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_ExternalPoolRef_To_sdn_ExternalPoolRef(a.(*ExternalPoolRef), b.(*sdn.ExternalPoolRef), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.ExternalPoolRef)(nil), (*ExternalPoolRef)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_ExternalPoolRef_To_v1alpha1_ExternalPoolRef(a.(*sdn.ExternalPoolRef), b.(*ExternalPoolRef), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*ExternalPoolSpec)(nil), (*sdn.ExternalPoolSpec)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_ExternalPoolSpec_To_sdn_ExternalPoolSpec(a.(*ExternalPoolSpec), b.(*sdn.ExternalPoolSpec), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.ExternalPoolSpec)(nil), (*ExternalPoolSpec)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_ExternalPoolSpec_To_v1alpha1_ExternalPoolSpec(a.(*sdn.ExternalPoolSpec), b.(*ExternalPoolSpec), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*ExternalPoolStatus)(nil), (*sdn.ExternalPoolStatus)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_ExternalPoolStatus_To_sdn_ExternalPoolStatus(a.(*ExternalPoolStatus), b.(*sdn.ExternalPoolStatus), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.ExternalPoolStatus)(nil), (*ExternalPoolStatus)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_ExternalPoolStatus_To_v1alpha1_ExternalPoolStatus(a.(*sdn.ExternalPoolStatus), b.(*ExternalPoolStatus), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*FloatingIP)(nil), (*sdn.FloatingIP)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_FloatingIP_To_sdn_FloatingIP(a.(*FloatingIP), b.(*sdn.FloatingIP), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.FloatingIP)(nil), (*FloatingIP)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_FloatingIP_To_v1alpha1_FloatingIP(a.(*sdn.FloatingIP), b.(*FloatingIP), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*FloatingIPList)(nil), (*sdn.FloatingIPList)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_FloatingIPList_To_sdn_FloatingIPList(a.(*FloatingIPList), b.(*sdn.FloatingIPList), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.FloatingIPList)(nil), (*FloatingIPList)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_FloatingIPList_To_v1alpha1_FloatingIPList(a.(*sdn.FloatingIPList), b.(*FloatingIPList), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*FloatingIPSpec)(nil), (*sdn.FloatingIPSpec)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_FloatingIPSpec_To_sdn_FloatingIPSpec(a.(*FloatingIPSpec), b.(*sdn.FloatingIPSpec), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.FloatingIPSpec)(nil), (*FloatingIPSpec)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_FloatingIPSpec_To_v1alpha1_FloatingIPSpec(a.(*sdn.FloatingIPSpec), b.(*FloatingIPSpec), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*FloatingIPStatus)(nil), (*sdn.FloatingIPStatus)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_FloatingIPStatus_To_sdn_FloatingIPStatus(a.(*FloatingIPStatus), b.(*sdn.FloatingIPStatus), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.FloatingIPStatus)(nil), (*FloatingIPStatus)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_FloatingIPStatus_To_v1alpha1_FloatingIPStatus(a.(*sdn.FloatingIPStatus), b.(*FloatingIPStatus), scope)
+	}); err != nil {
+		return err
+	}
 	if err := s.AddGeneratedConversionFunc((*LocalVPCRef)(nil), (*sdn.LocalVPCRef)(nil), func(a, b interface{}, scope conversion.Scope) error {
 		return Convert_v1alpha1_LocalVPCRef_To_sdn_LocalVPCRef(a.(*LocalVPCRef), b.(*sdn.LocalVPCRef), scope)
 	}); err != nil {
@@ -208,6 +298,238 @@ func RegisterConversions(s *runtime.Scheme) error {
 		return err
 	}
 	return nil
+}
+
+func autoConvert_v1alpha1_ExternalPool_To_sdn_ExternalPool(in *ExternalPool, out *sdn.ExternalPool, s conversion.Scope) error {
+	out.ObjectMeta = in.ObjectMeta
+	if err := Convert_v1alpha1_ExternalPoolSpec_To_sdn_ExternalPoolSpec(&in.Spec, &out.Spec, s); err != nil {
+		return err
+	}
+	if err := Convert_v1alpha1_ExternalPoolStatus_To_sdn_ExternalPoolStatus(&in.Status, &out.Status, s); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Convert_v1alpha1_ExternalPool_To_sdn_ExternalPool is an autogenerated conversion function.
+func Convert_v1alpha1_ExternalPool_To_sdn_ExternalPool(in *ExternalPool, out *sdn.ExternalPool, s conversion.Scope) error {
+	return autoConvert_v1alpha1_ExternalPool_To_sdn_ExternalPool(in, out, s)
+}
+
+func autoConvert_sdn_ExternalPool_To_v1alpha1_ExternalPool(in *sdn.ExternalPool, out *ExternalPool, s conversion.Scope) error {
+	out.ObjectMeta = in.ObjectMeta
+	if err := Convert_sdn_ExternalPoolSpec_To_v1alpha1_ExternalPoolSpec(&in.Spec, &out.Spec, s); err != nil {
+		return err
+	}
+	if err := Convert_sdn_ExternalPoolStatus_To_v1alpha1_ExternalPoolStatus(&in.Status, &out.Status, s); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Convert_sdn_ExternalPool_To_v1alpha1_ExternalPool is an autogenerated conversion function.
+func Convert_sdn_ExternalPool_To_v1alpha1_ExternalPool(in *sdn.ExternalPool, out *ExternalPool, s conversion.Scope) error {
+	return autoConvert_sdn_ExternalPool_To_v1alpha1_ExternalPool(in, out, s)
+}
+
+func autoConvert_v1alpha1_ExternalPoolList_To_sdn_ExternalPoolList(in *ExternalPoolList, out *sdn.ExternalPoolList, s conversion.Scope) error {
+	out.ListMeta = in.ListMeta
+	out.Items = *(*[]sdn.ExternalPool)(unsafe.Pointer(&in.Items))
+	return nil
+}
+
+// Convert_v1alpha1_ExternalPoolList_To_sdn_ExternalPoolList is an autogenerated conversion function.
+func Convert_v1alpha1_ExternalPoolList_To_sdn_ExternalPoolList(in *ExternalPoolList, out *sdn.ExternalPoolList, s conversion.Scope) error {
+	return autoConvert_v1alpha1_ExternalPoolList_To_sdn_ExternalPoolList(in, out, s)
+}
+
+func autoConvert_sdn_ExternalPoolList_To_v1alpha1_ExternalPoolList(in *sdn.ExternalPoolList, out *ExternalPoolList, s conversion.Scope) error {
+	out.ListMeta = in.ListMeta
+	out.Items = *(*[]ExternalPool)(unsafe.Pointer(&in.Items))
+	return nil
+}
+
+// Convert_sdn_ExternalPoolList_To_v1alpha1_ExternalPoolList is an autogenerated conversion function.
+func Convert_sdn_ExternalPoolList_To_v1alpha1_ExternalPoolList(in *sdn.ExternalPoolList, out *ExternalPoolList, s conversion.Scope) error {
+	return autoConvert_sdn_ExternalPoolList_To_v1alpha1_ExternalPoolList(in, out, s)
+}
+
+func autoConvert_v1alpha1_ExternalPoolRef_To_sdn_ExternalPoolRef(in *ExternalPoolRef, out *sdn.ExternalPoolRef, s conversion.Scope) error {
+	out.Name = in.Name
+	return nil
+}
+
+// Convert_v1alpha1_ExternalPoolRef_To_sdn_ExternalPoolRef is an autogenerated conversion function.
+func Convert_v1alpha1_ExternalPoolRef_To_sdn_ExternalPoolRef(in *ExternalPoolRef, out *sdn.ExternalPoolRef, s conversion.Scope) error {
+	return autoConvert_v1alpha1_ExternalPoolRef_To_sdn_ExternalPoolRef(in, out, s)
+}
+
+func autoConvert_sdn_ExternalPoolRef_To_v1alpha1_ExternalPoolRef(in *sdn.ExternalPoolRef, out *ExternalPoolRef, s conversion.Scope) error {
+	out.Name = in.Name
+	return nil
+}
+
+// Convert_sdn_ExternalPoolRef_To_v1alpha1_ExternalPoolRef is an autogenerated conversion function.
+func Convert_sdn_ExternalPoolRef_To_v1alpha1_ExternalPoolRef(in *sdn.ExternalPoolRef, out *ExternalPoolRef, s conversion.Scope) error {
+	return autoConvert_sdn_ExternalPoolRef_To_v1alpha1_ExternalPoolRef(in, out, s)
+}
+
+func autoConvert_v1alpha1_ExternalPoolSpec_To_sdn_ExternalPoolSpec(in *ExternalPoolSpec, out *sdn.ExternalPoolSpec, s conversion.Scope) error {
+	out.CIDRs = *(*[]string)(unsafe.Pointer(&in.CIDRs))
+	out.Advertisement = sdn.ExternalPoolAdvertisement(in.Advertisement)
+	return nil
+}
+
+// Convert_v1alpha1_ExternalPoolSpec_To_sdn_ExternalPoolSpec is an autogenerated conversion function.
+func Convert_v1alpha1_ExternalPoolSpec_To_sdn_ExternalPoolSpec(in *ExternalPoolSpec, out *sdn.ExternalPoolSpec, s conversion.Scope) error {
+	return autoConvert_v1alpha1_ExternalPoolSpec_To_sdn_ExternalPoolSpec(in, out, s)
+}
+
+func autoConvert_sdn_ExternalPoolSpec_To_v1alpha1_ExternalPoolSpec(in *sdn.ExternalPoolSpec, out *ExternalPoolSpec, s conversion.Scope) error {
+	out.CIDRs = *(*[]string)(unsafe.Pointer(&in.CIDRs))
+	out.Advertisement = ExternalPoolAdvertisement(in.Advertisement)
+	return nil
+}
+
+// Convert_sdn_ExternalPoolSpec_To_v1alpha1_ExternalPoolSpec is an autogenerated conversion function.
+func Convert_sdn_ExternalPoolSpec_To_v1alpha1_ExternalPoolSpec(in *sdn.ExternalPoolSpec, out *ExternalPoolSpec, s conversion.Scope) error {
+	return autoConvert_sdn_ExternalPoolSpec_To_v1alpha1_ExternalPoolSpec(in, out, s)
+}
+
+func autoConvert_v1alpha1_ExternalPoolStatus_To_sdn_ExternalPoolStatus(in *ExternalPoolStatus, out *sdn.ExternalPoolStatus, s conversion.Scope) error {
+	out.Allocated = in.Allocated
+	out.Available = in.Available
+	out.Conditions = *(*[]v1.Condition)(unsafe.Pointer(&in.Conditions))
+	return nil
+}
+
+// Convert_v1alpha1_ExternalPoolStatus_To_sdn_ExternalPoolStatus is an autogenerated conversion function.
+func Convert_v1alpha1_ExternalPoolStatus_To_sdn_ExternalPoolStatus(in *ExternalPoolStatus, out *sdn.ExternalPoolStatus, s conversion.Scope) error {
+	return autoConvert_v1alpha1_ExternalPoolStatus_To_sdn_ExternalPoolStatus(in, out, s)
+}
+
+func autoConvert_sdn_ExternalPoolStatus_To_v1alpha1_ExternalPoolStatus(in *sdn.ExternalPoolStatus, out *ExternalPoolStatus, s conversion.Scope) error {
+	out.Allocated = in.Allocated
+	out.Available = in.Available
+	out.Conditions = *(*[]v1.Condition)(unsafe.Pointer(&in.Conditions))
+	return nil
+}
+
+// Convert_sdn_ExternalPoolStatus_To_v1alpha1_ExternalPoolStatus is an autogenerated conversion function.
+func Convert_sdn_ExternalPoolStatus_To_v1alpha1_ExternalPoolStatus(in *sdn.ExternalPoolStatus, out *ExternalPoolStatus, s conversion.Scope) error {
+	return autoConvert_sdn_ExternalPoolStatus_To_v1alpha1_ExternalPoolStatus(in, out, s)
+}
+
+func autoConvert_v1alpha1_FloatingIP_To_sdn_FloatingIP(in *FloatingIP, out *sdn.FloatingIP, s conversion.Scope) error {
+	out.ObjectMeta = in.ObjectMeta
+	if err := Convert_v1alpha1_FloatingIPSpec_To_sdn_FloatingIPSpec(&in.Spec, &out.Spec, s); err != nil {
+		return err
+	}
+	if err := Convert_v1alpha1_FloatingIPStatus_To_sdn_FloatingIPStatus(&in.Status, &out.Status, s); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Convert_v1alpha1_FloatingIP_To_sdn_FloatingIP is an autogenerated conversion function.
+func Convert_v1alpha1_FloatingIP_To_sdn_FloatingIP(in *FloatingIP, out *sdn.FloatingIP, s conversion.Scope) error {
+	return autoConvert_v1alpha1_FloatingIP_To_sdn_FloatingIP(in, out, s)
+}
+
+func autoConvert_sdn_FloatingIP_To_v1alpha1_FloatingIP(in *sdn.FloatingIP, out *FloatingIP, s conversion.Scope) error {
+	out.ObjectMeta = in.ObjectMeta
+	if err := Convert_sdn_FloatingIPSpec_To_v1alpha1_FloatingIPSpec(&in.Spec, &out.Spec, s); err != nil {
+		return err
+	}
+	if err := Convert_sdn_FloatingIPStatus_To_v1alpha1_FloatingIPStatus(&in.Status, &out.Status, s); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Convert_sdn_FloatingIP_To_v1alpha1_FloatingIP is an autogenerated conversion function.
+func Convert_sdn_FloatingIP_To_v1alpha1_FloatingIP(in *sdn.FloatingIP, out *FloatingIP, s conversion.Scope) error {
+	return autoConvert_sdn_FloatingIP_To_v1alpha1_FloatingIP(in, out, s)
+}
+
+func autoConvert_v1alpha1_FloatingIPList_To_sdn_FloatingIPList(in *FloatingIPList, out *sdn.FloatingIPList, s conversion.Scope) error {
+	out.ListMeta = in.ListMeta
+	out.Items = *(*[]sdn.FloatingIP)(unsafe.Pointer(&in.Items))
+	return nil
+}
+
+// Convert_v1alpha1_FloatingIPList_To_sdn_FloatingIPList is an autogenerated conversion function.
+func Convert_v1alpha1_FloatingIPList_To_sdn_FloatingIPList(in *FloatingIPList, out *sdn.FloatingIPList, s conversion.Scope) error {
+	return autoConvert_v1alpha1_FloatingIPList_To_sdn_FloatingIPList(in, out, s)
+}
+
+func autoConvert_sdn_FloatingIPList_To_v1alpha1_FloatingIPList(in *sdn.FloatingIPList, out *FloatingIPList, s conversion.Scope) error {
+	out.ListMeta = in.ListMeta
+	out.Items = *(*[]FloatingIP)(unsafe.Pointer(&in.Items))
+	return nil
+}
+
+// Convert_sdn_FloatingIPList_To_v1alpha1_FloatingIPList is an autogenerated conversion function.
+func Convert_sdn_FloatingIPList_To_v1alpha1_FloatingIPList(in *sdn.FloatingIPList, out *FloatingIPList, s conversion.Scope) error {
+	return autoConvert_sdn_FloatingIPList_To_v1alpha1_FloatingIPList(in, out, s)
+}
+
+func autoConvert_v1alpha1_FloatingIPSpec_To_sdn_FloatingIPSpec(in *FloatingIPSpec, out *sdn.FloatingIPSpec, s conversion.Scope) error {
+	if err := Convert_v1alpha1_LocalVPCRef_To_sdn_LocalVPCRef(&in.VPCRef, &out.VPCRef, s); err != nil {
+		return err
+	}
+	out.Target = in.Target
+	if err := Convert_v1alpha1_ExternalPoolRef_To_sdn_ExternalPoolRef(&in.PoolRef, &out.PoolRef, s); err != nil {
+		return err
+	}
+	out.Address = in.Address
+	return nil
+}
+
+// Convert_v1alpha1_FloatingIPSpec_To_sdn_FloatingIPSpec is an autogenerated conversion function.
+func Convert_v1alpha1_FloatingIPSpec_To_sdn_FloatingIPSpec(in *FloatingIPSpec, out *sdn.FloatingIPSpec, s conversion.Scope) error {
+	return autoConvert_v1alpha1_FloatingIPSpec_To_sdn_FloatingIPSpec(in, out, s)
+}
+
+func autoConvert_sdn_FloatingIPSpec_To_v1alpha1_FloatingIPSpec(in *sdn.FloatingIPSpec, out *FloatingIPSpec, s conversion.Scope) error {
+	if err := Convert_sdn_LocalVPCRef_To_v1alpha1_LocalVPCRef(&in.VPCRef, &out.VPCRef, s); err != nil {
+		return err
+	}
+	out.Target = in.Target
+	if err := Convert_sdn_ExternalPoolRef_To_v1alpha1_ExternalPoolRef(&in.PoolRef, &out.PoolRef, s); err != nil {
+		return err
+	}
+	out.Address = in.Address
+	return nil
+}
+
+// Convert_sdn_FloatingIPSpec_To_v1alpha1_FloatingIPSpec is an autogenerated conversion function.
+func Convert_sdn_FloatingIPSpec_To_v1alpha1_FloatingIPSpec(in *sdn.FloatingIPSpec, out *FloatingIPSpec, s conversion.Scope) error {
+	return autoConvert_sdn_FloatingIPSpec_To_v1alpha1_FloatingIPSpec(in, out, s)
+}
+
+func autoConvert_v1alpha1_FloatingIPStatus_To_sdn_FloatingIPStatus(in *FloatingIPStatus, out *sdn.FloatingIPStatus, s conversion.Scope) error {
+	out.Address = in.Address
+	out.Phase = sdn.FloatingIPPhase(in.Phase)
+	out.Conditions = *(*[]v1.Condition)(unsafe.Pointer(&in.Conditions))
+	return nil
+}
+
+// Convert_v1alpha1_FloatingIPStatus_To_sdn_FloatingIPStatus is an autogenerated conversion function.
+func Convert_v1alpha1_FloatingIPStatus_To_sdn_FloatingIPStatus(in *FloatingIPStatus, out *sdn.FloatingIPStatus, s conversion.Scope) error {
+	return autoConvert_v1alpha1_FloatingIPStatus_To_sdn_FloatingIPStatus(in, out, s)
+}
+
+func autoConvert_sdn_FloatingIPStatus_To_v1alpha1_FloatingIPStatus(in *sdn.FloatingIPStatus, out *FloatingIPStatus, s conversion.Scope) error {
+	out.Address = in.Address
+	out.Phase = FloatingIPPhase(in.Phase)
+	out.Conditions = *(*[]v1.Condition)(unsafe.Pointer(&in.Conditions))
+	return nil
+}
+
+// Convert_sdn_FloatingIPStatus_To_v1alpha1_FloatingIPStatus is an autogenerated conversion function.
+func Convert_sdn_FloatingIPStatus_To_v1alpha1_FloatingIPStatus(in *sdn.FloatingIPStatus, out *FloatingIPStatus, s conversion.Scope) error {
+	return autoConvert_sdn_FloatingIPStatus_To_v1alpha1_FloatingIPStatus(in, out, s)
 }
 
 func autoConvert_v1alpha1_LocalVPCRef_To_sdn_LocalVPCRef(in *LocalVPCRef, out *sdn.LocalVPCRef, s conversion.Scope) error {

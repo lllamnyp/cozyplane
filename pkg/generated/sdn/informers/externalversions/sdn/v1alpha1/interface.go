@@ -24,6 +24,10 @@ import (
 
 // Interface provides access to all the informers in this group version.
 type Interface interface {
+	// ExternalPools returns a ExternalPoolInformer.
+	ExternalPools() ExternalPoolInformer
+	// FloatingIPs returns a FloatingIPInformer.
+	FloatingIPs() FloatingIPInformer
 	// Ports returns a PortInformer.
 	Ports() PortInformer
 	// VPCs returns a VPCInformer.
@@ -43,6 +47,16 @@ type version struct {
 // New returns a new Interface.
 func New(f internalinterfaces.SharedInformerFactory, namespace string, tweakListOptions internalinterfaces.TweakListOptionsFunc) Interface {
 	return &version{factory: f, namespace: namespace, tweakListOptions: tweakListOptions}
+}
+
+// ExternalPools returns a ExternalPoolInformer.
+func (v *version) ExternalPools() ExternalPoolInformer {
+	return &externalPoolInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
+}
+
+// FloatingIPs returns a FloatingIPInformer.
+func (v *version) FloatingIPs() FloatingIPInformer {
+	return &floatingIPInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
 // Ports returns a PortInformer.
