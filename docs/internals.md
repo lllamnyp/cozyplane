@@ -426,8 +426,28 @@ is a dual-stack cluster (v6 node pod CIDRs); the overlay does not.
 Built in two steps so neither is debugged against the other: **(1)** re-key every
 map and the Go marshaling to 128-bit with v4 stored v4-mapped, still parsing only
 v4 — the v4 e2e must stay green, proving the plumbing; **(2)** add v6 parse +
-overlay delivery on top. NDP (for v6 floating IPs, replacing the ARP responder),
-ICMPv6, and v6 gateway egress are later phases.
+overlay delivery on top.
+
+Step 2's parse is one `parse_ip` that reads either an IPv4 or IPv6 frame into a
+`struct pkt {is_v6, proto, src, dst}` — both addresses already the 128-bit map
+key (v4 in NAT64 form, v6 native). It *copies* the addresses onto the stack, so
+they survive any later in-place NAT rewrite that would invalidate a header
+pointer. Each of the three delivery hooks (`from_pod`, `to_pod`, `from_overlay`)
+then drives the same `net_of` / `local_of` / `remote_of` / `encap` lookups
+regardless of family — `from_overlay` never touches L4, so it is entirely
+family-agnostic; `from_pod`/`to_pod` gate their **v4-only** branches behind
+`!is_v6` and re-derive the `struct iphdr *` there. Those v4-only branches are the
+`169.254.1.1` fabric bridge (`bridge_forward`/`bridge_reverse`) and the floating
+NAT (`floating_forward`/`floating_egress_snat`) — all of which rewrite IPv4
+checksums or advertise via ARP. A v6 packet skips straight to overlay delivery;
+the fabric-IP lookups it would otherwise reach (`bridge_of`) can only ever hold
+v4 keys, so they miss harmlessly. `from_uplink` stays v4-only (floating-IP
+ingress + ARP): a v6 frame there is left to the kernel.
+
+The upshot is v6 gets **intra-VPC and cross-node overlay delivery, isolation, and
+same-family peering** for free — everything that flows through the overlay path.
+NDP (for v6 floating IPs, replacing the ARP responder), ICMPv6, the v6 fabric
+bridge (north-south), and v6 gateway egress are later phases.
 
 ## 4. Control flow
 

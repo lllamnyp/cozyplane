@@ -26,8 +26,9 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-#define ETH_P_IP  0x0800
-#define ETH_P_ARP 0x0806
+#define ETH_P_IP   0x0800
+#define ETH_P_IPV6 0x86DD
+#define ETH_P_ARP  0x0806
 #define ARPOP_REQUEST 1
 #define ARPOP_REPLY   2
 #define TC_ACT_OK 0
@@ -124,6 +125,23 @@ static __always_inline __u32 v4_of_128(const struct addr128 *a)
 	__u32 v4;
 	__builtin_memcpy(&v4, &a->b[12], 4);
 	return v4;
+}
+
+// v6_link_scoped reports whether a v6 address is link-local (fe80::/10) or
+// multicast (ff00::/8). Such traffic — neighbour discovery (NS/NA) to the pod's
+// on-link gateway, router solicitations, etc. — never leaves the pod<->host-veth
+// link, so it bypasses VPC overlay delivery and the isolation check: the kernel
+// and the host veth (which owns the gateway address) handle it, exactly as the
+// kernel handles v4 ARP (which, not being an IP packet, never reaches these
+// hooks at all). Without this, a pod's NS to its gateway's solicited-node
+// multicast looks like off-net VPC egress and the isolation check drops it.
+static __always_inline int v6_link_scoped(const struct addr128 *a)
+{
+	if (a->b[0] == 0xff) // ff00::/8 multicast
+		return 1;
+	if (a->b[0] == 0xfe && (a->b[1] & 0xc0) == 0x80) // fe80::/10 link-local
+		return 1;
+	return 0;
 }
 
 // Scoped LPM key: {network id, address}. Entries always fully specify the
@@ -429,6 +447,54 @@ static __always_inline int parse_ipv4(struct __sk_buff *skb, struct iphdr **ip)
 	if ((void *)(*ip + 1) > data_end)
 		return -1;
 	return 0;
+}
+
+// A parsed IP packet, reduced to what the family-agnostic delivery path needs:
+// both addresses as 128-bit map keys (v4 in NAT64 form, v6 native) and the
+// family, so a caller can gate the v4-only NAT branches. The L4 protocol is the
+// v4 protocol byte or the v6 next-header (extension headers are not walked — a
+// v6 VPC's inner packets are plain TCP/UDP/ICMPv6, and only the overlay path,
+// which never reads L4, runs for v6 today).
+struct pkt {
+	__u8 is_v6;
+	__u8 proto;
+	struct addr128 src;
+	struct addr128 dst;
+};
+
+// parse_ip fills a struct pkt from either an IPv4 or IPv6 frame. The addresses
+// are copied out (stack values), so they survive any later in-place packet
+// rewrite that would invalidate a header pointer. Returns -1 for anything that
+// is neither v4 nor v6 (e.g. ARP), which the caller passes to the kernel.
+static __always_inline int parse_ip(struct __sk_buff *skb, struct pkt *p)
+{
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+	struct ethhdr *eth = data;
+
+	if ((void *)(eth + 1) > data_end)
+		return -1;
+	if (eth->h_proto == bpf_htons(ETH_P_IP)) {
+		struct iphdr *ip = (void *)(eth + 1);
+		if ((void *)(ip + 1) > data_end)
+			return -1;
+		p->is_v6 = 0;
+		p->proto = ip->protocol;
+		v4_to_128(&p->src, ip->saddr);
+		v4_to_128(&p->dst, ip->daddr);
+		return 0;
+	}
+	if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
+		struct ipv6hdr *ip6 = (void *)(eth + 1);
+		if ((void *)(ip6 + 1) > data_end)
+			return -1;
+		p->is_v6 = 1;
+		p->proto = ip6->nexthdr;
+		__builtin_memcpy(p->src.b, &ip6->saddr, 16);
+		__builtin_memcpy(p->dst.b, &ip6->daddr, 16);
+		return 0;
+	}
+	return -1;
 }
 
 // deliver_local redirects the frame into a local pod's veth (through to_pod).
@@ -792,8 +858,8 @@ static __always_inline int floating_egress_snat(struct __sk_buff *skb, struct ip
 SEC("tc")
 int cozyplane_from_pod(struct __sk_buff *skb)
 {
-	struct iphdr *ip;
-	if (parse_ipv4(skb, &ip) < 0)
+	struct pkt p;
+	if (parse_ip(skb, &p) < 0)
 		return TC_ACT_OK;
 
 	__u32 ifindex = skb->ifindex;
@@ -804,29 +870,39 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 		is_gw = *sp & PORT_F_GATEWAY;
 	}
 
-	// A VPC pod's reply to the gateway (169.254.1.1) is the return half of the
-	// north-south bridge: un-NAT it and deliver on the default network.
-	if (ip->daddr == bpf_htonl(LINK_LOCAL_GW))
-		return bridge_reverse(skb, ip, srcnet);
-	struct addr128 d128;
-	v4_to_128(&d128, ip->daddr);
+	// v6 link-local / multicast (the pod resolving its on-link gateway via NDP,
+	// router solicitations, …) is link-scoped: hand it to the kernel so the host
+	// veth answers, never overlay-deliver it or subject it to isolation.
+	if (p.is_v6 && v6_link_scoped(&p.dst))
+		return TC_ACT_OK;
+
 	// The destination's network, resolved within the source's scope: its own
 	// CIDR or a peer's. Overlapping CIDRs in other VPCs are invisible here.
-	__u32 dstnet = net_of(&networks, srcnet, d128);
+	// Family-agnostic — the addresses are already 128-bit map keys.
+	__u32 dstnet = net_of(&networks, srcnet, p.dst);
 
-	// Off-net traffic from a floating pod egresses from its public IP (both its
-	// replies and the connections it originates): SNAT VPC->public and redirect
-	// out the uplink, dropping cluster-internal destinations. Checked before
-	// isolation, which would otherwise send it to the gateway or drop it.
-	if (srcnet && !dstnet) {
-		int fr = floating_egress_snat(skb, ip, srcnet);
-		if (fr != FLOAT_MISS)
-			return fr;
-		// The miss path leaves the packet untouched, but floating_egress_snat's
-		// inlined body writes the packet on its hit path, so the verifier treats
-		// `ip` as invalidated here — re-derive it.
+	// The north-south bridge and floating IPs are v4-only today (v6 fabric IPs
+	// and an NDP responder are later phases), so a v6 packet skips straight to
+	// the family-agnostic overlay delivery below.
+	if (!p.is_v6) {
+		struct iphdr *ip;
 		if (parse_ipv4(skb, &ip) < 0)
 			return TC_ACT_OK;
+		// A VPC pod's reply to the gateway (169.254.1.1) is the return half of
+		// the north-south bridge: un-NAT it and deliver on the default network.
+		if (ip->daddr == bpf_htonl(LINK_LOCAL_GW))
+			return bridge_reverse(skb, ip, srcnet);
+		// Off-net traffic from a floating pod egresses from its public IP (both
+		// its replies and the connections it originates): SNAT VPC->public and
+		// redirect out the uplink, dropping cluster-internal destinations.
+		// Checked before isolation, which would otherwise send it to the gateway
+		// or drop it. On a hit floating_egress_snat returns the action; on a miss
+		// the packet is untouched, so p.src/p.dst (stack copies) stay valid.
+		if (srcnet && !dstnet) {
+			int fr = floating_egress_snat(skb, ip, srcnet);
+			if (fr != FLOAT_MISS)
+				return fr;
+		}
 	}
 
 	// Isolation: same-network or explicitly peered traffic only (egress side) —
@@ -850,7 +926,7 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	}
 
 	// Same-node destination: redirect through the pod's veth egress (-> to_pod).
-	struct endpoint *l = local_of(dstnet, d128);
+	struct endpoint *l = local_of(dstnet, p.dst);
 	if (l) {
 		// A gateway forwarding into its VPC may carry an off-VPC source (the
 		// internet's reply); mark it so the destination's anti-spoof admits it.
@@ -860,14 +936,15 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	}
 
 	// Remote destination in the same network (or a peer): encapsulate.
-	__u32 *node_ip = remote_of(dstnet, d128);
+	__u32 *node_ip = remote_of(dstnet, p.dst);
 	if (node_ip)
 		return encap(skb, dstnet, *node_ip, is_gw);
 
 	// Same-node north-south: a default-network packet to a local VPC pod's
 	// fabric IP. Redirect into the pod's veth (to_pod does the DNAT), bypassing
-	// the kernel FORWARD chain so no netfilter accept rule is needed.
-	struct bridge_ep *be = bridge_of(d128);
+	// the kernel FORWARD chain so no netfilter accept rule is needed. Fabric IPs
+	// are v4-only, so a v6 packet always misses here and falls to the kernel.
+	struct bridge_ep *be = bridge_of(p.dst);
 	if (be) {
 		struct endpoint *l = local_of(be->net, be->vpc_ip);
 		if (l)
@@ -883,31 +960,39 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 SEC("tc")
 int cozyplane_to_pod(struct __sk_buff *skb)
 {
-	struct iphdr *ip;
-	if (parse_ipv4(skb, &ip) < 0)
+	struct pkt p;
+	if (parse_ip(skb, &p) < 0)
 		return TC_ACT_OK;
 
-	// The forward half of the north-south bridge: a packet whose destination is
-	// a fabric IP (routed here by the pod's /32) is DNATed to the VPC IP and its
-	// client masqueraded to the gateway, then delivered — no isolation check
-	// (this IS the sanctioned north-south path). Fabric IPs are unique, so the
-	// lookup is unambiguous even under overlapping VPC CIDRs.
-	struct addr128 d128, s128;
-	v4_to_128(&d128, ip->daddr);
-	v4_to_128(&s128, ip->saddr);
+	// The north-south bridge and floating IPs are v4-only today; a v6 packet
+	// goes straight to the family-agnostic isolation check below.
+	if (!p.is_v6) {
+		struct iphdr *ip;
+		if (parse_ipv4(skb, &ip) < 0)
+			return TC_ACT_OK;
+		// The forward half of the north-south bridge: a packet whose destination
+		// is a fabric IP (routed here by the pod's /32) is DNATed to the VPC IP
+		// and its client masqueraded to the gateway, then delivered — no
+		// isolation check (this IS the sanctioned north-south path). Fabric IPs
+		// are unique, so the lookup is unambiguous under overlapping VPC CIDRs.
+		struct bridge_ep *be = bridge_of(p.dst);
+		if (be)
+			return bridge_forward(skb, ip, be->net, be->vpc_ip);
 
-	struct bridge_ep *be = bridge_of(d128);
-	if (be)
-		return bridge_forward(skb, ip, be->net, be->vpc_ip);
+		// A floating IP: DNAT public->VPC, preserving the external client's
+		// source. Also sanctioned north-south (no isolation check follows).
+		struct bridge_ep *fe = float_of(p.dst);
+		if (fe)
+			return floating_forward(skb, ip, fe->net, fe->vpc_ip);
 
-	// A floating IP: DNAT public->VPC, preserving the external client's source.
-	// Also sanctioned north-south (no isolation check follows).
-	struct bridge_ep *fe = float_of(d128);
-	if (fe)
-		return floating_forward(skb, ip, fe->net, fe->vpc_ip);
+		// A masqueraded reply already carries the gateway source; allow it.
+		if (ip->saddr == bpf_htonl(LINK_LOCAL_GW))
+			return TC_ACT_OK;
+	}
 
-	// A masqueraded reply already carries the gateway source; allow it.
-	if (ip->saddr == bpf_htonl(LINK_LOCAL_GW))
+	// v6 link-local / multicast reaching the pod (an NA from its on-link gateway,
+	// router advertisements, …) is link-scoped; admit it without isolation.
+	if (p.is_v6 && v6_link_scoped(&p.src))
 		return TC_ACT_OK;
 
 	__u32 ifindex = skb->ifindex;
@@ -917,7 +1002,7 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 		dstnet = PORT_NET(*dp);
 	// Recover the source's network from the destination's scope (symmetric to
 	// from_pod): its own CIDR or a peer's under this pod's network.
-	__u32 srcnet = net_of(&networks, dstnet, s128);
+	__u32 srcnet = net_of(&networks, dstnet, p.src);
 
 	// Isolation: same-network or explicitly peered traffic only (ingress side).
 	// The exception is gateway-forwarded traffic into a VPC pod: its source is
@@ -945,19 +1030,18 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 	if (bpf_skb_get_tunnel_key(skb, &tk, sizeof(tk), 0) < 0)
 		return TC_ACT_OK;
 
-	struct iphdr *ip;
-	if (parse_ipv4(skb, &ip) < 0)
+	struct pkt p;
+	if (parse_ip(skb, &p) < 0)
 		return TC_ACT_OK;
 
 	__u32 gw = tk.tunnel_id & TUN_F_GATEWAY;
 	__u32 vni = (__u32)tk.tunnel_id & ~TUN_F_GATEWAY;
-	struct addr128 d128;
-	v4_to_128(&d128, ip->daddr);
 	if (vni == cfg(CFG_VNI)) {
 		// Default network. A cross-node north-south packet to a local VPC pod's
 		// fabric IP is delivered to its veth here (to_pod does the DNAT),
 		// bypassing the kernel FORWARD chain; everything else the kernel routes.
-		struct bridge_ep *be = bridge_of(d128);
+		// Fabric IPs are v4-only, so a v6 packet misses and the kernel routes it.
+		struct bridge_ep *be = bridge_of(p.dst);
 		if (be) {
 			struct endpoint *l = local_of(be->net, be->vpc_ip);
 			if (l)
@@ -967,7 +1051,8 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 	}
 
 	// A local pod in this VPC (intra-VPC, peered, or a gateway->tenant reply).
-	struct endpoint *ep = local_of(vni, d128);
+	// The lookup is 128-bit, so a v6 VPC pod is delivered exactly like a v4 one.
+	struct endpoint *ep = local_of(vni, p.dst);
 	if (ep) {
 		if (gw)
 			skb->mark = GW_MARK;
