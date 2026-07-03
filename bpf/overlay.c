@@ -221,9 +221,9 @@ struct {
 // IP} (reusing struct bridge_ep). The bridges map turned outward: instead of a
 // fabric IP from the node pod CIDR, the key is a public address advertised
 // (ARP/NDP) from the target pod's own node. from_uplink redirects an inbound
-// packet into the pod's veth; to_pod DNATs public->VPC while *preserving* the
-// external client's source, and from_pod reverses the reply. No masquerade, no
-// gateway — this is the fabric bridge with source preservation.
+// packet into the pod's veth; to_pod DNATs public->VPC (keeping the client's
+// source), and from_pod SNATs the pod's egress the other way. A true public IP:
+// the same address inbound and outbound, no masquerade, no gateway, no conntrack.
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, __u32);
@@ -232,29 +232,30 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } floating SEC(".maps");
 
-// float_ct records a floating-IP inbound connection so the reply can be reversed
-// (VPC IP -> publicIP) without masquerading the client. It is what bounds the
-// reverse-NAT to *reply* traffic: a pod's own-initiated egress from a
-// floating-bound IP has no ct entry and is left alone (reversing that too would
-// be the future Elastic-IP-egress upgrade). Keyed by the 5-tuple as the reply
-// presents it; the value is the publicIP to restore.
-struct float_ct_key {
-	__u8 proto;
-	__u8 pad[3];
-	__u32 net;
-	__u32 vpc_ip;      // network order
-	__u32 client_ip;   // network order
-	__u16 pod_port;    // network order
-	__u16 client_port; // network order
-};
-
+// floating_egress is the reverse of `floating`: (net, VPC IP) -> publicIP. A
+// floating pod's off-net egress is SNATed from its public IP through this map,
+// so a reply to an inbound connection and a connection the pod originates are
+// the same stateless rewrite (no float_ct). Keyed like `locals`.
 struct {
-	__uint(type, BPF_MAP_TYPE_LRU_HASH);
-	__type(key, struct float_ct_key);
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct local_key);
 	__type(value, __u32); // publicIP, network order
-	__uint(max_entries, 262144);
+	__uint(max_entries, 65536);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
-} float_ct SEC(".maps");
+} floating_egress SEC(".maps");
+
+// internal holds the cluster-internal CIDRs (pod/service/node networks) at scope
+// 0. A floating pod egresses straight out the uplink, bypassing the VPC gateway
+// that would otherwise enforce the tenant->system boundary — so from_pod drops
+// its traffic to any of these. Programmed by the agent.
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__type(key, struct lpm_key);
+	__type(value, __u8);
+	__uint(max_entries, 64);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} internal SEC(".maps");
 
 // The bridge's own L4 connection table (no kernel conntrack). A north-south
 // connection is masqueraded to 169.254.1.1:gw_port; the pod's reply is reversed
@@ -660,131 +661,71 @@ static __always_inline int bridge_reverse(struct __sk_buff *skb, struct iphdr *i
 	return deliver_net0(skb, rv->client_ip);
 }
 
-// floating_forward is the inbound half of a floating IP, done in to_pod when a
-// packet's destination is a floating address: DNAT public->VPC on the
-// destination while KEEPING the external client as the source (no masquerade),
-// record the connection so the reply can be reversed, and deliver. Sanctioned
-// north-south, like bridge_forward — the isolation check below does not run.
-// floating_forward_icmp DNATs a floating-IP echo request public->VPC, keeping the
-// real client source (unlike the bridge it does not masquerade, so the client IP
-// itself demuxes replies and the id is left untouched). The connection is
-// recorded so from_pod can reverse the reply.
-static __always_inline int floating_forward_icmp(struct __sk_buff *skb, struct iphdr *ip, __u32 net, __u32 vpc_ip)
+// floating_egress_of returns the public IP a floating pod egresses from, or NULL
+// when (net, vpc_ip) has no floating IP.
+static __always_inline __u32 *floating_egress_of(__u32 net, __u32 vpc_ip)
 {
-	__u8 type;
-	__u16 id;
-	if (icmp_echo(skb, &type, &id) < 0)
-		return TC_ACT_SHOT;
-	if (type != ICMP_ECHO_REQUEST)
-		return TC_ACT_SHOT;
-	__u32 public_ip = ip->daddr;
-
-	struct float_ct_key k = {
-		.proto = IPPROTO_ICMP,
-		.net = net,
-		.vpc_ip = vpc_ip,
-		.client_ip = ip->saddr,
-		.client_port = id,
-	};
-	bpf_map_update_elem(&float_ct, &k, &public_ip, BPF_ANY);
-
-	nat_addr(skb, IPPROTO_ICMP, IP_DADDR_OFF, public_ip, vpc_ip);
-	return TC_ACT_OK;
+	struct local_key key = { .net = net, .ip = vpc_ip };
+	return bpf_map_lookup_elem(&floating_egress, &key);
 }
 
+// is_internal reports whether an address falls in a cluster-internal CIDR.
+static __always_inline int is_internal(__u32 addr)
+{
+	struct lpm_key key = { .prefixlen = 64, .scope_net = 0, .addr = addr };
+	return bpf_map_lookup_elem(&internal, &key) != NULL;
+}
+
+// floating_forward is the inbound half of a floating IP, done in to_pod when a
+// packet's destination is a floating address: a stateless DNAT public->VPC that
+// keeps the external client as the source (no masquerade). Sanctioned
+// north-south, like bridge_forward — the isolation check below does not run.
+// TCP, UDP, and ICMP echo (request or reply — a reply is the return half of the
+// pod's own outbound ping); other ICMP is dropped.
 static __always_inline int floating_forward(struct __sk_buff *skb, struct iphdr *ip, __u32 net, __u32 vpc_ip)
 {
 	if (ip->ihl != 5)
 		return TC_ACT_SHOT;
 	__u8 proto = ip->protocol;
-	if (proto == IPPROTO_ICMP)
-		return floating_forward_icmp(skb, ip, net, vpc_ip);
-	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
-		return TC_ACT_SHOT; // TCP/UDP/ICMP-echo; other ICMP to a floating IP is dropped
-	__u16 cport, pport;
-	if (l4_ports(skb, &cport, &pport) < 0)
+	if (proto == IPPROTO_ICMP) {
+		__u8 type;
+		__u16 id;
+		if (icmp_echo(skb, &type, &id) < 0)
+			return TC_ACT_SHOT;
+		if (type != ICMP_ECHO_REQUEST && type != ICMP_ECHO_REPLY)
+			return TC_ACT_SHOT;
+	} else if (proto != IPPROTO_TCP && proto != IPPROTO_UDP) {
 		return TC_ACT_SHOT;
-	__u32 public_ip = ip->daddr;
-
-	struct float_ct_key k = {
-		.proto = proto,
-		.net = net,
-		.vpc_ip = vpc_ip,
-		.client_ip = ip->saddr,
-		.pod_port = pport,
-		.client_port = cport,
-	};
-	bpf_map_update_elem(&float_ct, &k, &public_ip, BPF_ANY);
-
-	nat_addr(skb, proto, IP_DADDR_OFF, public_ip, vpc_ip);
+	}
+	nat_addr(skb, proto, IP_DADDR_OFF, ip->daddr, vpc_ip);
 	return TC_ACT_OK; // delivered to the pod, the real client still its source
 }
 
-// floating_reverse is the reply half, done in from_pod when a VPC pod replies to
-// the external client of one of its floating IPs. If a float_ct entry matches,
-// SNAT the source VPC IP -> publicIP and redirect the reply out the uplink with
-// kernel neighbour resolution for the client, returning the redirect action. The
-// redirect is essential: the reply's source is now the public IP, which is
-// advertised as a local /32 on the uplink, so the normal RX path would drop it
-// as a martian source (local IP arriving on the pod veth). redirect_neigh
-// bypasses that (and rp_filter and the FORWARD chain) and fills the L2 header
-// from the client's neighbour entry. No match => FLOAT_MISS: not a floating
-// reply, fall through to the normal egress path.
-// floating_reverse_icmp reverses a floating-IP echo reply: match the connection
-// (the preserved client IP + id), SNAT source VPC->public, and redirect it out
-// the uplink. No id rewrite — the pod echoed the client's original id.
-static __always_inline int floating_reverse_icmp(struct __sk_buff *skb, struct iphdr *ip, __u32 net)
-{
-	__u8 type;
-	__u16 id;
-	if (icmp_echo(skb, &type, &id) < 0)
-		return FLOAT_MISS;
-	if (type != ICMP_ECHO_REPLY)
-		return FLOAT_MISS;
-
-	struct float_ct_key k = {
-		.proto = IPPROTO_ICMP,
-		.net = net,
-		.vpc_ip = ip->saddr,
-		.client_ip = ip->daddr,
-		.client_port = id,
-	};
-	__u32 *public_ip = bpf_map_lookup_elem(&float_ct, &k);
-	if (!public_ip)
-		return FLOAT_MISS;
-
-	__u32 uplink = cfg(CFG_UPLINK_IFINDEX);
-	if (!uplink)
-		return FLOAT_MISS;
-	nat_addr(skb, IPPROTO_ICMP, IP_SADDR_OFF, ip->saddr, *public_ip);
-	return bpf_redirect_neigh(uplink, NULL, 0, 0);
-}
-
-static __always_inline int floating_reverse(struct __sk_buff *skb, struct iphdr *ip, __u32 net)
+// floating_egress_snat is the outbound half, done in from_pod for a floating
+// pod's *internet*-bound traffic: SNAT source VPC->public and redirect it out
+// the uplink (kernel neighbour resolution for the destination — which also
+// sidesteps rp_filter and the FORWARD chain). It serves both a reply to an
+// inbound connection and a connection the pod originates: a true public IP, the
+// same address in both directions, stateless.
+//
+// Cluster-internal destinations are left to the normal path (FLOAT_MISS): they
+// fall through to the VPC gateway, which proxies cluster DNS and denies the rest
+// exactly as it does for a non-floating pod — so a floating pod keeps the same
+// internal reachability, and simply *also* egresses the internet from its public
+// IP. FLOAT_MISS likewise when the pod has no floating IP. ICMP needs no id
+// rewrite (the identifier is the pod's own).
+static __always_inline int floating_egress_snat(struct __sk_buff *skb, struct iphdr *ip, __u32 net)
 {
 	if (ip->ihl != 5)
 		return FLOAT_MISS;
 	__u8 proto = ip->protocol;
-	if (proto == IPPROTO_ICMP)
-		return floating_reverse_icmp(skb, ip, net);
-	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
+	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP && proto != IPPROTO_ICMP)
 		return FLOAT_MISS;
-	__u16 pport, cport;
-	if (l4_ports(skb, &pport, &cport) < 0)
-		return FLOAT_MISS;
-
-	struct float_ct_key k = {
-		.proto = proto,
-		.net = net,
-		.vpc_ip = ip->saddr,
-		.client_ip = ip->daddr,
-		.pod_port = pport,
-		.client_port = cport,
-	};
-	__u32 *public_ip = bpf_map_lookup_elem(&float_ct, &k);
+	__u32 *public_ip = floating_egress_of(net, ip->saddr);
 	if (!public_ip)
 		return FLOAT_MISS;
-
+	if (is_internal(ip->daddr))
+		return FLOAT_MISS; // internal: let the gateway proxy DNS / deny the rest
 	__u32 uplink = cfg(CFG_UPLINK_IFINDEX);
 	if (!uplink)
 		return FLOAT_MISS;
@@ -817,16 +758,15 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	// CIDR or a peer's. Overlapping CIDRs in other VPCs are invisible here.
 	__u32 dstnet = net_of(&networks, srcnet, ip->daddr);
 
-	// A VPC pod replying to the external client of one of its floating IPs: the
-	// destination is off-net (dstnet 0) but a float_ct match reverses the
-	// source-preserving NAT (VPC IP -> publicIP) and redirects the reply out the
-	// uplink. Checked before isolation, which would send it to the gateway or
-	// drop it.
+	// Off-net traffic from a floating pod egresses from its public IP (both its
+	// replies and the connections it originates): SNAT VPC->public and redirect
+	// out the uplink, dropping cluster-internal destinations. Checked before
+	// isolation, which would otherwise send it to the gateway or drop it.
 	if (srcnet && !dstnet) {
-		int fr = floating_reverse(skb, ip, srcnet);
+		int fr = floating_egress_snat(skb, ip, srcnet);
 		if (fr != FLOAT_MISS)
 			return fr;
-		// The miss path leaves the packet untouched, but floating_reverse's
+		// The miss path leaves the packet untouched, but floating_egress_snat's
 		// inlined body writes the packet on its hit path, so the verifier treats
 		// `ip` as invalidated here — re-derive it.
 		if (parse_ipv4(skb, &ip) < 0)

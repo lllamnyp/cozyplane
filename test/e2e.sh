@@ -207,6 +207,16 @@ got=""; for _ in $(seq 1 12); do got=$(extget "http://$FIP/" | tr -d '[:space:]'
 # ICMP echo through the floating IP (external ping, source-preserving).
 gotp=""; for _ in $(seq 1 8); do docker run --rm --network kind busybox:1.36 ping -c1 -W2 "$FIP" >/dev/null 2>&1 && { gotp=ok; break; }; sleep 2; done
 [ "$gotp" = ok ] && pass "external client ping -> $FIP (floating ICMP)" || fail "external client ping -> $FIP (floating ICMP)"
+# EIP egress: a1 (floating-bound) initiates outbound; the remote must see the
+# floating IP as the source, not the node/gateway address.
+docker run -d --rm --name eipcap --network kind nicolaka/netshoot \
+  sh -c 'tcpdump -lnni eth0 "port 9999" > /tmp/cap.txt 2>&1' >/dev/null 2>&1
+sleep 3
+EIPIP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' eipcap 2>/dev/null)
+for _ in 1 2 3 4; do $K -n team-a exec a1 -- wget -qO- -T2 "http://$EIPIP:9999/" >/dev/null 2>&1; sleep 1; done
+srcseen=$(docker exec eipcap grep -oE "$FIP" /tmp/cap.txt 2>/dev/null | head -1)
+docker rm -f eipcap >/dev/null 2>&1
+[ "$srcseen" = "$FIP" ] && pass "a1 outbound source = floating IP $FIP (EIP egress)" || fail "a1 outbound source = floating IP $FIP (EIP egress, saw '$srcseen')"
 
 echo "[revocation]"
 $K -n team-a delete vpcbinding vpc-a >/dev/null

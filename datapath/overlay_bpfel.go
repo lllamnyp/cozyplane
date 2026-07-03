@@ -62,17 +62,6 @@ type overlayEndpoint struct {
 	Pad     [2]uint8
 }
 
-type overlayFloatCtKey struct {
-	_          structs.HostLayout
-	Proto      uint8
-	Pad        [3]uint8
-	Net        uint32
-	VpcIp      uint32
-	ClientIp   uint32
-	PodPort    uint16
-	ClientPort uint16
-}
-
 type overlayGwEntry struct {
 	_      structs.HostLayout
 	GwIp   uint32
@@ -105,9 +94,10 @@ const (
 	overlayMapBridges               = "bridges"
 	overlayMapCtFwd                 = "ct_fwd"
 	overlayMapCtRev                 = "ct_rev"
-	overlayMapFloatCt               = "float_ct"
 	overlayMapFloating              = "floating"
+	overlayMapFloatingEgress        = "floating_egress"
 	overlayMapGateways              = "gateways"
+	overlayMapInternal              = "internal"
 	overlayMapLocals                = "locals"
 	overlayMapNetworks              = "networks"
 	overlayMapParams                = "params"
@@ -173,19 +163,20 @@ type overlayProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type overlayMapSpecs struct {
-	Bridges   *ebpf.MapSpec `ebpf:"bridges"`
-	CtFwd     *ebpf.MapSpec `ebpf:"ct_fwd"`
-	CtRev     *ebpf.MapSpec `ebpf:"ct_rev"`
-	FloatCt   *ebpf.MapSpec `ebpf:"float_ct"`
-	Floating  *ebpf.MapSpec `ebpf:"floating"`
-	Gateways  *ebpf.MapSpec `ebpf:"gateways"`
-	Locals    *ebpf.MapSpec `ebpf:"locals"`
-	Networks  *ebpf.MapSpec `ebpf:"networks"`
-	Params    *ebpf.MapSpec `ebpf:"params"`
-	Peers     *ebpf.MapSpec `ebpf:"peers"`
-	Ports     *ebpf.MapSpec `ebpf:"ports"`
-	Remotes   *ebpf.MapSpec `ebpf:"remotes"`
-	UplinkMac *ebpf.MapSpec `ebpf:"uplink_mac"`
+	Bridges        *ebpf.MapSpec `ebpf:"bridges"`
+	CtFwd          *ebpf.MapSpec `ebpf:"ct_fwd"`
+	CtRev          *ebpf.MapSpec `ebpf:"ct_rev"`
+	Floating       *ebpf.MapSpec `ebpf:"floating"`
+	FloatingEgress *ebpf.MapSpec `ebpf:"floating_egress"`
+	Gateways       *ebpf.MapSpec `ebpf:"gateways"`
+	Internal       *ebpf.MapSpec `ebpf:"internal"`
+	Locals         *ebpf.MapSpec `ebpf:"locals"`
+	Networks       *ebpf.MapSpec `ebpf:"networks"`
+	Params         *ebpf.MapSpec `ebpf:"params"`
+	Peers          *ebpf.MapSpec `ebpf:"peers"`
+	Ports          *ebpf.MapSpec `ebpf:"ports"`
+	Remotes        *ebpf.MapSpec `ebpf:"remotes"`
+	UplinkMac      *ebpf.MapSpec `ebpf:"uplink_mac"`
 }
 
 // overlayVariableSpecs contains global variables before they are loaded into the kernel.
@@ -214,19 +205,20 @@ func (o *overlayObjects) Close() error {
 //
 // It can be passed to loadOverlayObjects or ebpf.CollectionSpec.LoadAndAssign.
 type overlayMaps struct {
-	Bridges   *ebpf.Map `ebpf:"bridges"`
-	CtFwd     *ebpf.Map `ebpf:"ct_fwd"`
-	CtRev     *ebpf.Map `ebpf:"ct_rev"`
-	FloatCt   *ebpf.Map `ebpf:"float_ct"`
-	Floating  *ebpf.Map `ebpf:"floating"`
-	Gateways  *ebpf.Map `ebpf:"gateways"`
-	Locals    *ebpf.Map `ebpf:"locals"`
-	Networks  *ebpf.Map `ebpf:"networks"`
-	Params    *ebpf.Map `ebpf:"params"`
-	Peers     *ebpf.Map `ebpf:"peers"`
-	Ports     *ebpf.Map `ebpf:"ports"`
-	Remotes   *ebpf.Map `ebpf:"remotes"`
-	UplinkMac *ebpf.Map `ebpf:"uplink_mac"`
+	Bridges        *ebpf.Map `ebpf:"bridges"`
+	CtFwd          *ebpf.Map `ebpf:"ct_fwd"`
+	CtRev          *ebpf.Map `ebpf:"ct_rev"`
+	Floating       *ebpf.Map `ebpf:"floating"`
+	FloatingEgress *ebpf.Map `ebpf:"floating_egress"`
+	Gateways       *ebpf.Map `ebpf:"gateways"`
+	Internal       *ebpf.Map `ebpf:"internal"`
+	Locals         *ebpf.Map `ebpf:"locals"`
+	Networks       *ebpf.Map `ebpf:"networks"`
+	Params         *ebpf.Map `ebpf:"params"`
+	Peers          *ebpf.Map `ebpf:"peers"`
+	Ports          *ebpf.Map `ebpf:"ports"`
+	Remotes        *ebpf.Map `ebpf:"remotes"`
+	UplinkMac      *ebpf.Map `ebpf:"uplink_mac"`
 }
 
 func (m *overlayMaps) Close() error {
@@ -234,9 +226,10 @@ func (m *overlayMaps) Close() error {
 		m.Bridges,
 		m.CtFwd,
 		m.CtRev,
-		m.FloatCt,
 		m.Floating,
+		m.FloatingEgress,
 		m.Gateways,
+		m.Internal,
 		m.Locals,
 		m.Networks,
 		m.Params,

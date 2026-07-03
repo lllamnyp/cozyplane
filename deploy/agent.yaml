@@ -97,7 +97,7 @@ spec:
           imagePullPolicy: IfNotPresent
           # --cluster-cidr enables node masquerade: pod traffic leaving the
           # cluster is SNATed to the node (pods get an internet return path).
-          args: ["--mtu=1450", "--cluster-cidr=10.244.0.0/16"]
+          args: ["--mtu=1450", "--cluster-cidr=10.244.0.0/16", "--internal-cidrs=10.244.0.0/16,10.96.0.0/16"]
           env:
             - name: NODE_NAME
               valueFrom:

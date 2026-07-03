@@ -68,12 +68,13 @@ const (
 
 func main() {
 	var (
-		nodeName    = os.Getenv("NODE_NAME")
-		mtu         int
-		vni         uint
-		cniConfName string
-		genevePort  uint
-		clusterCIDR string
+		nodeName      = os.Getenv("NODE_NAME")
+		mtu           int
+		vni           uint
+		cniConfName   string
+		genevePort    uint
+		clusterCIDR   string
+		internalCIDRs string
 	)
 	flag.IntVar(&mtu, "mtu", 1450, "pod MTU (underlay MTU minus Geneve overhead)")
 	flag.UintVar(&vni, "vni", uint(datapath.DefaultVNI), "VNI for the default network")
@@ -83,6 +84,8 @@ func main() {
 		"Geneve UDP destination port (use a non-default port to coexist with another overlay on 6081)")
 	flag.StringVar(&clusterCIDR, "cluster-cidr", "",
 		"cluster pod supernet; when set, pod traffic leaving it is masqueraded to the node address (pod egress to the outside)")
+	flag.StringVar(&internalCIDRs, "internal-cidrs", "",
+		"comma-separated cluster-internal CIDRs (pod, service, node networks) a floating pod's public-IP egress must not reach")
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
@@ -92,13 +95,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(nodeName, mtu, uint32(vni), cniConfName, uint16(genevePort), clusterCIDR, log); err != nil {
+	if err := run(nodeName, mtu, uint32(vni), cniConfName, uint16(genevePort), clusterCIDR, internalCIDRs, log); err != nil {
 		log.Error("agent failed", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort uint16, clusterCIDR string, log *slog.Logger) error {
+func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort uint16, clusterCIDR, internalCIDRs string, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -144,6 +147,13 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	// A no-op for every non-floating packet, so it is always safe to attach.
 	if _, err := mgr.AttachUplinkIngress(); err != nil {
 		return fmt.Errorf("attach uplink ingress: %w", err)
+	}
+	// Cluster-internal CIDRs a floating pod's public-IP egress must not reach
+	// (it bypasses the gateway that would otherwise deny them).
+	if internal := splitCIDRs(internalCIDRs); len(internal) > 0 {
+		if err := mgr.SetInternal(internal); err != nil {
+			return fmt.Errorf("program internal CIDRs: %w", err)
+		}
 	}
 	log.Info("datapath loaded", "vni", vni, "geneve", datapath.GeneveDevice, "uplink", uplink)
 
@@ -688,6 +698,17 @@ func desiredFloating(fips []*sdnv1alpha1.FloatingIP, ports []*sdnv1alpha1.Port, 
 			continue // target not a live Port on this node
 		}
 		out[f.Status.Address] = floatingView{vpcIP: f.Spec.Target, vni: vni}
+	}
+	return out
+}
+
+// splitCIDRs parses a comma-separated CIDR list, dropping blanks.
+func splitCIDRs(s string) []string {
+	var out []string
+	for _, c := range strings.Split(s, ",") {
+		if c = strings.TrimSpace(c); c != "" {
+			out = append(out, c)
+		}
 	}
 	return out
 }

@@ -317,46 +317,54 @@ the client-masquerade removed, so the tenant sees the *real* caller. The pieces:
   It does *not* rewrite the packet: the DNAT happens where the bridge's does, in
   `to_pod`. This mirrors the bridge exactly (`from_uplink` is to floating what
   `from_pod`/`from_overlay` are to the fabric bridge).
-- **`to_pod` does the DNAT** (`floating_forward`, right beside `bridge_forward`).
+- **`to_pod` does the inbound DNAT** (`floating_forward`, beside `bridge_forward`).
   It DNATs `publicIP → vpcIP` on the destination, keeping the external client as
-  the source — *not* masqueraded to `169.254.1.1` — and records a
-  **source-preserving** conntrack entry (`float_ct`). Like `bridge_forward` it
-  returns delivered, so the isolation check below never runs.
-- **Reply through `from_pod`.** The pod replies `vpcIP → client` via its
-  `169.254.1.1` default route — which every pod has unconditionally
-  (`configurePodIface`), gateway or not. `from_pod` (already on every veth) finds
-  the source-preserving ct, SNATs `vpcIP → publicIP`, and **`bpf_redirect_neigh`s
-  it out the uplink** (kernel neighbour resolution for the external client). The
-  redirect is not optional: because `publicIP` is advertised as a local `/32`, the
-  normal RX path would drop the reply as a *martian source* (a local address
-  arriving on the pod veth), and it would also face `rp_filter` and the FORWARD
-  chain. `redirect_neigh` bypasses all three and fills the L2 header from the
-  client's neighbour entry — the same "don't route, deliver by identity" move the
-  rest of the datapath makes. (A pool must still be a routable range disjoint from
-  the pod CIDR so the client and the switch fabric can reach it.)
+  the source — *not* masqueraded to `169.254.1.1`. It is **stateless**: a plain
+  `floating`-map lookup, no conntrack. Like `bridge_forward` it returns delivered,
+  so the isolation check below never runs.
+- **Egress through `from_pod`** — the address is a *true public IP*, used for the
+  pod's **outbound** traffic too, not just replies. `from_pod` looks the pod's
+  `{net, vpcIP}` up in a reverse map (`floating_egress`); on a hit it SNATs the
+  source `vpcIP → publicIP` and **`bpf_redirect_neigh`s it out the uplink** (kernel
+  neighbour resolution for the destination). This one path covers both a reply to
+  an inbound connection *and* a connection the pod originates — the mapping is a
+  stateless 1:1 bijection either way (which is why `float_ct` is gone). The
+  redirect matters: the reply would otherwise face `rp_filter` and the FORWARD
+  chain; `redirect_neigh` bypasses them and fills the L2 header from the
+  destination's neighbour entry — the datapath's usual "don't route, deliver by
+  identity."
+- **Internet only takes the public IP; internal still goes to the gateway.**
+  Before the SNAT, `from_pod` checks the destination against an `internal` LPM map
+  (pod/service/node CIDRs, programmed by the agent). Only *non*-internal (internet)
+  destinations egress from the public IP; a cluster-internal destination falls
+  through to the normal path — the VPC gateway, which proxies cluster DNS on `:53`
+  and denies the rest, exactly as for a non-floating pod. So a floating pod keeps
+  the **same internal reachability** as any tenant pod (its own VPC and peers via
+  overlay delivery, cluster DNS via the gateway, other system services denied) and
+  simply *also* egresses the internet from its public IP. A floating pod needs no
+  gateway to work; if the VPC has none, its internal/DNS traffic is dropped like
+  any gateway-less VPC's and it uses external DNS.
 
 **Inbound walk (external client → floatingIP → tenant pod B in VPC-X):**
 `client → floatingIP` arrives at B's node (its agent answered ARP) → `from_uplink`
 redirects it into B's veth (`locals[{X, B-ip}]`) → `to_pod`'s `floating_forward`
-DNATs it to `client → B-ip`, keeping the client source, and stamps the ct → B
-replies `B-ip → client` toward `169.254.1.1` → `from_pod` matches the ct, rewrites
-the source `B-ip → floatingIP`, and `redirect_neigh`s it out the uplink to the
-client, unmasqueraded.
+DNATs it to `client → B-ip`, keeping the client source → B replies `B-ip → client`
+toward `169.254.1.1` → `from_pod` finds `floating_egress[{X, B-ip}]`, SNATs the
+source `B-ip → floatingIP`, and `redirect_neigh`s it out the uplink, unmasqueraded.
 
-**Why the conntrack, and how EIP egress drops in later.** The 1:1 map is a static
-bijection, so reversing a reply needs no state in principle — but *unconditionally*
-SNAT-ing every off-net packet from a floating-bound `vpcIP` to `publicIP` would
-also rewrite the pod's **own-initiated** egress, which is the full Elastic-IP
-semantic deferred to later. The ct is exactly what bounds this to *reply* traffic:
-`from_pod` reverses only flows an inbound connection created. Removing that bound
-(reverse the `floating` map for any egress from the bound `vpcIP`) is the whole of
-the future EIP-egress upgrade — no API or map change, just a policy flip.
+**Outbound walk (B originates a connection to the internet):** identical from
+`from_pod` on — `floating_egress[{X, B-ip}]` hits, the destination is not
+cluster-internal, so `B-ip → dst` is SNATed to `floatingIP → dst` and redirected
+out the uplink. The remote sees B's public IP as the source, matching the address
+it is reached on. The reply retraces the inbound walk (`from_uplink` → DNAT). It
+is one stateless bijection: inbound DNAT via `floating`, outbound SNAT via
+`floating_egress`, no conntrack on either side.
 
-**No gateway.** Floating ingress does not use, and does not require, the VPC's
-egress gateway. A floating IP is `Ready` once its target IP is a **live Port** (a
-running pod to advertise from and deliver to); with no live target the address
-stays reserved but silent (see §4, the controller). It is distributed (DVR) from
-day one because it rides the pod's node.
+**No gateway.** A floating pod uses neither the VPC's egress gateway nor any
+conntrack; both directions are the 1:1 map. A floating IP is `Ready` once its
+target IP is a **live Port** (a running pod to advertise from and deliver to);
+with no live target the address stays reserved but silent (see §4, the
+controller). It is distributed (DVR) from day one because it rides the pod's node.
 
 ### Addressing / byte order (for maintainers)
 

@@ -113,6 +113,12 @@ spec:
             # node address, giving pods an internet return path.
             - "--cluster-cidr={{ .Values.egress.clusterCIDR }}"
             {{- end }}
+            {{- $internal := concat (list .Values.egress.clusterCIDR .Values.egress.serviceCIDR) .Values.egress.internalCIDRs | compact }}
+            {{- if $internal }}
+            # Cluster-internal CIDRs a floating pod's public-IP egress skips
+            # (routed to the gateway instead, which proxies DNS / denies the rest).
+            - "--internal-cidrs={{ join "," $internal }}"
+            {{- end }}
           env:
             - name: NODE_NAME
               valueFrom:

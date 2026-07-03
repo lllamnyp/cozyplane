@@ -30,30 +30,59 @@ import (
 // only publish the mapping in the pinned `floating` map the datapath keys on; the
 // agent advertises the address (ARP/NDP) separately, from the pod's own node.
 
-// SetFloating records publicIP -> {net, VPC IP} in the floating map. net is the
-// target pod's network id (its VNI). The reply reversal (VPC IP -> publicIP) is
-// stateful in float_ct, managed entirely in the datapath.
+// SetFloating records the 1:1 mapping in both directions: floating[publicIP] =
+// {net, VPC IP} for inbound DNAT, and floating_egress[{net, VPC IP}] = publicIP
+// for the pod's outbound SNAT. net is the target pod's network id (its VNI). No
+// conntrack — the datapath is stateless in both directions.
 func (m *Manager) SetFloating(publicIP, vpcIP string, net_ uint32) error {
 	pip := net.ParseIP(publicIP).To4()
 	vip := net.ParseIP(vpcIP).To4()
 	if pip == nil || vip == nil {
 		return fmt.Errorf("public %q / vpc %q not IPv4", publicIP, vpcIP)
 	}
-	ep := overlayBridgeEp{Net: net_, VpcIp: binary.LittleEndian.Uint32(vip)}
-	if err := m.objs.Floating.Put(binary.LittleEndian.Uint32(pip), &ep); err != nil {
+	pub := binary.LittleEndian.Uint32(pip)
+	vpc := binary.LittleEndian.Uint32(vip)
+	if err := m.objs.Floating.Put(pub, &overlayBridgeEp{Net: net_, VpcIp: vpc}); err != nil {
 		return fmt.Errorf("set floating %s: %w", publicIP, err)
+	}
+	if err := m.objs.FloatingEgress.Put(&overlayLocalKey{Net: net_, Ip: vpc}, pub); err != nil {
+		return fmt.Errorf("set floating egress %s: %w", publicIP, err)
 	}
 	return nil
 }
 
-// DelFloating removes a public IP from the floating map (idempotent).
+// DelFloating removes a public IP from both directions of the floating map
+// (idempotent). The reverse entry is keyed by {net, VPC IP}, recovered from the
+// forward entry.
 func (m *Manager) DelFloating(publicIP string) error {
 	pip := net.ParseIP(publicIP).To4()
 	if pip == nil {
 		return fmt.Errorf("public IP %q is not IPv4", publicIP)
 	}
-	if err := m.objs.Floating.Delete(binary.LittleEndian.Uint32(pip)); err != nil && !isNotExist(err) {
+	pub := binary.LittleEndian.Uint32(pip)
+	var ep overlayBridgeEp
+	if err := m.objs.Floating.Lookup(pub, &ep); err == nil {
+		_ = m.objs.FloatingEgress.Delete(&overlayLocalKey{Net: ep.Net, Ip: ep.VpcIp})
+	}
+	if err := m.objs.Floating.Delete(pub); err != nil && !isNotExist(err) {
 		return fmt.Errorf("del floating %s: %w", publicIP, err)
+	}
+	return nil
+}
+
+// SetInternal programs the cluster-internal CIDRs (pod/service/node networks)
+// into the internal map. A floating pod's egress to any of them is dropped in
+// from_pod — it bypasses the VPC gateway that would otherwise deny them.
+func (m *Manager) SetInternal(cidrs []string) error {
+	for _, c := range cidrs {
+		key, err := lpmKey(0, c)
+		if err != nil {
+			return err
+		}
+		var one uint8 = 1
+		if err := m.objs.Internal.Put(&key, one); err != nil {
+			return fmt.Errorf("set internal %s: %w", c, err)
+		}
 	}
 	return nil
 }

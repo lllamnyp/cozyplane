@@ -332,13 +332,17 @@ client-masquerade removed.
   from the **target pod's own node**, so ingress is always local and the address
   follows the pod: distributed (DVR) from day one. Overlapping CIDRs isolate for
   free because delivery is by `{net, vpcIP}`, exactly like the bridge.
-- **Source preservation is the point.** Unlike the fabric bridge (which
+- **A true public IP, both directions.** Unlike the fabric bridge (which
   masquerades the caller to `169.254.1.1`), a floating IP keeps the real external
-  client address, so the tenant workload sees who is calling. A source-preserving
-  conntrack entry bounds the reverse-NAT to *reply* traffic; lifting that bound to
-  reverse-map any egress from the bound `vpcIP` is the later, opt-in **Elastic-IP
-  egress** upgrade (the workload also *originates* from its public address) — no
-  API or map change, just a policy flip.
+  client address inbound, and the workload also **originates** from that address
+  outbound (Elastic-IP semantics) — so a VM's source IP equals the public IP it is
+  reached on, which is exactly what external allow-listing needs. Both directions
+  are the same stateless 1:1 map (inbound DNAT `public→vpc`, outbound SNAT
+  `vpc→public`), no conntrack. Only *internet*-bound traffic takes the public IP;
+  cluster-internal destinations still fall through to the VPC gateway (which
+  proxies cluster DNS and denies the rest), so a floating workload keeps the same
+  internal reachability as any tenant pod and simply *also* egresses the internet
+  from its public IP.
 - **Not a Service `type=LoadBalancer`.** A floating IP is 1:1 (one workload, not
   a load-balanced backend set) and source-preserving; a LoadBalancer VIP is
   1:many. They *layer* — a floating IP can later front a Service VIP — but they
