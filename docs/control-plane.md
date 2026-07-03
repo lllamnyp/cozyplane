@@ -47,6 +47,14 @@ Two tiers: **declarative** (authored by tenants/operators, desired state) and
   annotation. A pod may reference several.
 - **`VPCPeering`**, **`GatewayPolicy`** — cross-VPC and the controlled doors
   (DNS/metadata/API/egress) from `design.md` §10.
+- **`ExternalPool`** (cluster-scoped) — `{ cidrs[], advertisement (L2|BGP) }`. An
+  admin-defined range of externally-routable addresses; the MetalLB
+  IPAddressPool analog. `status` tracks allocation counts.
+- **`FloatingIP`** — `{ vpcRef (local), target (tenant IP), poolRef?, address? }`.
+  Binds one pool address 1:1 to a workload in a VPC, bidirectionally (the ingress
+  door in `design.md` §10). `status` carries the assigned `address` + `phase`; it
+  stays `Pending` — never provisioning a gateway it does not own — until the
+  target VPC's egress gateway is enabled, the anchor its 1:1 NAT rides on.
 
 ### Realized
 

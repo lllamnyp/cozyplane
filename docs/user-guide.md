@@ -307,6 +307,67 @@ also cover your node/management networks.
 > return path too (pod CIDRs aren't routable outside the cluster). VPC pods
 > never use it directly — their egress path is always their gateway.
 
+## Expose a workload with a floating IP
+
+An egress gateway gets a VPC *out*; a **floating IP** gets one workload *in* — an
+externally-routable address, reachable from outside the cluster, mapped 1:1 to a
+tenant IP. Unlike a Service `type=LoadBalancer` (one VIP over many backends,
+inbound only), a floating IP is a single workload's public identity in **both**
+directions: inbound connections land on it, and that workload's egress leaves
+*from* it.
+
+An operator defines a pool of routable addresses once, cluster-wide:
+
+```yaml
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: ExternalPool
+metadata: {name: public}
+spec:
+  cidrs: ["203.0.113.0/24"]
+  advertisement: L2
+```
+
+A tenant then claims one for a workload in their VPC:
+
+```yaml
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: FloatingIP
+metadata: {name: web, namespace: team-a}
+spec:
+  vpcRef: {name: vpc-a}      # a VPC in this namespace
+  target: 10.0.0.5           # the tenant IP to expose
+  # poolRef: {name: public}  # optional; the single pool if omitted
+  # address: 203.0.113.7     # optional; a specific address, else lowest free
+```
+
+A floating IP is realized on the VPC's **egress gateway** — the same per-VPC pod
+that handles egress anchors the 1:1 NAT — so it **requires the target VPC to have
+its gateway enabled** (`spec.egress.natGateway: true`). It does not turn the
+gateway on for you: a floating IP does not own the VPC, so while the gateway is
+off the binding reserves its address but stays `Pending`, telling you exactly
+what to fix:
+
+```bash
+kubectl -n team-a get floatingip web
+# NAME   ADDRESS       VPC     TARGET     PHASE
+# web    203.0.113.7   vpc-a   10.0.0.5   Pending
+
+kubectl -n team-a get floatingip web -o \
+  jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}'
+# PoolResolved=True
+# AddressAssigned=True
+# GatewayEnabled=False       <- enable spec.egress.natGateway on vpc-a
+```
+
+Enable the gateway on `vpc-a` and the binding goes `Ready`.
+
+> **Status today.** The `ExternalPool`/`FloatingIP` API, address allocation, and
+> the gateway gate are live — `Ready` means an address is assigned and the anchor
+> is in place. The datapath that actually carries packets to and from the
+> floating address (the gateway 1:1 DNAT/SNAT and address advertisement on the
+> physical network) is being wired incrementally, so end-to-end reachability
+> does not work on every setup yet.
+
 ## Limitations (today)
 
 These are prototype constraints, not permanent:
@@ -320,9 +381,10 @@ These are prototype constraints, not permanent:
   stays `Pending` with `CIDRsDisjoint=False`.
 - **VPC egress is all-or-nothing**: `spec.egress.natGateway` opens internet +
   cluster DNS; there is no per-destination policy, no Service exposure into a
-  VPC, no metadata endpoint, and no floating/public IPs (ingress with source
-  preservation) yet. Without it a VPC remains a closed island for outbound
-  traffic (inbound north-south, same-VPC, and peered-VPC traffic still work).
+  VPC, and no metadata endpoint yet. Without it a VPC remains a closed island for
+  outbound traffic (inbound north-south, same-VPC, and peered-VPC traffic still
+  work). Per-workload **public ingress** now has an API — floating IPs, see above
+  — but its packet datapath is still landing.
 - **The gateway is a single pod per VPC** (Recreate strategy): a node failure
   or image roll interrupts tenant egress until it reschedules; established
   flows don't survive the move (conntrack is in the pod).

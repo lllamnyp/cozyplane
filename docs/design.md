@@ -312,6 +312,42 @@ and anything outside its VPC:
 - **Service LB for tenant pods** (ClusterIP/LB scoped to the VPC) handled in
   eBPF within the VPC scope.
 
+### Ingress: floating IPs
+
+Egress gives a VPC a way *out*; a **floating IP** gives one workload a way *in* —
+an externally-routable address, reachable from off-cluster, that is the
+workload's public identity in **both** directions (inbound connections land on
+it; the workload's egress is SNATed *from* it). This is the OpenStack
+floating-IP model, not the AWS internet gateway: overlapping tenant CIDRs plus a
+per-VPC gateway already shaped like a Neutron L3 router make the
+floating-IP-on-the-router design fit almost line-for-line.
+
+- **Two resources, the MetalLB split.** An admin defines an `ExternalPool` (a
+  cluster-scoped range of routable addresses + how they're announced); a tenant
+  creates a `FloatingIP` binding one address from a pool 1:1 to a tenant IP in a
+  VPC. Operator owns the pool, tenant claims an address.
+- **1:1 NAT on the gateway.** The binding is a static `publicIP ↔ tenantIP`
+  rewrite anchored on that VPC's gateway pod. Overlapping CIDRs isolate for free
+  — each VPC's floating IPs live in its own gateway netns, where the tenant IP is
+  unambiguous. Because it is a static bijection (no port overload) it needs no
+  conntrack, so it is strictly *simpler* than the egress PAT.
+- **Not a Service `type=LoadBalancer`.** A floating IP is 1:1 (one workload, not
+  a load-balanced backend set) and bidirectional (also the egress source); a
+  LoadBalancer VIP is 1:many and inbound-only. They *layer* — a floating IP can
+  later front a Service VIP — but they are different primitives, and floating IPs
+  deliberately need neither the Service proxy nor the kube-proxy replacement.
+- **Ownership boundary.** A floating IP does **not** own the VPC it targets, so
+  it never enables the gateway on the owner's behalf: no auto-provisioning, and
+  no editing `spec.egress` on a VPC it doesn't own. Without a gateway the binding
+  reserves its address but stays `Pending` (`GatewayEnabled=False`) until the
+  owner opts in. The gateway is the anchor; the floating IP is a guest on it.
+- **Realization is swappable.** The API describes only the *binding*, never where
+  the NAT runs — so today's centralized rewrite in the gateway pod (the Neutron
+  non-DVR model) can become a distributed DNAT at the ingress node once the eBPF
+  Service datapath lands (DVR), with no API change. Advertisement — getting the
+  physical network to deliver the address to the anchoring node — starts as an L2
+  ARP/NDP responder and grows a BGP mode.
+
 ## 11. Open questions, answered
 
 - **Jumbo frames — lean in.** Run the **underlay at 9000 MTU** so Geneve
@@ -380,5 +416,8 @@ CRDs (sketch):
   node-side only). Audit operators that reverse-connect.
 - **Conntrack scale** for the per-pod bridge across many probes/connections.
 - **Geneve identity TLV** interop and offload support on target NICs.
-- **Gateway HA** and per-VPC egress IP management.
+- **Gateway HA** and per-VPC public-IP management (egress identity + floating
+  IPs). The gateway pod is a single anchor today, so egress conntrack and
+  floating-IP ingress share one failure domain; the distributed (DVR)
+  realization and advertisement failover on gateway reschedule are open.
 - **Migration cutover atomicity** under partial map-propagation failure.
