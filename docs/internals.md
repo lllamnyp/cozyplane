@@ -293,11 +293,17 @@ the client-masquerade removed, so the tenant sees the *real* caller. The pieces:
   (L2 mode; BGP later). So `client → publicIP` always arrives where the pod
   already is: floating ingress is always *local*, never cross-node, and the
   address follows the pod on reschedule.
-- **An uplink-ingress hook.** A tc program at the node uplink's ingress catches
-  `client → publicIP`, DNATs `publicIP → vpcIP`, records a **source-preserving**
-  conntrack entry, and `bpf_redirect`s into the target's veth by identity
-  (`locals[{net, vpcIP}]` — the pod is local by construction). The client's real
-  address is kept; unlike the bridge, it is *not* masqueraded to `169.254.1.1`.
+- **An uplink-ingress hook** (`from_uplink`). A tc program at the node uplink's
+  ingress catches `client → publicIP` and `bpf_redirect`s it into the target's
+  veth by identity (`locals[{net, vpcIP}]` — the pod is local by construction).
+  It does *not* rewrite the packet: the DNAT happens where the bridge's does, in
+  `to_pod`. This mirrors the bridge exactly (`from_uplink` is to floating what
+  `from_pod`/`from_overlay` are to the fabric bridge).
+- **`to_pod` does the DNAT** (`floating_forward`, right beside `bridge_forward`).
+  It DNATs `publicIP → vpcIP` on the destination, keeping the external client as
+  the source — *not* masqueraded to `169.254.1.1` — and records a
+  **source-preserving** conntrack entry (`float_ct`). Like `bridge_forward` it
+  returns delivered, so the isolation check below never runs.
 - **Reply through `from_pod`.** The pod replies `vpcIP → client` via its
   `169.254.1.1` default route — which every pod has unconditionally
   (`configurePodIface`), gateway or not. `from_pod` (already on every veth) finds
@@ -308,12 +314,12 @@ the client-masquerade removed, so the tenant sees the *real* caller. The pieces:
   from the pod CIDR.)
 
 **Inbound walk (external client → floatingIP → tenant pod B in VPC-X):**
-`client → floatingIP` arrives at B's node (its agent answered ARP) → the
-uplink-ingress hook DNATs to `client → B-ip`, stamps the ct, and redirects into
-B's veth (`locals[{X, B-ip}]`) with the client address intact → B replies
-`B-ip → client` toward `169.254.1.1` → `from_pod` matches the ct, rewrites
-`B-ip → client` back to `floatingIP → client`, and it routes out the uplink to
-the client, unmasqueraded.
+`client → floatingIP` arrives at B's node (its agent answered ARP) → `from_uplink`
+redirects it into B's veth (`locals[{X, B-ip}]`) → `to_pod`'s `floating_forward`
+DNATs it to `client → B-ip`, keeping the client source, and stamps the ct → B
+replies `B-ip → client` toward `169.254.1.1` → `from_pod` matches the ct, rewrites
+the source `B-ip → floatingIP`, and it routes out the uplink to the client,
+unmasqueraded.
 
 **Why the conntrack, and how EIP egress drops in later.** The 1:1 map is a static
 bijection, so reversing a reply needs no state in principle — but *unconditionally*

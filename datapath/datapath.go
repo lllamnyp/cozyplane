@@ -127,6 +127,22 @@ func (m *Manager) AttachUplink() (string, error) {
 	return name, nil
 }
 
+// AttachUplinkIngress attaches from_uplink at the ingress of the node's
+// default-route interface — the entry point for off-cluster traffic destined to
+// a floating IP advertised from this node. It is a no-op for every other packet
+// (one hash lookup), so it is safe to attach unconditionally. Returns the uplink
+// interface name.
+func (m *Manager) AttachUplinkIngress() (string, error) {
+	idx, name, err := defaultRouteLink()
+	if err != nil {
+		return "", err
+	}
+	if err := AttachIngress(idx, m.objs.CozyplaneFromUplink); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
 // defaultRouteLink returns the ifindex and name of the IPv4 default-route link.
 func defaultRouteLink() (int, string, error) {
 	routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)

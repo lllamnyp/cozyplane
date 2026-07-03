@@ -56,6 +56,17 @@ type overlayEndpoint struct {
 	Pad     [2]uint8
 }
 
+type overlayFloatCtKey struct {
+	_          structs.HostLayout
+	Proto      uint8
+	Pad        [3]uint8
+	Net        uint32
+	VpcIp      uint32
+	ClientIp   uint32
+	PodPort    uint16
+	ClientPort uint16
+}
+
 type overlayGwEntry struct {
 	_      structs.HostLayout
 	GwIp   uint32
@@ -88,6 +99,8 @@ const (
 	overlayMapBridges               = "bridges"
 	overlayMapCtFwd                 = "ct_fwd"
 	overlayMapCtRev                 = "ct_rev"
+	overlayMapFloatCt               = "float_ct"
+	overlayMapFloating              = "floating"
 	overlayMapGateways              = "gateways"
 	overlayMapLocals                = "locals"
 	overlayMapNetworks              = "networks"
@@ -97,6 +110,7 @@ const (
 	overlayMapRemotes               = "remotes"
 	overlayProgCozyplaneFromOverlay = "cozyplane_from_overlay"
 	overlayProgCozyplaneFromPod     = "cozyplane_from_pod"
+	overlayProgCozyplaneFromUplink  = "cozyplane_from_uplink"
 	overlayProgCozyplaneToPod       = "cozyplane_to_pod"
 )
 
@@ -144,6 +158,7 @@ type overlaySpecs struct {
 type overlayProgramSpecs struct {
 	CozyplaneFromOverlay *ebpf.ProgramSpec `ebpf:"cozyplane_from_overlay"`
 	CozyplaneFromPod     *ebpf.ProgramSpec `ebpf:"cozyplane_from_pod"`
+	CozyplaneFromUplink  *ebpf.ProgramSpec `ebpf:"cozyplane_from_uplink"`
 	CozyplaneToPod       *ebpf.ProgramSpec `ebpf:"cozyplane_to_pod"`
 }
 
@@ -154,6 +169,8 @@ type overlayMapSpecs struct {
 	Bridges  *ebpf.MapSpec `ebpf:"bridges"`
 	CtFwd    *ebpf.MapSpec `ebpf:"ct_fwd"`
 	CtRev    *ebpf.MapSpec `ebpf:"ct_rev"`
+	FloatCt  *ebpf.MapSpec `ebpf:"float_ct"`
+	Floating *ebpf.MapSpec `ebpf:"floating"`
 	Gateways *ebpf.MapSpec `ebpf:"gateways"`
 	Locals   *ebpf.MapSpec `ebpf:"locals"`
 	Networks *ebpf.MapSpec `ebpf:"networks"`
@@ -192,6 +209,8 @@ type overlayMaps struct {
 	Bridges  *ebpf.Map `ebpf:"bridges"`
 	CtFwd    *ebpf.Map `ebpf:"ct_fwd"`
 	CtRev    *ebpf.Map `ebpf:"ct_rev"`
+	FloatCt  *ebpf.Map `ebpf:"float_ct"`
+	Floating *ebpf.Map `ebpf:"floating"`
 	Gateways *ebpf.Map `ebpf:"gateways"`
 	Locals   *ebpf.Map `ebpf:"locals"`
 	Networks *ebpf.Map `ebpf:"networks"`
@@ -206,6 +225,8 @@ func (m *overlayMaps) Close() error {
 		m.Bridges,
 		m.CtFwd,
 		m.CtRev,
+		m.FloatCt,
+		m.Floating,
 		m.Gateways,
 		m.Locals,
 		m.Networks,
@@ -228,6 +249,7 @@ type overlayVariables struct {
 type overlayPrograms struct {
 	CozyplaneFromOverlay *ebpf.Program `ebpf:"cozyplane_from_overlay"`
 	CozyplaneFromPod     *ebpf.Program `ebpf:"cozyplane_from_pod"`
+	CozyplaneFromUplink  *ebpf.Program `ebpf:"cozyplane_from_uplink"`
 	CozyplaneToPod       *ebpf.Program `ebpf:"cozyplane_to_pod"`
 }
 
@@ -235,6 +257,7 @@ func (p *overlayPrograms) Close() error {
 	return _OverlayClose(
 		p.CozyplaneFromOverlay,
 		p.CozyplaneFromPod,
+		p.CozyplaneFromUplink,
 		p.CozyplaneToPod,
 	)
 }
