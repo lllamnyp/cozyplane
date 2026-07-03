@@ -388,23 +388,35 @@ an accidental endianness flip fails the build, not just a packet at runtime.
 
 The API is already family-agnostic (`VPC.cidrs`, `Port.ip`, … are strings), so
 IPv6 is a datapath change, not an API one. Every map address widens from a
-`__u32` to a **128-bit** field; a v4 address is stored as its v4-mapped form
-`::ffff:a.b.c.d`. There is one map set, not a v4 set beside a v6 set — the maps
-stay keyed by `{net_id, address}`, only wider. `net_id` (the VNI) is the scope,
-exactly as before; the address is now 16 bytes in network order (a v6 LPM key is
-`{prefixlen, scope_net, addr[16]}`). The delivery hooks parse either family, read
-src/dst as 128-bit, and drive the same lookups.
+`__u32` to a **128-bit** field. There is one map set, not a v4 set beside a v6
+set — the maps stay keyed by `{net_id, address}`, only wider. `net_id` (the VNI)
+is the scope, exactly as before; the address is now 16 bytes in network order (a
+v6 LPM key is `{prefixlen, scope_net, addr[16]}`). The delivery hooks parse
+either family, read src/dst as 128-bit, and drive the same lookups.
+
+**A v4 address is stored in its RFC 6052 (NAT64) form**, `64:ff9b::a.b.c.d` (the
+v4 in the low 32 bits under a `/96` prefix), *not* the RFC 4291 IPv4-mapped
+`::ffff:a.b.c.d`. The difference matters for the future: `::ffff:` is a
+representation form the IPv6 stack will not route on the wire, so a v6 pod could
+never use it to reach a v4 pod; `64:ff9b::` is an ordinary global v6 address
+built for exactly that. Storing v4 in the NAT64 form means a later cross-family
+translator — a v6 pod addressing a v4 pod as `64:ff9b::v4` — will *match the
+stored map entry*, so cross-family peering becomes a translation problem to solve
+rather than one the representation forecloses. The prefix is the well-known
+`64:ff9b::/96` for now; RFC 6052 network-specific prefixes (appropriate for the
+private v4 tenants actually use) are a later config knob, so it lives behind one
+constant.
 
 **Mixed-family multi-tenancy falls out for free**, which is the main reason for
 unified keys over parallel maps. Tenant A can run a v4 VPC and tenant B a v6 VPC
-in the *same* cluster and the *same* maps: A's pods are `::ffff:10.x` entries
+in the *same* cluster and the *same* maps: A's pods are `64:ff9b::10.x` entries
 under net X, B's are native `fd00::x` under net Y — distinct 128-bit values,
 distinct nets, no possibility of collision (and no second map set to keep in
 sync). A dual-stack VPC's pod simply has two entries, one per family, under its
-one net. What is deliberately *not* supported is peering *across* families (a v4
-VPC ↔ a v6 VPC): peered traffic is routed natively, and there is no address a v4
-pod can put on the wire to reach a v6 pod without translation — so a cross-family
-peering is refused, like an overlapping one.
+one net. Peering *across* families (a v4 VPC ↔ a v6 VPC) still needs a NAT64-style
+translator and is deferred — but, per the representation choice above, it is *not*
+precluded: same-family peering works today, cross-family is future work the map
+layout already accommodates.
 
 The transport is unaffected: v6 VPC traffic rides the existing Geneve underlay as
 a v6 inner packet under a v4 outer (the tunnel key stays the node's v4 IP), so v6
