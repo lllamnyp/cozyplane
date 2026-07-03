@@ -311,10 +311,10 @@ also cover your node/management networks.
 
 An egress gateway gets a VPC *out*; a **floating IP** gets one workload *in* — an
 externally-routable address, reachable from outside the cluster, mapped 1:1 to a
-tenant IP. Unlike a Service `type=LoadBalancer` (one VIP over many backends,
-inbound only), a floating IP is a single workload's public identity in **both**
-directions: inbound connections land on it, and that workload's egress leaves
-*from* it.
+tenant IP, with the caller's **real source address preserved**. Unlike a Service
+`type=LoadBalancer` (one VIP over many backends), a floating IP points at a single
+workload. It needs no egress gateway — the address maps straight to the tenant IP
+in the eBPF datapath.
 
 An operator defines a pool of routable addresses once, cluster-wide:
 
@@ -340,12 +340,12 @@ spec:
   # address: 203.0.113.7     # optional; a specific address, else lowest free
 ```
 
-A floating IP is realized on the VPC's **egress gateway** — the same per-VPC pod
-that handles egress anchors the 1:1 NAT — so it **requires the target VPC to have
-its gateway enabled** (`spec.egress.natGateway: true`). It does not turn the
-gateway on for you: a floating IP does not own the VPC, so while the gateway is
-off the binding reserves its address but stays `Pending`, telling you exactly
-what to fix:
+The address is **reserved** as soon as the binding is created, but it is only
+advertised and made reachable while the `target` IP belongs to a **live Port** —
+a running pod. That gives the datapath a node to advertise the address from and
+deliver to, and it means the address follows the pod across reschedules. Until a
+pod is actually running with the target IP, the binding holds its address but
+stays `Pending` — the address is yours, just not yet announced:
 
 ```bash
 kubectl -n team-a get floatingip web
@@ -356,17 +356,18 @@ kubectl -n team-a get floatingip web -o \
   jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}'
 # PoolResolved=True
 # AddressAssigned=True
-# GatewayEnabled=False       <- enable spec.egress.natGateway on vpc-a
+# TargetLive=False           <- no running pod has 10.0.0.5 in vpc-a yet
 ```
 
-Enable the gateway on `vpc-a` and the binding goes `Ready`.
+Start a pod with `10.0.0.5` in `vpc-a` and the binding goes `Ready`. Binding a
+floating IP to a VM NIC's persistent address makes it a stable public IP that
+survives pod churn and live migration.
 
-> **Status today.** The `ExternalPool`/`FloatingIP` API, address allocation, and
-> the gateway gate are live — `Ready` means an address is assigned and the anchor
-> is in place. The datapath that actually carries packets to and from the
-> floating address (the gateway 1:1 DNAT/SNAT and address advertisement on the
-> physical network) is being wired incrementally, so end-to-end reachability
-> does not work on every setup yet.
+> **Status today.** The `ExternalPool`/`FloatingIP` API and address allocation
+> are live. The eBPF datapath that carries packets to and from the floating
+> address (the `floating` map, the uplink-ingress DNAT with source preservation,
+> the `from_pod` reply, and ARP/NDP advertisement) is being wired incrementally,
+> so end-to-end reachability does not work on every setup yet.
 
 ## Limitations (today)
 

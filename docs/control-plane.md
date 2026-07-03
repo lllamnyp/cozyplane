@@ -51,10 +51,13 @@ Two tiers: **declarative** (authored by tenants/operators, desired state) and
   admin-defined range of externally-routable addresses; the MetalLB
   IPAddressPool analog. `status` tracks allocation counts.
 - **`FloatingIP`** — `{ vpcRef (local), target (tenant IP), poolRef?, address? }`.
-  Binds one pool address 1:1 to a workload in a VPC, bidirectionally (the ingress
-  door in `design.md` §10). `status` carries the assigned `address` + `phase`; it
-  stays `Pending` — never provisioning a gateway it does not own — until the
-  target VPC's egress gateway is enabled, the anchor its 1:1 NAT rides on.
+  Binds one pool address 1:1 to a workload in a VPC, source-preserving (the
+  ingress door in `design.md` §10). `status` carries the assigned `address` +
+  `phase`. The address is reserved permanently, but the binding is `Ready` (and
+  the address advertised + programmed) only while its `target` is a **live Port**
+  — a running pod to advertise from and deliver to; no live target ⇒ reserved but
+  silent. It needs no egress gateway (the NAT is in the eBPF bridge, not the
+  gateway).
 
 ### Realized
 

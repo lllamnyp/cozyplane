@@ -280,49 +280,55 @@ bridge delivers by identity, never by a shared address.
 ### Floating IPs (external north-south)
 
 The dual-address bridge above is *internal* north-south: a fabric IP reachable
-from the cluster's default overlay. A **floating IP** extends that to *external*
-north-south — a routable public address, reachable from off-cluster, bound 1:1
-to a tenant IP — and it rides the per-VPC egress gateway rather than the eBPF
-bridge. Two owners, two domains:
+from the cluster's default overlay. A **floating IP** is the same idea turned
+outward — a routable public address, reachable from off-cluster, bound 1:1 to a
+tenant IP — realized as an **extension of the eBPF bridge, not the gateway**. No
+iptables, no gateway pod: it is the fabric bridge with an external address and
+the client-masquerade removed, so the tenant sees the *real* caller. The pieces:
 
-- **The gateway pod owns the NAT**, in its own netns, where the tenant IP is
-  unambiguous even under overlapping CIDRs. For each `FloatingIP` bound to its
-  VPC it programs two rules beside its existing egress MASQUERADE:
-  - `PREROUTING -d <floatingIP> -j DNAT --to <tenantIP>` — inbound. Conntrack
-    reverses it automatically, so a reply `tenantIP → client` leaves as
-    `floatingIP → client` with no second rule.
-  - `POSTROUTING -s <tenantIP> -o <fabric-leg> -j SNAT --to <floatingIP>` —
-    egress *from* the floating IP (Elastic-IP semantics), ordered before the
-    shared masquerade so a workload with a floating IP uses it in both
-    directions while its VPC-mates still share the gateway address.
-- **The node agent owns delivery + advertisement**, on the host. On the node
-  running the VPC's gateway it installs a `/32` route pushing `<floatingIP>` into
-  the gateway pod's netns (the host side of the gateway's fabric veth) and
-  answers ARP/NDP for it on the uplink, so the physical fabric steers the address
-  to this node (L2 mode; BGP later).
+- **`floating` map** (`publicIP → {net, vpcIP}`), programmed by the agent — the
+  external-facing sibling of `bridges`.
+- **Advertisement from the target pod's own node.** The agent on whatever node
+  currently hosts the target's Port answers ARP/NDP for `publicIP` on the uplink
+  (L2 mode; BGP later). So `client → publicIP` always arrives where the pod
+  already is: floating ingress is always *local*, never cross-node, and the
+  address follows the pod on reschedule.
+- **An uplink-ingress hook.** A tc program at the node uplink's ingress catches
+  `client → publicIP`, DNATs `publicIP → vpcIP`, records a **source-preserving**
+  conntrack entry, and `bpf_redirect`s into the target's veth by identity
+  (`locals[{net, vpcIP}]` — the pod is local by construction). The client's real
+  address is kept; unlike the bridge, it is *not* masqueraded to `169.254.1.1`.
+- **Reply through `from_pod`.** The pod replies `vpcIP → client` via its
+  `169.254.1.1` default route — which every pod has unconditionally
+  (`configurePodIface`), gateway or not. `from_pod` (already on every veth) finds
+  the source-preserving ct, SNATs `vpcIP → publicIP`, and lets it route out the
+  uplink. `publicIP` is outside the cluster pod CIDR, so the node masquerade rule
+  (`-s <clusterCIDR> …`) does not touch it — the reply reaches the client sourced
+  from the floating address. (This is why a pool must be a routable range disjoint
+  from the pod CIDR.)
 
-**Inbound walk (external client → floatingIP → tenant pod B in VPC-X):** the
-fabric delivers `client → floatingIP` to the gateway's node (it answered ARP) →
-the node's `/32` route pushes it into the gateway netns → `PREROUTING` DNATs it
-to `client → B-ip` → routing sends it out the gateway's **VPC leg**, where
-`from_pod` (ports bit 31) marks it gateway-forwarded (same-node mark, or the
-`TUN_F_GATEWAY` VNI bit cross-node) → delivered to B by identity
-(`locals[{X,B-ip}]` same-node, `remotes[{X,B-ip}]` Geneve cross-node) → B's
-`to_pod` admits the off-VPC source because the gateway mark is set. B's reply
-retraces it: off-VPC → `gateways[X]` → the gateway, where conntrack un-DNATs
-`B-ip → client` back to `floatingIP → client`.
+**Inbound walk (external client → floatingIP → tenant pod B in VPC-X):**
+`client → floatingIP` arrives at B's node (its agent answered ARP) → the
+uplink-ingress hook DNATs to `client → B-ip`, stamps the ct, and redirects into
+B's veth (`locals[{X, B-ip}]`) with the client address intact → B replies
+`B-ip → client` toward `169.254.1.1` → `from_pod` matches the ct, rewrites
+`B-ip → client` back to `floatingIP → client`, and it routes out the uplink to
+the client, unmasqueraded.
 
-**Escaping node masquerade.** The reply leaves the gateway's fabric leg sourced
-from `floatingIP`, a public address *outside* the cluster pod CIDR — so the node
-masquerade rule (`-s <clusterCIDR> ...`) does not match it and the source is
-preserved to the client. This is why a pool must be drawn from a routable range
-disjoint from the pod CIDR.
+**Why the conntrack, and how EIP egress drops in later.** The 1:1 map is a static
+bijection, so reversing a reply needs no state in principle — but *unconditionally*
+SNAT-ing every off-net packet from a floating-bound `vpcIP` to `publicIP` would
+also rewrite the pod's **own-initiated** egress, which is the full Elastic-IP
+semantic deferred to later. The ct is exactly what bounds this to *reply* traffic:
+`from_pod` reverses only flows an inbound connection created. Removing that bound
+(reverse the `floating` map for any egress from the bound `vpcIP`) is the whole of
+the future EIP-egress upgrade — no API or map change, just a policy flip.
 
-**Realization note.** This is the centralized (Neutron non-DVR) datapath: every
-floating-IP flow funnels through the one gateway pod, sharing its failure domain
-with egress conntrack. The `FloatingIP` API says nothing about this — a later
-distributed DNAT at the ingress node (once the eBPF Service datapath exists) can
-replace it with no API change.
+**No gateway.** Floating ingress does not use, and does not require, the VPC's
+egress gateway. A floating IP is `Ready` once its target IP is a **live Port** (a
+running pod to advertise from and deliver to); with no live target the address
+stays reserved but silent (see §4, the controller). It is distributed (DVR) from
+day one because it rides the pod's node.
 
 ### Addressing / byte order (for maintainers)
 
