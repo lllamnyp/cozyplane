@@ -20,6 +20,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+
+	"github.com/vishvananda/netlink"
 )
 
 // A floating IP is the north-south bridge turned outward: a routable public
@@ -56,4 +58,63 @@ func (m *Manager) DelFloating(publicIP string) error {
 		return fmt.Errorf("del floating %s: %w", publicIP, err)
 	}
 	return nil
+}
+
+// Floatings returns the public IPs currently programmed in the floating map, so
+// a restarted agent can prune entries whose FloatingIPs or target Ports vanished
+// while it was down.
+func (m *Manager) Floatings() (map[string]bool, error) {
+	out := map[string]bool{}
+	var key uint32
+	var ep overlayBridgeEp
+	it := m.objs.Floating.Iterate()
+	for it.Next(&key, &ep) {
+		b := make([]byte, 4)
+		binary.LittleEndian.PutUint32(b, key)
+		out[net.IP(b).String()] = true
+	}
+	return out, it.Err()
+}
+
+// AdvertiseFloating answers ARP for a public IP on the uplink so the physical
+// fabric delivers it to this node — a per-address proxy neighbour (NTF_PROXY),
+// which responds for exactly this IP and needs no global proxy_arp. Idempotent.
+func AdvertiseFloating(publicIP, uplink string) error {
+	neigh, err := floatingProxyNeigh(publicIP, uplink)
+	if err != nil {
+		return err
+	}
+	if err := netlink.NeighAdd(neigh); err != nil && !isExist(err) {
+		return fmt.Errorf("advertise floating %s on %s: %w", publicIP, uplink, err)
+	}
+	return nil
+}
+
+// UnadvertiseFloating removes the proxy-ARP entry for a public IP (idempotent).
+func UnadvertiseFloating(publicIP, uplink string) error {
+	neigh, err := floatingProxyNeigh(publicIP, uplink)
+	if err != nil {
+		return err
+	}
+	if err := netlink.NeighDel(neigh); err != nil && !isNotExist(err) {
+		return fmt.Errorf("unadvertise floating %s on %s: %w", publicIP, uplink, err)
+	}
+	return nil
+}
+
+func floatingProxyNeigh(publicIP, uplink string) (*netlink.Neigh, error) {
+	link, err := netlink.LinkByName(uplink)
+	if err != nil {
+		return nil, fmt.Errorf("lookup uplink %s: %w", uplink, err)
+	}
+	ip := net.ParseIP(publicIP).To4()
+	if ip == nil {
+		return nil, fmt.Errorf("public IP %q is not IPv4", publicIP)
+	}
+	return &netlink.Neigh{
+		LinkIndex: link.Attrs().Index,
+		Family:    netlink.FAMILY_V4,
+		Flags:     netlink.NTF_PROXY,
+		IP:        ip,
+	}, nil
 }

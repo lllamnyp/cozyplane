@@ -77,6 +77,52 @@ func TestDesiredGateways(t *testing.T) {
 	}
 }
 
+// desiredFloating programs only floating IPs whose target tenant IP is realized
+// by a live Port on THIS node, carrying the target IP and the Port's VNI. A
+// remote target, an unassigned address, or a target with no live Port here all
+// contribute nothing.
+func TestDesiredFloating(t *testing.T) {
+	ports := []*sdnv1alpha1.Port{
+		vpcPort("v101.10-0-0-5", "team-a", "vpc-a", "10.0.0.5", "self"),
+		vpcPort("v101.10-0-0-6", "team-a", "vpc-a", "10.0.0.6", "other"),
+	}
+	fips := []*sdnv1alpha1.FloatingIP{
+		floatingIPObj("team-a", "web", "vpc-a", "10.0.0.5", "203.0.113.7"),   // local target: programmed
+		floatingIPObj("team-a", "api", "vpc-a", "10.0.0.6", "203.0.113.8"),   // target on another node: skipped
+		floatingIPObj("team-a", "unset", "vpc-a", "10.0.0.5", ""),            // no address yet: skipped
+		floatingIPObj("team-a", "nopod", "vpc-a", "10.0.0.9", "203.0.113.9"), // no live Port: skipped
+	}
+	got := desiredFloating(fips, ports, "self")
+	if len(got) != 1 {
+		t.Fatalf("got %d, want 1: %+v", len(got), got)
+	}
+	if v, ok := got["203.0.113.7"]; !ok || v.vpcIP != "10.0.0.5" || v.vni != 101 {
+		t.Errorf("203.0.113.7 = %+v (ok=%v), want {10.0.0.5 101}", v, ok)
+	}
+}
+
+func vpcPort(name, ns, vpc, ip, node string) *sdnv1alpha1.Port {
+	return &sdnv1alpha1.Port{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: sdnv1alpha1.PortSpec{
+			VPCRef: sdnv1alpha1.VPCRef{Namespace: ns, Name: vpc},
+			IP:     ip,
+			Node:   node,
+		},
+	}
+}
+
+func floatingIPObj(ns, name, vpc, target, address string) *sdnv1alpha1.FloatingIP {
+	return &sdnv1alpha1.FloatingIP{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: sdnv1alpha1.FloatingIPSpec{
+			VPCRef: sdnv1alpha1.LocalVPCRef{Name: vpc},
+			Target: target,
+		},
+		Status: sdnv1alpha1.FloatingIPStatus{Address: address},
+	}
+}
+
 func TestVNIFromPortName(t *testing.T) {
 	cases := []struct {
 		name string

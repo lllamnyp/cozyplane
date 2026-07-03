@@ -140,6 +140,11 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	if err != nil {
 		return fmt.Errorf("attach uplink: %w", err)
 	}
+	// from_uplink at the uplink ingress: the entry point for floating-IP traffic.
+	// A no-op for every non-floating packet, so it is always safe to attach.
+	if _, err := mgr.AttachUplinkIngress(); err != nil {
+		return fmt.Errorf("attach uplink ingress: %w", err)
+	}
 	log.Info("datapath loaded", "vni", vni, "geneve", datapath.GeneveDevice, "uplink", uplink)
 
 	cfg, err := rest.InClusterConfig()
@@ -190,6 +195,7 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		watchPorts(ctx, factory, sdnClient, client, mgr, nodeName, log)
 		watchPeerings(ctx, factory, mgr, log)
 		watchGateways(ctx, factory, mgr, nodeName, log)
+		watchFloatingIPs(ctx, factory, mgr, uplink, nodeName, log)
 		factory.Start(ctx.Done())
 	}
 
@@ -571,6 +577,121 @@ func desiredGateways(ports []*sdnv1alpha1.Port, selfName string) map[uint32]gate
 		desired[vni] = gw
 	}
 	return desired
+}
+
+// watchFloatingIPs programs this node's floating IPs: for each FloatingIP whose
+// target tenant IP is realized by a Port on THIS node, it writes the
+// publicIP -> {net, VPC IP} floating-map entry and answers ARP for the public
+// address on the uplink. Like watchGateways it recomputes and diffs against the
+// pinned map on every relevant event, so a restarted agent prunes floating IPs
+// whose FloatingIP or target Port vanished while it was down. Advertising only
+// from the target's node keeps ingress local (DVR).
+func watchFloatingIPs(ctx context.Context, factory sdninformers.SharedInformerFactory, mgr *datapath.Manager, uplink, selfName string, log *slog.Logger) {
+	fips := factory.Sdn().V1alpha1().FloatingIPs()
+	ports := factory.Sdn().V1alpha1().Ports()
+
+	var mu sync.Mutex
+	resync := func() {
+		mu.Lock()
+		defer mu.Unlock()
+
+		allFips, err := fips.Lister().List(labels.Everything())
+		if err != nil {
+			log.Error("list floatingips", "err", err)
+			return
+		}
+		allPorts, err := ports.Lister().List(labels.Everything())
+		if err != nil {
+			log.Error("list ports", "err", err)
+			return
+		}
+		desired := desiredFloating(allFips, allPorts, selfName)
+
+		current, err := mgr.Floatings()
+		if err != nil {
+			log.Error("read floating map", "err", err)
+			return
+		}
+		for pub, v := range desired {
+			// Put unconditionally: an existing entry may be stale (target moved).
+			if err := mgr.SetFloating(pub, v.vpcIP, v.vni); err != nil {
+				log.Error("set floating", "public", pub, "err", err)
+				continue
+			}
+			if err := datapath.AdvertiseFloating(pub, uplink); err != nil {
+				log.Error("advertise floating", "public", pub, "err", err)
+			}
+			if !current[pub] {
+				log.Info("floating set", "public", pub, "target", v.vpcIP, "vni", v.vni)
+			}
+		}
+		for pub := range current {
+			if _, ok := desired[pub]; !ok {
+				if err := mgr.DelFloating(pub); err != nil {
+					log.Error("del floating", "public", pub, "err", err)
+					continue
+				}
+				_ = datapath.UnadvertiseFloating(pub, uplink)
+				log.Info("floating removed", "public", pub)
+			}
+		}
+	}
+
+	onAny := cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(any) { resync() },
+		UpdateFunc: func(_, newObj any) { resync() },
+		DeleteFunc: func(any) { resync() },
+	}
+	_, _ = fips.Informer().AddEventHandler(onAny)
+	// Ports too: a target IP gaining or losing a live Port on this node — or a
+	// Port moving nodes — changes what this node advertises.
+	_, _ = ports.Informer().AddEventHandler(onAny)
+
+	go func() {
+		if cache.WaitForCacheSync(ctx.Done(), fips.Informer().HasSynced, ports.Informer().HasSynced) {
+			resync()
+		}
+	}()
+}
+
+// floatingView is what this node must program for one floating IP: the target
+// tenant IP and its network id (VNI).
+type floatingView struct {
+	vpcIP string
+	vni   uint32
+}
+
+// desiredFloating computes the floating IPs this node must program: those whose
+// target tenant IP is realized by a live Port on THIS node (the node that
+// advertises and delivers). The VNI comes from the target Port's name. A
+// FloatingIP's local vpcRef resolves in its own namespace, which is the target
+// Port's VPCRef namespace.
+func desiredFloating(fips []*sdnv1alpha1.FloatingIP, ports []*sdnv1alpha1.Port, selfName string) map[string]floatingView {
+	type portKey struct{ ns, name, ip string }
+	local := map[portKey]uint32{}
+	for _, p := range ports {
+		if p.Spec.Node != selfName || p.Spec.IP == "" {
+			continue
+		}
+		vni, ok := vniFromPortName(p.Name)
+		if !ok {
+			continue
+		}
+		local[portKey{p.Spec.VPCRef.Namespace, p.Spec.VPCRef.Name, p.Spec.IP}] = vni
+	}
+
+	out := map[string]floatingView{}
+	for _, f := range fips {
+		if f.Status.Address == "" {
+			continue
+		}
+		vni, ok := local[portKey{f.Namespace, f.Spec.VPCRef.Name, f.Spec.Target}]
+		if !ok {
+			continue // target not a live Port on this node
+		}
+		out[f.Status.Address] = floatingView{vpcIP: f.Spec.Target, vni: vni}
+	}
+	return out
 }
 
 // vniFromPortName parses the VNI out of a Port name (v<vni>.<ip-dashed>).
