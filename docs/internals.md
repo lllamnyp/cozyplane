@@ -384,6 +384,39 @@ This byte-order contract is locked by `datapath/keys_test.go`, which asserts the
 keys marshal to the address in network order regardless of host endianness — so
 an accidental endianness flip fails the build, not just a packet at runtime.
 
+### IPv6 / dual-stack — unified 128-bit keys (in progress)
+
+The API is already family-agnostic (`VPC.cidrs`, `Port.ip`, … are strings), so
+IPv6 is a datapath change, not an API one. Every map address widens from a
+`__u32` to a **128-bit** field; a v4 address is stored as its v4-mapped form
+`::ffff:a.b.c.d`. There is one map set, not a v4 set beside a v6 set — the maps
+stay keyed by `{net_id, address}`, only wider. `net_id` (the VNI) is the scope,
+exactly as before; the address is now 16 bytes in network order (a v6 LPM key is
+`{prefixlen, scope_net, addr[16]}`). The delivery hooks parse either family, read
+src/dst as 128-bit, and drive the same lookups.
+
+**Mixed-family multi-tenancy falls out for free**, which is the main reason for
+unified keys over parallel maps. Tenant A can run a v4 VPC and tenant B a v6 VPC
+in the *same* cluster and the *same* maps: A's pods are `::ffff:10.x` entries
+under net X, B's are native `fd00::x` under net Y — distinct 128-bit values,
+distinct nets, no possibility of collision (and no second map set to keep in
+sync). A dual-stack VPC's pod simply has two entries, one per family, under its
+one net. What is deliberately *not* supported is peering *across* families (a v4
+VPC ↔ a v6 VPC): peered traffic is routed natively, and there is no address a v4
+pod can put on the wire to reach a v6 pod without translation — so a cross-family
+peering is refused, like an overlapping one.
+
+The transport is unaffected: v6 VPC traffic rides the existing Geneve underlay as
+a v6 inner packet under a v4 outer (the tunnel key stays the node's v4 IP), so v6
+VPCs work on a v4 cluster. What v6 *north-south* needs (a v6 fabric IP for a pod)
+is a dual-stack cluster (v6 node pod CIDRs); the overlay does not.
+
+Built in two steps so neither is debugged against the other: **(1)** re-key every
+map and the Go marshaling to 128-bit with v4 stored v4-mapped, still parsing only
+v4 — the v4 e2e must stay green, proving the plumbing; **(2)** add v6 parse +
+overlay delivery on top. NDP (for v6 floating IPs, replacing the ARP responder),
+ICMPv6, and v6 gateway egress are later phases.
+
 ## 4. Control flow
 
 ### Bootstrap order & invariant
