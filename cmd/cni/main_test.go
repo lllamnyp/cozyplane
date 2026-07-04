@@ -28,6 +28,49 @@ import (
 	sdnfake "github.com/lllamnyp/cozyplane/pkg/generated/sdn/clientset/versioned/fake"
 )
 
+func TestNodeCIDRFor(t *testing.T) {
+	const (
+		v4 = "10.244.1.0/24"
+		v6 = "fd00:10:244:1::/64"
+	)
+	tests := []struct {
+		name    string
+		cidrs   []string
+		single  string
+		wantV6  bool
+		expect  string
+		wantErr bool
+	}{
+		{name: "v4 vpc, dual-stack node", cidrs: []string{v4, v6}, wantV6: false, expect: v4},
+		{name: "v6 vpc, dual-stack node", cidrs: []string{v4, v6}, wantV6: true, expect: v6},
+		{name: "v4 vpc, v4-only node", cidrs: []string{v4}, wantV6: false, expect: v4},
+		// The decoupling: a v6 VPC on a v4-only node falls back to the v4 fabric
+		// CIDR instead of erroring — east-west VPC traffic keys on the VPC IP.
+		{name: "v6 vpc, v4-only node falls back", cidrs: []string{v4}, wantV6: true, expect: v4},
+		{name: "v4 vpc, v6-only node falls back", cidrs: []string{v6}, wantV6: false, expect: v6},
+		{name: "single PodCIDR fallback field", single: v4, wantV6: true, expect: v4},
+		{name: "no CIDRs at all errors", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			state := &datapath.AgentState{PodCIDR: tc.single, PodCIDRs: tc.cidrs}
+			got, err := nodeCIDRFor(state, tc.wantV6)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.expect {
+				t.Fatalf("got %q, want %q", got, tc.expect)
+			}
+		})
+	}
+}
+
 // These tests use sdnfake.NewSimpleClientset (not the newer NewClientset): the
 // server-side-apply-aware fake needs an OpenAPI schema for typed conversion that
 // isn't wired for our generated types, so Create fails there. The simple tracker
