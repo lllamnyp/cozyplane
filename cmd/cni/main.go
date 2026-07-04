@@ -763,6 +763,14 @@ func configurePodIface(podIPs []net.IP, pinnedMAC net.HardwareAddr) (net.Hardwar
 			return nil, err
 		}
 	}
+	// Return the MAC the host side must record in `locals` for redirect delivery.
+	// When pinned, it is the value we just set — netlink does not refresh the
+	// cached link.Attrs() after LinkSetHardwareAddr, so reading it back would give
+	// the stale pre-pin MAC and the datapath would deliver to the wrong address
+	// (KubeVirt hands the *pinned* MAC to the guest).
+	if len(pinnedMAC) == 6 {
+		return pinnedMAC, nil
+	}
 	return link.Attrs().HardwareAddr, nil
 }
 
