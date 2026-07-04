@@ -1,0 +1,107 @@
+# VM live migration — persistent Ports (IP + MAC preservation)
+
+**Hard requirement** (`design.md` §1, §5): a VM's NIC identity — its **VPC IP and
+MAC** — must survive live migration between nodes. The system-fabric `fabricIP`
+(`status.podIP`) may change; the VM never sees it. This doc is the *as-built*
+plan for realizing `design.md` §5 / `control-plane.md` §5 as a first increment.
+
+## What KubeVirt does, and what it needs from us
+
+A live migration spins up a **second** virt-launcher pod (the *target*) on the
+destination node while the *source* keeps running; the VM's memory is copied over
+a source→target connection (default/fabric network, not the VPC IP); at cutover
+KubeVirt flips execution to the target and tears the source down. Source and
+target are **different pods with different names** for the **same VMI**.
+
+For the VM's L2/L3 identity to survive, the target pod's interface must carry the
+**same IP and MAC** as the source's. KubeVirt only permits this for the **pod
+(bridge) binding** and only when the VM template is annotated
+`kubevirt.io/allow-pod-bridge-network-live-migration: ""` — then the VMI reports
+`LiveMigratable=True`. (Masquerade binding NATs the VM behind a stable internal
+IP, so the pod IP is irrelevant and *not* preserved — it is not the target of
+this feature.) With bridge binding KubeVirt takes the IP+MAC cozyplane configured
+on the pod interface and hands them to the guest via its **own DHCP**; so all
+cozyplane must do is put the **same IP+MAC on the target pod's interface** and
+make the overlay deliver to wherever the VM currently runs.
+
+This is exactly OVN-Kubernetes' model (ovn-kubernetes.io/features/live-migration):
+a persistent logical-switch-port pins IP+MAC; only the *chassis* (node) binding
+moves; the guest keeps its DHCP lease. cozyplane's `Port` is the logical port and
+`locals`/`remotes` are the chassis binding — so the pieces already exist.
+
+## Identity: the persistent Port
+
+A **persistent Port** pins `{VPC, VPC IP, MAC}` to a **VM NIC identity**, not to a
+pod. A virt-launcher pod's CNI ADD **binds** to it instead of claiming a fresh IP.
+
+A pod is a VM NIC pod when it carries the label **`vm.kubevirt.io/name`** (the VM
+name); `kubevirt.io/created-by` is the VMI UID (stable across migration) and
+`kubevirt.io/nodeName` is the **active** location (the node the VM currently runs
+on — set on the target only *after* cutover). The stable key is
+`{vpcNamespace, vpc, vm.kubevirt.io/name}`; the Port is named
+`v<vni>-vm-<vmname>` (distinct from the ephemeral `v<vni>.<ip>` shape), so a
+lookup by VM identity needs no IP.
+
+- **First pod** (VM start): no persistent Port exists → **create** it, allocating
+  the VPC IP (as today) and **generating a stable locally-administered MAC**
+  (`02:…`), stored in `spec.mac`. Report the fabric IP as `status.podIP` as usual.
+- **Later pod** (restart or migration target): the persistent Port exists →
+  **bind**: reuse `spec.ip` and `spec.mac`, set the **pod interface MAC** to it,
+  configure the same VPC IP. A fresh fabric IP is still allocated (per pod).
+
+The pod interface MAC is pinned because KubeVirt copies it to the guest; the
+host-veth MAC (used only for same-node redirect delivery) stays per-pod and is
+re-learned in `locals` on each bind — internal, never guest-visible.
+
+## Cutover: the location follows `kubevirt.io/nodeName`
+
+`locals` is per-node: every node programs its **local** virt-launcher pod's
+`{net, vpcIP} → veth,MAC` at CNI ADD, so during the overlap both the source and
+target nodes can deliver locally. `remotes` (the cross-node location) must point
+at the **active** node — the one where the VM actually runs.
+
+The active node is the pod whose `kubevirt.io/nodeName` equals its own node. A
+**persistent-Port controller** watches virt-launcher pods and keeps the Port's
+`spec.node`/`spec.nodeIP` = the active pod's node; the agent already turns
+`spec.node` into the `remotes` entry, so the cutover is: KubeVirt sets
+`kubevirt.io/nodeName` on the target → controller flips `spec.node` → every
+agent's `remotes[{net,vpcIP}]` re-points to the target. The VPC IP/MAC never
+change, so the VM and its in-VPC peers see only a sub-second reroute — no
+gratuitous ARP (we own the forwarding tables).
+
+**Overlap caveat (v1):** between target-pod ADD and cutover, the target node also
+has `locals[{net,vpcIP}]`, so a pod *co-located on the target node* that dials the
+VM's IP in that window would be delivered to the not-yet-running target. This is
+rare (same-node co-tenant, sub-second) and is the one rough edge; a later refinement
+gates the target's `locals` on `kubevirt.io/nodeName` so local delivery, too, only
+switches at cutover. Cross-node and source-local traffic are always correct.
+
+## Lifecycle / GC
+
+Ports are cluster-scoped, so a namespaced VMI ownerRef can't GC them. The
+persistent-Port controller owns the lifecycle: it **keeps** the Port while any
+virt-launcher pod (or the VMI) for its identity exists, and **deletes** it once
+they are all gone (VM stopped/deleted). A single virt-launcher pod's CNI DEL must
+**not** delete a persistent Port (that is what lets IP+MAC survive pod churn) — it
+only clears that pod's local datapath state; contrast the ephemeral path, where
+DEL deletes the Port. The sever finalizer still guarantees the owning node drains
+before the Port is really removed.
+
+## Scope of this increment
+
+- Bridge-binding VMs on the **default network path into a VPC** (primary network),
+  matching KubeVirt's "only primary networks are live-migratable".
+- IP + MAC preserved; fabric IP (and thus `status.podIP`) changes per pod, and the
+  system-view DNS re-point (`control-plane.md` §5) is **later** — name-based
+  addressing isn't wired yet, so nothing depends on a stable fabric A record.
+- Not yet: the `/migrate` + `/bind` Port subresources (the controller reconciles
+  `spec.node` directly for now), staged-`locals` gating, v6 VM NICs.
+
+## Test (dev4, real KubeVirt)
+
+A bridge-bound cirros VM (annotation set) attached to a VPC: capture its VPC IP +
+MAC, `virtctl migrate`, and assert **the VPC IP and MAC are identical** on the
+target, the same guest keeps running, and an in-VPC peer reaches it throughout
+(the IP never moved from the guest's view). Repeat on the default network (no VPC)
+for the non-VPC case. Contrast with the earlier masquerade test, which could not
+show preservation because the guest IP was NATed.
