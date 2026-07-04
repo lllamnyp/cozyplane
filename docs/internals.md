@@ -189,6 +189,12 @@ DROP` discards it. The agent inserts `-i cozyplane0 -j ACCEPT` and `-o cozyplane
 -j ACCEPT` at the top of the `FORWARD` chain (via `iptables`, nft backend) so
 overlay traffic is accepted before that drop.
 
+**This is an interim measure.** It is only needed against an iptables-mode
+kube-proxy, yet the call is fatal to agent startup, so it currently makes
+cozyplane hard-require netfilter even where nothing would drop the traffic.
+Making it conditional (and moving the node masquerade below to eBPF) so a
+netfilter-less node can run cozyplane is tracked in [#10](../../issues/10).
+
 ### Packet walks
 
 **Default network, cross-node (pod A on N1 → pod B on N2):** A sends → host veth
@@ -584,7 +590,12 @@ one informer factory):
 With `--cluster-cidr` set the agent also installs the classic node masquerade
 (`-s <clusterCIDR> ! -d <clusterCIDR> -j MASQUERADE`): pod CIDRs aren't
 routable outside the cluster, so without it no pod — including a gateway
-forwarding tenant traffic — has an internet return path.
+forwarding tenant traffic — has an internet return path. This is the one place
+cozyplane delegates *NAT* to the kernel instead of the eBPF datapath, and it is
+**interim**: it's node-boundary SNAT, not tenant policy, and the call is fatal to
+agent startup (hard-requiring netfilter). Moving it into eBPF — or gating it off
+when a kube-proxy-replacement already masquerades cluster egress — is tracked in
+[#10](../../issues/10).
 
 ### Controller
 
@@ -706,9 +717,12 @@ mostly future work. As built:
 - The north-south bridge is eBPF NAT (its own `ct_fwd`/`ct_rev` table): TCP, UDP,
   and ICMP echo (ping), for both fabric IPs and floating IPs. ICMP *error*
   messages are not NAT'd yet, so PMTU discovery through the bridge is broken (a
-  follow-up). The datapath is netfilter-free except the agent's node masquerade
-  and overlay FORWARD-ACCEPT (both non-NAT, both candidates to move to eBPF) and
-  the gateway pod's internal filter (in its own netns).
+  follow-up). The tenant datapath is netfilter-free; the agent's two node-boundary
+  netfilter rules — the cluster-egress node masquerade (SNAT) and the overlay
+  FORWARD-ACCEPT (non-NAT) — are an **interim** dependency that currently makes
+  netfilter mandatory (both fatal to startup) and are slated to move to eBPF /
+  become optional ([#10](../../issues/10)). The gateway pod's internal filter runs
+  in its own netns.
 - VPC egress is opt-in and coarse: `spec.egress.natGateway` opens internet +
   cluster DNS through a single per-VPC gateway pod; no per-destination policy,
   Service exposure, or metadata endpoint yet. **Floating IPs** (source-preserving

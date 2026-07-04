@@ -31,10 +31,11 @@ they're discovered rather than leaving them only in issues.
 - [x] Geneve overlay delivery (collect-metadata, per-node device)
 - [x] Per-pod dual-address bridge (fabric IP ↔ VPC IP), unique fabric IP per pod
 - [x] Overlapping VPC CIDRs: net-scoped (VNI-keyed) delivery, no collision
-- [x] eBPF bridge NAT for north-south — no iptables, no fwmark, no policy routing
-- [x] Node masquerade that excludes cozyplane egress interfaces
+- [x] eBPF bridge NAT for cozyplane north-south (VPC gateways, floating IPs) — no iptables, no fwmark, no policy routing
+- [x] Node masquerade that excludes cozyplane egress interfaces *(interim: via netfilter — see below)*
 - [ ] North-south ICMP to a fabric IP / PMTU edge cases — [#3](../../issues/3)
 - [ ] Per-VPC traffic counters in the datapath hooks (metering/billing foundation) — [#2](../../issues/2)
+- [ ] Remove the netfilter/iptables dependency: move cluster-egress SNAT to eBPF, make the FORWARD ACCEPT conditional (today `firewall.go` hard-requires netfilter, fatal to agent startup) — [#10](../../issues/10)
 
 ## 3. VPC features — peering, egress, floating IPs
 
@@ -105,3 +106,4 @@ they're discovered rather than leaving them only in issues.
 | [#7](../../issues/7) | Agent: recreate incompatible pinned eBPF maps on load | Deployment |
 | [#8](../../issues/8) | IPv6 guests don't autoconfigure (no RA / DHCPv6) | IPv6 |
 | [#9](../../issues/9) | North-south to a v6 VPC IP when the fabric IP is v4 | IPv6 |
+| [#10](../../issues/10) | Remove the netfilter/iptables dependency (`firewall.go`) | Datapath / deployment |

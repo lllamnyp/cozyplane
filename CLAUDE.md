@@ -23,15 +23,21 @@ change is — resolve that first, in writing.
 ## Hard invariants — don't violate these without changing the design first
 
 1. **The datapath is pure eBPF. Never reach for iptables, fwmark, or policy
-   routing to move, isolate, or NAT pod/VPC traffic.** Delivery, isolation, and
-   north-south NAT all live in the four hooks (`from_pod`/`to_pod`/`from_overlay`/
-   `from_uplink`) with the datapath's own connection table — no kernel conntrack on
-   the fast path. If you need new forwarding behaviour, add/extend an eBPF hook.
-   *The only* iptables in the tree is `firewall.go`: a coarse `FORWARD ... ACCEPT`
-   (so kube-proxy's `ctstate INVALID` drop doesn't eat decapsulated overlay
-   replies, which bypass conntrack) plus node masquerade. That is infrastructure
-   plumbing, not the datapath — don't grow it into packet logic. (internals.md §
-   "Trick 2", "eBPF NAT")
+   routing to move, isolate, or NAT pod/VPC traffic.** Tenant delivery, isolation,
+   and cozyplane's own north-south NAT (VPC gateways, floating IPs) all live in the
+   four hooks (`from_pod`/`to_pod`/`from_overlay`/`from_uplink`) with the datapath's
+   own connection table — no kernel conntrack on the fast path. If you need new
+   forwarding behaviour, add/extend an eBPF hook.
+   *The only* iptables in the tree is `firewall.go`, and it is an **interim**
+   compromise, not an endorsement: a coarse `FORWARD ... ACCEPT` (so an
+   iptables-mode kube-proxy's `ctstate INVALID` drop doesn't eat decapsulated
+   overlay replies, which bypass conntrack) plus the flannel-style cluster-egress
+   masquerade for default-network pods. Both are node-boundary plumbing, not tenant
+   datapath — **don't grow them into packet logic**, and don't add new netfilter
+   rules. Note the real cost: these calls are **fatal to agent startup**, so
+   cozyplane currently hard-requires netfilter on every node. Removing that
+   dependency (egress SNAT in eBPF; conditional FORWARD ACCEPT) is tracked in
+   [#10](../../issues/10). (internals.md § "Trick 2", "eBPF NAT", "node masquerade")
 
 2. **Addresses are 128-bit everywhere; a v4 address is stored in RFC 6052 NAT64
    form `64:ff9b::a.b.c.d`, never `::ffff:a.b.c.d`.** One map set, not parallel
