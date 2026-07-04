@@ -54,9 +54,10 @@ struct cozy_mac {
 	__u8 pad[2];
 };
 
-#define IPPROTO_ICMP 1
-#define IPPROTO_TCP  6
-#define IPPROTO_UDP  17
+#define IPPROTO_ICMP   1
+#define IPPROTO_TCP    6
+#define IPPROTO_UDP    17
+#define IPPROTO_ICMPV6 58
 
 // Netfilter is entirely absent from the datapath: the fabric<->VPC bridge NAT
 // (north-south) is done here in eBPF with a small connection table, not
@@ -75,6 +76,23 @@ struct cozy_mac {
 #define ICMP_ID_OFF   (L4_OFF + 4)
 #define ICMP_ECHO_REPLY   0
 #define ICMP_ECHO_REQUEST 8
+
+// IPv6 fabric-bridge offsets: a fixed 40-byte header (no extension headers on
+// the inner VPC traffic the bridge handles). No L3 checksum exists in IPv6, so a
+// v6 address rewrite touches only the L4 (pseudo-header) checksum — but over all
+// 16 bytes, and for ICMPv6 too (unlike ICMPv4, whose csum ignores the IP header).
+#define IP6_HDR_OFF   ETH_HLEN
+#define IP6_SADDR_OFF (IP6_HDR_OFF + 8)
+#define IP6_DADDR_OFF (IP6_HDR_OFF + 24)
+#define L4_OFF6       (IP6_HDR_OFF + 40)
+#define L4_SPORT_OFF6 (L4_OFF6 + 0)
+#define L4_DPORT_OFF6 (L4_OFF6 + 2)
+#define TCP_CSUM_OFF6  (L4_OFF6 + 16)
+#define UDP_CSUM_OFF6  (L4_OFF6 + 6)
+#define ICMP6_CSUM_OFF (L4_OFF6 + 2)
+#define ICMP6_ID_OFF   (L4_OFF6 + 4)
+#define ICMP6_ECHO_REQUEST 128
+#define ICMP6_ECHO_REPLY   129
 
 // ports-map value layout: bit 31 flags a VPC egress-gateway leg; the low bits
 // are the network id (VNIs stay far below 2^23, see TUN_F_GATEWAY).
@@ -597,6 +615,95 @@ static __always_inline void nat_icmp_id(struct __sk_buff *skb, __u16 old, __u16 
 	bpf_skb_store_bytes(skb, ICMP_ID_OFF, &new, sizeof(new), 0);
 }
 
+// ---- IPv6 fabric-bridge NAT primitives -----------------------------------
+// The v6 fabric bridge reuses the bridges/ct_fwd/ct_rev maps (all addr128-keyed)
+// and mirrors the v4 bridge; only the header rewrites differ, because IPv6 has no
+// L3 checksum and folds the address into every L4 pseudo-header (ICMPv6 included).
+
+// The v6 masquerade gateway: fe80::1, the address the host veth owns. A bridged
+// pod's client is masqueraded to it, so the pod's reply comes back to from_pod.
+#define LINK_LOCAL_GW6 { { 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } }
+
+static __always_inline int addr128_eq(const struct addr128 *a, const struct addr128 *b)
+{
+#pragma unroll
+	for (int i = 0; i < 16; i++)
+		if (a->b[i] != b->b[i])
+			return 0;
+	return 1;
+}
+
+// l4_ports6 reads the TCP/UDP ports of an IPv6 frame (fixed 40-byte header).
+static __always_inline int l4_ports6(struct __sk_buff *skb, __u16 *sport, __u16 *dport)
+{
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+	if (data + L4_OFF6 + 4 > data_end)
+		return -1;
+	__u16 *p = data + L4_OFF6;
+	*sport = p[0];
+	*dport = p[1];
+	return 0;
+}
+
+// icmp6_echo reads an ICMPv6 echo message's type and identifier (fixed header).
+static __always_inline int icmp6_echo(struct __sk_buff *skb, __u8 *type, __u16 *id)
+{
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+	if (data + L4_OFF6 + 8 > data_end)
+		return -1;
+	__u8 *t = data + L4_OFF6;
+	__u16 *idp = data + ICMP6_ID_OFF;
+	*type = *t;
+	*id = *idp;
+	return 0;
+}
+
+static __always_inline __u32 l4_csum_off6(__u8 proto)
+{
+	if (proto == IPPROTO_TCP)
+		return TCP_CSUM_OFF6;
+	if (proto == IPPROTO_UDP)
+		return UDP_CSUM_OFF6;
+	return ICMP6_CSUM_OFF; // ICMPv6
+}
+
+// nat_addr6 rewrites a 16-byte IPv6 address (at addr_off) and fixes the L4
+// checksum over the full address change. There is no IPv6 header checksum; TCP,
+// UDP, and ICMPv6 all carry the address in their pseudo-header sum, so the fix
+// applies to every L4 proto the bridge handles. UDP with a zero checksum keeps
+// its "no checksum" marker via BPF_F_MARK_MANGLED_0.
+static __always_inline void nat_addr6(struct __sk_buff *skb, __u8 proto, __u32 addr_off,
+				      const struct addr128 *old, const struct addr128 *new)
+{
+	__s64 diff = bpf_csum_diff((__be32 *)old->b, 16, (__be32 *)new->b, 16, 0);
+	__u64 flags = BPF_F_PSEUDO_HDR;
+	if (proto == IPPROTO_UDP)
+		flags |= BPF_F_MARK_MANGLED_0;
+	bpf_l4_csum_replace(skb, l4_csum_off6(proto), 0, diff, flags);
+	bpf_skb_store_bytes(skb, addr_off, new->b, 16, 0);
+}
+
+// nat_port6 rewrites an L4 port (at port_off) of an IPv6 frame and fixes the L4
+// checksum. The port is not in the pseudo-header, so a plain 2-byte update.
+static __always_inline void nat_port6(struct __sk_buff *skb, __u8 proto, __u32 port_off, __u16 old, __u16 new)
+{
+	__u64 flags = 2;
+	if (proto == IPPROTO_UDP)
+		flags |= BPF_F_MARK_MANGLED_0;
+	bpf_l4_csum_replace(skb, l4_csum_off6(proto), old, new, flags);
+	bpf_skb_store_bytes(skb, port_off, &new, sizeof(new), 0);
+}
+
+// nat_icmp6_id rewrites the ICMPv6 echo identifier and fixes the ICMPv6 checksum
+// (a plain 2-byte incremental update, like ICMPv4).
+static __always_inline void nat_icmp6_id(struct __sk_buff *skb, __u16 old, __u16 new)
+{
+	bpf_l4_csum_replace(skb, ICMP6_CSUM_OFF, old, new, 2);
+	bpf_skb_store_bytes(skb, ICMP6_ID_OFF, &new, sizeof(new), 0);
+}
+
 // alloc_gw_port picks a free masquerade port for a new north-south connection:
 // the reverse-lookup key {proto, gw_port, net, vpc_ip, pod_port} must be unique,
 // so probe (bounded) with BPF_NOEXIST — the insert that wins owns the port.
@@ -793,6 +900,126 @@ static __always_inline int bridge_reverse(struct __sk_buff *skb, struct iphdr *i
 	return deliver_net0(skb, rv->client_ip);
 }
 
+// bridge_forward6 is the v6 fabric bridge forward half, done in to_pod when a
+// packet's destination is a v6 fabric IP: DNAT fabric->VPC and masquerade the
+// client to fe80::1:gw_port, mirroring bridge_forward. The client/fabric/vpc
+// addresses are already 128-bit in `p`, and ct_fwd/ct_rev are addr128-keyed, so
+// the connection table is shared with v4. TCP/UDP/ICMPv6-echo; other ICMPv6 is
+// dropped (NDP never reaches here — it is link-scoped and short-circuited).
+static __always_inline int bridge_forward6(struct __sk_buff *skb, struct pkt *p, __u32 net, struct addr128 vpc_ip)
+{
+	__u8 proto = p->proto;
+	struct addr128 gw = LINK_LOCAL_GW6;
+
+	if (proto == IPPROTO_ICMPV6) {
+		__u8 type;
+		__u16 id;
+		if (icmp6_echo(skb, &type, &id) < 0)
+			return TC_ACT_SHOT;
+		if (type != ICMP6_ECHO_REQUEST)
+			return TC_ACT_SHOT;
+		struct ct_fwd_key fk = {
+			.proto = proto,
+			.net = net,
+			.client_ip = p->src,
+			.fabric_ip = p->dst,
+			.client_port = id,
+		};
+		__u16 gw_id;
+		__u16 *have = bpf_map_lookup_elem(&ct_fwd, &fk);
+		if (have) {
+			gw_id = *have;
+		} else {
+			gw_id = alloc_gw_port(proto, net, vpc_ip, 0, p->dst, p->src, id);
+			if (!gw_id)
+				return TC_ACT_SHOT;
+			bpf_map_update_elem(&ct_fwd, &fk, &gw_id, BPF_ANY);
+		}
+		nat_addr6(skb, proto, IP6_DADDR_OFF, &p->dst, &vpc_ip);
+		nat_addr6(skb, proto, IP6_SADDR_OFF, &p->src, &gw);
+		nat_icmp6_id(skb, id, gw_id);
+		return TC_ACT_OK;
+	}
+	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
+		return TC_ACT_SHOT;
+	__u16 cport, pport;
+	if (l4_ports6(skb, &cport, &pport) < 0)
+		return TC_ACT_SHOT;
+	struct ct_fwd_key fk = {
+		.proto = proto,
+		.net = net,
+		.client_ip = p->src,
+		.fabric_ip = p->dst,
+		.client_port = cport,
+		.pod_port = pport,
+	};
+	__u16 gw_port;
+	__u16 *have = bpf_map_lookup_elem(&ct_fwd, &fk);
+	if (have) {
+		gw_port = *have;
+	} else {
+		gw_port = alloc_gw_port(proto, net, vpc_ip, pport, p->dst, p->src, cport);
+		if (!gw_port)
+			return TC_ACT_SHOT;
+		bpf_map_update_elem(&ct_fwd, &fk, &gw_port, BPF_ANY);
+	}
+	nat_addr6(skb, proto, IP6_DADDR_OFF, &p->dst, &vpc_ip);
+	nat_addr6(skb, proto, IP6_SADDR_OFF, &p->src, &gw);
+	nat_port6(skb, proto, L4_SPORT_OFF6, cport, gw_port);
+	return TC_ACT_OK; // delivered to the pod (src is now the gateway)
+}
+
+// bridge_reverse6 is the v6 reply un-NAT, done in from_pod when a v6 VPC pod
+// replies to fe80::1: recover the masquerade port, restore vpc->fabric on the
+// source and gateway->client on the destination, and deliver on the default
+// network. The parallel of bridge_reverse.
+static __always_inline int bridge_reverse6(struct __sk_buff *skb, struct pkt *p, __u32 net)
+{
+	__u8 proto = p->proto;
+	struct addr128 gw = LINK_LOCAL_GW6;
+
+	if (proto == IPPROTO_ICMPV6) {
+		__u8 type;
+		__u16 gw_id;
+		if (icmp6_echo(skb, &type, &gw_id) < 0)
+			return TC_ACT_OK;
+		if (type != ICMP6_ECHO_REPLY)
+			return TC_ACT_OK;
+		struct ct_rev_key rk = {
+			.proto = proto,
+			.gw_port = gw_id,
+			.net = net,
+			.vpc_ip = p->src,
+		};
+		struct ct_rev_val *rv = bpf_map_lookup_elem(&ct_rev, &rk);
+		if (!rv)
+			return TC_ACT_OK;
+		nat_addr6(skb, proto, IP6_SADDR_OFF, &p->src, &rv->fabric_ip);
+		nat_addr6(skb, proto, IP6_DADDR_OFF, &gw, &rv->client_ip);
+		nat_icmp6_id(skb, gw_id, rv->client_port);
+		return deliver_net0(skb, rv->client_ip);
+	}
+	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
+		return TC_ACT_OK;
+	__u16 pport, gw_port;
+	if (l4_ports6(skb, &pport, &gw_port) < 0)
+		return TC_ACT_OK;
+	struct ct_rev_key rk = {
+		.proto = proto,
+		.gw_port = gw_port,
+		.net = net,
+		.vpc_ip = p->src,
+		.pod_port = pport,
+	};
+	struct ct_rev_val *rv = bpf_map_lookup_elem(&ct_rev, &rk);
+	if (!rv)
+		return TC_ACT_OK;
+	nat_addr6(skb, proto, IP6_SADDR_OFF, &p->src, &rv->fabric_ip);
+	nat_addr6(skb, proto, IP6_DADDR_OFF, &gw, &rv->client_ip);
+	nat_port6(skb, proto, L4_DPORT_OFF6, gw_port, rv->client_port);
+	return deliver_net0(skb, rv->client_ip);
+}
+
 // floating_forward is the inbound half of a floating IP, done in to_pod when a
 // packet's destination is a floating address: a stateless DNAT public->VPC that
 // keeps the external client as the source (no masquerade). Sanctioned
@@ -869,6 +1096,14 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 		srcnet = PORT_NET(*sp);
 		is_gw = *sp & PORT_F_GATEWAY;
 	}
+
+	// A v6 VPC pod's reply to fe80::1 is the return half of the v6 fabric bridge:
+	// un-NAT it and deliver on the default network. Tested before the link-scoped
+	// bypass below because it is *unicast* to the gateway, whereas NDP is to the
+	// solicited-node multicast — so the two never collide.
+	struct addr128 gw6 = LINK_LOCAL_GW6;
+	if (p.is_v6 && addr128_eq(&p.dst, &gw6))
+		return bridge_reverse6(skb, &p, srcnet);
 
 	// v6 link-local / multicast (the pod resolving its on-link gateway via NDP,
 	// router solicitations, …) is link-scoped: hand it to the kernel so the host
@@ -988,6 +1223,16 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 		// A masqueraded reply already carries the gateway source; allow it.
 		if (ip->saddr == bpf_htonl(LINK_LOCAL_GW))
 			return TC_ACT_OK;
+	}
+
+	// The forward half of the v6 fabric bridge: destination is a v6 fabric IP ->
+	// DNAT to the VPC IP and masquerade the client to fe80::1, then deliver. No
+	// isolation check (this IS the sanctioned north-south path). Same bridges map
+	// as v4, keyed by the 128-bit address, so a v6 fabric IP resolves here.
+	if (p.is_v6) {
+		struct bridge_ep *be = bridge_of(p.dst);
+		if (be)
+			return bridge_forward6(skb, &p, be->net, be->vpc_ip);
 	}
 
 	// v6 link-local / multicast reaching the pod (an NA from its on-link gateway,
