@@ -894,9 +894,18 @@ func configureHostVeth(name string, podIPs []net.IP, netID uint32, podMAC net.Ha
 
 func cmdDel(args *skel.CmdArgs) error {
 	// Clear the ports map entries; the host veths (and their tc filters) go
-	// with the pod veths deleted below.
+	// with the pod veths deleted below. Capture the VPC veth's net id first so the
+	// local delivery entry can be cleaned by (net, VPC IP) below even when this
+	// pod's Port cannot be consulted — a migration source whose persistent Port
+	// has been re-pointed to the target pod, so a Port lookup by this pod misses.
+	vpcNet, haveVPCNet := uint32(0), false
 	for _, name := range []string{hostVethNameFor(args.ContainerID), gwHostVethNameFor(args.ContainerID)} {
 		if hv, e := netlink.LinkByName(name); e == nil {
+			if name == hostVethNameFor(args.ContainerID) {
+				if n, ok, e := datapath.GetPortNet(hv.Attrs().Index); e == nil && ok {
+					vpcNet, haveVPCNet = n, true
+				}
+			}
 			_ = datapath.DelPortNet(hv.Attrs().Index)
 			_ = datapath.DetachVeth(hv.Attrs().Index)
 		}
@@ -931,6 +940,12 @@ func cmdDel(args *skel.CmdArgs) error {
 				if p.Spec.FabricIP != "" {
 					_ = datapath.DelBridge(p.Spec.FabricIP, hostVethNameFor(args.ContainerID))
 				}
+				// A persistent (VM NIC) Port outlives its pod so the VPC IP + MAC
+				// survive pod churn / live migration: never delete it here — the
+				// persistent-Port controller GCs it when the VM is gone.
+				if p.Labels[labelVMName] != "" {
+					continue
+				}
 				_ = client.SdnV1alpha1().Ports().Delete(context.TODO(), p.Name, metav1.DeleteOptions{})
 			}
 		}
@@ -954,12 +969,17 @@ func cmdDel(args *skel.CmdArgs) error {
 		if e == ip.ErrLinkNotFound {
 			return nil
 		}
-		// Release the default-network local entry (net 0). VPC/gateway addrs
-		// live under their VNI scope and were cleared via their Ports; a net-0
-		// delete of a VPC IP is a harmless miss.
+		// Release the default-network local entry (net 0), and — for a VPC pod —
+		// the VPC-net entry too, keyed by (captured net, VPC IP from the veth).
+		// Doing it from the veth address makes cleanup independent of the Port,
+		// so a migration source clears its own local delivery entry even though
+		// its persistent Port now points at the target pod.
 		for _, a := range addrs {
 			if a.IP != nil {
 				_ = datapath.DelLocal(0, a.IP)
+				if haveVPCNet && vpcNet != 0 {
+					_ = datapath.DelLocal(vpcNet, a.IP)
+				}
 			}
 		}
 		return e

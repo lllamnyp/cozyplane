@@ -39,6 +39,28 @@ func SetPortNet(ifindex int, netID uint32) error {
 	return nil
 }
 
+// GetPortNet returns the network id recorded for a veth (the gateway flag
+// stripped), so a DEL can clean the local datapath by (net, IP) even when the
+// pod's Port is not the one to consult — e.g. a migration source whose
+// persistent Port has already been re-pointed to the target pod. ok is false
+// when the veth has no entry.
+func GetPortNet(ifindex int) (netID uint32, ok bool, err error) {
+	m, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "ports"), nil)
+	if err != nil {
+		return 0, false, fmt.Errorf("open pinned ports map: %w", err)
+	}
+	defer m.Close()
+
+	var v uint32
+	if err := m.Lookup(uint32(ifindex), &v); err != nil {
+		if isNotExist(err) {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("get port net: %w", err)
+	}
+	return PortNet(v), true, nil
+}
+
 // DelPortNet removes a veth's entry from the ports map.
 func DelPortNet(ifindex int) error {
 	m, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "ports"), nil)
