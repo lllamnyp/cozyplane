@@ -444,10 +444,56 @@ the fabric-IP lookups it would otherwise reach (`bridge_of`) can only ever hold
 v4 keys, so they miss harmlessly. `from_uplink` stays v4-only (floating-IP
 ingress + ARP): a v6 frame there is left to the kernel.
 
+One wrinkle the overlay path forced: v6 neighbour discovery *is* an IPv6 packet,
+whereas v4 ARP is not and so never reaches these hooks. A pod resolving its
+on-link gateway sends an NS to that gateway's solicited-node **multicast**, which
+—being off-net from the VPC's point of view—the isolation rule would drop.
+`v6_link_scoped` short-circuits link-local (`fe80::/10`) and multicast
+(`ff00::/8`) to `TC_ACT_OK` in both `from_pod` (on dst) and `to_pod` (on src):
+that traffic never leaves the pod↔host-veth link, so the kernel and the host veth
+handle it. The host veth **owns** `fe80::1` (assigned outright, not proxied):
+Linux NDP *proxy* does not answer for link-local targets, so unlike v4's
+`proxy_arp` for `169.254.1.1`, the gateway address is a real address on the veth.
+
 The upshot is v6 gets **intra-VPC and cross-node overlay delivery, isolation, and
-same-family peering** for free — everything that flows through the overlay path.
-NDP (for v6 floating IPs, replacing the ARP responder), ICMPv6, the v6 fabric
-bridge (north-south), and v6 gateway egress are later phases.
+same-family peering** for free — everything that flows through the overlay path,
+including ICMPv6 east-west (the delivery path never inspects L4). The v6 fabric
+bridge (north-south), v6 floating IPs (NDP responder), and v6 gateway egress are
+later phases.
+
+### IPv6 north-south — the v6 fabric bridge (planned)
+
+East-west v6 works on a v4 cluster; **north-south v6 needs a dual-stack cluster**,
+because a pod's reachable fabric IP comes from the node pod CIDR, and only a
+dual-stack cluster gives nodes a v6 pod CIDR. With that, the design is the exact
+parallel of the v4 fabric bridge (`bridges` map, `ct_fwd`/`ct_rev` conntrack — all
+already `addr128`-keyed and reusable across families), with three v6-specific
+points:
+
+- **Checksums differ.** IPv6 has *no* header checksum, so a v6 address rewrite
+  never touches an L3 csum (there is none). But TCP, UDP, *and* ICMPv6 all carry
+  the address in their pseudo-header checksum — including ICMPv6, unlike ICMPv4,
+  whose checksum ignores the IP header. So `nat_addr6` fixes only the L4 csum, but
+  must fix it over the full **16-byte** address change (eight 16-bit words via
+  `bpf_l4_csum_replace`), for every L4 proto including ICMPv6. Header offsets use
+  the fixed 40-byte IPv6 header (no options): L4 at `ETH_HLEN + 40`.
+
+- **The masquerade gateway is `fe80::1`** (the address the host veth already owns),
+  the direct analog of `169.254.1.1`. `to_pod` DNATs fabric→VPC and masquerades
+  the client to `fe80::1:gw_port`; the pod replies to `fe80::1`, which `from_pod`
+  reverses. This collides with the `v6_link_scoped` bypass above — a reply to
+  `fe80::1` is link-local — so `from_pod` must test `dst == fe80::1` (unicast to
+  the gateway → `bridge_reverse6`) **before** the link-scoped short-circuit. NDP
+  never conflicts: it is to the solicited-node *multicast*, not unicast `fe80::1`.
+
+- **ICMPv6 echo** is type 128/129 (not v4's 8/0); the echo identifier stands in
+  for the L4 port in conntrack exactly as for v4, but its rewrite also touches the
+  ICMPv6 (pseudo-header) checksum.
+
+A v6 VPC pod then reports its v6 fabric IP as `status.podIP` (kubelet probes,
+Services), the CNI programs the v6 `/128` fabric route + `bridges` entry it
+currently skips, and a dual-stack e2e proves a default-network client reaching a
+v6 pod's fabric IP (TCP + ICMPv6), including under overlapping v6 CIDRs.
 
 ## 4. Control flow
 
