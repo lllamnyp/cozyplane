@@ -44,6 +44,22 @@ const (
 	// LabelPodUID is the attached pod's UID (stable across name reuse).
 	LabelPodUID = "sdn.cozystack.io/pod-uid"
 
+	// LabelVMName marks a *persistent* Port and records the VM identity it is
+	// pinned to (the KubeVirt VM name, within LabelPodNamespace). A virt-launcher
+	// pod's CNI ADD binds to the persistent Port for its VM instead of claiming a
+	// fresh one, so the VPC IP + MAC survive pod churn and live migration. The
+	// persistent-Port controller selects on this to drive migration cutover and GC.
+	LabelVMName = "sdn.cozystack.io/vm-name"
+
+	// KubeVirt labels on a virt-launcher pod, read to recognize a VM NIC and drive
+	// migration. The stable VM identity is (namespace, KubeVirtLabelVMName); the
+	// pod carrying the active binding has KubeVirtLabelNodeName equal to its own
+	// node (KubeVirt sets it on the migration target only after cutover).
+	KubeVirtLabelApp      = "kubevirt.io"       // value "virt-launcher" on VM pods
+	KubeVirtLabelVMName   = "vm.kubevirt.io/name"
+	KubeVirtLabelNodeName = "kubevirt.io/nodeName"
+	KubeVirtLabelVMIUID   = "kubevirt.io/created-by" // the VMI UID (stable across migration)
+
 	// FinalizerSever holds a Port until the agent on its node has severed the
 	// live datapath (or confirmed there is nothing to sever). A revocation
 	// that lands while that agent is down therefore waits, still terminating,
