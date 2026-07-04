@@ -174,10 +174,18 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	if podCIDR == "" {
 		return fmt.Errorf("node %q has no spec.podCIDR (is --allocate-node-cidrs enabled?)", nodeName)
 	}
+	// PodCIDRs carries every family (dual-stack: a v4 and a v6 CIDR); fall back to
+	// the single PodCIDR on a single-stack node. A v6 VPC pod's fabric IP is drawn
+	// from the v6 entry.
+	podCIDRs := self.Spec.PodCIDRs
+	if len(podCIDRs) == 0 {
+		podCIDRs = []string{podCIDR}
+	}
 	state := &datapath.AgentState{
 		NodeName:  nodeName,
 		NodeIP:    internalIP(self),
 		PodCIDR:   podCIDR,
+		PodCIDRs:  podCIDRs,
 		MTU:       mtu,
 		Namespace: os.Getenv("AGENT_NAMESPACE"), // gates gateway-attach to the system namespace
 	}
@@ -236,12 +244,17 @@ func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.
 			log.Warn("node has no InternalIP", "node", node.Name)
 			return
 		}
-		// Node pod CIDRs are the default network (scope 0).
-		if err := mgr.SetRemote(0, node.Spec.PodCIDR, net.ParseIP(ip)); err != nil {
-			log.Error("set remote", "node", node.Name, "err", err)
-			return
+		// Node pod CIDRs are the default network (scope 0). On a dual-stack node
+		// there are two (a v4 and a v6); the Geneve endpoint stays the node's v4
+		// IP for both (the underlay is v4). Overlay/fabric delivery of a v6 pod IP
+		// then resolves the node just like a v4 one.
+		for _, cidr := range nodePodCIDRs(node) {
+			if err := mgr.SetRemote(0, cidr, net.ParseIP(ip)); err != nil {
+				log.Error("set remote", "node", node.Name, "cidr", cidr, "err", err)
+				continue
+			}
+			log.Info("remote set", "node", node.Name, "podCIDR", cidr, "nodeIP", ip)
 		}
-		log.Info("remote set", "node", node.Name, "podCIDR", node.Spec.PodCIDR, "nodeIP", ip)
 	}
 
 	_, err := nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -252,8 +265,10 @@ func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.
 			if !ok || node.Name == selfName || node.Spec.PodCIDR == "" {
 				return
 			}
-			if err := mgr.DelRemote(0, node.Spec.PodCIDR); err != nil {
-				log.Error("del remote", "node", node.Name, "err", err)
+			for _, cidr := range nodePodCIDRs(node) {
+				if err := mgr.DelRemote(0, cidr); err != nil {
+					log.Error("del remote", "node", node.Name, "cidr", cidr, "err", err)
+				}
 			}
 		},
 	})
@@ -858,4 +873,16 @@ func internalIP(node *corev1.Node) string {
 		}
 	}
 	return ""
+}
+
+// nodePodCIDRs returns a node's pod CIDRs across all families: Spec.PodCIDRs on a
+// dual-stack node (a v4 and a v6), falling back to the single Spec.PodCIDR.
+func nodePodCIDRs(node *corev1.Node) []string {
+	if len(node.Spec.PodCIDRs) > 0 {
+		return node.Spec.PodCIDRs
+	}
+	if node.Spec.PodCIDR != "" {
+		return []string{node.Spec.PodCIDR}
+	}
+	return nil
 }

@@ -103,13 +103,21 @@ func delFabricRoute(fabricIP, hostVeth string) error {
 }
 
 func fabricRoute(fabricIP string, ifindex int) (*netlink.Route, error) {
-	ip := net.ParseIP(fabricIP).To4()
+	ip := net.ParseIP(fabricIP)
 	if ip == nil {
-		return nil, fmt.Errorf("fabric IP %q is not IPv4", fabricIP)
+		return nil, fmt.Errorf("fabric IP %q is not an IP", fabricIP)
+	}
+	// A host route to the pod's veth: /32 for a v4 fabric IP, /128 for v6.
+	bits := 32
+	if ip.To4() == nil {
+		ip = ip.To16()
+		bits = 128
+	} else {
+		ip = ip.To4()
 	}
 	return &netlink.Route{
 		LinkIndex: ifindex,
-		Dst:       &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)},
+		Dst:       &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)},
 		Scope:     netlink.SCOPE_LINK,
 	}, nil
 }

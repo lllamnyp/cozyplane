@@ -84,6 +84,35 @@ var (
 // isV6 reports whether ip is an IPv6 address (not a v4 or v4-in-v6).
 func isV6(ip net.IP) bool { return ip.To4() == nil }
 
+// cidrIsV6 reports whether a CIDR string is IPv6.
+func cidrIsV6(cidr string) (bool, error) {
+	ip, _, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return false, fmt.Errorf("parse CIDR %q: %w", cidr, err)
+	}
+	return isV6(ip), nil
+}
+
+// nodeCIDRFor returns this node's pod CIDR of the requested family (from
+// AgentState.PodCIDRs, falling back to the single PodCIDR). A v6 VPC pod draws
+// its fabric IP from the v6 entry, which exists only on a dual-stack node.
+func nodeCIDRFor(state *datapath.AgentState, wantV6 bool) (string, error) {
+	cidrs := state.PodCIDRs
+	if len(cidrs) == 0 {
+		cidrs = []string{state.PodCIDR}
+	}
+	for _, c := range cidrs {
+		if v6, err := cidrIsV6(c); err == nil && v6 == wantV6 {
+			return c, nil
+		}
+	}
+	fam := "IPv4"
+	if wantV6 {
+		fam = "IPv6"
+	}
+	return "", fmt.Errorf("node has no %s pod CIDR for the fabric IP (is the cluster dual-stack?)", fam)
+}
+
 // hostMask returns the host-route mask for ip's family (/32 or /128).
 func hostMask(ip net.IP) net.IPMask {
 	if isV6(ip) {
@@ -218,7 +247,13 @@ func addDefault(args *skel.CmdArgs, conf *NetConf) (result *current.Result, err 
 		mtu = state.MTU
 	}
 
-	ipamData, err := ipamStdin(args.StdinData, state.PodCIDR)
+	// Dual-stack: allocate from every node pod CIDR (a v4 and, on a dual-stack
+	// node, a v6), so a default pod gets an address per family.
+	cidrs := state.PodCIDRs
+	if len(cidrs) == 0 {
+		cidrs = []string{state.PodCIDR}
+	}
+	ipamData, err := ipamStdin(args.StdinData, cidrs...)
 	if err != nil {
 		return nil, err
 	}
@@ -239,14 +274,19 @@ func addDefault(args *skel.CmdArgs, conf *NetConf) (result *current.Result, err 
 	if len(ipamResult.IPs) == 0 {
 		return nil, fmt.Errorf("ipam returned no addresses")
 	}
-	podIP := ipamResult.IPs[0].Address.IP
+	podIPs := make([]net.IP, 0, len(ipamResult.IPs))
+	for _, ipc := range ipamResult.IPs {
+		podIPs = append(podIPs, ipc.Address.IP)
+	}
 
-	result, err = setupVeth(args, conf.CNIVersion, podIP, mtu, 0)
+	result, err = setupVeth(args, conf.CNIVersion, podIPs, mtu, 0)
 	if err != nil {
 		return nil, err
 	}
 	result.IPs = ipamResult.IPs
-	result.IPs[0].Interface = current.Int(0)
+	for i := range result.IPs {
+		result.IPs[i].Interface = current.Int(0)
+	}
 	return result, nil
 }
 
@@ -290,8 +330,18 @@ func addVPC(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, p
 	}
 
 	// Fabric IP (status.podIP): host-local from the node pod CIDR, unique and
-	// reachable on the default overlay.
-	ipamData, err := ipamStdin(args.StdinData, state.PodCIDR)
+	// reachable on the default overlay. Its family must match the VPC IP's, so a
+	// v6 VPC pod gets a v6 fabric IP from the node's v6 pod CIDR — determined here
+	// from the VPC CIDR (the VPC IP itself is only claimed below).
+	wantV6, err := cidrIsV6(vpc.Spec.CIDRs[0])
+	if err != nil {
+		return fmt.Errorf("vpc CIDR: %w", err)
+	}
+	fabricCIDR, err := nodeCIDRFor(state, wantV6)
+	if err != nil {
+		return err
+	}
+	ipamData, err := ipamStdin(args.StdinData, fabricCIDR)
 	if err != nil {
 		return err
 	}
@@ -325,26 +375,23 @@ func addVPC(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, p
 	}()
 
 	// The pod interface carries the VPC IP; tag the veth with the VPC net id.
-	result, err := setupVeth(args, conf.CNIVersion, vpcIP, mtu, uint32(vpc.Status.VNI))
+	result, err := setupVeth(args, conf.CNIVersion, []net.IP{vpcIP}, mtu, uint32(vpc.Status.VNI))
 	if err != nil {
 		return err
 	}
 
 	// Bridge: route the (unique) fabric IP to this veth and publish the
-	// fabric -> {net, VPC IP} mapping; the eBPF datapath does the NAT. The bridge
-	// is v4-only (its NAT rewrites IPv4 headers), so a v6 VPC pod skips it — v6
-	// north-south is a later phase. Such a pod still gets a v4 fabric IP as its
-	// identity/podIP, just no node->pod bridge until the v6 fabric bridge lands.
-	if !isV6(vpcIP) {
-		if err = datapath.AddBridge(fabricIP.String(), vpcIP.String(), hostVethNameFor(args.ContainerID), uint32(vpc.Status.VNI)); err != nil {
-			return err
-		}
+	// fabric -> {net, VPC IP} mapping; the eBPF datapath does the NAT. Both
+	// families are handled — the v6 fabric bridge (bridge_forward6/reverse6)
+	// mirrors the v4 one, and the fabric IP's family matches the VPC IP's.
+	if err = datapath.AddBridge(fabricIP.String(), vpcIP.String(), hostVethNameFor(args.ContainerID), uint32(vpc.Status.VNI)); err != nil {
+		return err
 	}
 
-	// Report the fabric IP as status.podIP.
+	// Report the fabric IP as status.podIP (host mask for its family).
 	result.IPs = []*current.IPConfig{{
 		Interface: current.Int(0),
-		Address:   net.IPNet{IP: fabricIP, Mask: net.CIDRMask(32, 32)},
+		Address:   net.IPNet{IP: fabricIP, Mask: hostMask(fabricIP)},
 	}}
 	return types.PrintResult(result, conf.CNIVersion)
 }
@@ -483,7 +530,7 @@ func addGatewayLeg(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, pod
 
 	// Host side is a normal VPC port, flagged as the gateway leg so the
 	// datapath blesses the off-VPC sources it forwards inward.
-	return configureHostVeth(hostVethName, gwIP, uint32(vpc.Status.VNI)|datapath.PortGatewayFlag, podMAC)
+	return configureHostVeth(hostVethName, []net.IP{gwIP}, uint32(vpc.Status.VNI)|datapath.PortGatewayFlag, podMAC)
 }
 
 // requireVPCBinding implements default-deny attachment: a VPCBinding in the
@@ -584,7 +631,7 @@ func portName(vni int32, ip string) string {
 
 // setupVeth creates the pod veth, configures the pod-side address and routes,
 // configures the host side, and attaches the classifier with the given net id.
-func setupVeth(args *skel.CmdArgs, cniVersion string, podIP net.IP, mtu int, netID uint32) (*current.Result, error) {
+func setupVeth(args *skel.CmdArgs, cniVersion string, podIPs []net.IP, mtu int, netID uint32) (*current.Result, error) {
 	hostNS, err := ns.GetCurrentNS()
 	if err != nil {
 		return nil, fmt.Errorf("get host netns: %w", err)
@@ -599,14 +646,14 @@ func setupVeth(args *skel.CmdArgs, cniVersion string, podIP net.IP, mtu int, net
 			return e
 		}
 		hostVethName = hostVeth.Name
-		mac, e := configurePodIface(podIP)
+		mac, e := configurePodIface(podIPs)
 		podMAC = mac
 		return e
 	}); err != nil {
 		return nil, err
 	}
 
-	if err := configureHostVeth(hostVethName, podIP, netID, podMAC); err != nil {
+	if err := configureHostVeth(hostVethName, podIPs, netID, podMAC); err != nil {
 		return nil, err
 	}
 
@@ -616,15 +663,21 @@ func setupVeth(args *skel.CmdArgs, cniVersion string, podIP net.IP, mtu int, net
 	}, nil
 }
 
-// ipamStdin rewrites the plugin config so host-local allocates from the node pod CIDR.
-func ipamStdin(stdin []byte, podCIDR string) ([]byte, error) {
+// ipamStdin rewrites the plugin config so host-local allocates from the node pod
+// CIDR(s). Passing both a v4 and a v6 CIDR makes host-local return one address
+// per family (dual-stack): each CIDR is its own range set.
+func ipamStdin(stdin []byte, podCIDRs ...string) ([]byte, error) {
 	var raw map[string]interface{}
 	if err := json.Unmarshal(stdin, &raw); err != nil {
 		return nil, err
 	}
+	ranges := make([][]map[string]string, 0, len(podCIDRs))
+	for _, c := range podCIDRs {
+		ranges = append(ranges, []map[string]string{{"subnet": c}})
+	}
 	raw["ipam"] = map[string]interface{}{
 		"type":   ipamPlugin,
-		"ranges": [][]map[string]string{{{"subnet": podCIDR}}},
+		"ranges": ranges,
 	}
 	return json.Marshal(raw)
 }
@@ -632,11 +685,29 @@ func ipamStdin(stdin []byte, podCIDR string) ([]byte, error) {
 // configurePodIface sets the pod's eth0 address, brings it up, and installs the
 // link-local default route. Runs inside the pod netns. Returns the eth0 MAC so
 // the host side can record it for same-node redirect delivery.
-func configurePodIface(podIP net.IP) (net.HardwareAddr, error) {
+func configurePodIface(podIPs []net.IP) (net.HardwareAddr, error) {
 	link, err := netlink.LinkByName(contVethName)
 	if err != nil {
 		return nil, err
 	}
+	if err := netlink.LinkSetUp(link); err != nil {
+		return nil, err
+	}
+	// One address per family (dual-stack default pods get a v4 and a v6), each
+	// with its own on-link gateway + default route.
+	for _, podIP := range podIPs {
+		if err := addPodAddrRoute(link, podIP); err != nil {
+			return nil, err
+		}
+	}
+	return link.Attrs().HardwareAddr, nil
+}
+
+// addPodAddrRoute adds one pod address and its on-link gateway + default route,
+// inside the pod netns. The gateway (169.254.1.1 or fe80::1) is never assigned
+// anywhere; the host veth answers for it (proxy_arp for v4, its own fe80::1 for
+// v6), Calico-style.
+func addPodAddrRoute(link netlink.Link, podIP net.IP) error {
 	gw := podGateway(podIP)
 	addr := &netlink.Addr{IPNet: &net.IPNet{IP: podIP, Mask: hostMask(podIP)}}
 	if isV6(podIP) {
@@ -646,35 +717,28 @@ func configurePodIface(podIP net.IP) (net.HardwareAddr, error) {
 		_ = datapath.WriteProcSys(fmt.Sprintf("net/ipv6/conf/%s/disable_ipv6", contVethName), "0")
 		addr.Flags = unix.IFA_F_NODAD
 	}
-	if err := netlink.AddrAdd(link, addr); err != nil {
-		return nil, fmt.Errorf("add pod address: %w", err)
+	if err := netlink.AddrAdd(link, addr); err != nil && !isExist(err) {
+		return fmt.Errorf("add pod address: %w", err)
 	}
-	if err := netlink.LinkSetUp(link); err != nil {
-		return nil, err
-	}
-	mac := link.Attrs().HardwareAddr
-	// A link-scope route to the gateway (its /32 or /128) makes it on-link, then a
-	// default route through it. The gateway is never assigned anywhere; the host
-	// veth answers for it (proxy_arp for v4, proxy_ndp for v6), Calico-style.
 	if err := netlink.RouteAdd(&netlink.Route{
 		LinkIndex: link.Attrs().Index,
 		Scope:     netlink.SCOPE_LINK,
 		Dst:       &net.IPNet{IP: gw, Mask: hostMask(gw)},
-	}); err != nil {
-		return nil, fmt.Errorf("add gateway route: %w", err)
+	}); err != nil && !isExist(err) {
+		return fmt.Errorf("add gateway route: %w", err)
 	}
 	// A v6 default route through a link-local next hop must name the link.
-	if err := netlink.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Gw: gw}); err != nil {
-		return nil, fmt.Errorf("add default route: %w", err)
+	if err := netlink.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Gw: gw}); err != nil && !isExist(err) {
+		return fmt.Errorf("add default route: %w", err)
 	}
-	return mac, nil
+	return nil
 }
 
 // configureHostVeth brings up the host-side veth, enables proxy_arp and
 // forwarding, installs the /32 route (host->local-pod), attaches both classifier
 // hooks (from_pod ingress, to_pod egress), and records the pod's network id and
 // local endpoint.
-func configureHostVeth(name string, podIP net.IP, netID uint32, podMAC net.HardwareAddr) error {
+func configureHostVeth(name string, podIPs []net.IP, netID uint32, podMAC net.HardwareAddr) error {
 	hv, err := netlink.LinkByName(name)
 	if err != nil {
 		return err
@@ -682,12 +746,18 @@ func configureHostVeth(name string, podIP net.IP, netID uint32, podMAC net.Hardw
 	if err := netlink.LinkSetUp(hv); err != nil {
 		return err
 	}
+	hasV6 := false
+	for _, ip := range podIPs {
+		if isV6(ip) {
+			hasV6 = true
+		}
+	}
 	sysctls := map[string]string{
 		fmt.Sprintf("net/ipv4/conf/%s/proxy_arp", name):  "1",
 		fmt.Sprintf("net/ipv4/conf/%s/forwarding", name): "1",
 		fmt.Sprintf("net/ipv4/conf/%s/rp_filter", name):  "0",
 	}
-	if isV6(podIP) {
+	if hasV6 {
 		// Enable v6 on the host veth so it can own the gateway address below.
 		sysctls[fmt.Sprintf("net/ipv6/conf/%s/disable_ipv6", name)] = "0"
 	}
@@ -700,7 +770,7 @@ func configureHostVeth(name string, podIP net.IP, netID uint32, podMAC net.Hardw
 	// pod's NDP natively. Linux NDP *proxy* (proxy_ndp) does not cover link-local
 	// targets, so — unlike v4's proxy_arp for 169.254.1.1 — we assign the address
 	// outright. It is a distinct link per veth pair, so fe80::1 never collides.
-	if isV6(podIP) {
+	if hasV6 {
 		if err := netlink.AddrAdd(hv, &netlink.Addr{
 			IPNet: &net.IPNet{IP: linkLocalGWv6, Mask: net.CIDRMask(64, 64)},
 			Flags: unix.IFA_F_NODAD,
@@ -708,22 +778,25 @@ func configureHostVeth(name string, podIP net.IP, netID uint32, podMAC net.Hardw
 			return fmt.Errorf("add v6 gateway address on host veth: %w", err)
 		}
 	}
-	// A default-network pod has a unique IP, reached by the host through this
-	// main-table host route. VPC pods are delivered by eBPF (same-node redirect,
-	// cross-node from_overlay) or, north-south, by the bridge's per-pod table —
-	// never by a main-table VPC-IP route, which would collide under overlapping
-	// CIDRs. So install the main-table route only for the default network.
-	if netID == 0 {
-		if err := netlink.RouteAdd(&netlink.Route{
-			LinkIndex: hv.Attrs().Index,
-			Scope:     netlink.SCOPE_LINK,
-			Dst:       &net.IPNet{IP: podIP, Mask: hostMask(podIP)},
-		}); err != nil {
-			return fmt.Errorf("add pod host route: %w", err)
-		}
-	}
 
 	idx := hv.Attrs().Index
+
+	// A default-network pod has a unique IP, reached by the host through a
+	// main-table host route (one per family). VPC pods are delivered by eBPF
+	// (same-node redirect, cross-node from_overlay) or, north-south, by the
+	// bridge's per-pod table — never by a main-table VPC-IP route, which would
+	// collide under overlapping CIDRs. So install the route only for net 0.
+	if netID == 0 {
+		for _, podIP := range podIPs {
+			if err := netlink.RouteAdd(&netlink.Route{
+				LinkIndex: idx,
+				Scope:     netlink.SCOPE_LINK,
+				Dst:       &net.IPNet{IP: podIP, Mask: hostMask(podIP)},
+			}); err != nil && !isExist(err) {
+				return fmt.Errorf("add pod host route: %w", err)
+			}
+		}
+	}
 
 	fromPod, err := datapath.OpenPinnedProgram()
 	if err != nil {
@@ -746,9 +819,14 @@ func configureHostVeth(name string, podIP net.IP, netID uint32, podMAC net.Hardw
 	if err := datapath.SetPortNet(idx, netID); err != nil {
 		return err
 	}
-	// Record the local endpoint (keyed by network id, so overlapping VPCs stay
-	// distinct) for eBPF-redirect delivery through to_pod.
-	return datapath.SetLocal(datapath.PortNet(netID), podIP, idx, podMAC)
+	// Record a local endpoint per address (keyed by network id, so overlapping
+	// VPCs stay distinct) for eBPF-redirect delivery through to_pod.
+	for _, podIP := range podIPs {
+		if err := datapath.SetLocal(datapath.PortNet(netID), podIP, idx, podMAC); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func cmdDel(args *skel.CmdArgs) error {
@@ -762,9 +840,12 @@ func cmdDel(args *skel.CmdArgs) error {
 	}
 
 	podNS, podName, podUID, _ := podIdentity(args)
-	podCIDR := ""
+	var podCIDRs []string
 	if state, e := datapath.LoadAgentState(); e == nil {
-		podCIDR = state.PodCIDR
+		podCIDRs = state.PodCIDRs
+		if len(podCIDRs) == 0 && state.PodCIDR != "" {
+			podCIDRs = []string{state.PodCIDR}
+		}
 	}
 
 	// Release a VPC Port if this pod had one. Prefer the pod UID (unique, never
@@ -793,8 +874,9 @@ func cmdDel(args *skel.CmdArgs) error {
 	}
 
 	// Release default-network IPAM (no-op for VPC pods, which use no host-local).
-	if podCIDR != "" {
-		if ipamData, e := ipamStdin(args.StdinData, podCIDR); e == nil {
+	// Both families are released — the ADD allocated one address per node CIDR.
+	if len(podCIDRs) != 0 {
+		if ipamData, e := ipamStdin(args.StdinData, podCIDRs...); e == nil {
 			_ = ipam.ExecDel(ipamPlugin, ipamData)
 		}
 	}

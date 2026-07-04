@@ -204,6 +204,15 @@ EOF
 sleep 5
 check "v6a1(vpc6a) -> v6b1(vpc6b) after peering (v6 peering)" "v6b1" httpid team-a v6a1 "[$V6B1]"
 
+echo "[IPv6 north-south: default client -> v6 fabric IP]"
+# v6a1's fabric IP is a v6 address from the node's v6 pod CIDR; a default-network
+# client (dual-stack cli) reaches it, and to_pod's bridge_forward6 DNATs
+# fabric->VPC while masquerading the client to fe80::1 (reversed in from_pod).
+V6AFAB=$(fabric v6a1)
+check "cli(default) -> v6a1 v6 fabric ($V6AFAB) (north-south TCP)" "v6a1" httpid default cli "[$V6AFAB]"
+check_ok "cli(default) -> v6a1 v6 fabric ping (north-south ICMPv6)" \
+  $K exec cli -- ping -c2 -W3 "$V6AFAB"
+
 echo "[egress via per-VPC gateway]"
 $K -n team-a patch vpc vpc-a --type=merge -p '{"spec":{"egress":{"natGateway":true}}}' >/dev/null
 $K -n kube-system wait --for=condition=Ready pod -l app=cozyplane-gateway --timeout=120s >/dev/null 2>&1 || sleep 15

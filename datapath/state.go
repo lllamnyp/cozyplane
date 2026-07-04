@@ -31,7 +31,12 @@ type AgentState struct {
 	// NodeIP is this node's host IP (the Geneve tunnel endpoint).
 	NodeIP string `json:"nodeIP"`
 	// PodCIDR is this node's slice of the cluster pod CIDR (default network).
+	// On a dual-stack node it is the IPv4 CIDR; see PodCIDRs for both families.
 	PodCIDR string `json:"podCIDR"`
+	// PodCIDRs is this node's pod CIDRs across families (dual-stack: a v4 and a
+	// v6 entry). A v6 VPC pod draws its fabric IP from the v6 entry. Empty falls
+	// back to PodCIDR (single-stack).
+	PodCIDRs []string `json:"podCIDRs,omitempty"`
 	// MTU is the pod MTU (underlay MTU minus Geneve overhead).
 	MTU int `json:"mtu"`
 	// Namespace is the agent's own (system) namespace. Gateway-attach

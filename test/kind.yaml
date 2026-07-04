@@ -3,8 +3,11 @@ apiVersion: kind.x-k8s.io/v1alpha4
 networking:
   # cozyplane is the CNI; disable kindnet.
   disableDefaultCNI: true
-  podSubnet: "10.244.0.0/16"
-  serviceSubnet: "10.96.0.0/16"
+  # Dual-stack: nodes get both a v4 and a v6 pod CIDR, so a v6 VPC pod can carry
+  # a v6 fabric IP (north-south) and default pods are reachable over both families.
+  ipFamily: dual
+  podSubnet: "10.244.0.0/16,fd00:10:244::/56"
+  serviceSubnet: "10.96.0.0/16,fd00:10:96::/112"
 nodes:
   - role: control-plane
   - role: worker
