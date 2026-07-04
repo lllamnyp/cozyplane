@@ -37,6 +37,8 @@ kube-proxy replacement / policy engine.
 | [docs/internals.md](docs/internals.md) | How it works as-built (datapath, control flow, packet walks) and how the code is structured |
 | [docs/design.md](docs/design.md) | The architecture vision (three planes, dual-address bridge, identity) |
 | [docs/control-plane.md](docs/control-plane.md) | The aggregated-apiserver control-plane design |
+| [docs/live-migration.md](docs/live-migration.md) | VM live migration via persistent Ports (IP + MAC preservation) |
+| [docs/roadmap.md](docs/roadmap.md) | Checklist of what's built and what's outstanding, with open-issue index |
 
 ## Repository layout (one line each)
 
