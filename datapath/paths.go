@@ -47,6 +47,9 @@ const (
 	cfgGeneveIfindex = uint32(0)
 	cfgVNI           = uint32(1)
 	cfgUplinkIfindex = uint32(2)
+	// cfgNodeIP is the node's v4 address (raw network-order bytes, native
+	// read) for the bpf cluster-egress masquerade; 0 disables it.
+	cfgNodeIP = uint32(3)
 )
 
 // DefaultVNI is the VNI used for the default (flat) pod network in M0.

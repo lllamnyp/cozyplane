@@ -231,6 +231,25 @@ $K -n kube-system wait --for=condition=Ready pod -l app=cozyplane-gateway --time
 check "a1(vpc-a, egress on) -> internet 1.1.1.1" "" bash -c "$K -n team-a exec a1 -- ping -c2 -W3 1.1.1.1 >/dev/null 2>&1 && echo"
 check_fail "bw1(vpc-b, no egress) -> internet 1.1.1.1" bash -c "$K -n team-b exec bw1 -- ping -c1 -W2 1.1.1.1 >/dev/null 2>&1"
 
+echo "[bpf cluster-egress masquerade (#10): netfilter does no NAT]"
+# --masquerade defaults to bpf: the agent removes the kernel MASQUERADE rule
+# and SNATs pod egress in the datapath at the uplink. Assert the kernel rule
+# is gone on every node while egress still works — TCP, ICMP echo, and the
+# ICMP-error path: traceroute's hop 2 is the docker gateway, whose
+# time-exceeded arrives at the NODE address and must be un-SNAT'd (embedded
+# header included) back to the pod.
+for n in $(kind get nodes --name "$CLUSTER" 2>/dev/null); do
+  check_fail "no COZYPLANE-MASQ nat rule on $n" \
+    bash -c "docker exec $n iptables -t nat -S 2>/dev/null | grep -q COZYPLANE-MASQ"
+done
+check_ok "cli -> internet ping (bpf masq, ICMP echo)" $K exec cli -- ping -c2 -W3 1.1.1.1
+check_ok "cli -> internet TCP (bpf masq)" \
+  bash -c "$K exec cli -- wget -qO- -T5 http://1.1.1.1/ 2>/dev/null | grep -qi ." 
+MKNET=$(docker network inspect kind -f '{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null)
+MKGW="$(echo "${MKNET:-172.18.0.0/16}" | cut -d. -f1-2).0.1"
+check "cli traceroute hop2 = docker gw $MKGW (masq ICMP-error un-SNAT)" "ok" \
+  bash -c "$K exec cli -- traceroute -q1 -w3 -m2 1.1.1.1 2>/dev/null | grep -q \"($MKGW)\" && echo ok"
+
 echo "[stale gateway .1 claim: abandoned-port GC unwedges the replacement]"
 # A gateway pod that dies uncleanly (node reboot) never runs CNI DEL, so its
 # fixed .1 Port survives with a claimant that no longer exists; the replacement

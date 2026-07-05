@@ -23,36 +23,50 @@ import (
 )
 
 // EnsureForwardRules accepts overlay traffic in the FORWARD chain ahead of
-// kube-proxy's rules — in BOTH families.
+// kube-proxy's rules — per family, and only where kube-proxy exists (#10).
 //
 // Pod egress is encapsulated by an eBPF tc redirect, which bypasses conntrack.
 // The decapsulated reply that returns on the Geneve device therefore has no
 // matching conntrack entry and kube-proxy's "ctstate INVALID -j DROP" rule in
 // KUBE-FORWARD discards it. Inserting an explicit ACCEPT for the Geneve device
 // at the top of FORWARD lets decapsulated traffic through before that drop.
+// kube-proxy programs the INVALID drop into ip6tables too, so both families
+// need it — a v4-only ACCEPT dropped cross-node v6 north-south replies.
 //
-// The rule is needed per family: kube-proxy programs the INVALID drop into
-// ip6tables too, and a v6 packet the overlay hands to the kernel (a decapped
-// north-south reply toward a default-network pod) dies there identically. A
-// v4-only ACCEPT made cross-node v6 north-south fail exactly when client and
-// server were on different nodes — caught by the e2e once client placement
-// was pinned cross-node.
-func EnsureForwardRules() error {
+// The rule exists to counter kube-proxy's, so it is installed per family only
+// when that family's KUBE-FORWARD chain does: on a kube-proxy-replacement node
+// there is no drop to dodge, nothing is installed, and an unusable netfilter
+// is a skip, not an error — cozyplane must not hard-require netfilter on nodes
+// where nothing else uses it. (The rule cannot be designed away while an
+// iptables kube-proxy is present: ClusterIP replies must traverse the client
+// node's conntrack to reverse the service DNAT, which is why from_overlay
+// hands default-network traffic to the kernel at all.)
+// Returns the families the rules were installed for, for the agent's log.
+func EnsureForwardRules() ([]string, error) {
+	var installed []string
 	for _, proto := range []iptables.Protocol{iptables.ProtocolIPv4, iptables.ProtocolIPv6} {
+		name := "v4"
+		if proto == iptables.ProtocolIPv6 {
+			name = "v6"
+		}
 		ipt, err := iptables.NewWithProtocol(proto)
 		if err != nil {
-			return fmt.Errorf("init iptables (proto %v): %w", proto, err)
+			continue // no iptables for this family: nothing installs drops either
+		}
+		if ok, err := ipt.ChainExists("filter", "KUBE-FORWARD"); err != nil || !ok {
+			continue // no kube-proxy in this family; no INVALID drop to dodge
 		}
 		for _, spec := range [][]string{
 			{"-i", GeneveDevice, "-j", "ACCEPT"},
 			{"-o", GeneveDevice, "-j", "ACCEPT"},
 		} {
 			if err := ipt.InsertUnique("filter", "FORWARD", 1, spec...); err != nil {
-				return fmt.Errorf("insert FORWARD rule %v (proto %v): %w", spec, proto, err)
+				return installed, fmt.Errorf("insert FORWARD rule %v (%s): %w", spec, name, err)
 			}
 		}
+		installed = append(installed, name)
 	}
-	return nil
+	return installed, nil
 }
 
 // masqChain holds the node masquerade policy.

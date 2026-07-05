@@ -342,6 +342,19 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } internal SEC(".maps");
 
+// masq_srcs holds the source CIDRs (the cluster pod supernet) whose
+// off-cluster egress the datapath masquerades to the node address at the
+// uplink (#10 — the eBPF replacement for the iptables MASQUERADE rule).
+// Empty unless the agent runs --masquerade=bpf.
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__type(key, struct lpm_key);
+	__type(value, __u8);
+	__uint(max_entries, 16);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} masq_srcs SEC(".maps");
+
 // The bridge's own L4 connection table (no kernel conntrack). A north-south
 // connection is masqueraded to 169.254.1.1:gw_port; the pod's reply is reversed
 // by looking the gw_port back up. ct_fwd dedups retransmits to one gw_port.
@@ -391,6 +404,14 @@ struct {
 #define CFG_GENEVE_IFINDEX 0
 #define CFG_VNI            1
 #define CFG_UPLINK_IFINDEX 2
+#define CFG_NODE_IP        3 // v4, network order in the low 32 bits
+
+// bpf-masquerade port range for cluster-egress SNAT (#10): disjoint from the
+// host ephemeral range (32768+) so a reverse lookup can never capture the
+// node's own connections, and below the default NodePort range (30000+) so an
+// allocated port never collides with a kube-proxy NodePort.
+#define MASQ_PORT_BASE 16384
+#define MASQ_PORT_SPAN 13616
 
 // floating_reverse returns this when the packet is not a floating-IP reply, so
 // the caller falls through to the normal egress path.
@@ -449,6 +470,12 @@ static __always_inline int is_internal(struct addr128 addr)
 {
 	struct lpm_key key = { .prefixlen = LPM_FULL, .scope_net = 0, .addr = addr };
 	return bpf_map_lookup_elem(&internal, &key) != NULL;
+}
+
+static __always_inline int is_masq_src(struct addr128 addr)
+{
+	struct lpm_key key = { .prefixlen = LPM_FULL, .scope_net = 0, .addr = addr };
+	return bpf_map_lookup_elem(&masq_srcs, &key) != NULL;
 }
 
 static __always_inline struct bridge_ep *bridge_of(struct addr128 fabric)
@@ -832,8 +859,9 @@ static __always_inline void emb_rewrite(struct __sk_buff *skb, struct emb *e,
 // alloc_gw_port picks a free masquerade port for a new north-south connection:
 // the reverse-lookup key {proto, gw_port, net, vpc_ip, pod_port} must be unique,
 // so probe (bounded) with BPF_NOEXIST — the insert that wins owns the port.
-static __always_inline __u16 alloc_gw_port(__u8 proto, __u32 net, struct addr128 vpc_ip, __u16 pod_port,
-					   struct addr128 fabric_ip, struct addr128 client_ip, __u16 client_port)
+static __always_inline __u16 alloc_gw_port_in(__u8 proto, __u32 net, struct addr128 vpc_ip, __u16 pod_port,
+					      struct addr128 fabric_ip, struct addr128 client_ip, __u16 client_port,
+					      __u32 port_base, __u32 port_span)
 {
 	__u32 base = bpf_get_prandom_u32();
 	struct ct_rev_val rv = {
@@ -843,7 +871,7 @@ static __always_inline __u16 alloc_gw_port(__u8 proto, __u32 net, struct addr128
 	};
 #pragma unroll
 	for (int i = 0; i < 16; i++) {
-		__u16 p = bpf_htons(1024 + ((base + i) % 64000));
+		__u16 p = bpf_htons(port_base + ((base + i) % port_span));
 		struct ct_rev_key rk = {
 			.proto = proto,
 			.gw_port = p,
@@ -855,6 +883,12 @@ static __always_inline __u16 alloc_gw_port(__u8 proto, __u32 net, struct addr128
 			return p;
 	}
 	return 0;
+}
+
+static __always_inline __u16 alloc_gw_port(__u8 proto, __u32 net, struct addr128 vpc_ip, __u16 pod_port,
+					   struct addr128 fabric_ip, struct addr128 client_ip, __u16 client_port)
+{
+	return alloc_gw_port_in(proto, net, vpc_ip, pod_port, fabric_ip, client_ip, client_port, 1024, 64000);
 }
 
 // bridge_forward_icmp_err translates a network-emitted ICMP error (typically
@@ -1320,6 +1354,172 @@ static __always_inline int floating_egress_snat(struct __sk_buff *skb, struct ip
 	return bpf_redirect_neigh(uplink, NULL, 0, 0);
 }
 
+#define MASQ_MISS -1
+
+// masq_snat is the cluster-egress bpf masquerade (#10), run in from_pod at the
+// uplink-egress attachment only: a packet whose source is a (default-network)
+// pod address and whose destination is off-cluster gets its source rewritten
+// to the node IP and its port/id to an allocated masquerade port — the same
+// ct_fwd/ct_rev machinery as the north-south bridge, reused with net=0 and
+// inverted roles (vpc_ip:=remote, fabric_ip/client_ip:=pod). Ports come from
+// MASQ_PORT_BASE..+SPAN: disjoint from the host ephemeral range so reverse
+// lookups can't capture the node's own connections, and below the NodePort
+// range so an allocation never collides with one. v4-only, TCP/UDP/ICMP-echo —
+// the same practical envelope as the kernel MASQUERADE rule it replaces.
+static __always_inline int masq_snat(struct __sk_buff *skb, struct pkt *p)
+{
+	if (!is_masq_src(p->src) || is_internal(p->dst))
+		return MASQ_MISS;
+	__u32 node_ip = cfg(CFG_NODE_IP);
+	if (!node_ip)
+		return MASQ_MISS;
+
+	void *data = (void *)(long)skb->data, *end = (void *)(long)skb->data_end;
+	struct iphdr *ip = data + ETH_HLEN;
+	if ((void *)(ip + 1) > end || ip->ihl != 5)
+		return MASQ_MISS;
+	__u8 proto = ip->protocol;
+	__u32 osrc = ip->saddr;
+
+	if (proto == IPPROTO_ICMP) {
+		__u8 type;
+		__u16 id;
+		if (icmp_echo(skb, &type, &id) < 0 || type != ICMP_ECHO_REQUEST)
+			return MASQ_MISS;
+		struct ct_fwd_key fk = {
+			.proto = proto, .net = 0,
+			.client_ip = p->src, .fabric_ip = p->dst,
+			.client_port = id,
+		};
+		__u16 gw_id;
+		__u16 *have = bpf_map_lookup_elem(&ct_fwd, &fk);
+		if (have) {
+			gw_id = *have;
+		} else {
+			gw_id = alloc_gw_port_in(proto, 0, p->dst, 0, p->src, p->src, id,
+						 MASQ_PORT_BASE, MASQ_PORT_SPAN);
+			if (!gw_id)
+				return MASQ_MISS; // table full: better unmasqueraded than dropped
+			bpf_map_update_elem(&ct_fwd, &fk, &gw_id, BPF_ANY);
+		}
+		nat_addr(skb, proto, IP_SADDR_OFF, osrc, node_ip);
+		nat_icmp_id(skb, id, gw_id);
+		return TC_ACT_OK;
+	}
+	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
+		return MASQ_MISS;
+	__u16 sport, dport;
+	if (l4_ports(skb, &sport, &dport) < 0)
+		return MASQ_MISS;
+	struct ct_fwd_key fk = {
+		.proto = proto, .net = 0,
+		.client_ip = p->src, .fabric_ip = p->dst,
+		.client_port = sport, .pod_port = dport,
+	};
+	__u16 gw_port;
+	__u16 *have = bpf_map_lookup_elem(&ct_fwd, &fk);
+	if (have) {
+		gw_port = *have;
+	} else {
+		gw_port = alloc_gw_port_in(proto, 0, p->dst, dport, p->src, p->src, sport,
+					   MASQ_PORT_BASE, MASQ_PORT_SPAN);
+		if (!gw_port)
+			return MASQ_MISS;
+		bpf_map_update_elem(&ct_fwd, &fk, &gw_port, BPF_ANY);
+	}
+	nat_addr(skb, proto, IP_SADDR_OFF, osrc, node_ip);
+	nat_port(skb, proto, L4_SPORT_OFF, sport, gw_port);
+	return TC_ACT_OK;
+}
+
+// masq_reverse un-SNATs a reply to a bpf-masqueraded connection, run in
+// from_uplink at the uplink ingress — BEFORE netfilter, so the kernel's
+// conntrack (which watched the original pod-sourced flow leave through
+// FORWARD) sees a reply that matches ESTABLISHED; no INVALID drop can fire.
+// Only packets to the node IP whose port/id sits in the masquerade range and
+// hits ct_rev are touched, so the node's own traffic (host ephemeral ports
+// and NodePorts are outside the range) passes untouched. Inbound ICMP errors
+// about masqueraded flows (frag-needed: the pod's PMTU signal) are translated
+// with the same embedded-header rewrite as the bridge.
+static __always_inline int masq_reverse(struct __sk_buff *skb, struct pkt *p)
+{
+	__u32 node_ip = cfg(CFG_NODE_IP);
+	if (!node_ip || v4_of_128(&p->dst) != node_ip)
+		return MASQ_MISS;
+
+	void *data = (void *)(long)skb->data, *end = (void *)(long)skb->data_end;
+	struct iphdr *ip = data + ETH_HLEN;
+	if ((void *)(ip + 1) > end || ip->ihl != 5)
+		return MASQ_MISS;
+	__u8 proto = ip->protocol;
+	__u32 odst = ip->daddr;
+
+	if (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
+		__u16 sport, dport;
+		if (l4_ports(skb, &sport, &dport) < 0)
+			return MASQ_MISS;
+		__u16 h = bpf_ntohs(dport);
+		if (h < MASQ_PORT_BASE || h >= MASQ_PORT_BASE + MASQ_PORT_SPAN)
+			return MASQ_MISS;
+		struct ct_rev_key rk = {
+			.proto = proto, .gw_port = dport, .net = 0,
+			.vpc_ip = p->src, .pod_port = sport,
+		};
+		struct ct_rev_val *rv = bpf_map_lookup_elem(&ct_rev, &rk);
+		if (!rv)
+			return MASQ_MISS;
+		nat_addr(skb, proto, IP_DADDR_OFF, odst, v4_of_128(&rv->fabric_ip));
+		nat_port(skb, proto, L4_DPORT_OFF, dport, rv->client_port);
+		return TC_ACT_OK; // the kernel routes to the pod (host /32 route)
+	}
+	if (proto != IPPROTO_ICMP)
+		return MASQ_MISS;
+	__u8 type;
+	__u16 id;
+	if (icmp_echo(skb, &type, &id) < 0)
+		return MASQ_MISS;
+	if (type == ICMP_ECHO_REPLY) {
+		__u16 h = bpf_ntohs(id);
+		if (h < MASQ_PORT_BASE || h >= MASQ_PORT_BASE + MASQ_PORT_SPAN)
+			return MASQ_MISS;
+		struct ct_rev_key rk = {
+			.proto = proto, .gw_port = id, .net = 0,
+			.vpc_ip = p->src,
+		};
+		struct ct_rev_val *rv = bpf_map_lookup_elem(&ct_rev, &rk);
+		if (!rv)
+			return MASQ_MISS;
+		nat_addr(skb, proto, IP_DADDR_OFF, odst, v4_of_128(&rv->fabric_ip));
+		nat_icmp_id(skb, id, rv->client_port);
+		return TC_ACT_OK;
+	}
+	if (!icmp_v4_err(type))
+		return MASQ_MISS;
+	struct emb e;
+	if (emb_load(skb, &e) < 0)
+		return MASQ_MISS;
+	if (e.proto != IPPROTO_TCP && e.proto != IPPROTO_UDP)
+		return MASQ_MISS;
+	if (e.saddr != odst)
+		return MASQ_MISS; // embedded source must be the node (the SNAT'd packet)
+	__u16 h = bpf_ntohs(e.sport);
+	if (h < MASQ_PORT_BASE || h >= MASQ_PORT_BASE + MASQ_PORT_SPAN)
+		return MASQ_MISS;
+	struct addr128 remote128;
+	v4_to_128(&remote128, e.daddr);
+	struct ct_rev_key rk = {
+		.proto = e.proto, .gw_port = e.sport, .net = 0,
+		.vpc_ip = remote128, .pod_port = e.dport,
+	};
+	struct ct_rev_val *rv = bpf_map_lookup_elem(&ct_rev, &rk);
+	if (!rv)
+		return MASQ_MISS;
+	__u32 pod = v4_of_128(&rv->fabric_ip);
+	nat_addr(skb, IPPROTO_ICMP, IP_DADDR_OFF, odst, pod);
+	emb_rewrite(skb, &e, pod, e.daddr, EMB_SPORT_OFF, e.sport, rv->client_port);
+	return TC_ACT_OK; // conntrack sees it RELATED to the pod's flow
+}
+
 // cozyplane_from_pod: source-side hook (pod egress). Enforces isolation, then
 // delivers: same-node via redirect, cross-node via encap, off-VPC via gateway.
 SEC("tc")
@@ -1335,6 +1535,16 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	if (sp) {
 		srcnet = PORT_NET(*sp);
 		is_gw = *sp & PORT_F_GATEWAY;
+	}
+
+	// At the uplink-egress attachment only: bpf cluster-egress masquerade
+	// (#10). A kernel-forwarded pod packet leaving the cluster gets SNAT'd
+	// here instead of by an iptables MASQUERADE rule. Everything else (node
+	// traffic, geneve encap, floated egress with its public source) misses.
+	if (!p.is_v6 && ifindex == cfg(CFG_UPLINK_IFINDEX)) {
+		int m = masq_snat(skb, &p);
+		if (m != MASQ_MISS)
+			return m;
 	}
 
 	// A v6 VPC pod's reply to fe80::1 is the return half of the v6 fabric bridge:
@@ -1623,6 +1833,16 @@ int cozyplane_from_uplink(struct __sk_buff *skb)
 	struct iphdr *ip;
 	if (parse_ipv4(skb, &ip) < 0)
 		return TC_ACT_OK;
+
+	// Un-SNAT replies to bpf-masqueraded cluster egress (#10) before netfilter
+	// sees them: the kernel's conntrack watched the pod-sourced flow leave, so
+	// the restored reply matches ESTABLISHED and routes to the pod normally.
+	struct pkt mp;
+	if (parse_ip(skb, &mp) == 0 && !mp.is_v6) {
+		int m = masq_reverse(skb, &mp);
+		if (m != MASQ_MISS)
+			return m;
+	}
 
 	struct addr128 d128;
 	v4_to_128(&d128, ip->daddr);

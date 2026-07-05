@@ -28,16 +28,18 @@ change is — resolve that first, in writing.
    four hooks (`from_pod`/`to_pod`/`from_overlay`/`from_uplink`) with the datapath's
    own connection table — no kernel conntrack on the fast path. If you need new
    forwarding behaviour, add/extend an eBPF hook.
-   *The only* iptables in the tree is `firewall.go`, and it is an **interim**
-   compromise, not an endorsement: a coarse `FORWARD ... ACCEPT` (so an
-   iptables-mode kube-proxy's `ctstate INVALID` drop doesn't eat decapsulated
-   overlay replies, which bypass conntrack) plus the flannel-style cluster-egress
-   masquerade for default-network pods. Both are node-boundary plumbing, not tenant
-   datapath — **don't grow them into packet logic**, and don't add new netfilter
-   rules. Note the real cost: these calls are **fatal to agent startup**, so
-   cozyplane currently hard-requires netfilter on every node. Removing that
-   dependency (egress SNAT in eBPF; conditional FORWARD ACCEPT) is tracked in
-   [#10](../../issues/10). (internals.md § "Trick 2", "eBPF NAT", "node masquerade")
+   *The only* netfilter in the tree is `firewall.go`, and it is conditional
+   (#10): the `FORWARD ... ACCEPT` pair installs per family **only when that
+   family's `KUBE-FORWARD` chain exists** (it counters kube-proxy's `ctstate
+   INVALID` drop, which is the only reason it exists — and it cannot be designed
+   away under an iptables kube-proxy, because ClusterIP replies must traverse the
+   client node's conntrack to reverse the service DNAT); the cluster-egress
+   masquerade defaults to **`--masquerade=bpf`** (eBPF SNAT at the uplink hooks,
+   ct-tracked in the bridge's tables, masquerade ports 16384–29999, disjoint
+   from host-ephemeral and NodePort ranges), with `iptables` as the legacy mode.
+   Net rule: **cozyplane touches netfilter only if the cluster's kube-proxy
+   does** — don't add new netfilter rules; new NAT/forwarding behaviour goes in
+   the eBPF hooks. (internals.md § "Trick 2", "eBPF NAT", "node masquerade")
 
 2. **Addresses are 128-bit everywhere; a v4 address is stored in RFC 6052 NAT64
    form `64:ff9b::a.b.c.d`, never `::ffff:a.b.c.d`.** One map set, not parallel

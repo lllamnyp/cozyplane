@@ -193,11 +193,16 @@ ACCEPT, the v6 north-south *reply* toward a default-network pod (the one leg
 `from_overlay` hands to the kernel) was dropped exactly when client and server
 sat on different nodes.
 
-**This is an interim measure.** It is only needed against an iptables-mode
-kube-proxy, yet the call is fatal to agent startup, so it currently makes
-cozyplane hard-require netfilter even where nothing would drop the traffic.
-Making it conditional (and moving the node masquerade below to eBPF) so a
-netfilter-less node can run cozyplane is tracked in [#10](../../issues/10).
+**The rule is conditional (#10):** the agent installs it per family only when
+that family's `KUBE-FORWARD` chain exists — i.e. exactly when an iptables-mode
+kube-proxy is present, which is also the only world where the drop exists. On a
+kube-proxy-replacement node nothing is installed, and netfilter being
+unreachable is a warning, not a startup failure. The rule cannot be *designed
+away* while coexisting with an iptables kube-proxy: ClusterIP replies must
+traverse the client node's conntrack to reverse the service DNAT, so
+`from_overlay` deliberately hands default-network traffic to the kernel instead
+of redirecting past netfilter. (Coexistence is today's deployment reality, not
+an architectural commitment — cozyplane may eventually own Services.)
 
 ### Packet walks
 
@@ -591,15 +596,36 @@ one informer factory):
   each agent programs its own view). The VNI is parsed from the Port name
   (`v<vni>.…`, the documented naming contract).
 
-With `--cluster-cidr` set the agent also installs the classic node masquerade
-(`-s <clusterCIDR> ! -d <clusterCIDR> -j MASQUERADE`): pod CIDRs aren't
-routable outside the cluster, so without it no pod — including a gateway
-forwarding tenant traffic — has an internet return path. This is the one place
-cozyplane delegates *NAT* to the kernel instead of the eBPF datapath, and it is
-**interim**: it's node-boundary SNAT, not tenant policy, and the call is fatal to
-agent startup (hard-requiring netfilter). Moving it into eBPF — or gating it off
-when a kube-proxy-replacement already masquerades cluster egress — is tracked in
-[#10](../../issues/10).
+With `--cluster-cidr` set the agent provides the cluster-egress masquerade:
+pod CIDRs aren't routable outside the cluster, so without it no default-network
+pod — including a gateway forwarding tenant traffic — has an internet return
+path. `--masquerade` selects the implementation ([#10](../../issues/10)):
+
+- **`bpf` (default)** — SNAT in the eBPF datapath, no netfilter. `from_pod` at
+  the **uplink egress** (already attached there) rewrites a packet whose source
+  is in the `masq_srcs` LPM (the pod CIDRs) and whose destination is not
+  internal: source → the node IP (`params[CFG_NODE_IP]`), source port → a
+  masquerade port from the same `ct_fwd`/`ct_rev` machinery as the north-south
+  bridge, reused with `net=0` and inverted roles (`vpc_ip`:=remote address,
+  `fabric_ip`/`client_ip`:=pod address) so the map ABI is unchanged. Masquerade
+  ports come from **16384–32767** — disjoint from the host's ephemeral range
+  (32768+), so a reverse lookup can never capture the node's own connections.
+  `from_uplink` at the **uplink ingress** un-SNATs matching replies *before*
+  netfilter ever sees them, then hands off to the kernel: its conntrack saw the
+  original pod-sourced flow leave through FORWARD, so the un-SNAT'd reply
+  matches ESTABLISHED and no INVALID drop can fire even under kube-proxy. ICMP
+  echo masquerades by identifier, and inbound ICMP *errors* (frag-needed — the
+  pod's PMTU signal for its own egress) are translated with the same
+  embedded-header rewrite the bridge uses. v4-only, like the kernel rule it
+  replaces; TCP/UDP/ICMP (other protocols don't egress — same practical
+  envelope as before).
+- **`iptables`** — the classic `-s <clusterCIDR> ! -d <clusterCIDR> -j
+  MASQUERADE` kernel rule (with RETURNs for cozyplane-owned egress interfaces),
+  for clusters that prefer netfilter to own NAT.
+- **`off`** — the environment masquerades elsewhere.
+
+Net effect of the pair: **cozyplane touches netfilter only if the cluster's
+kube-proxy does.**
 
 ### Map-ABI upgrades — pinned-map reconcile & local-state rebuild
 

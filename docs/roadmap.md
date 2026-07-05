@@ -32,10 +32,10 @@ they're discovered rather than leaving them only in issues.
 - [x] Per-pod dual-address bridge (fabric IP ↔ VPC IP), unique fabric IP per pod
 - [x] Overlapping VPC CIDRs: net-scoped (VNI-keyed) delivery, no collision
 - [x] eBPF bridge NAT for cozyplane north-south (VPC gateways, floating IPs) — no iptables, no fwmark, no policy routing
-- [x] Node masquerade that excludes cozyplane egress interfaces *(interim: via netfilter — see below)*
+- [x] Cluster-egress masquerade: eBPF by default (`iptables`/`off` modes available)
 - [x] North-south ICMP through the bridge: echo, and IPv4 ICMP *errors* with embedded-header NAT — port-unreachable/traceroute outward, frag-needed (PMTU) inward, fabric + floating (e2e: UDP traceroute end-to-end) — [#3](../../issues/3)
 - [ ] Per-VPC traffic counters in the datapath hooks (metering/billing foundation) — [#2](../../issues/2)
-- [ ] Remove the netfilter/iptables dependency: move cluster-egress SNAT to eBPF, make the FORWARD ACCEPT conditional (today `firewall.go` hard-requires netfilter, fatal to agent startup) — [#10](../../issues/10)
+- [x] Netfilter made conditional (#10): cluster-egress masquerade moved to eBPF (`--masquerade=bpf` default; ct-tracked SNAT at the uplink incl. ICMP echo + errors, e2e-proved with the kernel rule absent), and the FORWARD ACCEPT installs only where kube-proxy's `KUBE-FORWARD` exists — **cozyplane touches netfilter only if the cluster's kube-proxy does**. It cannot be removed entirely under an iptables kube-proxy: ClusterIP replies must traverse the client node's conntrack — [#10](../../issues/10)
 
 ## 3. VPC features — peering, egress, floating IPs
 
@@ -108,4 +108,4 @@ they're discovered rather than leaving them only in issues.
 | [#7](../../issues/7) | Agent: recreate incompatible pinned eBPF maps on load | Deployment |
 | [#8](../../issues/8) | IPv6 guests don't autoconfigure (no RA / DHCPv6) | IPv6 |
 | [#9](../../issues/9) | North-south to a v6 VPC IP when the fabric IP is v4 | IPv6 |
-| [#10](../../issues/10) | Remove the netfilter/iptables dependency (`firewall.go`) | Datapath / deployment |
+| [#10](../../issues/10) | Netfilter dependency (closed: conditional; eBPF masquerade default) | Datapath / deployment |

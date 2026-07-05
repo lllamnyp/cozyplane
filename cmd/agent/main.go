@@ -75,6 +75,7 @@ func main() {
 		genevePort    uint
 		clusterCIDR   string
 		internalCIDRs string
+		masqMode      string
 	)
 	flag.IntVar(&mtu, "mtu", 1450, "pod MTU (underlay MTU minus Geneve overhead)")
 	flag.UintVar(&vni, "vni", uint(datapath.DefaultVNI), "VNI for the default network")
@@ -84,6 +85,8 @@ func main() {
 		"Geneve UDP destination port (use a non-default port to coexist with another overlay on 6081)")
 	flag.StringVar(&clusterCIDR, "cluster-cidr", "",
 		"cluster pod supernet; when set, pod traffic leaving it is masqueraded to the node address (pod egress to the outside)")
+	flag.StringVar(&masqMode, "masquerade", "bpf",
+		"cluster-egress masquerade implementation: bpf (eBPF SNAT at the uplink, no netfilter), iptables (kernel MASQUERADE rule), off (the environment masquerades elsewhere)")
 	flag.StringVar(&internalCIDRs, "internal-cidrs", "",
 		"comma-separated cluster-internal CIDRs (pod, service, node networks) a floating pod's public-IP egress must not reach")
 	flag.Parse()
@@ -95,13 +98,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(nodeName, mtu, uint32(vni), cniConfName, uint16(genevePort), clusterCIDR, internalCIDRs, log); err != nil {
+	if err := run(nodeName, mtu, uint32(vni), cniConfName, uint16(genevePort), clusterCIDR, internalCIDRs, masqMode, log); err != nil {
 		log.Error("agent failed", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort uint16, clusterCIDR, internalCIDRs string, log *slog.Logger) error {
+func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort uint16, clusterCIDR, internalCIDRs, masqMode string, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -131,12 +134,30 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	if err := mgr.AttachOverlay(); err != nil {
 		return fmt.Errorf("attach overlay hook: %w", err)
 	}
-	if err := datapath.EnsureForwardRules(); err != nil {
+	// Overlay FORWARD ACCEPTs: installed per family only where kube-proxy's
+	// KUBE-FORWARD chain (whose INVALID drop they counter) exists (#10).
+	if fams, err := datapath.EnsureForwardRules(); err != nil {
 		return fmt.Errorf("ensure forward rules: %w", err)
+	} else if len(fams) > 0 {
+		log.Info("installed overlay FORWARD ACCEPTs (kube-proxy present)", "families", fams)
 	}
-	if clusterCIDR != "" {
+	// Cluster-egress masquerade (#10): bpf (the default) programs it into the
+	// datapath below once the node IP is known; iptables installs the classic
+	// kernel rule; each mode tears the other's state down so a switch never
+	// double-NATs.
+	if clusterCIDR != "" && masqMode == "iptables" {
 		if err := datapath.EnsureMasquerade(clusterCIDR); err != nil {
 			return fmt.Errorf("ensure masquerade: %w", err)
+		}
+	} else if clusterCIDR != "" {
+		datapath.RemoveMasquerade(clusterCIDR)
+	}
+	if masqMode != "bpf" {
+		if err := mgr.SetNodeIP(nil); err != nil {
+			log.Warn("clear bpf masquerade", "err", err)
+		}
+		if err := mgr.SyncMasqSources(nil); err != nil {
+			log.Warn("clear bpf masquerade sources", "err", err)
 		}
 	}
 	uplink, err := mgr.AttachUplink()
@@ -214,6 +235,15 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	}
 	if err := datapath.WritePluginKubeconfig(); err != nil {
 		log.Warn("write plugin kubeconfig (VPC attachment unavailable)", "err", err)
+	}
+	if masqMode == "bpf" && clusterCIDR != "" {
+		if err := mgr.SyncMasqSources(splitCIDRs(clusterCIDR)); err != nil {
+			return fmt.Errorf("program masquerade sources: %w", err)
+		}
+		if err := mgr.SetNodeIP(net.ParseIP(state.NodeIP)); err != nil {
+			return fmt.Errorf("program masquerade node IP: %w", err)
+		}
+		log.Info("bpf cluster-egress masquerade enabled", "sources", clusterCIDR, "nodeIP", state.NodeIP)
 	}
 	log.Info("published node state", "nodeIP", state.NodeIP, "podCIDR", podCIDR, "mtu", mtu)
 
