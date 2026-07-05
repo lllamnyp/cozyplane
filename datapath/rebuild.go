@@ -354,15 +354,22 @@ func cozyVethByIndex(ifindex int) netlink.Link {
 	return l
 }
 
-// aliasVouches reports whether ifindex is a cozyplane veth whose alias record
-// covers (net, addr).
+// aliasVouches reports whether the entry pointing at ifindex should be kept:
+// the veth must exist, and when it carries a valid alias record the record
+// must cover (net, addr). A live veth WITHOUT a valid alias is kept — it was
+// created by a pre-alias CNI release, and its map entries are trustworthy,
+// just not re-derivable. (Pruning those on the first post-alias agent start
+// broke every pre-existing pod's delivery — caught live on the dev cluster.)
 func aliasVouches(ifindex int, net_ uint32, addr overlayAddr128) bool {
 	l := cozyVethByIndex(ifindex)
 	if l == nil {
-		return false
+		return false // veth gone: the entry is stale
 	}
 	rawNet, ips, _, ok := parseVethAlias(l.Attrs().Alias)
-	if !ok || PortNet(rawNet) != net_ {
+	if !ok {
+		return true // pre-alias veth: benefit of the doubt
+	}
+	if PortNet(rawNet) != net_ {
 		return false
 	}
 	for _, ip := range ips {
