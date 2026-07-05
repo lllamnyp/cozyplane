@@ -144,6 +144,9 @@ func main() {
 	if err := (&sdncontroller.PortGCReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		// Claimant-gone checks confirm against the API server directly — a
+		// stale cache read must not GC a just-created pod's newborn Port.
+		Reader: mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PortGC")
 		os.Exit(1)

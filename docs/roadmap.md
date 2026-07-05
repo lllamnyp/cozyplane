@@ -81,7 +81,7 @@ they're discovered rather than leaving them only in issues.
 - [x] Cozystack chart integration (aggregated-apiserver mode, operator etcd, RBAC/CRDs)
 - [x] Image digest-pinning in the chart
 - [x] Agent recreates incompatible pinned eBPF maps on load and rebuilds pod state from veth alias records — a map-ABI upgrade is a rolling DaemonSet update, no node reboots (e2e-covered) — [#7](../../issues/7)
-- [ ] Gateway `.1` Port reuse: a replacement gateway pod can't rebind the fixed `.1` Port after an unclean death
+- [x] Gateway `.1` Port reuse after an unclean death: the controller GCs live Ports whose claimant pod is gone (VM persistent Ports exempt), so the replacement's ADD retry claims the freed `.1` (e2e-covered)
 - [ ] Release image index digest is non-deterministic (defeats chart digest-pinning) — [#4](../../issues/4)
 
 ## 7. CI & testing

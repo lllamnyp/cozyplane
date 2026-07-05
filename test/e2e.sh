@@ -219,6 +219,39 @@ $K -n kube-system wait --for=condition=Ready pod -l app=cozyplane-gateway --time
 check "a1(vpc-a, egress on) -> internet 1.1.1.1" "" bash -c "$K -n team-a exec a1 -- ping -c2 -W3 1.1.1.1 >/dev/null 2>&1 && echo"
 check_fail "bw1(vpc-b, no egress) -> internet 1.1.1.1" bash -c "$K -n team-b exec bw1 -- ping -c1 -W2 1.1.1.1 >/dev/null 2>&1"
 
+echo "[stale gateway .1 claim: abandoned-port GC unwedges the replacement]"
+# A gateway pod that dies uncleanly (node reboot) never runs CNI DEL, so its
+# fixed .1 Port survives with a claimant that no longer exists; the replacement
+# then loops on AlreadyExists forever. Fabricate exactly that: a stale .1 Port
+# for vpc-c whose claimant pod is gone, then enable vpc-c's egress. The
+# controller's abandoned-port GC must free the claim (through the sever
+# finalizer) and the gateway must still come up and route.
+CVNI=$($K -n team-a get vpc vpc-c -o jsonpath='{.status.vni}')
+$K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: Port
+metadata:
+  name: v${CVNI}.10-1-0-1
+  finalizers: [sdn.cozystack.io/sever]
+  labels:
+    sdn.cozystack.io/vpc-namespace: team-a
+    sdn.cozystack.io/vpc: vpc-c
+    sdn.cozystack.io/pod-namespace: kube-system
+    sdn.cozystack.io/pod-name: cozyplane-gateway-dead-beef
+    sdn.cozystack.io/pod-uid: 00000000-dead-beef-0000-000000000000
+spec:
+  vpcRef: {namespace: team-a, name: vpc-c}
+  ip: 10.1.0.1
+  node: ${W}
+  podNamespace: kube-system
+  podName: cozyplane-gateway-dead-beef
+  gateway: true
+EOF
+$K -n team-a patch vpc vpc-c --type=merge -p '{"spec":{"egress":{"natGateway":true}}}' >/dev/null
+check_ok "vpc-c gateway Ready despite the stale .1 claim (GC freed it)" \
+  $K -n kube-system wait --for=condition=Ready pod -l "app=cozyplane-gateway,sdn.cozystack.io/vpc=vpc-c" --timeout=120s
+check "c1(vpc-c, egress on) -> internet 1.1.1.1" "" bash -c "$K -n team-a exec c1 -- ping -c2 -W3 1.1.1.1 >/dev/null 2>&1 && echo"
+
 echo "[floating IP: external ingress, source-preserving]"
 # Bind a public IP to a1's VPC IP; an off-cluster client (a container on the
 # kind L2, off the overlay) must reach a1 through it. Exercises from_uplink ->

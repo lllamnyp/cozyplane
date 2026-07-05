@@ -666,9 +666,26 @@ the peer's VNI, and reverts to `Pending` when either input goes away. It watches
 VPCPeerings (each half re-enqueues its reciprocal) and VPCs (each VPC re-enqueues
 the halves referencing it). No finalizer — deleting a half has nothing to reap.
 
-`PortGCReconciler` releases the sever finalizer from terminating Ports whose
-node no longer exists — the agent that would acknowledge is never coming back,
-and the workload died with its node.
+`PortGCReconciler` handles the two abandoned-Port cases the normal lifecycle
+misses:
+
+- it releases the sever finalizer from *terminating* Ports whose node no longer
+  exists — the agent that would acknowledge is never coming back, and the
+  workload died with its node;
+- it **deletes live Ports whose claimant pod is gone** (the pod recorded in the
+  Port's pod labels no longer exists, or its UID differs — the name was reused
+  by a new pod). A pod that dies uncleanly (node reboot, forced eviction) never
+  runs CNI DEL, so its Port leaks; for an ordinary pod that leaks an address,
+  but for a **gateway pod it wedges the replacement forever** — the fixed `.1`
+  claim fails `AlreadyExists` and the pod stays ContainerCreating. GC frees the
+  name; the kubelet's next ADD retry claims it fresh. VM persistent Ports
+  (`vm-name` label) are exempt — the PersistentPortReconciler owns their
+  lifecycle, and a launcher pod's absence there must *not* release the pinned
+  IP+MAC. Deletion still passes through the sever finalizer, so the owning node
+  drains first (or PortGC's node-gone path releases it). Before deleting, the
+  claimant's absence is confirmed against the API server directly — the
+  informer cache could lag a *just-created* pod and GC would otherwise kill a
+  newborn Port.
 
 `GatewayReconciler` realizes `VPC.spec.egress.natGateway` as a per-VPC gateway
 Deployment (`cozyplane-gateway-<vni>`) in the system namespace: a privileged
