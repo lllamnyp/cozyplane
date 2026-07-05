@@ -61,7 +61,7 @@ they're discovered rather than leaving them only in issues.
 - [ ] North-south to a v6 VPC IP when the fabric IP is v4 (cross-family) — [#9](../../issues/9)
 - [x] ICMPv6 errors through the v6 bridge: packet-too-big (v6 PMTU — vital, v6 never fragments in flight), dest-unreach, time-exceeded, with embedded-header NAT (e2e: UDP traceroute6 end-to-end)
 - [x] v6 floating IPs: NDP responder (solicited+override NA from `from_uplink`), stateless v6 DNAT/SNAT halves incl. ICMPv6 error rewrites (e2e: external NDP-resolved HTTP/ping6/EIP-egress/traceroute6)
-- [ ] v6 gateway egress (v6 masquerade + a v6 upstream) — `internals.md`
+- [ ] v6 gateway egress — bigger than first scoped: `addGatewayLeg` is v4-only (v4 mask on the `.1`, v4 link-local next hop), the gateway netns needs ip6tables twins (its own netns — out of scope of the netfilter rule), and the from_pod off-net→gateway handoff needs v6 validation; kind can test against an on-link external v6 container — `internals.md`
 - [ ] Cross-family VPC peering (v4 ↔ v6 via a NAT64 translator; the `64:ff9b::` map layout accommodates it) — `internals.md`
 
 ## 5. Live migration (KubeVirt)
