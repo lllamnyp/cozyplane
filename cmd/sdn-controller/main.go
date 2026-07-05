@@ -117,6 +117,9 @@ func main() {
 	if err := (&sdncontroller.VPCReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		// VNI allocation must read live, never the lagging informer cache —
+		// a stale read hands two VPCs the same network id (isolation break).
+		Reader: mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "VPC")
 		os.Exit(1)

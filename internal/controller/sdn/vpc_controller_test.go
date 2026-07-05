@@ -17,6 +17,8 @@ limitations under the License.
 package sdn
 
 import (
+	"time"
+
 	"context"
 	"testing"
 
@@ -138,5 +140,100 @@ func TestVPCReconcileAssignsVNIAndReady(t *testing.T) {
 	}
 	if got.Status.Phase != sdnv1alpha1.VPCPhaseReady {
 		t.Errorf("phase = %q, want %q", got.Status.Phase, sdnv1alpha1.VPCPhaseReady)
+	}
+}
+
+// A duplicate VNI (two VPCs sharing a network id) is a cross-tenant isolation
+// break — it could arise before allocation read the API server live (the
+// informer cache lagged the reconciler's own status writes). Repair is
+// deterministic: the younger claim (creationTimestamp, then namespace/name)
+// yields and reallocates; the older keeps its id. Reconciling the winner is a
+// no-op, so the pair converges without fighting.
+func TestVPCDuplicateVNIRepair(t *testing.T) {
+	scheme := testScheme(t)
+	older := &sdnv1alpha1.VPC{
+		ObjectMeta: metav1.ObjectMeta{Name: "older", Namespace: "team-b",
+			CreationTimestamp: metav1.Date(2026, 7, 5, 6, 38, 24, 0, time.UTC)},
+		Spec:   sdnv1alpha1.VPCSpec{CIDRs: []string{"10.0.0.0/24"}},
+		Status: sdnv1alpha1.VPCStatus{VNI: 101, Phase: sdnv1alpha1.VPCPhaseReady},
+	}
+	younger := &sdnv1alpha1.VPC{
+		ObjectMeta: metav1.ObjectMeta{Name: "younger", Namespace: "team-a",
+			CreationTimestamp: metav1.Date(2026, 7, 5, 6, 38, 25, 0, time.UTC)},
+		Spec:   sdnv1alpha1.VPCSpec{CIDRs: []string{"10.1.0.0/24"}},
+		Status: sdnv1alpha1.VPCStatus{VNI: 101, Phase: sdnv1alpha1.VPCPhaseReady},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(older, younger).
+		WithStatusSubresource(&sdnv1alpha1.VPC{}).Build()
+	r := &VPCReconciler{Client: c, Scheme: scheme}
+	ctx := context.Background()
+
+	// The younger duplicate yields and reallocates.
+	ykey := types.NamespacedName{Namespace: "team-a", Name: "younger"}
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: ykey}); err != nil {
+		t.Fatalf("reconcile younger: %v", err)
+	}
+	got := &sdnv1alpha1.VPC{}
+	if err := c.Get(ctx, ykey, got); err != nil {
+		t.Fatalf("get younger: %v", err)
+	}
+	if got.Status.VNI == 101 || got.Status.VNI == 0 {
+		t.Errorf("younger duplicate should have reallocated, got vni=%d", got.Status.VNI)
+	}
+
+	// The older (winning) claim keeps its VNI.
+	okey := types.NamespacedName{Namespace: "team-b", Name: "older"}
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: okey}); err != nil {
+		t.Fatalf("reconcile older: %v", err)
+	}
+	if err := c.Get(ctx, okey, got); err != nil {
+		t.Fatalf("get older: %v", err)
+	}
+	if got.Status.VNI != 101 {
+		t.Errorf("older claim must keep its VNI, got %d", got.Status.VNI)
+	}
+}
+
+// Equal creationTimestamps (1s granularity — the live incident had both VPCs
+// created the same second) fall back to namespace/name order; exactly one side
+// yields.
+func TestVPCDuplicateVNIRepairTimestampTie(t *testing.T) {
+	scheme := testScheme(t)
+	ts := metav1.Date(2026, 7, 5, 6, 38, 24, 0, time.UTC)
+	winner := &sdnv1alpha1.VPC{ // "team-a/aaa" < "team-b/bbb"
+		ObjectMeta: metav1.ObjectMeta{Name: "aaa", Namespace: "team-a", CreationTimestamp: ts},
+		Spec:       sdnv1alpha1.VPCSpec{CIDRs: []string{"10.0.0.0/24"}},
+		Status:     sdnv1alpha1.VPCStatus{VNI: 105, Phase: sdnv1alpha1.VPCPhaseReady},
+	}
+	loser := &sdnv1alpha1.VPC{
+		ObjectMeta: metav1.ObjectMeta{Name: "bbb", Namespace: "team-b", CreationTimestamp: ts},
+		Spec:       sdnv1alpha1.VPCSpec{CIDRs: []string{"10.1.0.0/24"}},
+		Status:     sdnv1alpha1.VPCStatus{VNI: 105, Phase: sdnv1alpha1.VPCPhaseReady},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(winner, loser).
+		WithStatusSubresource(&sdnv1alpha1.VPC{}).Build()
+	r := &VPCReconciler{Client: c, Scheme: scheme}
+	ctx := context.Background()
+
+	for _, k := range []types.NamespacedName{
+		{Namespace: "team-a", Name: "aaa"},
+		{Namespace: "team-b", Name: "bbb"},
+	} {
+		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: k}); err != nil {
+			t.Fatalf("reconcile %s: %v", k, err)
+		}
+	}
+	a, b := &sdnv1alpha1.VPC{}, &sdnv1alpha1.VPC{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "team-a", Name: "aaa"}, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "team-b", Name: "bbb"}, b); err != nil {
+		t.Fatal(err)
+	}
+	if a.Status.VNI != 105 {
+		t.Errorf("tiebreak winner must keep the VNI, got %d", a.Status.VNI)
+	}
+	if b.Status.VNI == 105 || b.Status.VNI == 0 {
+		t.Errorf("tiebreak loser must reallocate, got %d", b.Status.VNI)
 	}
 }
