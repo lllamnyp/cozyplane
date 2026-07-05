@@ -37,14 +37,23 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
 
+      # Digest-reproducible (#4): no provenance/SBOM attestation manifests (they
+      # embed run metadata and land in the index, changing its digest every
+      # run), and rewrite-timestamp + SOURCE_DATE_EPOCH pin layer mtimes and the
+      # image-config timestamps, so the same source tree always produces the
+      # same index digest. Labels from metadata-action are dropped for the same
+      # reason (they embed the run's revision/created timestamps).
       - id: build
         uses: docker/build-push-action@v6
+        env:
+          SOURCE_DATE_EPOCH: 0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: true
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,rewrite-timestamp=true,push=true
+          provenance: false
+          sbom: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
