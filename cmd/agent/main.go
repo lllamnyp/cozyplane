@@ -421,6 +421,28 @@ func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory,
 			}
 			return
 		}
+		// A persistent (VM) Port's locals entry follows spec.node — the
+		// staged-locals half of live migration: the target's entry appears
+		// only at cutover (programmed here from the veth's alias record),
+		// and the source's disappears at the same moment, so same-node
+		// delivery flips exactly when cross-node delivery does.
+		if port.Labels[sdnv1alpha1.LabelVMName] != "" && port.Spec.IP != "" {
+			if net_, ok := vniFromPortName(port.Name); ok {
+				if port.Spec.Node == selfName {
+					if programmed, err := datapath.EnsureLocalFromVeth(net_, net.ParseIP(port.Spec.IP)); err != nil {
+						log.Error("program persistent-port locals at cutover", "port", port.Name, "err", err)
+					} else if programmed {
+						log.Info("persistent port local delivery enabled (cutover)", "port", port.Name, "ip", port.Spec.IP)
+					}
+					// The route from when the VM lived elsewhere is stale now.
+					if err := mgr.DelRemote(net_, hostCIDR(port.Spec.IP)); err != nil {
+						log.Error("del stale remote for local persistent port", "port", port.Name, "err", err)
+					}
+				} else if err := datapath.DelLocal(net_, net.ParseIP(port.Spec.IP)); err != nil {
+					log.Error("del persistent-port locals (moved away)", "port", port.Name, "err", err)
+				}
+			}
+		}
 		if port.Spec.Node == selfName || port.Spec.IP == "" || port.Spec.NodeIP == "" {
 			return // local ports are reached directly; skip incomplete ones
 		}

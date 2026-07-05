@@ -115,6 +115,35 @@ func SetVethAlias(link netlink.Link, rawNet uint32, ips []net.IP, mac net.Hardwa
 	return nil
 }
 
+// EnsureLocalFromVeth programs the locals entry for (net, ip) from the local
+// veth whose alias record covers it — the cutover half of staged locals: a
+// migration-target CNI ADD defers its locals entry (the VM is still active
+// elsewhere), and the agent calls this when the persistent Port's node
+// becomes this node. Returns false when no such veth exists (the ADD hasn't
+// happened here yet — it will program locals itself, seeing spec.node==self).
+func EnsureLocalFromVeth(net_ uint32, ip net.IP) (bool, error) {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return false, fmt.Errorf("list links: %w", err)
+	}
+	for _, l := range links {
+		name := l.Attrs().Name
+		if !strings.HasPrefix(name, podVethPrefix) && !strings.HasPrefix(name, gwVethPrefix) {
+			continue
+		}
+		rawNet, ips, mac, ok := parseVethAlias(l.Attrs().Alias)
+		if !ok || PortNet(rawNet) != net_ {
+			continue
+		}
+		for _, aip := range ips {
+			if aip.Equal(ip) {
+				return true, SetLocal(net_, ip, l.Attrs().Index, mac)
+			}
+		}
+	}
+	return false, nil
+}
+
 // RebuildStats reports what a local-state rebuild did.
 type RebuildStats struct {
 	Rebuilt    int      // veths whose ports/locals/bridges entries were re-put

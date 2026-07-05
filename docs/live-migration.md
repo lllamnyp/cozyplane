@@ -69,12 +69,19 @@ agent's `remotes[{net,vpcIP}]` re-points to the target. The VPC IP/MAC never
 change, so the VM and its in-VPC peers see only a sub-second reroute — no
 gratuitous ARP (we own the forwarding tables).
 
-**Overlap caveat (v1):** between target-pod ADD and cutover, the target node also
-has `locals[{net,vpcIP}]`, so a pod *co-located on the target node* that dials the
-VM's IP in that window would be delivered to the not-yet-running target. This is
-rare (same-node co-tenant, sub-second) and is the one rough edge; a later refinement
-gates the target's `locals` on `kubevirt.io/nodeName` so local delivery, too, only
-switches at cutover. Cross-node and source-local traffic are always correct.
+**Staged locals (as built):** the target's `locals` entry is gated on the
+cutover, closing the overlap window v1 had. A migration-target ADD (the bound
+persistent Port's `spec.node` is another node) stages everything — interface,
+bridge, ports entry, alias record — but removes its own `locals` entry, so a
+client co-located with the target keeps delivering to the *active* location
+via `remotes`. At cutover the agent watching Ports sees `spec.node` become its
+node and programs `locals` from the veth's alias record (and drops the stale
+remote route); the source node's agent symmetrically removes its `locals`
+entry the moment `spec.node` leaves it — so same-node delivery flips exactly
+when cross-node delivery does, on both ends. One residue: the agent's
+local-state rebuild (an agent restart mid-migration) re-programs a staged
+target's locals from the alias for the remainder of that window — rare enough
+to accept and documented in `internals.md`.
 
 ## Lifecycle / GC
 
@@ -95,7 +102,7 @@ before the Port is really removed.
   system-view DNS re-point (`control-plane.md` §5) is **later** — name-based
   addressing isn't wired yet, so nothing depends on a stable fabric A record.
 - Not yet: the `/migrate` + `/bind` Port subresources (the controller reconciles
-  `spec.node` directly for now), staged-`locals` gating, v6 VM NICs.
+  `spec.node` directly for now).
 
 ## Test (dev4, real KubeVirt)
 

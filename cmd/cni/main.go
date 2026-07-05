@@ -414,6 +414,20 @@ func addVPC(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, p
 		return err
 	}
 
+	// Staged locals (live-migration overlap window): a migration target binds
+	// the persistent Port while the VM is still ACTIVE on another node. Local
+	// delivery must keep following the active location until cutover —
+	// otherwise a client co-located with the target would be delivered into
+	// the not-yet-running VM. Everything else is staged now (iface, bridge,
+	// alias, ports); the agent programs locals from the veth's alias record
+	// the moment the cutover re-points spec.node here, and removes the
+	// source side's entry symmetrically.
+	if bound && port.Spec.Node != "" && port.Spec.Node != state.NodeName {
+		if err = datapath.DelLocal(uint32(vpc.Status.VNI), vpcIP); err != nil {
+			return err
+		}
+	}
+
 	// Report the fabric IP as status.podIP (host mask for its family).
 	result.IPs = []*current.IPConfig{{
 		Interface: current.Int(0),
