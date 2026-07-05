@@ -36,6 +36,8 @@ import (
 type Manager struct {
 	objs          overlayObjects
 	geneveIfindex int
+	uplinkIfindex int
+	uplinkMAC     net.HardwareAddr
 	recreatedPins []string
 }
 
@@ -168,6 +170,8 @@ func (m *Manager) AttachUplinkIngress() (string, error) {
 	if err := m.setUplinkMAC(link.Attrs().HardwareAddr); err != nil {
 		return "", err
 	}
+	m.uplinkIfindex = idx
+	m.uplinkMAC = link.Attrs().HardwareAddr
 	return name, nil
 }
 

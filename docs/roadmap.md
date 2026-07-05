@@ -22,7 +22,7 @@ they're discovered rather than leaving them only in issues.
 - [x] Default-deny VPC attachment: a `VPCBinding` authorizes use, the VPC's namespace is ownership
 - [ ] `/migrate` + `/bind` Port subresources (the controller reconciles `spec.node` directly for now) — `live-migration.md`
 - [ ] Observability subresource(s) (e.g. `/ports`) — `control-plane.md`
-- [ ] Agent token rotation (written once at startup today) — `internals.md`
+- [x] Agent token rotation: the plugin kubeconfig references a host-visible tokenFile the agent refreshes as kubelet rotates the projected SA token (the embedded-once copy only worked via the API server's expired-token grace)
 - [ ] Multi-tenancy model (the API is single-tenant today) — `design.md`
 
 ## 2. Datapath core
@@ -74,7 +74,7 @@ they're discovered rather than leaving them only in issues.
 - [x] IP + MAC preservation validated end-to-end on dev4 (both directions)
 - [x] IPv6 VM live migration demonstrated on a v4-only cluster (IP+MAC preserved, sub-second cutover)
 - [ ] Stage the target's `locals` on `kubevirt.io/nodeName` (close the same-node overlap window) — `live-migration.md`
-- [ ] Gratuitous ARP/NA on move (today relies on the client's neighbor cache expiring) — `internals.md`
+- [x] Gratuitous ARP / unsolicited NA when a floating IP is programmed locally (fixes external L2 caches on a node move; e2e observes both frames on the wire)
 - [ ] VM-migration e2e test (cozystack has none)
 
 ## 6. Deployment robustness

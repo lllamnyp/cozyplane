@@ -310,7 +310,11 @@ stateless model — inbound public→VPC DNAT preserving the client
 (`floating_forward`/`floating_forward6`), outbound VPC→public SNAT out the
 uplink (`floating_egress_snat`/`floating_egress_snat6`) — including the
 ICMP/ICMPv6 error embedded-header rewrites, so PMTU and traceroute work through
-a floating address in either family.
+a floating address in either family. When the agent programs a floating address
+locally (creation, or a move from another node) it also **announces** it — a
+gratuitous ARP or an unsolicited override Neighbor Advertisement on the uplink —
+so external peers holding a warm cache for the previous node re-learn
+immediately instead of waiting out their cache.
 
 The dual-address bridge above is *internal* north-south: a fabric IP reachable
 from the cluster's default overlay. A **floating IP** is the same idea turned
@@ -756,7 +760,10 @@ The plugin runs in the host mount namespace and can't read the agent pod's
 service-account files, so the agent materializes a self-contained kubeconfig
 (embedding its SA token + CA) at `/run/cozyplane/kubeconfig`
 (`datapath.WritePluginKubeconfig`). The plugin uses it for the VPC lookup and
-Port claims. (Token rotation is a known TODO — it's written once at startup.)
+Port claims. The kubeconfig references a **tokenFile** (`/run/cozyplane/token`)
+rather than embedding the token: bound SA tokens expire (~1h) and kubelet
+refreshes the projected file, so the agent re-syncs the host-visible copy every
+minute and the short-lived plugin reads it fresh per invocation.
 
 ## 5. Code structure (package by package)
 

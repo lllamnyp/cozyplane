@@ -19,10 +19,14 @@ cniConfName: "10-cozyplane.conflist"
 # Cluster networking facts for pod egress to the outside world. Not reliably
 # discoverable in-cluster, so declared here.
 egress:
-  # The cluster pod supernet. Enables node masquerade (pods get an internet
-  # return path) and is denied to VPC tenants at their gateways. Empty disables
-  # both.
+  # The cluster pod supernet(s), comma-separated for dual-stack (e.g.
+  # "10.244.0.0/16,fd00:10:244::/56"). Enables the cluster-egress masquerade
+  # (pods get an off-cluster return path) and is denied to VPC tenants at
+  # their gateways. Empty disables both.
   clusterCIDR: "10.244.0.0/16"
+  # Masquerade implementation: "bpf" (eBPF SNAT at the uplink, no netfilter,
+  # both families), "iptables" (legacy kernel rule, v4 only), or "off".
+  masquerade: "bpf"
   # The Service CIDR, denied to VPC tenants at their gateways.
   serviceCIDR: "10.96.0.0/16"
   # Cluster DNS ClusterIP; the one cluster-internal door a VPC gateway opens

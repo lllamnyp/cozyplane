@@ -109,9 +109,10 @@ spec:
             - "--geneve-port={{ .Values.genevePort }}"
             - "--cni-conf-name={{ .Values.cniConfName }}"
             {{- if .Values.egress.clusterCIDR }}
-            # Node masquerade: pod traffic leaving the cluster is SNATed to the
-            # node address, giving pods an internet return path.
+            # Cluster-egress masquerade: pod traffic leaving the cluster is
+            # SNATed to the node address, giving pods an off-cluster return path.
             - "--cluster-cidr={{ .Values.egress.clusterCIDR }}"
+            - "--masquerade={{ .Values.egress.masquerade | default "bpf" }}"
             {{- end }}
             {{- $internal := concat (list .Values.egress.clusterCIDR .Values.egress.serviceCIDR) .Values.egress.internalCIDRs | compact }}
             {{- if $internal }}

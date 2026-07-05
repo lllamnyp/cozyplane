@@ -37,6 +37,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -235,6 +236,26 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	if err := state.Save(); err != nil {
 		return fmt.Errorf("publish agent state: %w", err)
 	}
+	// Keep the plugin's token copy fresh as kubelet rotates the projected SA
+	// token (bound tokens expire ~hourly; the embedded-once copy only worked
+	// via the API server's expired-token grace). Cheap poll, well inside the
+	// refresh window.
+	go func() {
+		tick := time.NewTicker(time.Minute)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				if rotated, err := datapath.SyncPluginToken(); err != nil {
+					log.Warn("sync plugin token", "err", err)
+				} else if rotated {
+					log.Info("plugin SA token rotated")
+				}
+			}
+		}
+	}()
 	if err := datapath.WritePluginKubeconfig(); err != nil {
 		log.Warn("write plugin kubeconfig (VPC attachment unavailable)", "err", err)
 	}
@@ -706,6 +727,13 @@ func watchFloatingIPs(ctx context.Context, factory sdninformers.SharedInformerFa
 				continue
 			}
 			if !current[pub] {
+				// Newly local here (created, or moved from another node):
+				// nudge external L2 caches at the old location (GARP /
+				// unsolicited NA). Best-effort — new queries are answered by
+				// the datapath regardless.
+				if err := mgr.AnnounceAddress(net.ParseIP(pub)); err != nil {
+					log.Warn("announce floating address", "public", pub, "err", err)
+				}
 				log.Info("floating set", "public", pub, "target", v.vpcIP, "vni", v.vni)
 			}
 		}

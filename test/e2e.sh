@@ -313,6 +313,9 @@ KNET6=$(docker network inspect kind -f '{{range .IPAM.Config}}{{.Subnet}}
 V6PFX=${KNET6%%::*}
 FIP6="${V6PFX}:f10a::10"
 V6A2IP=$(vpcip v6a2)
+docker run -d --rm --name nacap --network kind nicolaka/netshoot \
+  sh -c "tcpdump -lnni eth0 icmp6 > /tmp/cap.txt 2>&1" >/dev/null 2>&1
+sleep 2
 $K apply -f - >/dev/null <<EOF
 apiVersion: sdn.cozystack.io/v1alpha1
 kind: ExternalPool
@@ -326,6 +329,10 @@ spec: {vpcRef: {name: vpc6a}, target: "$V6A2IP", address: "$FIP6", poolRef: {nam
 EOF
 $K -n team-a wait --for=jsonpath='{.status.phase}'=Ready floatingip/v6a2-fip --timeout=30s >/dev/null 2>&1
 check "v6a2-fip Ready with $FIP6" "Ready" $K -n team-a get floatingip v6a2-fip -o jsonpath='{.status.phase}'
+sleep 3
+na=$(docker exec nacap grep -ciE "neighbor advertisement.*tgt is $FIP6" /tmp/cap.txt 2>/dev/null)
+docker rm -f nacap >/dev/null 2>&1
+[ "${na:-0}" -ge 1 ] && pass "unsolicited NA announced $FIP6 on programming" || fail "unsolicited NA announced $FIP6 on programming (saw ${na:-0})"
 got6=""; for _ in $(seq 1 12); do got6=$(docker run --rm --network kind curlimages/curl:8.11.0 -s -m3 -g "http://[$FIP6]/" 2>/dev/null | tr -d '[:space:]'); [ "$got6" = "v6a2" ] && break; sleep 2; done
 [ "$got6" = "v6a2" ] && pass "external v6 client -> [$FIP6] reaches v6a2 (NDP + DNAT)" || fail "external v6 client -> [$FIP6] reaches v6a2 (got '$got6')"
 gotp6=""; for _ in $(seq 1 8); do docker run --rm --network kind busybox:1.36 ping -6 -c1 -W2 "$FIP6" >/dev/null 2>&1 && { gotp6=ok; break; }; sleep 2; done
@@ -405,6 +412,11 @@ KNET=$(docker network inspect kind -f '{{(index .IPAM.Config 0).Subnet}}' 2>/dev
 KPFX=$(echo "${KNET:-172.18.0.0/16}" | cut -d. -f1-2)
 FIP="${KPFX}.240.10"
 A1IP=$(vpcip a1)
+# Watch for the gratuitous ARP the agent emits when the address becomes local
+# (the nudge that fixes external L2 caches when a floating IP moves nodes).
+docker run -d --rm --name garpcap --network kind nicolaka/netshoot \
+  sh -c "tcpdump -lnni eth0 arp > /tmp/cap.txt 2>&1" >/dev/null 2>&1
+sleep 2
 $K apply -f - >/dev/null <<EOF
 apiVersion: sdn.cozystack.io/v1alpha1
 kind: ExternalPool
@@ -418,6 +430,10 @@ spec: {vpcRef: {name: vpc-a}, target: "$A1IP", address: "$FIP", poolRef: {name: 
 EOF
 $K -n team-a wait --for=jsonpath='{.status.phase}'=Ready floatingip/a1-fip --timeout=30s >/dev/null 2>&1
 check "a1-fip Ready with $FIP" "Ready" $K -n team-a get floatingip a1-fip -o jsonpath='{.status.phase}'
+sleep 3
+garp=$(docker exec garpcap grep -cE "Request who-has $FIP .*tell $FIP" /tmp/cap.txt 2>/dev/null)
+docker rm -f garpcap >/dev/null 2>&1
+[ "${garp:-0}" -ge 1 ] && pass "gratuitous ARP announced $FIP on programming" || fail "gratuitous ARP announced $FIP on programming (saw ${garp:-0})"
 # External client: a throwaway container on the kind network, not a cluster node.
 extget() { docker run --rm --network kind curlimages/curl:8.11.0 -s -m3 "$1" 2>/dev/null; }
 got=""; for _ in $(seq 1 12); do got=$(extget "http://$FIP/" | tr -d '[:space:]'); [ "$got" = "a1" ] && break; sleep 2; done

@@ -29,6 +29,11 @@ import (
 // in-pod service-account files, so the agent materializes a self-contained one.
 const PluginKubeconfig = "/run/cozyplane/kubeconfig"
 
+// PluginToken is the host-visible copy of the agent's projected SA token,
+// referenced by the plugin kubeconfig (tokenFile) and refreshed by the agent
+// as kubelet rotates the source.
+const PluginToken = "/run/cozyplane/token"
+
 const saDir = "/var/run/secrets/kubernetes.io/serviceaccount"
 
 // WritePluginKubeconfig writes a kubeconfig (embedding the agent's SA token and
@@ -36,10 +41,34 @@ const saDir = "/var/run/secrets/kubernetes.io/serviceaccount"
 //
 // NOTE: the projected SA token rotates; for the prototype this is written once
 // at startup. Periodic refresh is a follow-up.
-func WritePluginKubeconfig() error {
+// SyncPluginToken copies the agent's (kubelet-refreshed) projected SA token to
+// the host-visible path the plugin kubeconfig references. Returns true when
+// the token changed. The kubeconfig embeds a tokenFile, not the token itself:
+// bound tokens expire (~1h) and kubelet refreshes the projected file, so a
+// once-embedded copy goes stale — it only kept working via the API server's
+// grace for expired bound tokens. The plugin is short-lived and reads the
+// file fresh on every invocation.
+func SyncPluginToken() (bool, error) {
 	token, err := os.ReadFile(filepath.Join(saDir, "token"))
 	if err != nil {
-		return fmt.Errorf("read SA token: %w", err)
+		return false, fmt.Errorf("read SA token: %w", err)
+	}
+	if old, err := os.ReadFile(PluginToken); err == nil && string(old) == string(token) {
+		return false, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(PluginToken), 0o755); err != nil {
+		return false, err
+	}
+	tmp := PluginToken + ".tmp"
+	if err := os.WriteFile(tmp, token, 0o600); err != nil {
+		return false, err
+	}
+	return true, os.Rename(tmp, PluginToken)
+}
+
+func WritePluginKubeconfig() error {
+	if _, err := SyncPluginToken(); err != nil {
+		return err
 	}
 	ca, err := os.ReadFile(filepath.Join(saDir, "ca.crt"))
 	if err != nil {
@@ -66,8 +95,8 @@ current-context: cozyplane
 users:
 - name: cozyplane
   user:
-    token: %s
-`, net.JoinHostPort(host, port), base64.StdEncoding.EncodeToString(ca), string(token))
+    tokenFile: %s
+`, net.JoinHostPort(host, port), base64.StdEncoding.EncodeToString(ca), PluginToken)
 
 	if err := os.MkdirAll(filepath.Dir(PluginKubeconfig), 0o755); err != nil {
 		return err
