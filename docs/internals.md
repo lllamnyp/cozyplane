@@ -597,12 +597,59 @@ agent startup (hard-requiring netfilter). Moving it into eBPF — or gating it o
 when a kube-proxy-replacement already masquerades cluster egress — is tracked in
 [#10](../../issues/10).
 
+### Map-ABI upgrades — pinned-map reconcile & local-state rebuild
+
+Maps are pinned by name and reused across restarts, so a release that changes a
+map's shape (the 128-bit rekey was the first) cannot reuse the old pins: the load
+fails and, before this mechanism, the agent crash-looped until the node was
+rebooted to clear bpffs ([#7](../../issues/7)). The agent now handles it:
+
+- **Reconcile pins at load.** Before loading, the agent checks every
+  pinned-by-name map spec against whatever is pinned under `PinRoot`
+  (`MapSpec.Compatible` — the same test map reuse applies) and **removes
+  incompatible or unopenable pins**, so the load creates fresh maps. Removing a
+  pin is invisible to running pods: the tcx links on their veths keep the old
+  program → old map objects alive until re-attach below.
+- **The host veth alias is the rebuild record.** `configureHostVeth` stores
+  `cozyplane:1;net=…;gw=…;mac=…;ips=…` — exactly the `ports`/`locals` payload —
+  as the veth's link alias at ADD. It is host-local (no API dependency), survives
+  agent restarts, and dies with the veth. Nothing else persists this state:
+  `locals`/`bridges`/`ports` are CNI-written and are *not* derivable from the
+  agent's watches (default-network pods have no `Port` object at all).
+- **Rebuild + re-attach at every agent start.** The agent walks the `cph*`/`cpg*`
+  links: parses the alias and re-`Put`s the `ports` and `locals` entries;
+  re-derives a VPC pod's `bridges` entry from the veth's scope-link fabric route
+  (the one host route whose destination is not a pod address); then swaps both
+  tcx links to the freshly pinned programs **attach-new-then-rename-pin**, so
+  there is never an unfiltered window on the veth. Running this unconditionally
+  (not just after an ABI break) also closes a second gap: previously an existing
+  pod kept executing the *previous release's* program until the pod was
+  recreated.
+- **The one-release gap.** A veth without the alias (created by a pre-alias CNI)
+  cannot be rebuilt; after an ABI break such pods need a restart, and the agent
+  logs each one. On a compatible restart they are unaffected — state lives in the
+  maps, which are reused.
+- `ct_fwd`/`ct_rev` across an ABI break are recreated empty: established
+  bridge/floating flows reset once, like a conntrack flush. Acceptable.
+
+Net effect: **an upgrade across a map-ABI change is a rolling DaemonSet update** —
+no node reboots ([#7](../../issues/7) acceptance).
+
 ### Controller
 
 `VPCReconciler` lists VPCs cluster-wide, assigns the lowest free VNI ≥ 100 to any
-VPC without one, and sets `status.phase = Ready`. (VNI selection is
-list-then-pick; a conflicting status update just requeues. Fine for the
-prototype.)
+VPC without one, and sets `status.phase = Ready`. The allocation list goes to the
+**API server directly (`APIReader`), never the informer cache**: the cache lags
+the reconciler's own status writes, so back-to-back reconciles of two fresh VPCs
+could both see a VNI as free and assign it twice — a **cross-tenant isolation
+break** (two VPCs sharing a network id are one delivery domain, and a peering
+whose CIDRs collide then overwrites the victim's own `networks` entry). Caught
+live in the e2e once the map-recreation phase re-tested a VPC late enough.
+Reconciles are serial (default MaxConcurrentReconciles=1), so live-list +
+assign-before-return is race-free. The reconciler also **repairs duplicates**
+(pre-fix clusters): if another VPC holds the same VNI, the deterministic loser —
+younger by creationTimestamp, then namespace/name — clears its VNI and
+reallocates; the winner keeps it. A conflicting status update just requeues.
 
 `VPCBindingReconciler` holds each `VPCBinding` with a reap finalizer. On deletion
 it deletes the `Port`s for `(consumer-namespace, vpcRef)` — unless another live

@@ -916,6 +916,12 @@ func configureHostVeth(name string, podIPs []net.IP, netID uint32, podMAC net.Ha
 			return err
 		}
 	}
+	// Mirror the ports/locals payload onto the veth's link alias — the rebuild
+	// record a restarted agent re-derives the maps from after a map-ABI
+	// recreate (see datapath/rebuild.go).
+	if err := datapath.SetVethAlias(hv, netID, podIPs, podMAC); err != nil {
+		return err
+	}
 	return nil
 }
 

@@ -36,13 +36,20 @@ import (
 type Manager struct {
 	objs          overlayObjects
 	geneveIfindex int
+	recreatedPins []string
 }
 
 // New returns an unloaded Manager.
 func New() *Manager { return &Manager{} }
 
-// Load removes the memlock limit, loads the eBPF objects (pinning maps by name
-// under PinRoot), pins the classifier program, and records the VNI.
+// RecreatedPins returns the names of pinned maps Load removed because the new
+// object file could not reuse them (a map-ABI change); their state was rebuilt
+// by RebuildLocalState / the agent's watches. Empty on a compatible restart.
+func (m *Manager) RecreatedPins() []string { return m.recreatedPins }
+
+// Load removes the memlock limit, reconciles stale pins, loads the eBPF
+// objects (pinning maps by name under PinRoot), pins the classifier program,
+// and records the VNI.
 func (m *Manager) Load(vni uint32) error {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return fmt.Errorf("remove memlock: %w", err)
@@ -50,6 +57,15 @@ func (m *Manager) Load(vni uint32) error {
 	if err := os.MkdirAll(PinRoot, 0o755); err != nil {
 		return fmt.Errorf("mkdir pin root: %w", err)
 	}
+
+	// A pinned map the new object cannot reuse (map-ABI change) would fail the
+	// load below; remove such pins so they are created fresh (issue #7). The
+	// caller rebuilds their CNI-written state via RebuildLocalState.
+	recreated, err := reconcilePins()
+	if err != nil {
+		return fmt.Errorf("reconcile pinned maps: %w", err)
+	}
+	m.recreatedPins = recreated
 
 	opts := &ebpf.CollectionOptions{Maps: ebpf.MapOptions{PinPath: PinRoot}}
 	if err := loadOverlayObjects(&m.objs, opts); err != nil {

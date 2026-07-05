@@ -80,7 +80,7 @@ they're discovered rather than leaving them only in issues.
 
 - [x] Cozystack chart integration (aggregated-apiserver mode, operator etcd, RBAC/CRDs)
 - [x] Image digest-pinning in the chart
-- [ ] Agent recreates incompatible pinned eBPF maps on load (avoid node reboots on a map-ABI upgrade) — [#7](../../issues/7)
+- [x] Agent recreates incompatible pinned eBPF maps on load and rebuilds pod state from veth alias records — a map-ABI upgrade is a rolling DaemonSet update, no node reboots (e2e-covered) — [#7](../../issues/7)
 - [ ] Gateway `.1` Port reuse: a replacement gateway pod can't rebind the fixed `.1` Port after an unclean death
 - [ ] Release image index digest is non-deterministic (defeats chart digest-pinning) — [#4](../../issues/4)
 

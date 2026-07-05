@@ -94,6 +94,60 @@ func attachTCX(ifindex int, prog *ebpf.Program, attach ebpf.AttachType, ingress 
 	return l.Close()
 }
 
+// ReattachIngress swaps an interface's ingress classifier to prog. Unlike
+// AttachIngress (fresh attach points, where a remove-then-attach window is
+// harmless because no traffic flows yet) this is for *live* veths: the new
+// link is attached before the old pin is replaced, so the interface is never
+// without a classifier — a VPC pod must not see an unfiltered window.
+func ReattachIngress(ifindex int, prog *ebpf.Program) error {
+	return reattachTCX(ifindex, prog, ebpf.AttachTCXIngress, true)
+}
+
+// ReattachEgress swaps an interface's egress classifier to prog (see
+// ReattachIngress).
+func ReattachEgress(ifindex int, prog *ebpf.Program) error {
+	return reattachTCX(ifindex, prog, ebpf.AttachTCXEgress, false)
+}
+
+func reattachTCX(ifindex int, prog *ebpf.Program, attach ebpf.AttachType, ingress bool) error {
+	if err := os.MkdirAll(filepath.Join(PinRoot, "links"), 0o755); err != nil {
+		return err
+	}
+	// tcx is a program *list*: the new link coexists with the old one (which
+	// runs first — its terminal verdicts win until the swap) so ordering is
+	// attach-new, then atomically rename the pin over the old link's. Losing
+	// its pin drops the old link's last reference and detaches it.
+	l, err := link.AttachTCX(link.TCXOptions{
+		Interface: ifindex,
+		Program:   prog,
+		Attach:    attach,
+	})
+	if isExist(err) {
+		// This exact program is already attached here — a pod ADDed after the
+		// agent pinned the fresh programs (the CNI attaches the same pinned
+		// object). Already the desired end state.
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("attach tcx (ifindex %d): %w", ifindex, err)
+	}
+	pin := linkPinPath(ifindex, ingress)
+	// bpffs rejects dentry names containing dots (EPERM), so the temp pin uses
+	// a dash. Unique per (ifindex, direction), like the pin itself.
+	tmp := pin + "-swap"
+	_ = os.Remove(tmp)
+	if err := l.Pin(tmp); err != nil {
+		l.Close()
+		return fmt.Errorf("pin tcx link: %w", err)
+	}
+	if err := os.Rename(tmp, pin); err != nil {
+		_ = os.Remove(tmp)
+		l.Close()
+		return fmt.Errorf("swap tcx link pin: %w", err)
+	}
+	return l.Close()
+}
+
 // DetachVeth removes the pinned ingress (from_pod) and egress (to_pod) links for
 // an interface (used on CNI DEL). Removing a pin drops the last reference,
 // detaching the program.

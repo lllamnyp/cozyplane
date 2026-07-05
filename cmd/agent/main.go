@@ -157,6 +157,26 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	}
 	log.Info("datapath loaded", "vni", vni, "geneve", datapath.GeneveDevice, "uplink", uplink)
 
+	// Restore the CNI-written map state (ports/locals/bridges) of existing local
+	// pods from their veths' alias records, and swap every veth's classifiers to
+	// the freshly pinned programs. Vital after a map-ABI recreate (issue #7 —
+	// the maps came back empty); on a compatible restart it is a no-op re-put
+	// plus a program refresh existing pods would otherwise miss. Best-effort:
+	// a partly-rebuilt node beats a crash-looping agent.
+	if recreated := mgr.RecreatedPins(); len(recreated) > 0 {
+		log.Warn("recreated incompatible pinned maps (map-ABI change)", "maps", recreated)
+	}
+	stats, err := mgr.RebuildLocalState()
+	if err != nil {
+		log.Warn("local-state rebuild incomplete", "err", err)
+	}
+	if stats.Rebuilt > 0 || stats.Reattached > 0 || len(stats.Skipped) > 0 {
+		log.Info("local pod state rebuilt", "rebuilt", stats.Rebuilt, "reattached", stats.Reattached, "skipped", stats.Skipped)
+	}
+	if len(stats.Skipped) > 0 && len(mgr.RecreatedPins()) > 0 {
+		log.Warn("veths without a rebuild record lost their datapath state; restart their pods", "veths", stats.Skipped)
+	}
+
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
 		return fmt.Errorf("in-cluster config: %w", err)

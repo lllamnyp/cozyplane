@@ -260,6 +260,27 @@ srcseen=$(docker exec eipcap grep -oE "$FIP" /tmp/cap.txt 2>/dev/null | head -1)
 docker rm -f eipcap >/dev/null 2>&1
 [ "$srcseen" = "$FIP" ] && pass "a1 outbound source = floating IP $FIP (EIP egress)" || fail "a1 outbound source = floating IP $FIP (EIP egress, saw '$srcseen')"
 
+echo "[map recreation: agent restart heals existing pods (no reboot)]"
+# Simulate the effect of a map-ABI upgrade: remove the CNI-written pinned maps
+# (exactly what reconcilePins does to incompatible pins — the load then creates
+# them fresh and empty) on every node, and roll the agents. The restarted agents
+# must rebuild ports/locals/bridges from the veth alias records and re-attach
+# the classifiers, so the EXISTING pods — not recreated — keep full
+# connectivity, isolation included (issue #7).
+for n in $(kind get nodes --name "$CLUSTER" 2>/dev/null); do
+  docker exec "$n" sh -c 'rm -f /sys/fs/bpf/cozyplane/locals /sys/fs/bpf/cozyplane/bridges /sys/fs/bpf/cozyplane/ports'
+done
+$K -n kube-system rollout restart ds/cozyplane-agent >/dev/null
+$K -n kube-system rollout status ds/cozyplane-agent --timeout=180s >/dev/null 2>&1
+sleep 5
+check "a1 -> a2 after map recreation (VPC cross-node, rebuilt locals)" "a2" httpid team-a a1 "$A2"
+check "$BSRC -> $A2 still reaches $BPEER (net scoping survived the ports rebuild)" "$BPEER" httpid team-b "$BSRC" "$A2"
+check "cli -> a1.fabric after map recreation (rebuilt bridges)" "a1" bash -c "$K exec cli -- wget -qO- -T4 http://$(fabric a1)/ 2>/dev/null"
+check "v6a1 -> v6a2 after map recreation (v6 VPC, 128-bit rebuild)" "v6a2" httpid team-a v6a1 "[$V6A2]"
+check_ok "cli -> coredns after map recreation (default network)" $K exec cli -- ping -c2 -W2 "$CD"
+check_fail "cli(default) -> VPC IP still blocked after map recreation" \
+  bash -c "$K exec cli -- wget -qO- -T3 http://10.0.0.2/ 2>/dev/null | grep -q ."
+
 echo "[revocation]"
 $K -n team-a delete vpcbinding vpc-a >/dev/null
 sleep 6
