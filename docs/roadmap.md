@@ -60,7 +60,7 @@ they're discovered rather than leaving them only in issues.
 - [ ] IPv6 guest autoconfiguration: RA + DHCPv6 responder for VM (bridge-binding) NICs — [#8](../../issues/8)
 - [ ] North-south to a v6 VPC IP when the fabric IP is v4 (cross-family) — [#9](../../issues/9)
 - [x] ICMPv6 errors through the v6 bridge: packet-too-big (v6 PMTU — vital, v6 never fragments in flight), dest-unreach, time-exceeded, with embedded-header NAT (e2e: UDP traceroute6 end-to-end)
-- [ ] v6 floating IPs (NDP responder replacing the ARP responder) — `internals.md`
+- [x] v6 floating IPs: NDP responder (solicited+override NA from `from_uplink`), stateless v6 DNAT/SNAT halves incl. ICMPv6 error rewrites (e2e: external NDP-resolved HTTP/ping6/EIP-egress/traceroute6)
 - [ ] v6 gateway egress (v6 masquerade + a v6 upstream) — `internals.md`
 - [ ] Cross-family VPC peering (v4 ↔ v6 via a NAT64 translator; the `64:ff9b::` map layout accommodates it) — `internals.md`
 

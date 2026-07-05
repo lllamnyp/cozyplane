@@ -283,6 +283,48 @@ check_ok "vpc-c gateway Ready despite the stale .1 claim (GC freed it)" \
   $K -n kube-system wait --for=condition=Ready pod -l "app=cozyplane-gateway,sdn.cozystack.io/vpc=vpc-c" --timeout=120s
 check "c1(vpc-c, egress on) -> internet 1.1.1.1" "" bash -c "$K -n team-a exec c1 -- ping -c2 -W3 1.1.1.1 >/dev/null 2>&1 && echo"
 
+echo "[v6 floating IP: NDP advertisement, stateless DNAT, EIP egress]"
+# The v6 twin of the floating phase: the pool sits inside the kind network's
+# on-link ULA /64, so the external client resolves the address by NDP — which
+# only works if from_uplink's floating_ndp answers the solicitation.
+KNET6=$(docker network inspect kind -f '{{range .IPAM.Config}}{{.Subnet}}
+{{end}}' 2>/dev/null | grep : | head -1)
+V6PFX=${KNET6%%::*}
+FIP6="${V6PFX}:f10a::10"
+V6A2IP=$(vpcip v6a2)
+$K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: ExternalPool
+metadata: {name: e2e-pub6}
+spec: {cidrs: ["${V6PFX}:f10a::/96"], advertisement: L2}
+---
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: FloatingIP
+metadata: {name: v6a2-fip, namespace: team-a}
+spec: {vpcRef: {name: vpc6a}, target: "$V6A2IP", address: "$FIP6", poolRef: {name: e2e-pub6}}
+EOF
+$K -n team-a wait --for=jsonpath='{.status.phase}'=Ready floatingip/v6a2-fip --timeout=30s >/dev/null 2>&1
+check "v6a2-fip Ready with $FIP6" "Ready" $K -n team-a get floatingip v6a2-fip -o jsonpath='{.status.phase}'
+got6=""; for _ in $(seq 1 12); do got6=$(docker run --rm --network kind curlimages/curl:8.11.0 -s -m3 -g "http://[$FIP6]/" 2>/dev/null | tr -d '[:space:]'); [ "$got6" = "v6a2" ] && break; sleep 2; done
+[ "$got6" = "v6a2" ] && pass "external v6 client -> [$FIP6] reaches v6a2 (NDP + DNAT)" || fail "external v6 client -> [$FIP6] reaches v6a2 (got '$got6')"
+gotp6=""; for _ in $(seq 1 8); do docker run --rm --network kind busybox:1.36 ping -6 -c1 -W2 "$FIP6" >/dev/null 2>&1 && { gotp6=ok; break; }; sleep 2; done
+[ "$gotp6" = ok ] && pass "external v6 ping -> $FIP6 (floating ICMPv6 echo)" || fail "external v6 ping -> $FIP6 (floating ICMPv6 echo)"
+# EIP egress: v6a2's outbound to an external v6 listener must carry the
+# floating source (floating_egress_snat6), not the VPC or fabric address.
+docker run -d --rm --name eipcap6 --network kind nicolaka/netshoot \
+  sh -c 'tcpdump -lnni eth0 "port 9998" > /tmp/cap.txt 2>&1' >/dev/null 2>&1
+sleep 3
+EIP6IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}' eipcap6 2>/dev/null)
+for _ in 1 2 3 4; do $K -n team-a exec v6a2 -- wget -qO- -T2 "http://[$EIP6IP]:9998/" >/dev/null 2>&1; sleep 1; done
+srcseen6=$(docker exec eipcap6 grep -oiE "$FIP6" /tmp/cap.txt 2>/dev/null | head -1)
+docker rm -f eipcap6 >/dev/null 2>&1
+[ -n "$srcseen6" ] && pass "v6a2 outbound source = floating $FIP6 (v6 EIP egress)" || fail "v6a2 outbound source = floating $FIP6 (v6 EIP egress, saw '$srcseen6')"
+# Errors out through the v6 floating path: external traceroute6's probes
+# elicit ICMPv6 port-unreachable from v6a2's kernel; the embedded destination
+# must be swapped VPC->public or the probes never correlate.
+extlast6=$(docker run --rm --network kind nicolaka/netshoot traceroute6 -q1 -w3 -m6 "$FIP6" 2>/dev/null | tail -1)
+if echo "$extlast6" | grep -qi "$FIP6"; then pass "external traceroute6 reaches $FIP6 (v6 floating error rewrite)"; else fail "external traceroute6 reaches $FIP6 (last hop: $extlast6)"; fi
+
 echo "[ICMP errors through the bridge (#3): traceroute correlates embedded headers]"
 # A UDP traceroute prints a hop only when the returned ICMP error's EMBEDDED
 # packet matches the probe it sent, so reaching the destination proves the
@@ -351,7 +393,7 @@ spec: {cidrs: ["${KPFX}.240.0/24"], advertisement: L2}
 apiVersion: sdn.cozystack.io/v1alpha1
 kind: FloatingIP
 metadata: {name: a1-fip, namespace: team-a}
-spec: {vpcRef: {name: vpc-a}, target: "$A1IP", address: "$FIP"}
+spec: {vpcRef: {name: vpc-a}, target: "$A1IP", address: "$FIP", poolRef: {name: e2e-pub}}
 EOF
 $K -n team-a wait --for=jsonpath='{.status.phase}'=Ready floatingip/a1-fip --timeout=30s >/dev/null 2>&1
 check "a1-fip Ready with $FIP" "Ready" $K -n team-a get floatingip a1-fip -o jsonpath='{.status.phase}'

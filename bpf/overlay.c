@@ -110,6 +110,16 @@ struct cozy_mac {
 #define ICMP6_ECHO_REQUEST 128
 #define ICMP6_ECHO_REPLY   129
 
+#define ICMP6_NEIGH_SOLICIT 135
+#define ICMP6_NEIGH_ADVERT  136
+// Neighbor Solicitation layout (fixed IPv6 header assumed): 4-byte
+// flags/reserved word, 16-byte target, then options (source link-layer
+// address, type 1, 8 bytes, when present).
+#define NDP_FLAGS_OFF  (L4_OFF6 + 4)
+#define NDP_TARGET_OFF (L4_OFF6 + 8)
+#define NDP_OPT_OFF    (L4_OFF6 + 24)
+#define NDP_OPT_MAC_OFF (NDP_OPT_OFF + 2)
+
 // An ICMPv6 error (type < 128, RFC 4443) embeds the original packet after the
 // 8-byte ICMPv6 header: a fixed 40-byte IPv6 header (extension headers are not
 // handled — nexthdr must read TCP/UDP directly) + at least 8 L4 bytes.
@@ -1696,6 +1706,161 @@ static __always_inline int masq_reverse(struct __sk_buff *skb, struct pkt *p)
 	return TC_ACT_OK; // conntrack sees it RELATED to the pod's flow
 }
 
+// floating_forward6 is the v6 inbound half of a floating IP: a stateless DNAT
+// public->VPC that keeps the external client as the source, mirroring
+// floating_forward. TCP, UDP, ICMPv6 echo, and ICMPv6 errors (packet-too-big
+// = the pod's inbound PMTU signal) with the embedded source swapped.
+static __always_inline int floating_forward6(struct __sk_buff *skb, struct pkt *p, __u32 net, struct addr128 vpc_ip)
+{
+	__u8 proto = p->proto;
+	if (proto == IPPROTO_ICMPV6) {
+		__u8 type;
+		__u16 id;
+		if (icmp6_echo(skb, &type, &id) < 0)
+			return TC_ACT_SHOT;
+		if (icmp6_err(type)) {
+			struct emb6 e;
+			if (emb6_load(skb, &e) < 0)
+				return TC_ACT_SHOT;
+			if (!addr128_eq(&e.saddr, &p->dst))
+				return TC_ACT_SHOT; // embedded source must be the public IP
+			nat_addr6(skb, proto, IP6_DADDR_OFF, &p->dst, &vpc_ip);
+			emb6_rewrite(skb, &e, &vpc_ip, &e.daddr, 0, 0, 0);
+			return TC_ACT_OK;
+		}
+		if (type != ICMP6_ECHO_REQUEST && type != ICMP6_ECHO_REPLY)
+			return TC_ACT_SHOT;
+	} else if (proto != IPPROTO_TCP && proto != IPPROTO_UDP) {
+		return TC_ACT_SHOT;
+	}
+	nat_addr6(skb, proto, IP6_DADDR_OFF, &p->dst, &vpc_ip);
+	return TC_ACT_OK;
+}
+
+// floating_egress_snat6 is the v6 outbound half: SNAT VPC->public and redirect
+// out the uplink, mirroring floating_egress_snat. Pod-emitted ICMPv6 errors
+// about inbound floating flows get the embedded destination swapped back so
+// the external client's stack can match them (traceroute6, port unreachable).
+static __always_inline int floating_egress_snat6(struct __sk_buff *skb, struct pkt *p, __u32 net)
+{
+	__u8 proto = p->proto;
+	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP && proto != IPPROTO_ICMPV6)
+		return FLOAT_MISS;
+	struct addr128 *public_ip = floating_egress_of(net, p->src);
+	if (!public_ip)
+		return FLOAT_MISS;
+	if (is_internal(p->dst))
+		return FLOAT_MISS;
+	__u32 uplink = cfg(CFG_UPLINK_IFINDEX);
+	if (!uplink)
+		return FLOAT_MISS;
+	struct addr128 pub = *public_ip; // copied: stores below invalidate map values too
+	if (proto == IPPROTO_ICMPV6) {
+		__u8 type;
+		__u16 id;
+		if (icmp6_echo(skb, &type, &id) == 0 && icmp6_err(type)) {
+			struct emb6 e;
+			if (emb6_load(skb, &e) == 0 && addr128_eq(&e.daddr, &p->src))
+				emb6_rewrite(skb, &e, &e.saddr, &pub, 0, 0, 0);
+		}
+	}
+	nat_addr6(skb, proto, IP6_SADDR_OFF, &p->src, &pub);
+	return bpf_redirect_neigh(uplink, NULL, 0, 0);
+}
+
+// floating_ndp answers a Neighbor Solicitation for a floating v6 address with
+// a solicited+override Neighbor Advertisement carrying the uplink MAC — the
+// NDP twin of floating_arp (the L2 advertisement that pulls inbound traffic
+// to this node). The NS is rewritten to the NA in place and sent back out the
+// uplink; the ICMPv6 checksum is updated incrementally for every changed
+// field, pseudo-header included. DAD probes (unspecified source) are left
+// unanswered: cozyplane owns the address authoritatively, and answering DAD
+// would need the all-nodes multicast path instead.
+static __always_inline int floating_ndp(struct __sk_buff *skb)
+{
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+	struct ethhdr *eth = data;
+	if ((void *)(eth + 1) > data_end || eth->h_proto != bpf_htons(ETH_P_IPV6))
+		return FLOAT_MISS;
+	struct ipv6hdr *ip6 = (void *)(eth + 1);
+	if ((void *)(ip6 + 1) > data_end || ip6->nexthdr != IPPROTO_ICMPV6)
+		return FLOAT_MISS;
+	if (data + NDP_TARGET_OFF + 16 > data_end)
+		return FLOAT_MISS;
+	__u8 *icmp = data + L4_OFF6;
+	if (icmp[0] != ICMP6_NEIGH_SOLICIT)
+		return FLOAT_MISS;
+
+	struct addr128 target, req, zero = {};
+	__builtin_memcpy(target.b, data + NDP_TARGET_OFF, 16);
+	__builtin_memcpy(req.b, &ip6->saddr, 16);
+	if (addr128_eq(&req, &zero))
+		return FLOAT_MISS; // DAD probe; not answered (see above)
+
+	struct bridge_ep *fe = float_of(target);
+	if (!fe)
+		return FLOAT_MISS;
+	if (!local_of(fe->net, fe->vpc_ip))
+		return FLOAT_MISS;
+	__u32 zidx = 0;
+	struct cozy_mac *node = bpf_map_lookup_elem(&uplink_mac, &zidx);
+	if (!node)
+		return FLOAT_MISS;
+
+	// Incremental ICMPv6 checksum over every change: the pseudo-header (src
+	// becomes the target, dst becomes the requester) and the payload (type,
+	// flags, option type when present).
+	__u16 csum = 0;
+	bpf_skb_load_bytes(skb, ICMP6_CSUM_OFF, &csum, 2);
+	struct addr128 dst128;
+	__builtin_memcpy(dst128.b, &ip6->daddr, 16);
+	csum = csum_upd128(csum, &req, &target);   // pseudo src: requester -> target
+	csum = csum_upd128(csum, &dst128, &req);   // pseudo dst: sol-node mcast -> requester
+	__u16 otc = bpf_htons(ICMP6_NEIGH_SOLICIT << 8);
+	__u16 ntc = bpf_htons(ICMP6_NEIGH_ADVERT << 8);
+	csum = csum_upd16(csum, otc, ntc);         // type/code word
+	__u32 oflags = 0;
+	bpf_skb_load_bytes(skb, NDP_FLAGS_OFF, &oflags, 4);
+	__u32 nflags = bpf_htonl(0x60000000);      // Solicited | Override
+	csum = csum_upd32(csum, oflags, nflags);
+
+	__u8 req_mac[6];
+	__builtin_memcpy(req_mac, eth->h_source, 6);
+	__u8 have_opt = (void *)(data + NDP_OPT_OFF + 8) <= data_end;
+	if (have_opt) {
+		// Source link-layer option -> target link-layer option with our MAC.
+		__u16 oopt = 0, nopt;
+		bpf_skb_load_bytes(skb, NDP_OPT_OFF, &oopt, 2);
+		__u8 nb[2] = {2, 1};
+		__builtin_memcpy(&nopt, nb, 2);
+		csum = csum_upd16(csum, oopt, nopt);
+		__u16 om[3], nm[3];
+		bpf_skb_load_bytes(skb, NDP_OPT_MAC_OFF, om, 6);
+		__builtin_memcpy(nm, node->addr, 6);
+#pragma unroll
+		for (int i = 0; i < 3; i++)
+			csum = csum_upd16(csum, om[i], nm[i]);
+		bpf_skb_store_bytes(skb, NDP_OPT_OFF, nb, 2, 0);
+		bpf_skb_store_bytes(skb, NDP_OPT_MAC_OFF, node->addr, 6, 0);
+	}
+
+	__u8 na = ICMP6_NEIGH_ADVERT;
+	bpf_skb_store_bytes(skb, L4_OFF6, &na, 1, 0);
+	bpf_skb_store_bytes(skb, NDP_FLAGS_OFF, &nflags, 4, 0);
+	bpf_skb_store_bytes(skb, IP6_SADDR_OFF, target.b, 16, 0);
+	bpf_skb_store_bytes(skb, IP6_DADDR_OFF, req.b, 16, 0);
+	bpf_skb_store_bytes(skb, ICMP6_CSUM_OFF, &csum, 2, 0);
+
+	// Ethernet: back to the requester, from the node.
+	__u8 nmac[6];
+	__builtin_memcpy(nmac, node->addr, 6);
+	bpf_skb_store_bytes(skb, 0, req_mac, 6, 0);
+	bpf_skb_store_bytes(skb, 6, nmac, 6, 0);
+
+	return bpf_redirect(skb->ifindex, 0); // back out the uplink to the requester
+}
+
 // cozyplane_from_pod: source-side hook (pod egress). Enforces isolation, then
 // delivers: same-node via redirect, cross-node via encap, off-VPC via gateway.
 SEC("tc")
@@ -1764,6 +1929,13 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 			if (fr != FLOAT_MISS)
 				return fr;
 		}
+	}
+	// The v6 twin: a floating v6 pod's internet-bound traffic egresses from
+	// its public address. Link-scoped v6 (NDP) was already bypassed above.
+	if (p.is_v6 && srcnet && !dstnet) {
+		int fr = floating_egress_snat6(skb, &p, srcnet);
+		if (fr != FLOAT_MISS)
+			return fr;
 	}
 
 	// Isolation: same-network or explicitly peered traffic only (egress side) —
@@ -1856,6 +2028,10 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 	// isolation check (this IS the sanctioned north-south path). Same bridges map
 	// as v4, keyed by the 128-bit address, so a v6 fabric IP resolves here.
 	if (p.is_v6) {
+		// A v6 floating IP: stateless DNAT public->VPC, client preserved.
+		struct bridge_ep *fe6 = float_of(p.dst);
+		if (fe6)
+			return floating_forward6(skb, &p, fe6->net, fe6->vpc_ip);
 		struct bridge_ep *be = bridge_of(p.dst);
 		if (be)
 			return bridge_forward6(skb, &p, be->net, be->vpc_ip);
@@ -2005,10 +2181,25 @@ int cozyplane_from_uplink(struct __sk_buff *skb)
 	int arp = floating_arp(skb);
 	if (arp != FLOAT_MISS)
 		return arp;
+	int ndp = floating_ndp(skb);
+	if (ndp != FLOAT_MISS)
+		return ndp;
 
 	struct iphdr *ip;
-	if (parse_ipv4(skb, &ip) < 0)
+	if (parse_ipv4(skb, &ip) < 0) {
+		// v6 inbound to a floating address: deliver to the local pod like the
+		// v4 path below (to_pod on its veth does the public->VPC DNAT).
+		struct pkt p6;
+		if (parse_ip(skb, &p6) == 0 && p6.is_v6) {
+			struct bridge_ep *fe6 = float_of(p6.dst);
+			if (fe6) {
+				struct endpoint *l6 = local_of(fe6->net, fe6->vpc_ip);
+				if (l6)
+					return deliver_local(skb, l6);
+			}
+		}
 		return TC_ACT_OK;
+	}
 
 	// Un-SNAT replies to bpf-masqueraded cluster egress (#10) before netfilter
 	// sees them: the kernel's conntrack watched the pod-sourced flow leave, so

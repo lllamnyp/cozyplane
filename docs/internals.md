@@ -302,6 +302,16 @@ bridge delivers by identity, never by a shared address.
 
 ### Floating IPs (external north-south)
 
+Floating IPs are dual-family: a v4 address advertises via the `from_uplink`
+ARP responder, a v6 address via its NDP twin (`floating_ndp` answers Neighbor
+Solicitations with a solicited+override Advertisement carrying the uplink MAC;
+DAD probes are not answered). Both families share the same maps and the same
+stateless model — inbound public→VPC DNAT preserving the client
+(`floating_forward`/`floating_forward6`), outbound VPC→public SNAT out the
+uplink (`floating_egress_snat`/`floating_egress_snat6`) — including the
+ICMP/ICMPv6 error embedded-header rewrites, so PMTU and traceroute work through
+a floating address in either family.
+
 The dual-address bridge above is *internal* north-south: a fabric IP reachable
 from the cluster's default overlay. A **floating IP** is the same idea turned
 outward — a routable public address, reachable from off-cluster, bound 1:1 to a
