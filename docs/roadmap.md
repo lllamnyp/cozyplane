@@ -33,7 +33,7 @@ they're discovered rather than leaving them only in issues.
 - [x] Overlapping VPC CIDRs: net-scoped (VNI-keyed) delivery, no collision
 - [x] eBPF bridge NAT for cozyplane north-south (VPC gateways, floating IPs) — no iptables, no fwmark, no policy routing
 - [x] Node masquerade that excludes cozyplane egress interfaces *(interim: via netfilter — see below)*
-- [ ] North-south ICMP to a fabric IP / PMTU edge cases — [#3](../../issues/3)
+- [x] North-south ICMP through the bridge: echo, and IPv4 ICMP *errors* with embedded-header NAT — port-unreachable/traceroute outward, frag-needed (PMTU) inward, fabric + floating (e2e: UDP traceroute end-to-end) — [#3](../../issues/3)
 - [ ] Per-VPC traffic counters in the datapath hooks (metering/billing foundation) — [#2](../../issues/2)
 - [ ] Remove the netfilter/iptables dependency: move cluster-egress SNAT to eBPF, make the FORWARD ACCEPT conditional (today `firewall.go` hard-requires netfilter, fatal to agent startup) — [#10](../../issues/10)
 
@@ -59,6 +59,7 @@ they're discovered rather than leaving them only in issues.
 - [x] Fabric-IP family decoupled from VPC family — a v6 VPC runs on a v4-only cluster (validated on dev4)
 - [ ] IPv6 guest autoconfiguration: RA + DHCPv6 responder for VM (bridge-binding) NICs — [#8](../../issues/8)
 - [ ] North-south to a v6 VPC IP when the fabric IP is v4 (cross-family) — [#9](../../issues/9)
+- [ ] ICMPv6 errors through the v6 bridge (packet-too-big — the v6 PMTU signal; same embedded-rewrite pattern, ICMPv6 pseudo-header included) — `internals.md`
 - [ ] v6 floating IPs (NDP responder replacing the ARP responder) — `internals.md`
 - [ ] v6 gateway egress (v6 masquerade + a v6 upstream) — `internals.md`
 - [ ] Cross-family VPC peering (v4 ↔ v6 via a NAT64 translator; the `64:ff9b::` map layout accommodates it) — `internals.md`

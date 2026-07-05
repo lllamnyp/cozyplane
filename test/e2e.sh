@@ -264,6 +264,15 @@ check_ok "vpc-c gateway Ready despite the stale .1 claim (GC freed it)" \
   $K -n kube-system wait --for=condition=Ready pod -l "app=cozyplane-gateway,sdn.cozystack.io/vpc=vpc-c" --timeout=120s
 check "c1(vpc-c, egress on) -> internet 1.1.1.1" "" bash -c "$K -n team-a exec c1 -- ping -c2 -W3 1.1.1.1 >/dev/null 2>&1 && echo"
 
+echo "[ICMP errors through the bridge (#3): traceroute correlates embedded headers]"
+# A UDP traceroute prints a hop only when the returned ICMP error's EMBEDDED
+# packet matches the probe it sent, so reaching the destination proves the
+# error path end to end — including the embedded-header NAT (a bad checksum
+# would be dropped by the receiving kernel before traceroute ever saw it).
+A1FAB=$(fabric a1)
+check "cli UDP-traceroute reaches a1.fabric (bridge error un-NAT)" "ok" \
+  bash -c "$K exec cli -- traceroute -q1 -w3 -m4 $A1FAB 2>/dev/null | grep -q \"($A1FAB)\" && echo ok"
+
 echo "[stale locals pruning: a dead veth's entry must not shadow a reallocated IP]"
 # A pod that dies uncleanly leaves its locals/ports/bridges entries behind
 # (no CNI DEL ran). The leak turns into a blackhole when its VPC IP is later
@@ -338,6 +347,12 @@ for _ in 1 2 3 4; do $K -n team-a exec a1 -- wget -qO- -T2 "http://$EIPIP:9999/"
 srcseen=$(docker exec eipcap grep -oE "$FIP" /tmp/cap.txt 2>/dev/null | head -1)
 docker rm -f eipcap >/dev/null 2>&1
 [ "$srcseen" = "$FIP" ] && pass "a1 outbound source = floating IP $FIP (EIP egress)" || fail "a1 outbound source = floating IP $FIP (EIP egress, saw '$srcseen')"
+# ICMP errors out through the floating path (#3): the external traceroute's
+# probes elicit port-unreachable from a1's kernel; floating_egress_snat must
+# rewrite the embedded destination vpc->public or traceroute can't correlate
+# its probes and never prints the hop.
+extlast=$(docker run --rm --network kind nicolaka/netshoot traceroute -q1 -w3 -m6 "$FIP" 2>/dev/null | tail -1)
+if echo "$extlast" | grep -q "$FIP"; then pass "external UDP-traceroute reaches $FIP (floating error rewrite)"; else fail "external UDP-traceroute reaches $FIP (last hop: $extlast)"; fi
 
 echo "[map recreation: agent restart heals existing pods (no reboot)]"
 # Simulate the effect of a map-ABI upgrade: remove the CNI-written pinned maps

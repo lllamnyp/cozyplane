@@ -76,6 +76,22 @@ struct cozy_mac {
 #define ICMP_ID_OFF   (L4_OFF + 4)
 #define ICMP_ECHO_REPLY   0
 #define ICMP_ECHO_REQUEST 8
+#define ICMP_DEST_UNREACH  3
+#define ICMP_TIME_EXCEEDED 11
+#define ICMP_PARAM_PROB    12
+
+// An ICMPv4 error embeds the original packet: its IPv4 header + at least the
+// first 8 L4 bytes, right after the 8-byte ICMP header. Offsets assume an
+// options-free embedded header (checked: version/ihl must read 0x45).
+#define EMB_IP_OFF       (L4_OFF + 8)
+#define EMB_IP_PROTO_OFF (EMB_IP_OFF + 9)
+#define EMB_IP_CSUM_OFF  (EMB_IP_OFF + 10)
+#define EMB_SADDR_OFF    (EMB_IP_OFF + 12)
+#define EMB_DADDR_OFF    (EMB_IP_OFF + 16)
+#define EMB_L4_OFF       (EMB_IP_OFF + 20)
+#define EMB_SPORT_OFF    (EMB_L4_OFF)
+#define EMB_DPORT_OFF    (EMB_L4_OFF + 2)
+#define EMB_UDP_CSUM_OFF (EMB_L4_OFF + 6)
 
 // IPv6 fabric-bridge offsets: a fixed 40-byte header (no extension headers on
 // the inner VPC traffic the bridge handles). No L3 checksum exists in IPv6, so a
@@ -704,6 +720,115 @@ static __always_inline void nat_icmp6_id(struct __sk_buff *skb, __u16 old, __u16
 	bpf_skb_store_bytes(skb, ICMP6_ID_OFF, &new, sizeof(new), 0);
 }
 
+// icmp_v4_err reports whether an ICMPv4 type is an error that embeds the
+// packet it is about (dest-unreachable incl. frag-needed, time-exceeded,
+// parameter-problem).
+static __always_inline int icmp_v4_err(__u8 type)
+{
+	return type == ICMP_DEST_UNREACH || type == ICMP_TIME_EXCEEDED || type == ICMP_PARAM_PROB;
+}
+
+// csum_upd16/32: RFC 1624 incremental checksum update (HC' = ~(~HC + ~m + m')),
+// in plain C so embedded checksum fields can be recomputed and then written
+// like any other payload bytes (each write folded into the outer ICMP
+// checksum exactly once by emb_store16).
+static __always_inline __u16 csum_upd16(__u16 c, __u16 old, __u16 new)
+{
+	__u32 sum = (__u16)~c;
+	sum += (__u16)~old;
+	sum += new;
+	sum = (sum & 0xffff) + (sum >> 16);
+	sum = (sum & 0xffff) + (sum >> 16);
+	return ~sum;
+}
+
+static __always_inline __u16 csum_upd32(__u16 c, __u32 old, __u32 new)
+{
+	c = csum_upd16(c, old & 0xffff, new & 0xffff);
+	return csum_upd16(c, old >> 16, new >> 16);
+}
+
+// emb — the fields the bridge rewrites inside an ICMPv4 error's embedded
+// packet. Loaded/stored with skb_{load,store}_bytes at constant offsets.
+struct emb {
+	__u8  proto;
+	__u32 saddr, daddr; // network order
+	__u16 sport, dport; // network order
+	__u16 ip_csum;      // embedded IP header checksum
+	__u16 udp_csum;     // embedded UDP checksum (0 = none)
+};
+
+static __always_inline int emb_load(struct __sk_buff *skb, struct emb *e)
+{
+	__u8 vihl;
+	if (bpf_skb_load_bytes(skb, EMB_IP_OFF, &vihl, 1) < 0 || vihl != 0x45)
+		return -1;
+	if (bpf_skb_load_bytes(skb, EMB_IP_PROTO_OFF, &e->proto, 1) < 0 ||
+	    bpf_skb_load_bytes(skb, EMB_IP_CSUM_OFF, &e->ip_csum, 2) < 0 ||
+	    bpf_skb_load_bytes(skb, EMB_SADDR_OFF, &e->saddr, 4) < 0 ||
+	    bpf_skb_load_bytes(skb, EMB_DADDR_OFF, &e->daddr, 4) < 0 ||
+	    bpf_skb_load_bytes(skb, EMB_SPORT_OFF, &e->sport, 2) < 0 ||
+	    bpf_skb_load_bytes(skb, EMB_DPORT_OFF, &e->dport, 2) < 0)
+		return -1;
+	e->udp_csum = 0;
+	if (e->proto == IPPROTO_UDP &&
+	    bpf_skb_load_bytes(skb, EMB_UDP_CSUM_OFF, &e->udp_csum, 2) < 0)
+		return -1;
+	return 0;
+}
+
+// emb_store16/32 write an embedded field and fold the change into the OUTER
+// ICMP checksum (which sums the whole payload). Every embedded byte the
+// bridge touches — data and checksum fields alike — goes through these, so
+// the outer checksum stays exact; a receiver verifies it, making any rewrite
+// bug self-detect as a drop rather than silent corruption.
+static __always_inline void emb_store16(struct __sk_buff *skb, __u32 off, __u16 old, __u16 new)
+{
+	bpf_l4_csum_replace(skb, ICMP_CSUM_OFF, old, new, 2);
+	bpf_skb_store_bytes(skb, off, &new, sizeof(new), 0);
+}
+
+static __always_inline void emb_store32(struct __sk_buff *skb, __u32 off, __u32 old, __u32 new)
+{
+	bpf_l4_csum_replace(skb, ICMP_CSUM_OFF, old, new, 4);
+	bpf_skb_store_bytes(skb, off, &new, sizeof(new), 0);
+}
+
+// emb_rewrite applies one address+port translation to the embedded packet:
+// saddr->nsaddr, daddr->ndaddr, and (when nport != 0) the port at port_off ->
+// nport. The embedded IP checksum is recomputed for the address changes; the
+// embedded UDP checksum (when present) for both — its pseudo-header sums the
+// addresses. An absent UDP checksum that would become 0 stays 0 (no checksum).
+static __always_inline void emb_rewrite(struct __sk_buff *skb, struct emb *e,
+					__u32 nsaddr, __u32 ndaddr,
+					__u32 port_off, __u16 oport, __u16 nport)
+{
+	__u16 ip_csum = e->ip_csum;
+	ip_csum = csum_upd32(ip_csum, e->saddr, nsaddr);
+	ip_csum = csum_upd32(ip_csum, e->daddr, ndaddr);
+
+	if (e->saddr != nsaddr)
+		emb_store32(skb, EMB_SADDR_OFF, e->saddr, nsaddr);
+	if (e->daddr != ndaddr)
+		emb_store32(skb, EMB_DADDR_OFF, e->daddr, ndaddr);
+	if (ip_csum != e->ip_csum)
+		emb_store16(skb, EMB_IP_CSUM_OFF, e->ip_csum, ip_csum);
+	if (nport && nport != oport)
+		emb_store16(skb, port_off, oport, nport);
+
+	if (e->proto == IPPROTO_UDP && e->udp_csum) {
+		__u16 udp = e->udp_csum;
+		udp = csum_upd32(udp, e->saddr, nsaddr); // pseudo-header
+		udp = csum_upd32(udp, e->daddr, ndaddr);
+		if (nport)
+			udp = csum_upd16(udp, oport, nport);
+		if (!udp)
+			udp = 0xffff; // 0 means "no checksum" on the wire
+		if (udp != e->udp_csum)
+			emb_store16(skb, EMB_UDP_CSUM_OFF, e->udp_csum, udp);
+	}
+}
+
 // alloc_gw_port picks a free masquerade port for a new north-south connection:
 // the reverse-lookup key {proto, gw_port, net, vpc_ip, pod_port} must be unique,
 // so probe (bounded) with BPF_NOEXIST — the insert that wins owns the port.
@@ -732,17 +857,60 @@ static __always_inline __u16 alloc_gw_port(__u8 proto, __u32 net, struct addr128
 	return 0;
 }
 
+// bridge_forward_icmp_err translates a network-emitted ICMP error (typically
+// frag-needed — the PMTU signal) toward the pod. The error is addressed to the
+// fabric IP because the pod's un-NAT'd reply carried it as source; its embedded
+// packet is that reply, fabric:pod_port -> client:client_port. Look the flow up
+// in ct_fwd (the same key its forward direction uses), then translate outer and
+// embedded through the same NAT: the pod must see the embedded packet exactly
+// as it sent it (vpc:pod_port -> gw:gw_port) or its stack won't match a socket.
+// Errors about ICMP-echo flows are not translated (no PMTU value for pings).
+static __always_inline int bridge_forward_icmp_err(struct __sk_buff *skb, struct iphdr *ip, __u32 net, struct addr128 vpc_ip)
+{
+	struct emb e;
+	if (emb_load(skb, &e) < 0)
+		return TC_ACT_SHOT;
+	if (e.proto != IPPROTO_TCP && e.proto != IPPROTO_UDP)
+		return TC_ACT_SHOT;
+	__u32 osrc = ip->saddr, odst = ip->daddr; // copied: stores below invalidate ip
+	if (e.saddr != odst)
+		return TC_ACT_SHOT; // embedded source must be the fabric IP the error targets
+
+	struct addr128 client128, fabric128;
+	v4_to_128(&client128, e.daddr);
+	v4_to_128(&fabric128, e.saddr);
+	struct ct_fwd_key fk = {
+		.proto = e.proto,
+		.net = net,
+		.client_ip = client128,
+		.fabric_ip = fabric128,
+		.client_port = e.dport,
+		.pod_port = e.sport,
+	};
+	__u16 *gw_port = bpf_map_lookup_elem(&ct_fwd, &fk);
+	if (!gw_port)
+		return TC_ACT_SHOT; // no such bridged flow
+
+	__u32 vpc = v4_of_128(&vpc_ip), gw = bpf_htonl(LINK_LOCAL_GW);
+	nat_addr(skb, IPPROTO_ICMP, IP_DADDR_OFF, odst, vpc);
+	nat_addr(skb, IPPROTO_ICMP, IP_SADDR_OFF, osrc, gw); // reporter hidden, like any client
+	emb_rewrite(skb, &e, vpc, gw, EMB_DPORT_OFF, e.dport, *gw_port);
+	return TC_ACT_OK; // delivered to the pod; its stack applies the PMTU/error
+}
+
 // bridge_forward_icmp is the ICMP-echo forward half: the echo identifier stands
 // in for the L4 port. A request is DNATed fabric->VPC, its client masqueraded to
 // the gateway, and its id rewritten to a unique gw_id so replies demux (the
-// client is hidden, so id is the only distinguishing field). Only echo requests
-// cross; ICMP errors are dropped (PMTU is a follow-up).
+// client is hidden, so id is the only distinguishing field). Echo requests and
+// ICMP errors cross (bridge_forward_icmp_err); the rest is dropped.
 static __always_inline int bridge_forward_icmp(struct __sk_buff *skb, struct iphdr *ip, __u32 net, struct addr128 vpc_ip)
 {
 	__u8 type;
 	__u16 id;
 	if (icmp_echo(skb, &type, &id) < 0)
 		return TC_ACT_SHOT;
+	if (icmp_v4_err(type))
+		return bridge_forward_icmp_err(skb, ip, net, vpc_ip);
 	if (type != ICMP_ECHO_REQUEST)
 		return TC_ACT_SHOT;
 	__u32 client = ip->saddr, fabric = ip->daddr;
@@ -841,12 +1009,54 @@ static __always_inline int deliver_net0(struct __sk_buff *skb, struct addr128 ds
 // to the gateway carries the gw_id in its identifier; look it up, restore
 // vpc->fabric and gateway->client, and rewrite the id back to the client's
 // original before delivering on the default network.
+// bridge_reverse_icmp_err translates a pod-emitted ICMP error (port
+// unreachable, time-exceeded — what makes UDP probes fail fast and traceroute
+// terminate) out to the client. The pod addressed it to the gateway because
+// the offending packet's masqueraded source was gw:gw_port; that packet is
+// embedded, so ct_rev keyed on the embedded (gw_port, vpc, pod_port) recovers
+// the client, and outer + embedded are translated back: the client's stack
+// must see its own original packet (client:client_port -> fabric:pod_port)
+// inside the error to match it to a socket. Errors about echo flows pass for
+// TCP/UDP only (no value in translating errors about pings).
+static __always_inline int bridge_reverse_icmp_err(struct __sk_buff *skb, struct iphdr *ip, __u32 net)
+{
+	struct emb e;
+	if (emb_load(skb, &e) < 0)
+		return TC_ACT_OK;
+	if (e.proto != IPPROTO_TCP && e.proto != IPPROTO_UDP)
+		return TC_ACT_OK;
+	__u32 osrc = ip->saddr; // copied: stores below invalidate ip
+	if (e.saddr != bpf_htonl(LINK_LOCAL_GW) || e.daddr != osrc)
+		return TC_ACT_OK; // embedded must be a bridged inbound: gw -> this pod
+
+	struct addr128 vpc128;
+	v4_to_128(&vpc128, e.daddr);
+	struct ct_rev_key rk = {
+		.proto = e.proto,
+		.gw_port = e.sport,
+		.net = net,
+		.vpc_ip = vpc128,
+		.pod_port = e.dport,
+	};
+	struct ct_rev_val *rv = bpf_map_lookup_elem(&ct_rev, &rk);
+	if (!rv)
+		return TC_ACT_OK;
+
+	__u32 fabric = v4_of_128(&rv->fabric_ip), client = v4_of_128(&rv->client_ip);
+	nat_addr(skb, IPPROTO_ICMP, IP_SADDR_OFF, osrc, fabric);
+	nat_addr(skb, IPPROTO_ICMP, IP_DADDR_OFF, bpf_htonl(LINK_LOCAL_GW), client);
+	emb_rewrite(skb, &e, client, fabric, EMB_SPORT_OFF, e.sport, rv->client_port);
+	return deliver_net0(skb, rv->client_ip);
+}
+
 static __always_inline int bridge_reverse_icmp(struct __sk_buff *skb, struct iphdr *ip, __u32 net)
 {
 	__u8 type;
 	__u16 gw_id;
 	if (icmp_echo(skb, &type, &gw_id) < 0)
 		return TC_ACT_OK;
+	if (icmp_v4_err(type))
+		return bridge_reverse_icmp_err(skb, ip, net);
 	if (type != ICMP_ECHO_REPLY)
 		return TC_ACT_OK;
 	struct addr128 vpc128;
@@ -1024,24 +1234,39 @@ static __always_inline int bridge_reverse6(struct __sk_buff *skb, struct pkt *p,
 // packet's destination is a floating address: a stateless DNAT public->VPC that
 // keeps the external client as the source (no masquerade). Sanctioned
 // north-south, like bridge_forward — the isolation check below does not run.
-// TCP, UDP, and ICMP echo (request or reply — a reply is the return half of the
-// pod's own outbound ping); other ICMP is dropped.
+// TCP, UDP, ICMP echo (request or reply — a reply is the return half of the
+// pod's own outbound ping), and ICMP errors (frag-needed = the pod's inbound
+// PMTU signal). Floating is stateless and source-preserving, so an error needs
+// only the public->VPC swap in the outer destination and the embedded source
+// (the pod's dropped packet left with the public address as its source).
 static __always_inline int floating_forward(struct __sk_buff *skb, struct iphdr *ip, __u32 net, struct addr128 vpc_ip)
 {
 	if (ip->ihl != 5)
 		return TC_ACT_SHOT;
 	__u8 proto = ip->protocol;
+	__u32 vpc = v4_of_128(&vpc_ip);
 	if (proto == IPPROTO_ICMP) {
 		__u8 type;
 		__u16 id;
 		if (icmp_echo(skb, &type, &id) < 0)
 			return TC_ACT_SHOT;
+		if (icmp_v4_err(type)) {
+			struct emb e;
+			__u32 odst = ip->daddr; // copied: stores below invalidate ip
+			if (emb_load(skb, &e) < 0)
+				return TC_ACT_SHOT;
+			if (e.saddr != odst)
+				return TC_ACT_SHOT; // embedded source must be the public IP
+			nat_addr(skb, proto, IP_DADDR_OFF, odst, vpc);
+			emb_rewrite(skb, &e, vpc, e.daddr, 0, 0, 0);
+			return TC_ACT_OK;
+		}
 		if (type != ICMP_ECHO_REQUEST && type != ICMP_ECHO_REPLY)
 			return TC_ACT_SHOT;
 	} else if (proto != IPPROTO_TCP && proto != IPPROTO_UDP) {
 		return TC_ACT_SHOT;
 	}
-	nat_addr(skb, proto, IP_DADDR_OFF, ip->daddr, v4_of_128(&vpc_ip));
+	nat_addr(skb, proto, IP_DADDR_OFF, ip->daddr, vpc);
 	return TC_ACT_OK; // delivered to the pod, the real client still its source
 }
 
@@ -1076,7 +1301,22 @@ static __always_inline int floating_egress_snat(struct __sk_buff *skb, struct ip
 	__u32 uplink = cfg(CFG_UPLINK_IFINDEX);
 	if (!uplink)
 		return FLOAT_MISS;
-	nat_addr(skb, proto, IP_SADDR_OFF, ip->saddr, v4_of_128(public_ip));
+	__u32 pub = v4_of_128(public_ip), osrc = ip->saddr; // copied: stores invalidate ip
+	if (proto == IPPROTO_ICMP) {
+		// A pod-emitted ICMP error (port unreachable to a probe, frag-needed)
+		// embeds the client's inbound packet, whose destination was the
+		// public address before the floating DNAT: swap it back so the
+		// client's stack can match the error to its socket. Stateless, like
+		// the rest of the floating path.
+		__u8 type;
+		__u16 id;
+		if (icmp_echo(skb, &type, &id) == 0 && icmp_v4_err(type)) {
+			struct emb e;
+			if (emb_load(skb, &e) == 0 && e.daddr == osrc)
+				emb_rewrite(skb, &e, e.saddr, pub, 0, 0, 0);
+		}
+	}
+	nat_addr(skb, proto, IP_SADDR_OFF, osrc, pub);
 	return bpf_redirect_neigh(uplink, NULL, 0, 0);
 }
 

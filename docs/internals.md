@@ -795,9 +795,18 @@ mostly future work. As built:
 - Overlapping VPC CIDRs are supported (net-scoped delivery, above); only
   *peering* overlapping VPCs is refused.
 - The north-south bridge is eBPF NAT (its own `ct_fwd`/`ct_rev` table): TCP, UDP,
-  and ICMP echo (ping), for both fabric IPs and floating IPs. ICMP *error*
-  messages are not NAT'd yet, so PMTU discovery through the bridge is broken (a
-  follow-up). The tenant datapath is netfilter-free; the agent's two node-boundary
+  ICMP echo (ping), and — for IPv4 — **ICMP errors** (dest-unreachable incl.
+  frag-needed, time-exceeded, parameter-problem), for both fabric IPs and
+  floating IPs. An error's *embedded* IP+L4 header is rewritten through the same
+  NAT as the flow it describes (masq bridge: ct-keyed on the embedded `gw_port`;
+  floating: stateless address swap), with every changed byte folded into the
+  outer ICMP checksum — a receiver verifies that checksum, so a bad rewrite
+  self-detects as a drop. Outward errors give clients port-unreachable and
+  working UDP traceroute; inward errors deliver frag-needed to the pod, so
+  IPv4 PMTU discovery through the bridge works (#3). Embedded *TCP* checksums
+  beyond the 8 guaranteed L4 bytes are left untouched (Linux correlates errors
+  by addresses+ports, not embedded checksums). ICMPv6 errors (packet-too-big)
+  are a follow-up — same pattern, ICMPv6's pseudo-header included. The tenant datapath is netfilter-free; the agent's two node-boundary
   netfilter rules — the cluster-egress node masquerade (SNAT) and the overlay
   FORWARD-ACCEPT (non-NAT) — are an **interim** dependency that currently makes
   netfilter mandatory (both fatal to startup) and are slated to move to eBPF /
