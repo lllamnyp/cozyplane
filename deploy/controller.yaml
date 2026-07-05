@@ -100,7 +100,7 @@ spec:
             - --metrics-bind-address=0
             - --health-probe-bind-address=:8081
             - --gateway-image=ghcr.io/lllamnyp/cozyplane:dev
-            - --internal-cidrs=10.244.0.0/16,10.96.0.0/16
+            - --internal-cidrs=10.244.0.0/16,10.96.0.0/16,fd00:10:244::/56,fd00:10:96::/112
             - --cluster-dns=10.96.0.10
           env:
             - name: POD_NAMESPACE

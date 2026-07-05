@@ -73,39 +73,56 @@ func main() {
 }
 
 func run(vpcIface, fabricIface, clusterDNS string, internalCIDRs []string, log *slog.Logger) error {
-	// The CNI sets this up at gateway-attach; re-assert in case the netns was
+	// The CNI sets these up at gateway-attach; re-assert in case the netns was
 	// recycled (privileged container, own netns only).
 	if err := datapath.WriteProcSys("net/ipv4/ip_forward", "1"); err != nil {
 		return fmt.Errorf("enable ip_forward: %w", err)
 	}
+	if err := datapath.WriteProcSys("net/ipv6/conf/all/forwarding", "1"); err != nil {
+		return fmt.Errorf("enable ipv6 forwarding: %w", err)
+	}
 
-	ipt, err := iptables.New()
-	if err != nil {
-		return fmt.Errorf("init iptables: %w", err)
-	}
-	for _, spec := range masqueradeRules(fabricIface) {
-		if err := ipt.AppendUnique("nat", "POSTROUTING", spec...); err != nil {
-			return fmt.Errorf("nat rule %v: %w", spec, err)
+	// The same policy in both families, each table seeing only its own
+	// internal CIDRs (a v6 VPC's gateway forwards v6 out the dual-stack fabric
+	// leg; the internal-deny must hold per family). This runs in the gateway's
+	// OWN netns — it is not part of the node's netfilter footprint.
+	for _, fam := range []struct {
+		proto iptables.Protocol
+		v6    bool
+	}{{iptables.ProtocolIPv4, false}, {iptables.ProtocolIPv6, true}} {
+		ipt, err := iptables.NewWithProtocol(fam.proto)
+		if err != nil {
+			return fmt.Errorf("init iptables (v6=%v): %w", fam.v6, err)
 		}
-	}
-	for _, spec := range dnsRedirectRules(vpcIface, clusterDNS, internalCIDRs) {
-		if err := ipt.AppendUnique("nat", "PREROUTING", spec...); err != nil {
-			return fmt.Errorf("dns redirect rule %v: %w", spec, err)
+		famCIDRs := cidrsOfFamily(internalCIDRs, fam.v6)
+		famDNS := clusterDNS
+		if dnsIP := net.ParseIP(clusterDNS); dnsIP != nil && (dnsIP.To4() == nil) != fam.v6 {
+			famDNS = "" // the cluster DNS ClusterIP is the other family
 		}
-	}
-	for _, spec := range inputRules(vpcIface) {
-		if err := ipt.AppendUnique("filter", "INPUT", spec...); err != nil {
-			return fmt.Errorf("input rule %v: %w", spec, err)
+		for _, spec := range masqueradeRules(fabricIface) {
+			if err := ipt.AppendUnique("nat", "POSTROUTING", spec...); err != nil {
+				return fmt.Errorf("nat rule %v (v6=%v): %w", spec, fam.v6, err)
+			}
 		}
-	}
-	for _, spec := range forwardRules(vpcIface, internalCIDRs) {
-		if err := ipt.AppendUnique("filter", "FORWARD", spec...); err != nil {
-			return fmt.Errorf("forward rule %v: %w", spec, err)
+		for _, spec := range dnsRedirectRules(vpcIface, famDNS, famCIDRs, fam.v6) {
+			if err := ipt.AppendUnique("nat", "PREROUTING", spec...); err != nil {
+				return fmt.Errorf("dns redirect rule %v (v6=%v): %w", spec, fam.v6, err)
+			}
 		}
-	}
-	// Default-deny anything the explicit rules didn't admit.
-	if err := ipt.ChangePolicy("filter", "FORWARD", "DROP"); err != nil {
-		return fmt.Errorf("set FORWARD policy: %w", err)
+		for _, spec := range inputRules(vpcIface, fam.v6) {
+			if err := ipt.AppendUnique("filter", "INPUT", spec...); err != nil {
+				return fmt.Errorf("input rule %v (v6=%v): %w", spec, fam.v6, err)
+			}
+		}
+		for _, spec := range forwardRules(vpcIface, famCIDRs) {
+			if err := ipt.AppendUnique("filter", "FORWARD", spec...); err != nil {
+				return fmt.Errorf("forward rule %v (v6=%v): %w", spec, fam.v6, err)
+			}
+		}
+		// Default-deny anything the explicit rules didn't admit.
+		if err := ipt.ChangePolicy("filter", "FORWARD", "DROP"); err != nil {
+			return fmt.Errorf("set FORWARD policy (v6=%v): %w", fam.v6, err)
+		}
 	}
 
 	if clusterDNS != "" {
@@ -138,11 +155,19 @@ func masqueradeRules(fabricIface string) [][]string {
 // rewritten to a CoreDNS *pod IP* inside the client's connect() — so matching
 // only the ClusterIP misses. Queries to external resolvers are not redirected;
 // they forward like any internet traffic.
-func dnsRedirectRules(vpcIface, clusterDNS string, internalCIDRs []string) [][]string {
-	if clusterDNS == "" {
+func dnsRedirectRules(vpcIface, clusterDNS string, internalCIDRs []string, v6 bool) [][]string {
+	var dsts []string
+	if clusterDNS != "" {
+		mask := "/32"
+		if v6 {
+			mask = "/128"
+		}
+		dsts = append(dsts, clusterDNS+mask)
+	}
+	dsts = append(dsts, internalCIDRs...)
+	if len(dsts) == 0 {
 		return nil
 	}
-	dsts := append([]string{clusterDNS + "/32"}, internalCIDRs...)
 	var rules [][]string
 	for _, dst := range dsts {
 		for _, proto := range []string{"udp", "tcp"} {
@@ -154,15 +179,37 @@ func dnsRedirectRules(vpcIface, clusterDNS string, internalCIDRs []string) [][]s
 	return rules
 }
 
+// cidrsOfFamily filters a CIDR list to one address family.
+func cidrsOfFamily(cidrs []string, v6 bool) []string {
+	var out []string
+	for _, c := range cidrs {
+		if ip, _, err := net.ParseCIDR(c); err == nil && (ip.To4() == nil) == v6 {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // inputRules restrict what the VPC side may address to the gateway itself:
 // the DNS proxy and reply traffic, nothing else.
-func inputRules(vpcIface string) [][]string {
-	return [][]string{
-		{"-i", vpcIface, "-p", "udp", "--dport", "53", "-j", "ACCEPT"},
-		{"-i", vpcIface, "-p", "tcp", "--dport", "53", "-j", "ACCEPT"},
-		{"-i", vpcIface, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"},
-		{"-i", vpcIface, "-j", "DROP"},
+func inputRules(vpcIface string, v6 bool) [][]string {
+	var rules [][]string
+	if v6 {
+		// NDP is ICMPv6 — unlike ARP, ip6tables sees it, and dropping the
+		// neighbor solicitation/advertisement leaves the VPC leg's fe80::1
+		// next hop unresolvable (the same v4/v6 asymmetry the datapath's
+		// v6_link_scoped bypass exists for).
+		rules = append(rules,
+			[]string{"-i", vpcIface, "-p", "icmpv6", "--icmpv6-type", "135", "-j", "ACCEPT"},
+			[]string{"-i", vpcIface, "-p", "icmpv6", "--icmpv6-type", "136", "-j", "ACCEPT"},
+		)
 	}
+	return append(rules,
+		[]string{"-i", vpcIface, "-p", "udp", "--dport", "53", "-j", "ACCEPT"},
+		[]string{"-i", vpcIface, "-p", "tcp", "--dport", "53", "-j", "ACCEPT"},
+		[]string{"-i", vpcIface, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"},
+		[]string{"-i", vpcIface, "-j", "DROP"},
+	)
 }
 
 // forwardRules is the gateway's forwarding policy, in order: replies pass,

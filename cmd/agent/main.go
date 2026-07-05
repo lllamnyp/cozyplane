@@ -145,12 +145,14 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	// datapath below once the node IP is known; iptables installs the classic
 	// kernel rule; each mode tears the other's state down so a switch never
 	// double-NATs.
-	if clusterCIDR != "" && masqMode == "iptables" {
-		if err := datapath.EnsureMasquerade(clusterCIDR); err != nil {
+	// --cluster-cidr may list both families; the legacy kernel rule is v4-only,
+	// so iptables mode uses the v4 entry (v6 egress needs --masquerade=bpf).
+	if v4cidr := firstV4CIDR(clusterCIDR); v4cidr != "" && masqMode == "iptables" {
+		if err := datapath.EnsureMasquerade(v4cidr); err != nil {
 			return fmt.Errorf("ensure masquerade: %w", err)
 		}
-	} else if clusterCIDR != "" {
-		datapath.RemoveMasquerade(clusterCIDR)
+	} else if v4cidr != "" {
+		datapath.RemoveMasquerade(v4cidr)
 	}
 	if masqMode != "bpf" {
 		if err := mgr.SetNodeIP(nil); err != nil {
@@ -243,7 +245,15 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		if err := mgr.SetNodeIP(net.ParseIP(state.NodeIP)); err != nil {
 			return fmt.Errorf("program masquerade node IP: %w", err)
 		}
-		log.Info("bpf cluster-egress masquerade enabled", "sources", clusterCIDR, "nodeIP", state.NodeIP)
+		// v6 masquerade needs a node v6 address; without one it stays off and
+		// pod v6 egress has no off-cluster return path (matching v4-only nodes).
+		nodeV6 := internalIPv6(self)
+		if nodeV6 != "" {
+			if err := mgr.SetNodeIP6(net.ParseIP(nodeV6)); err != nil {
+				return fmt.Errorf("program masquerade node IPv6: %w", err)
+			}
+		}
+		log.Info("bpf cluster-egress masquerade enabled", "sources", clusterCIDR, "nodeIP", state.NodeIP, "nodeIPv6", nodeV6)
 	}
 	log.Info("published node state", "nodeIP", state.NodeIP, "podCIDR", podCIDR, "mtu", mtu)
 
@@ -920,6 +930,28 @@ func internalIP(node *corev1.Node) string {
 	for _, a := range node.Status.Addresses {
 		if a.Type == corev1.NodeInternalIP {
 			return a.Address
+		}
+	}
+	return ""
+}
+
+// firstV4CIDR returns the first IPv4 CIDR in a comma-separated list.
+func firstV4CIDR(cidrs string) string {
+	for _, c := range splitCIDRs(cidrs) {
+		if ip, _, err := net.ParseCIDR(c); err == nil && ip.To4() != nil {
+			return c
+		}
+	}
+	return ""
+}
+
+// internalIPv6 returns the node's v6 InternalIP, if it has one (dual-stack).
+func internalIPv6(node *corev1.Node) string {
+	for _, a := range node.Status.Addresses {
+		if a.Type == corev1.NodeInternalIP {
+			if ip := net.ParseIP(a.Address); ip != nil && ip.To4() == nil {
+				return a.Address
+			}
 		}
 	}
 	return ""

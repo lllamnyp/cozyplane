@@ -60,13 +60,13 @@ func TestForwardRuleOrder(t *testing.T) {
 // rewrites it to a CoreDNS pod IP inside the client — so the pod/service
 // CIDRs are matched too. External resolvers are left alone.
 func TestDNSIsRedirectedNotForwarded(t *testing.T) {
-	assertRules(t, dnsRedirectRules("eth1", "10.96.0.10", []string{"10.244.0.0/16"}), []string{
+	assertRules(t, dnsRedirectRules("eth1", "10.96.0.10", []string{"10.244.0.0/16"}, false), []string{
 		"-i eth1 -d 10.96.0.10/32 -p udp --dport 53 -j REDIRECT --to-ports 53",
 		"-i eth1 -d 10.96.0.10/32 -p tcp --dport 53 -j REDIRECT --to-ports 53",
 		"-i eth1 -d 10.244.0.0/16 -p udp --dport 53 -j REDIRECT --to-ports 53",
 		"-i eth1 -d 10.244.0.0/16 -p tcp --dport 53 -j REDIRECT --to-ports 53",
 	})
-	if got := dnsRedirectRules("eth1", "", nil); got != nil {
+	if got := dnsRedirectRules("eth1", "", nil, false); got != nil {
 		t.Errorf("no redirect expected without --cluster-dns, got %v", got)
 	}
 }
@@ -74,7 +74,7 @@ func TestDNSIsRedirectedNotForwarded(t *testing.T) {
 // The VPC side may address the gateway itself only on :53 (the DNS proxy);
 // everything else to the gateway is dropped.
 func TestInputRestrictedToDNS(t *testing.T) {
-	assertRules(t, inputRules("eth1"), []string{
+	assertRules(t, inputRules("eth1", false), []string{
 		"-i eth1 -p udp --dport 53 -j ACCEPT",
 		"-i eth1 -p tcp --dport 53 -j ACCEPT",
 		"-i eth1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",

@@ -457,6 +457,16 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } uplink_mac SEC(".maps");
 
+// node_ip6 holds the node's v6 address for the v6 bpf masquerade (one entry;
+// params is a u32 array and cannot carry it). Zero disables v6 masquerade.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, struct addr128);
+	__uint(max_entries, 1);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} node_ip6 SEC(".maps");
+
 static __always_inline __u32 cfg(__u32 idx)
 {
 	__u32 *v = bpf_map_lookup_elem(&params, &idx);
@@ -1861,6 +1871,156 @@ static __always_inline int floating_ndp(struct __sk_buff *skb)
 	return bpf_redirect(skb->ifindex, 0); // back out the uplink to the requester
 }
 
+static __always_inline struct addr128 *masq_node6(void)
+{
+	__u32 zero = 0;
+	struct addr128 z = {};
+	struct addr128 *n = bpf_map_lookup_elem(&node_ip6, &zero);
+	if (!n || addr128_eq(n, &z))
+		return NULL;
+	return n;
+}
+
+// masq_snat6 / masq_reverse6: the v6 cluster-egress masquerade, mirroring the
+// v4 pair. Same ct tables (addr128-keyed, families coexist), same port range.
+// This is what gives the gateway pod's forwarded tenant-v6 traffic (and any
+// default-network pod's v6 egress) a routable return path — pod ULAs are not
+// routable outside the cluster, exactly like the v4 pod CIDRs.
+static __always_inline int masq_snat6(struct __sk_buff *skb, struct pkt *p)
+{
+	if (!is_masq_src(p->src) || is_internal(p->dst))
+		return MASQ_MISS;
+	if (v6_link_scoped(&p->dst))
+		return MASQ_MISS; // NDP and friends are the node's own business
+	struct addr128 *node6 = masq_node6();
+	if (!node6)
+		return MASQ_MISS;
+	struct addr128 node = *node6, src = p->src;
+	__u8 proto = p->proto;
+
+	if (proto == IPPROTO_ICMPV6) {
+		__u8 type;
+		__u16 id;
+		if (icmp6_echo(skb, &type, &id) < 0 || type != ICMP6_ECHO_REQUEST)
+			return MASQ_MISS;
+		struct ct_fwd_key fk = {
+			.proto = proto, .net = 0,
+			.client_ip = src, .fabric_ip = p->dst,
+			.client_port = id,
+		};
+		__u16 gw_id;
+		__u16 *have = bpf_map_lookup_elem(&ct_fwd, &fk);
+		if (have) {
+			gw_id = *have;
+		} else {
+			gw_id = alloc_gw_port_in(proto, 0, p->dst, 0, src, src, id,
+						 MASQ_PORT_BASE, MASQ_PORT_SPAN);
+			if (!gw_id)
+				return MASQ_MISS;
+			bpf_map_update_elem(&ct_fwd, &fk, &gw_id, BPF_ANY);
+		}
+		nat_addr6(skb, proto, IP6_SADDR_OFF, &src, &node);
+		nat_icmp6_id(skb, id, gw_id);
+		return TC_ACT_OK;
+	}
+	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
+		return MASQ_MISS;
+	__u16 sport, dport;
+	if (l4_ports6(skb, &sport, &dport) < 0)
+		return MASQ_MISS;
+	struct ct_fwd_key fk = {
+		.proto = proto, .net = 0,
+		.client_ip = src, .fabric_ip = p->dst,
+		.client_port = sport, .pod_port = dport,
+	};
+	__u16 gw_port;
+	__u16 *have = bpf_map_lookup_elem(&ct_fwd, &fk);
+	if (have) {
+		gw_port = *have;
+	} else {
+		gw_port = alloc_gw_port_in(proto, 0, p->dst, dport, src, src, sport,
+					   MASQ_PORT_BASE, MASQ_PORT_SPAN);
+		if (!gw_port)
+			return MASQ_MISS;
+		bpf_map_update_elem(&ct_fwd, &fk, &gw_port, BPF_ANY);
+	}
+	nat_addr6(skb, proto, IP6_SADDR_OFF, &src, &node);
+	nat_port6(skb, proto, L4_SPORT_OFF6, sport, gw_port);
+	return TC_ACT_OK;
+}
+
+static __always_inline int masq_reverse6(struct __sk_buff *skb, struct pkt *p)
+{
+	struct addr128 *node6 = masq_node6();
+	if (!node6 || !addr128_eq(&p->dst, node6))
+		return MASQ_MISS;
+	struct addr128 node = *node6;
+	__u8 proto = p->proto;
+
+	if (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
+		__u16 sport, dport;
+		if (l4_ports6(skb, &sport, &dport) < 0)
+			return MASQ_MISS;
+		__u16 h = bpf_ntohs(dport);
+		if (h < MASQ_PORT_BASE || h >= MASQ_PORT_BASE + MASQ_PORT_SPAN)
+			return MASQ_MISS;
+		struct ct_rev_key rk = {
+			.proto = proto, .gw_port = dport, .net = 0,
+			.vpc_ip = p->src, .pod_port = sport,
+		};
+		struct ct_rev_val *rv = bpf_map_lookup_elem(&ct_rev, &rk);
+		if (!rv)
+			return MASQ_MISS;
+		nat_addr6(skb, proto, IP6_DADDR_OFF, &node, &rv->fabric_ip);
+		nat_port6(skb, proto, L4_DPORT_OFF6, dport, rv->client_port);
+		return TC_ACT_OK;
+	}
+	if (proto != IPPROTO_ICMPV6)
+		return MASQ_MISS;
+	__u8 type;
+	__u16 id;
+	if (icmp6_echo(skb, &type, &id) < 0)
+		return MASQ_MISS;
+	if (type == ICMP6_ECHO_REPLY) {
+		__u16 h = bpf_ntohs(id);
+		if (h < MASQ_PORT_BASE || h >= MASQ_PORT_BASE + MASQ_PORT_SPAN)
+			return MASQ_MISS;
+		struct ct_rev_key rk = {
+			.proto = proto, .gw_port = id, .net = 0,
+			.vpc_ip = p->src,
+		};
+		struct ct_rev_val *rv = bpf_map_lookup_elem(&ct_rev, &rk);
+		if (!rv)
+			return MASQ_MISS;
+		nat_addr6(skb, proto, IP6_DADDR_OFF, &node, &rv->fabric_ip);
+		nat_icmp6_id(skb, id, rv->client_port);
+		return TC_ACT_OK;
+	}
+	if (!icmp6_err(type))
+		return MASQ_MISS;
+	struct emb6 e;
+	if (emb6_load(skb, &e) < 0)
+		return MASQ_MISS;
+	if (e.proto != IPPROTO_TCP && e.proto != IPPROTO_UDP)
+		return MASQ_MISS;
+	if (!addr128_eq(&e.saddr, &node))
+		return MASQ_MISS;
+	__u16 h = bpf_ntohs(e.sport);
+	if (h < MASQ_PORT_BASE || h >= MASQ_PORT_BASE + MASQ_PORT_SPAN)
+		return MASQ_MISS;
+	struct ct_rev_key rk = {
+		.proto = e.proto, .gw_port = e.sport, .net = 0,
+		.vpc_ip = e.daddr, .pod_port = e.dport,
+	};
+	struct ct_rev_val *rv = bpf_map_lookup_elem(&ct_rev, &rk);
+	if (!rv)
+		return MASQ_MISS;
+	struct addr128 pod = rv->fabric_ip;
+	nat_addr6(skb, IPPROTO_ICMPV6, IP6_DADDR_OFF, &node, &pod);
+	emb6_rewrite(skb, &e, &pod, &e.daddr, EMB6_SPORT_OFF, e.sport, rv->client_port);
+	return TC_ACT_OK;
+}
+
 // cozyplane_from_pod: source-side hook (pod egress). Enforces isolation, then
 // delivers: same-node via redirect, cross-node via encap, off-VPC via gateway.
 SEC("tc")
@@ -1882,8 +2042,8 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	// (#10). A kernel-forwarded pod packet leaving the cluster gets SNAT'd
 	// here instead of by an iptables MASQUERADE rule. Everything else (node
 	// traffic, geneve encap, floated egress with its public source) misses.
-	if (!p.is_v6 && ifindex == cfg(CFG_UPLINK_IFINDEX)) {
-		int m = masq_snat(skb, &p);
+	if (ifindex == cfg(CFG_UPLINK_IFINDEX)) {
+		int m = p.is_v6 ? masq_snat6(skb, &p) : masq_snat(skb, &p);
 		if (m != MASQ_MISS)
 			return m;
 	}
@@ -2191,6 +2351,9 @@ int cozyplane_from_uplink(struct __sk_buff *skb)
 		// v4 path below (to_pod on its veth does the public->VPC DNAT).
 		struct pkt p6;
 		if (parse_ip(skb, &p6) == 0 && p6.is_v6) {
+			int m6 = masq_reverse6(skb, &p6);
+			if (m6 != MASQ_MISS)
+				return m6;
 			struct bridge_ep *fe6 = float_of(p6.dst);
 			if (fe6) {
 				struct endpoint *l6 = local_of(fe6->net, fe6->vpc_ip);

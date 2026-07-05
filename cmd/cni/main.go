@@ -521,29 +521,40 @@ func addGatewayLeg(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, pod
 		if e != nil {
 			return e
 		}
-		if e := netlink.AddrAdd(link, &netlink.Addr{IPNet: &net.IPNet{IP: gwIP, Mask: net.CIDRMask(32, 32)}}); e != nil {
+		gwAddr := &netlink.Addr{IPNet: &net.IPNet{IP: gwIP, Mask: hostMask(gwIP)}}
+		gwIsV6 := gwIP.To4() == nil
+		if gwIsV6 {
+			gwAddr.Flags = unix.IFA_F_NODAD
+		}
+		if e := netlink.AddrAdd(link, gwAddr); e != nil {
 			return fmt.Errorf("add gateway address: %w", e)
 		}
 		if e := netlink.LinkSetUp(link); e != nil {
 			return e
 		}
 		podMAC = link.Attrs().HardwareAddr
-		// Route the whole VPC CIDR out this leg via the proxy-arp'd link-local
-		// hop (onlink: the hop needs no route of its own — eth0 already claims
-		// a 169.254.1.1/32 link route).
+		// Route the whole VPC CIDR out this leg via the link-local hop the host
+		// veth answers for (v4: proxy-arp'd 169.254.1.1; v6: fe80::1 assigned
+		// outright). onlink: the hop needs no route of its own.
+		hop := linkLocalGW
+		if gwIsV6 {
+			hop = linkLocalGWv6
+		}
 		if e := netlink.RouteAdd(&netlink.Route{
 			LinkIndex: link.Attrs().Index,
 			Dst:       ipnet,
-			Gw:        linkLocalGW,
+			Gw:        hop,
 			Flags:     int(netlink.FLAG_ONLINK),
 		}); e != nil {
 			return fmt.Errorf("add VPC route: %w", e)
 		}
-		// The gateway forwards between its legs.
+		// The gateway forwards between its legs — both families; a v6 VPC's
+		// gateway still egresses over its dual-stack default-network leg.
 		for key, val := range map[string]string{
 			"net/ipv4/ip_forward":             "1",
 			"net/ipv4/conf/all/rp_filter":     "0",
 			"net/ipv4/conf/default/rp_filter": "0",
+			"net/ipv6/conf/all/forwarding":    "1",
 		} {
 			if e := datapath.WriteProcSys(key, val); e != nil {
 				return fmt.Errorf("set %s in gateway netns: %w", key, e)

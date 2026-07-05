@@ -626,9 +626,11 @@ path. `--masquerade` selects the implementation ([#10](../../issues/10)):
   matches ESTABLISHED and no INVALID drop can fire even under kube-proxy. ICMP
   echo masquerades by identifier, and inbound ICMP *errors* (frag-needed — the
   pod's PMTU signal for its own egress) are translated with the same
-  embedded-header rewrite the bridge uses. v4-only, like the kernel rule it
-  replaces; TCP/UDP/ICMP (other protocols don't egress — same practical
-  envelope as before).
+  embedded-header rewrite the bridge uses. **Both families**: the v6 pair
+  (`masq_snat6`/`masq_reverse6`, node v6 address in the `node_ip6` map) gives
+  pod ULAs — including a v6 VPC gateway's forwarded tenant traffic — an
+  off-cluster return path, which the kernel rule never did. TCP/UDP/ICMP
+  (other protocols don't egress — same practical envelope as before).
 - **`iptables`** — the classic `-s <clusterCIDR> ! -d <clusterCIDR> -j
   MASQUERADE` kernel rule (with RETURNs for cozyplane-owned egress interfaces),
   for clusters that prefer netfilter to own NAT.

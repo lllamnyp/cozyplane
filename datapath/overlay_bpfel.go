@@ -108,6 +108,7 @@ const (
 	overlayMapLocals                = "locals"
 	overlayMapMasqSrcs              = "masq_srcs"
 	overlayMapNetworks              = "networks"
+	overlayMapNodeIp6               = "node_ip6"
 	overlayMapParams                = "params"
 	overlayMapPeers                 = "peers"
 	overlayMapPorts                 = "ports"
@@ -181,6 +182,7 @@ type overlayMapSpecs struct {
 	Locals         *ebpf.MapSpec `ebpf:"locals"`
 	MasqSrcs       *ebpf.MapSpec `ebpf:"masq_srcs"`
 	Networks       *ebpf.MapSpec `ebpf:"networks"`
+	NodeIp6        *ebpf.MapSpec `ebpf:"node_ip6"`
 	Params         *ebpf.MapSpec `ebpf:"params"`
 	Peers          *ebpf.MapSpec `ebpf:"peers"`
 	Ports          *ebpf.MapSpec `ebpf:"ports"`
@@ -224,6 +226,7 @@ type overlayMaps struct {
 	Locals         *ebpf.Map `ebpf:"locals"`
 	MasqSrcs       *ebpf.Map `ebpf:"masq_srcs"`
 	Networks       *ebpf.Map `ebpf:"networks"`
+	NodeIp6        *ebpf.Map `ebpf:"node_ip6"`
 	Params         *ebpf.Map `ebpf:"params"`
 	Peers          *ebpf.Map `ebpf:"peers"`
 	Ports          *ebpf.Map `ebpf:"ports"`
@@ -243,6 +246,7 @@ func (m *overlayMaps) Close() error {
 		m.Locals,
 		m.MasqSrcs,
 		m.Networks,
+		m.NodeIp6,
 		m.Params,
 		m.Peers,
 		m.Ports,

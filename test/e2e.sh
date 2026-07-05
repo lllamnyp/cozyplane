@@ -76,7 +76,10 @@ spec: {vpcRef: {namespace: $1, name: $2}}
 EOF
 }
 
-cleanup() { [ "${KEEP:-0}" = "1" ] || kind delete cluster --name "$CLUSTER" >/dev/null 2>&1; }
+cleanup() {
+  docker rm -f v6tgt >/dev/null 2>&1
+  [ "${KEEP:-0}" = "1" ] || kind delete cluster --name "$CLUSTER" >/dev/null 2>&1
+}
 
 # ---- bring-up -------------------------------------------------------------
 if [ "${REUSE:-0}" != "1" ]; then
@@ -230,6 +233,19 @@ $K -n team-a patch vpc vpc-a --type=merge -p '{"spec":{"egress":{"natGateway":tr
 $K -n kube-system wait --for=condition=Ready pod -l app=cozyplane-gateway --timeout=120s >/dev/null 2>&1 || sleep 15
 check "a1(vpc-a, egress on) -> internet 1.1.1.1" "" bash -c "$K -n team-a exec a1 -- ping -c2 -W3 1.1.1.1 >/dev/null 2>&1 && echo"
 check_fail "bw1(vpc-b, no egress) -> internet 1.1.1.1" bash -c "$K -n team-b exec bw1 -- ping -c1 -W2 1.1.1.1 >/dev/null 2>&1"
+# v6 gateway egress: a v6 VPC's off-net traffic exits via its gateway pod
+# (v6 .1 leg, ip6tables masquerade in the pod) and then the node's v6 bpf
+# masquerade — the pod ULA is no more routable outside than the v4 pod CIDR.
+# The target is an external container's ULA on the kind L2 (the docker bridge
+# itself carries no v6 gateway address to ping).
+docker run -d --rm --name v6tgt --network kind busybox:1.36 sleep 900 >/dev/null 2>&1
+EGW6=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}' v6tgt 2>/dev/null)
+$K -n team-a patch vpc vpc6a --type=merge -p '{"spec":{"egress":{"natGateway":true}}}' >/dev/null
+$K -n kube-system wait --for=condition=Ready pod -l "app=cozyplane-gateway,sdn.cozystack.io/vpc=vpc6a" --timeout=120s >/dev/null 2>&1 || sleep 15
+check_ok "v6a1(vpc6a, egress on) -> off-cluster v6 $EGW6 (gateway + masq6)" \
+  $K -n team-a exec v6a1 -- ping -6 -c3 -W3 "$EGW6"
+check_fail "v6b1(vpc6b, no egress) -> off-cluster v6 $EGW6" \
+  bash -c "$K -n team-a exec v6b1 -- ping -6 -c1 -W2 $EGW6 >/dev/null 2>&1"
 
 echo "[bpf cluster-egress masquerade (#10): netfilter does no NAT]"
 # --masquerade defaults to bpf: the agent removes the kernel MASQUERADE rule
@@ -249,6 +265,11 @@ MKNET=$(docker network inspect kind -f '{{(index .IPAM.Config 0).Subnet}}' 2>/de
 MKGW="$(echo "${MKNET:-172.18.0.0/16}" | cut -d. -f1-2).0.1"
 check "cli traceroute hop2 = docker gw $MKGW (masq ICMP-error un-SNAT)" "ok" \
   bash -c "$K exec cli -- traceroute -q1 -w3 -m2 1.1.1.1 2>/dev/null | grep -q \"($MKGW)\" && echo ok"
+# The v6 twin: a default pod's off-cluster v6 egress rides masq_snat6 to the
+# node's v6 address (pod ULAs are unroutable outside), and the reply
+# un-SNATs through masq_reverse6. Same external container as the gateway test.
+check_ok "cli -> external v6 $EGW6 ping (bpf masq6, ICMPv6 echo)" \
+  $K exec cli -- ping -6 -c2 -W3 "$EGW6"
 
 echo "[stale gateway .1 claim: abandoned-port GC unwedges the replacement]"
 # A gateway pod that dies uncleanly (node reboot) never runs CNI DEL, so its

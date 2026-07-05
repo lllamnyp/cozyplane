@@ -81,6 +81,23 @@ func (m *Manager) SetNodeIP(ip net.IP) error {
 	return nil
 }
 
+// SetNodeIP6 publishes the node's v6 address for the v6 bpf masquerade (nil
+// clears it, disabling the v6 masq hooks — e.g. on a v4-only node).
+func (m *Manager) SetNodeIP6(ip net.IP) error {
+	var v overlayAddr128
+	if ip != nil {
+		a, err := addr128(ip)
+		if err != nil {
+			return err
+		}
+		v = a
+	}
+	if err := m.objs.NodeIp6.Put(uint32(0), &v); err != nil {
+		return fmt.Errorf("set node IPv6: %w", err)
+	}
+	return nil
+}
+
 // RemoveMasquerade tears down the iptables masquerade (chain + jump) — used
 // when --masquerade is not "iptables" so a mode switch doesn't double-NAT.
 // Best-effort by nature: on a netfilter-less node there is nothing to remove.
