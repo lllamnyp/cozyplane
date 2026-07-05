@@ -13,11 +13,14 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 ARG TARGETARCH=amd64
-RUN CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -trimpath -o /out/cozyplane-agent ./cmd/agent && \
-    CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -trimpath -o /out/cozyplane ./cmd/cni && \
-    CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -trimpath -o /out/sdn-controller ./cmd/sdn-controller && \
-    CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -trimpath -o /out/cozyplane-apiserver ./cmd/apiserver && \
-    CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -trimpath -o /out/cozyplane-gateway ./cmd/gateway
+# -buildvcs=false: VCS stamping embeds the commit hash, so two commits with
+# identical sources produced different binaries — exactly what defeats the
+# digest-pin loop (#4): the pin commit itself changed the digest it pinned.
+RUN CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -trimpath -buildvcs=false -o /out/cozyplane-agent ./cmd/agent && \
+    CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -trimpath -buildvcs=false -o /out/cozyplane ./cmd/cni && \
+    CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -trimpath -buildvcs=false -o /out/sdn-controller ./cmd/sdn-controller && \
+    CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -trimpath -buildvcs=false -o /out/cozyplane-apiserver ./cmd/apiserver && \
+    CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -trimpath -buildvcs=false -o /out/cozyplane-gateway ./cmd/gateway
 
 # Fetch the upstream host-local and loopback CNI plugins.
 FROM --platform=$BUILDPLATFORM curlimages/curl:8.11.0@sha256:83a505ba2ba62f208ed6e410c268b7b9aa48f0f7b403c8108b9773b44199dbba AS cni
