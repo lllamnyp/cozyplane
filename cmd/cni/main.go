@@ -861,8 +861,13 @@ func configureHostVeth(name string, podIPs []net.IP, netID uint32, podMAC net.Ha
 	// targets, so — unlike v4's proxy_arp for 169.254.1.1 — we assign the address
 	// outright. It is a distinct link per veth pair, so fe80::1 never collides.
 	if hasV6 {
+		// The mask must be 16 bytes for a 16-byte address: an 8-byte
+		// CIDRMask(64, 64) here made netlink fall back to prefixlen 0, and the
+		// kernel then installed `default dev <veth>` (the on-link route of a
+		// /0 address) — at metric 256 that outranks a host's RA default and
+		// hijacks node v6 egress. The agent's rebuild heals old veths.
 		if err := netlink.AddrAdd(hv, &netlink.Addr{
-			IPNet: &net.IPNet{IP: linkLocalGWv6, Mask: net.CIDRMask(64, 64)},
+			IPNet: &net.IPNet{IP: linkLocalGWv6, Mask: net.CIDRMask(64, 128)},
 			Flags: unix.IFA_F_NODAD,
 		}); err != nil && !isExist(err) {
 			return fmt.Errorf("add v6 gateway address on host veth: %w", err)

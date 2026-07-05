@@ -633,6 +633,10 @@ rebooted to clear bpffs ([#7](../../issues/7)). The agent now handles it:
   cannot be rebuilt; after an ABI break such pods need a restart, and the agent
   logs each one. On a compatible restart they are unaffected — state lives in the
   maps, which are reused.
+- **The walk also heals mis-masked veth addresses.** An early CNI wrote
+  `fe80::1/0` (an 8-byte CIDRMask on the 16-byte address), whose on-link ::/0
+  route — `default dev <veth>`, metric 256 — outranks a host's RA default and
+  hijacks node v6 egress. The rebuild replaces it with the intended /64.
 - **Stale entries are pruned, not just re-put.** A pod that dies uncleanly (its
   netns vanished, no CNI DEL) leaves `ports`/`locals`/`bridges` entries behind;
   a stale `locals` entry is not just a leak — once its VPC IP is reallocated to

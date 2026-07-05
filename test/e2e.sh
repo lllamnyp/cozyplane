@@ -138,6 +138,13 @@ echo "== assertions =="
 echo "[default network]"
 CD=$($K -n kube-system get pods -l k8s-app=kube-dns -o jsonpath='{.items[0].status.podIP}')
 check_ok "cli -> coredns (default overlay)" $K exec cli -- ping -c2 -W2 "$CD"
+# A mis-masked fe80::1/0 on a host veth makes the kernel install
+# `default dev cphX` (metric 256), outranking the host's RA default and
+# hijacking node v6 egress. Guard: no node routes v6 default via a pod veth.
+for n in $(kind get nodes --name "$CLUSTER" 2>/dev/null); do
+  check_fail "no v6 default route via a cozyplane veth on $n" \
+    bash -c "docker exec $n ip -6 route show default | grep -qE 'dev (cph|cpg)'"
+done
 
 echo "[default-deny attachment]"
 check_fail "pod without a VPCBinding never becomes Ready" \
@@ -271,9 +278,18 @@ $K -n team-a wait --for=condition=Ready pod/cx pod/cz --timeout=120s >/dev/null
 CXIP=$(vpcip cx)
 CXVETH=$(docker exec "$W" sh -c "grep -l 'ips=${CXIP}$' /sys/class/net/cph*/ifalias 2>/dev/null" | head -1 | cut -d/ -f5)
 docker exec "$W" ip link del "$CXVETH"
+# Piggyback on this restart: break a veth's fe80::1 to the historical /0 form
+# (what the pre-fix CNI wrote); the agent's rebuild must heal it back to /64
+# and remove the hijacking `default dev` route.
+CLIVETH=$(docker exec "$W2" sh -c 'grep -l "10.244" /sys/class/net/cph*/ifalias 2>/dev/null | head -1' | cut -d/ -f5)
+docker exec "$W2" sh -c "ip -6 addr del fe80::1/64 dev $CLIVETH 2>/dev/null; ip -6 addr add fe80::1/0 dev $CLIVETH nodad"
 $K -n kube-system rollout restart ds/cozyplane-agent >/dev/null
 $K -n kube-system rollout status ds/cozyplane-agent --timeout=180s >/dev/null 2>&1
 sleep 3
+check "agent healed the mis-masked fe80::1 back to /64" "1" \
+  bash -c "docker exec $W2 ip -6 addr show dev $CLIVETH | grep -c 'fe80::1/64'"
+check_fail "no default route left via $CLIVETH after the heal" \
+  bash -c "docker exec $W2 ip -6 route show default | grep -q $CLIVETH"
 $K -n team-a delete pod cx --now >/dev/null 2>&1
 sleep 4
 idpod team-a cy "$W2" vpc-c

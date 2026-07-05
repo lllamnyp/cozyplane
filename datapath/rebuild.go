@@ -26,6 +26,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 // The host veth's link alias is the rebuild record: configureHostVeth (CNI ADD)
@@ -119,7 +120,40 @@ type RebuildStats struct {
 	Rebuilt    int      // veths whose ports/locals/bridges entries were re-put
 	Reattached int      // veths whose tcx links were swapped to the fresh programs
 	Pruned     int      // stale map entries removed (veth died without a CNI DEL)
+	Healed     int      // veths whose mis-masked fe80::1/0 was replaced with /64
 	Skipped    []string // veths with no/invalid alias (pre-alias CNI) — not rebuildable
+}
+
+// healLinkLocalGW replaces a mis-masked fe80::1/0 on a host veth with the
+// intended fe80::1/64. The /0 came from an 8-byte CIDRMask on the 16-byte
+// address (fixed in the CNI); its damage is the kernel's on-link route for
+// ::/0 — `default dev <veth>` at metric 256, which outranks a host's RA
+// default and hijacks node v6 egress. Deleting the address removes that route.
+func healLinkLocalGW(l netlink.Link) (bool, error) {
+	addrs, err := netlink.AddrList(l, netlink.FAMILY_V6)
+	if err != nil {
+		return false, fmt.Errorf("list addrs: %w", err)
+	}
+	gw := net.ParseIP("fe80::1")
+	for _, a := range addrs {
+		if !a.IP.Equal(gw) {
+			continue
+		}
+		if ones, _ := a.Mask.Size(); ones == 64 {
+			return false, nil // already correct
+		}
+		if err := netlink.AddrDel(l, &a); err != nil {
+			return false, fmt.Errorf("del mis-masked fe80::1: %w", err)
+		}
+		if err := netlink.AddrAdd(l, &netlink.Addr{
+			IPNet: &net.IPNet{IP: gw, Mask: net.CIDRMask(64, 128)},
+			Flags: unix.IFA_F_NODAD,
+		}); err != nil {
+			return false, fmt.Errorf("re-add fe80::1/64: %w", err)
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 // RebuildLocalState re-derives the CNI-written map entries (ports, locals,
@@ -160,6 +194,12 @@ func (m *Manager) RebuildLocalState() (RebuildStats, error) {
 			errs = append(errs, fmt.Errorf("rebuild %s: %w", name, err))
 		} else {
 			stats.Rebuilt++
+		}
+
+		if healed, err := healLinkLocalGW(l); err != nil {
+			errs = append(errs, fmt.Errorf("heal %s fe80::1: %w", name, err))
+		} else if healed {
+			stats.Healed++
 		}
 
 		if err := ReattachIngress(idx, m.objs.CozyplaneFromPod); err != nil {
