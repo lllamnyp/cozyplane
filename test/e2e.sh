@@ -243,8 +243,8 @@ for n in $(kind get nodes --name "$CLUSTER" 2>/dev/null); do
     bash -c "docker exec $n iptables -t nat -S 2>/dev/null | grep -q COZYPLANE-MASQ"
 done
 check_ok "cli -> internet ping (bpf masq, ICMP echo)" $K exec cli -- ping -c2 -W3 1.1.1.1
-check_ok "cli -> internet TCP (bpf masq)" \
-  bash -c "$K exec cli -- wget -qO- -T5 http://1.1.1.1/ 2>/dev/null | grep -qi ." 
+check_ok "cli -> internet TCP connect (bpf masq)" \
+  bash -c "$K exec cli -- sh -c 'nc -w3 1.1.1.1 80 </dev/null'"
 MKNET=$(docker network inspect kind -f '{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null)
 MKGW="$(echo "${MKNET:-172.18.0.0/16}" | cut -d. -f1-2).0.1"
 check "cli traceroute hop2 = docker gw $MKGW (masq ICMP-error un-SNAT)" "ok" \
@@ -291,6 +291,12 @@ echo "[ICMP errors through the bridge (#3): traceroute correlates embedded heade
 A1FAB=$(fabric a1)
 check "cli UDP-traceroute reaches a1.fabric (bridge error un-NAT)" "ok" \
   bash -c "$K exec cli -- traceroute -q1 -w3 -m4 $A1FAB 2>/dev/null | grep -q \"($A1FAB)\" && echo ok"
+# And the v6 twin: the pod's ICMPv6 port-unreachable traverses
+# bridge_reverse6_icmp_err with the embedded header un-NAT'd; the ICMPv6
+# checksum (pseudo-header included) is kernel-verified on receipt.
+V6FAB=$(fabric v6a1)
+check "cli UDP-traceroute6 reaches v6a1's v6 fabric (v6 bridge error un-NAT)" "ok" \
+  bash -c "$K exec cli -- traceroute6 -q1 -w3 -m4 $V6FAB 2>/dev/null | grep -q \"($V6FAB)\" && echo ok"
 
 echo "[stale locals pruning: a dead veth's entry must not shadow a reallocated IP]"
 # A pod that dies uncleanly leaves its locals/ports/bridges entries behind

@@ -110,6 +110,18 @@ struct cozy_mac {
 #define ICMP6_ECHO_REQUEST 128
 #define ICMP6_ECHO_REPLY   129
 
+// An ICMPv6 error (type < 128, RFC 4443) embeds the original packet after the
+// 8-byte ICMPv6 header: a fixed 40-byte IPv6 header (extension headers are not
+// handled — nexthdr must read TCP/UDP directly) + at least 8 L4 bytes.
+#define EMB6_IP_OFF       (L4_OFF6 + 8)
+#define EMB6_NEXTHDR_OFF  (EMB6_IP_OFF + 6)
+#define EMB6_SADDR_OFF    (EMB6_IP_OFF + 8)
+#define EMB6_DADDR_OFF    (EMB6_IP_OFF + 24)
+#define EMB6_L4_OFF       (EMB6_IP_OFF + 40)
+#define EMB6_SPORT_OFF    (EMB6_L4_OFF)
+#define EMB6_DPORT_OFF    (EMB6_L4_OFF + 2)
+#define EMB6_UDP_CSUM_OFF (EMB6_L4_OFF + 6)
+
 // ports-map value layout: bit 31 flags a VPC egress-gateway leg; the low bits
 // are the network id (VNIs stay far below 2^23, see TUN_F_GATEWAY).
 #define PORT_F_GATEWAY (1u << 31)
@@ -856,6 +868,100 @@ static __always_inline void emb_rewrite(struct __sk_buff *skb, struct emb *e,
 	}
 }
 
+// icmp6_err reports whether an ICMPv6 type is an error (RFC 4443: errors are
+// types 0-127 — dest-unreachable, packet-too-big, time-exceeded, param-problem).
+static __always_inline int icmp6_err(__u8 type)
+{
+	return type < 128;
+}
+
+// csum_upd128 folds a 16-byte address change into a checksum (the ICMPv6 /
+// UDPv6 pseudo-header sums the full addresses).
+static __always_inline __u16 csum_upd128(__u16 c, const struct addr128 *o, const struct addr128 *n)
+{
+	__u32 ow[4], nw[4];
+	__builtin_memcpy(ow, o->b, 16);
+	__builtin_memcpy(nw, n->b, 16);
+#pragma unroll
+	for (int i = 0; i < 4; i++)
+		c = csum_upd32(c, ow[i], nw[i]);
+	return c;
+}
+
+// emb6 — the fields the v6 bridge rewrites inside an ICMPv6 error's embedded
+// packet. The embedded IPv6 header has no checksum of its own (unlike v4);
+// only the outer ICMPv6 checksum and the embedded UDP checksum matter.
+struct emb6 {
+	__u8  proto;
+	struct addr128 saddr, daddr;
+	__u16 sport, dport; // network order
+	__u16 udp_csum;
+};
+
+static __always_inline int emb6_load(struct __sk_buff *skb, struct emb6 *e)
+{
+	__u8 ver;
+	if (bpf_skb_load_bytes(skb, EMB6_IP_OFF, &ver, 1) < 0 || (ver >> 4) != 6)
+		return -1;
+	if (bpf_skb_load_bytes(skb, EMB6_NEXTHDR_OFF, &e->proto, 1) < 0 ||
+	    bpf_skb_load_bytes(skb, EMB6_SADDR_OFF, &e->saddr, 16) < 0 ||
+	    bpf_skb_load_bytes(skb, EMB6_DADDR_OFF, &e->daddr, 16) < 0 ||
+	    bpf_skb_load_bytes(skb, EMB6_SPORT_OFF, &e->sport, 2) < 0 ||
+	    bpf_skb_load_bytes(skb, EMB6_DPORT_OFF, &e->dport, 2) < 0)
+		return -1;
+	e->udp_csum = 0;
+	if (e->proto == IPPROTO_UDP &&
+	    bpf_skb_load_bytes(skb, EMB6_UDP_CSUM_OFF, &e->udp_csum, 2) < 0)
+		return -1;
+	return 0;
+}
+
+// emb6_store16 / emb6_store_addr write embedded fields and fold every changed
+// byte into the OUTER ICMPv6 checksum exactly once (same discipline as v4:
+// receivers verify it, so a rewrite bug self-detects as a drop).
+static __always_inline void emb6_store16(struct __sk_buff *skb, __u32 off, __u16 old, __u16 new)
+{
+	bpf_l4_csum_replace(skb, ICMP6_CSUM_OFF, old, new, 2);
+	bpf_skb_store_bytes(skb, off, &new, sizeof(new), 0);
+}
+
+static __always_inline void emb6_store_addr(struct __sk_buff *skb, __u32 off,
+					    const struct addr128 *o, const struct addr128 *n)
+{
+	__u32 ow[4], nw[4];
+	__builtin_memcpy(ow, o->b, 16);
+	__builtin_memcpy(nw, n->b, 16);
+#pragma unroll
+	for (int i = 0; i < 4; i++)
+		if (ow[i] != nw[i])
+			bpf_l4_csum_replace(skb, ICMP6_CSUM_OFF, ow[i], nw[i], 4);
+	bpf_skb_store_bytes(skb, off, n->b, 16, 0);
+}
+
+// emb6_rewrite applies one address+port translation to the embedded v6 packet.
+// The embedded UDP checksum (mandatory in v6) is recomputed for the
+// pseudo-header address changes and the port.
+static __always_inline void emb6_rewrite(struct __sk_buff *skb, struct emb6 *e,
+					 const struct addr128 *nsaddr, const struct addr128 *ndaddr,
+					 __u32 port_off, __u16 oport, __u16 nport)
+{
+	emb6_store_addr(skb, EMB6_SADDR_OFF, &e->saddr, nsaddr);
+	emb6_store_addr(skb, EMB6_DADDR_OFF, &e->daddr, ndaddr);
+	if (nport && nport != oport)
+		emb6_store16(skb, port_off, oport, nport);
+	if (e->proto == IPPROTO_UDP && e->udp_csum) {
+		__u16 udp = e->udp_csum;
+		udp = csum_upd128(udp, &e->saddr, nsaddr);
+		udp = csum_upd128(udp, &e->daddr, ndaddr);
+		if (nport)
+			udp = csum_upd16(udp, oport, nport);
+		if (!udp)
+			udp = 0xffff;
+		if (udp != e->udp_csum)
+			emb6_store16(skb, EMB6_UDP_CSUM_OFF, e->udp_csum, udp);
+	}
+}
+
 // alloc_gw_port picks a free masquerade port for a new north-south connection:
 // the reverse-lookup key {proto, gw_port, net, vpc_ip, pod_port} must be unique,
 // so probe (bounded) with BPF_NOEXIST — the insert that wins owns the port.
@@ -1144,6 +1250,72 @@ static __always_inline int bridge_reverse(struct __sk_buff *skb, struct iphdr *i
 	return deliver_net0(skb, rv->client_ip);
 }
 
+// bridge_forward6_icmp_err translates a network-emitted ICMPv6 error toward
+// the pod — packet-too-big above all: v6 does not fragment in flight, so
+// without this the pod never learns the path MTU for its bridged replies. The
+// v6 twin of bridge_forward_icmp_err; the outer address rewrites ride
+// nat_addr6 (the ICMPv6 checksum's pseudo-header covers them), the embedded
+// rewrite folds into the same checksum via emb6_rewrite.
+static __always_inline int bridge_forward6_icmp_err(struct __sk_buff *skb, struct pkt *p, __u32 net, struct addr128 vpc_ip)
+{
+	struct emb6 e;
+	if (emb6_load(skb, &e) < 0)
+		return TC_ACT_SHOT;
+	if (e.proto != IPPROTO_TCP && e.proto != IPPROTO_UDP)
+		return TC_ACT_SHOT;
+	if (!addr128_eq(&e.saddr, &p->dst))
+		return TC_ACT_SHOT; // embedded source must be the fabric IP the error targets
+
+	struct ct_fwd_key fk = {
+		.proto = e.proto,
+		.net = net,
+		.client_ip = e.daddr,
+		.fabric_ip = e.saddr,
+		.client_port = e.dport,
+		.pod_port = e.sport,
+	};
+	__u16 *gw_port = bpf_map_lookup_elem(&ct_fwd, &fk);
+	if (!gw_port)
+		return TC_ACT_SHOT;
+
+	struct addr128 gw = LINK_LOCAL_GW6;
+	nat_addr6(skb, IPPROTO_ICMPV6, IP6_DADDR_OFF, &p->dst, &vpc_ip);
+	nat_addr6(skb, IPPROTO_ICMPV6, IP6_SADDR_OFF, &p->src, &gw);
+	emb6_rewrite(skb, &e, &vpc_ip, &gw, EMB6_DPORT_OFF, e.dport, *gw_port);
+	return TC_ACT_OK;
+}
+
+// bridge_reverse6_icmp_err translates a pod-emitted ICMPv6 error (port
+// unreachable to a probe, time-exceeded) out to the client — the v6 twin of
+// bridge_reverse_icmp_err.
+static __always_inline int bridge_reverse6_icmp_err(struct __sk_buff *skb, struct pkt *p, __u32 net)
+{
+	struct addr128 gw = LINK_LOCAL_GW6;
+	struct emb6 e;
+	if (emb6_load(skb, &e) < 0)
+		return TC_ACT_OK;
+	if (e.proto != IPPROTO_TCP && e.proto != IPPROTO_UDP)
+		return TC_ACT_OK;
+	if (!addr128_eq(&e.saddr, &gw) || !addr128_eq(&e.daddr, &p->src))
+		return TC_ACT_OK; // embedded must be a bridged inbound: gw -> this pod
+
+	struct ct_rev_key rk = {
+		.proto = e.proto,
+		.gw_port = e.sport,
+		.net = net,
+		.vpc_ip = e.daddr,
+		.pod_port = e.dport,
+	};
+	struct ct_rev_val *rv = bpf_map_lookup_elem(&ct_rev, &rk);
+	if (!rv)
+		return TC_ACT_OK;
+
+	nat_addr6(skb, IPPROTO_ICMPV6, IP6_SADDR_OFF, &p->src, &rv->fabric_ip);
+	nat_addr6(skb, IPPROTO_ICMPV6, IP6_DADDR_OFF, &gw, &rv->client_ip);
+	emb6_rewrite(skb, &e, &rv->client_ip, &rv->fabric_ip, EMB6_SPORT_OFF, e.sport, rv->client_port);
+	return deliver_net0(skb, rv->client_ip);
+}
+
 // bridge_forward6 is the v6 fabric bridge forward half, done in to_pod when a
 // packet's destination is a v6 fabric IP: DNAT fabric->VPC and masquerade the
 // client to fe80::1:gw_port, mirroring bridge_forward. The client/fabric/vpc
@@ -1160,6 +1332,8 @@ static __always_inline int bridge_forward6(struct __sk_buff *skb, struct pkt *p,
 		__u16 id;
 		if (icmp6_echo(skb, &type, &id) < 0)
 			return TC_ACT_SHOT;
+		if (icmp6_err(type))
+			return bridge_forward6_icmp_err(skb, p, net, vpc_ip);
 		if (type != ICMP6_ECHO_REQUEST)
 			return TC_ACT_SHOT;
 		struct ct_fwd_key fk = {
@@ -1227,6 +1401,8 @@ static __always_inline int bridge_reverse6(struct __sk_buff *skb, struct pkt *p,
 		__u16 gw_id;
 		if (icmp6_echo(skb, &type, &gw_id) < 0)
 			return TC_ACT_OK;
+		if (icmp6_err(type))
+			return bridge_reverse6_icmp_err(skb, p, net);
 		if (type != ICMP6_ECHO_REPLY)
 			return TC_ACT_OK;
 		struct ct_rev_key rk = {

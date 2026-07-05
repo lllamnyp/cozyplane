@@ -59,7 +59,7 @@ they're discovered rather than leaving them only in issues.
 - [x] Fabric-IP family decoupled from VPC family — a v6 VPC runs on a v4-only cluster (validated on dev4)
 - [ ] IPv6 guest autoconfiguration: RA + DHCPv6 responder for VM (bridge-binding) NICs — [#8](../../issues/8)
 - [ ] North-south to a v6 VPC IP when the fabric IP is v4 (cross-family) — [#9](../../issues/9)
-- [ ] ICMPv6 errors through the v6 bridge (packet-too-big — the v6 PMTU signal; same embedded-rewrite pattern, ICMPv6 pseudo-header included) — `internals.md`
+- [x] ICMPv6 errors through the v6 bridge: packet-too-big (v6 PMTU — vital, v6 never fragments in flight), dest-unreach, time-exceeded, with embedded-header NAT (e2e: UDP traceroute6 end-to-end)
 - [ ] v6 floating IPs (NDP responder replacing the ARP responder) — `internals.md`
 - [ ] v6 gateway egress (v6 masquerade + a v6 upstream) — `internals.md`
 - [ ] Cross-family VPC peering (v4 ↔ v6 via a NAT64 translator; the `64:ff9b::` map layout accommodates it) — `internals.md`

@@ -831,8 +831,13 @@ mostly future work. As built:
   working UDP traceroute; inward errors deliver frag-needed to the pod, so
   IPv4 PMTU discovery through the bridge works (#3). Embedded *TCP* checksums
   beyond the 8 guaranteed L4 bytes are left untouched (Linux correlates errors
-  by addresses+ports, not embedded checksums). ICMPv6 errors (packet-too-big)
-  are a follow-up — same pattern, ICMPv6's pseudo-header included. The tenant datapath is netfilter-free; the agent's two node-boundary
+  by addresses+ports, not embedded checksums). **ICMPv6 errors** (dest-unreach,
+  packet-too-big — the v6 PMTU signal, vital since v6 never fragments in
+  flight, time-exceeded) traverse the v6 bridge the same way: outer address
+  rewrites ride the ICMPv6 pseudo-header via `nat_addr6`, the embedded v6
+  header has no checksum of its own, and the embedded (mandatory) UDP checksum
+  is recomputed over its pseudo-header. Errors about echo flows and embedded
+  packets behind extension headers are not translated. The tenant datapath is netfilter-free; the agent's two node-boundary
   netfilter rules — the cluster-egress node masquerade (SNAT) and the overlay
   FORWARD-ACCEPT (non-NAT) — are an **interim** dependency that currently makes
   netfilter mandatory (both fatal to startup) and are slated to move to eBPF /
