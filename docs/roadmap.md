@@ -83,7 +83,7 @@ they're discovered rather than leaving them only in issues.
 - [x] Image digest-pinning in the chart
 - [x] Agent recreates incompatible pinned eBPF maps on load and rebuilds pod state from veth alias records — a map-ABI upgrade is a rolling DaemonSet update, no node reboots (e2e-covered) — [#7](../../issues/7)
 - [x] Gateway `.1` Port reuse after an unclean death: the controller GCs live Ports whose claimant pod is gone (VM persistent Ports exempt), so the replacement's ADD retry claims the freed `.1` (e2e-covered)
-- [ ] Release image index digest is non-deterministic (defeats chart digest-pinning) — [#4](../../issues/4)
+- [x] Digest-reproducible release images: attestations off, SOURCE_DATE_EPOCH + rewrite-timestamp, digest-pinned bases — verified identical across CI reruns, and the pin-commit-rebuild loop converges — [#4](../../issues/4)
 
 ## 7. CI & testing
 
@@ -102,7 +102,7 @@ they're discovered rather than leaving them only in issues.
 | [#1](../../issues/1) | Gate `VPCPeering` creation on a `peer` virtual verb | Peering / RBAC |
 | [#2](../../issues/2) | Per-VPC traffic counters in the datapath hooks | Datapath / metering |
 | [#3](../../issues/3) | ICMP to a VPC pod's fabric IP is dropped (north-south ping / PMTU) | Datapath |
-| [#4](../../issues/4) | Release image index digest is non-deterministic | Packaging |
+| [#4](../../issues/4) | Release digest non-determinism (closed: reproducible) | Packaging |
 | [#5](../../issues/5) | Floating IPs: 1:1 public-address NAT on the per-VPC gateway | Floating IPs |
 | [#6](../../issues/6) | Site-to-site VPN: authorized-forwarder + per-VPC route table | Connectivity |
 | [#7](../../issues/7) | Agent: recreate incompatible pinned eBPF maps on load | Deployment |
