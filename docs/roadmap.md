@@ -46,8 +46,8 @@ they're discovered rather than leaving them only in issues.
 - [x] Gate `VPCPeering` creation on a `peer` virtual verb on the local VPC — strategy-enforced in aggregated mode (which also closed the `export` gap there: admission never sees aggregated resources), VAP twin for CRD mode — [#1](../../issues/1)
 - [ ] Floating IPs: 1:1 public-address NAT anchored on the per-VPC gateway (internet-gateway equivalent) — [#5](../../issues/5)
 - [ ] Site-to-site VPN: authorized-forwarder role + per-VPC route table — [#6](../../issues/6)
-- [ ] Network policy / security groups within and across VPCs — `design.md`, `user-guide.md`
-- [ ] Per-VPC metadata endpoint (a VPC is a closed island without it) — `user-guide.md`
+- [ ] Network policy / security groups within a VPC — **design draft: [security-groups.md](security-groups.md)** (awaiting review)
+- [ ] Per-VPC metadata endpoint + guest autoconfiguration — **design draft: [vm-provisioning.md](vm-provisioning.md)** (awaiting review; also closes #8)
 - [ ] Name-based addressing / system-view DNS re-point — `control-plane.md` §5
 
 ## 4. IPv6 / dual-stack
@@ -57,12 +57,12 @@ they're discovered rather than leaving them only in issues.
 - [x] IPv6 north-south fabric bridge (v6 masquerade, v6 NAT)
 - [x] Dual-stack default network; v6 fabric IPs from the node v6 pod CIDR
 - [x] Fabric-IP family decoupled from VPC family — a v6 VPC runs on a v4-only cluster (validated on dev4)
-- [ ] IPv6 guest autoconfiguration: RA + DHCPv6 responder for VM (bridge-binding) NICs — [#8](../../issues/8)
-- [ ] North-south to a v6 VPC IP when the fabric IP is v4 (cross-family) — [#9](../../issues/9)
+- [ ] IPv6 guest autoconfiguration (RA responder) — **design draft: [vm-provisioning.md](vm-provisioning.md)** — [#8](../../issues/8)
+- [ ] North-south to a v6 VPC IP when the fabric IP is v4 (cross-family) — **design draft: [cross-family.md](cross-family.md)** — [#9](../../issues/9)
 - [x] ICMPv6 errors through the v6 bridge: packet-too-big (v6 PMTU — vital, v6 never fragments in flight), dest-unreach, time-exceeded, with embedded-header NAT (e2e: UDP traceroute6 end-to-end)
 - [x] v6 floating IPs: NDP responder (solicited+override NA from `from_uplink`), stateless v6 DNAT/SNAT halves incl. ICMPv6 error rewrites (e2e: external NDP-resolved HTTP/ping6/EIP-egress/traceroute6)
 - [x] v6 gateway egress: dual-family gateway leg (`.1` in either family, `fe80::1` hop, NODAD), dual-family gateway netns firewall (with NDP accepts — ip6tables sees NDP, unlike ARP), and the v6 node masquerade (`masq_snat6`/`masq_reverse6`) that gives pod ULAs an off-cluster return path (e2e: v6 VPC → gateway → external container; isolation held)
-- [ ] Cross-family VPC peering (v4 ↔ v6 via a NAT64 translator; the `64:ff9b::` map layout accommodates it) — `internals.md`
+- [ ] Cross-family VPC peering (v4 ↔ v6 via a NAT64/SIIT translator) — **design draft: [cross-family.md](cross-family.md)**
 
 ## 5. Live migration (KubeVirt)
 
