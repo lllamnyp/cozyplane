@@ -55,7 +55,7 @@ const (
 	// migration. The stable VM identity is (namespace, KubeVirtLabelVMName); the
 	// pod carrying the active binding has KubeVirtLabelNodeName equal to its own
 	// node (KubeVirt sets it on the migration target only after cutover).
-	KubeVirtLabelApp      = "kubevirt.io"       // value "virt-launcher" on VM pods
+	KubeVirtLabelApp      = "kubevirt.io" // value "virt-launcher" on VM pods
 	KubeVirtLabelVMName   = "vm.kubevirt.io/name"
 	KubeVirtLabelNodeName = "kubevirt.io/nodeName"
 	KubeVirtLabelVMIUID   = "kubevirt.io/created-by" // the VMI UID (stable across migration)
