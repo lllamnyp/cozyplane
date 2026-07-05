@@ -73,7 +73,7 @@ they're discovered rather than leaving them only in issues.
 - [x] GC the persistent Port when the VM's pods are all gone
 - [x] IP + MAC preservation validated end-to-end on dev4 (both directions)
 - [x] IPv6 VM live migration demonstrated on a v4-only cluster (IP+MAC preserved, sub-second cutover)
-- [ ] Stage the target's `locals` on `kubevirt.io/nodeName` (close the same-node overlap window) — `live-migration.md`
+- [x] Staged locals: same-node delivery flips at cutover on both ends (target's entry gated on `spec.node`, programmed from the veth alias at cutover; source's removed symmetrically) — validated on dev4 with a bandwidth-throttled migration: target locals observed ABSENT mid-window, flip at cutover, gap patterns identical across observers (no path-asymmetric loss), IP+MAC preserved through two consecutive migrations
 - [x] Gratuitous ARP / unsolicited NA when a floating IP is programmed locally (fixes external L2 caches on a node move; e2e observes both frames on the wire)
 - [ ] VM-migration e2e test (cozystack has none)
 
