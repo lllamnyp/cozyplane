@@ -23,28 +23,35 @@ import (
 )
 
 // EnsureForwardRules accepts overlay traffic in the FORWARD chain ahead of
-// kube-proxy's rules.
+// kube-proxy's rules — in BOTH families.
 //
 // Pod egress is encapsulated by an eBPF tc redirect, which bypasses conntrack.
 // The decapsulated reply that returns on the Geneve device therefore has no
 // matching conntrack entry and kube-proxy's "ctstate INVALID -j DROP" rule in
 // KUBE-FORWARD discards it. Inserting an explicit ACCEPT for the Geneve device
 // at the top of FORWARD lets decapsulated traffic through before that drop.
+//
+// The rule is needed per family: kube-proxy programs the INVALID drop into
+// ip6tables too, and a v6 packet the overlay hands to the kernel (a decapped
+// north-south reply toward a default-network pod) dies there identically. A
+// v4-only ACCEPT made cross-node v6 north-south fail exactly when client and
+// server were on different nodes — caught by the e2e once client placement
+// was pinned cross-node.
 func EnsureForwardRules() error {
-	ipt, err := iptables.New()
-	if err != nil {
-		return fmt.Errorf("init iptables: %w", err)
-	}
-
-	for _, spec := range [][]string{
-		{"-i", GeneveDevice, "-j", "ACCEPT"},
-		{"-o", GeneveDevice, "-j", "ACCEPT"},
-	} {
-		if err := ipt.InsertUnique("filter", "FORWARD", 1, spec...); err != nil {
-			return fmt.Errorf("insert FORWARD rule %v: %w", spec, err)
+	for _, proto := range []iptables.Protocol{iptables.ProtocolIPv4, iptables.ProtocolIPv6} {
+		ipt, err := iptables.NewWithProtocol(proto)
+		if err != nil {
+			return fmt.Errorf("init iptables (proto %v): %w", proto, err)
+		}
+		for _, spec := range [][]string{
+			{"-i", GeneveDevice, "-j", "ACCEPT"},
+			{"-o", GeneveDevice, "-j", "ACCEPT"},
+		} {
+			if err := ipt.InsertUnique("filter", "FORWARD", 1, spec...); err != nil {
+				return fmt.Errorf("insert FORWARD rule %v (proto %v): %w", spec, proto, err)
+			}
 		}
 	}
-
 	return nil
 }
 

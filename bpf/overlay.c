@@ -1283,9 +1283,11 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 	__u32 vni = (__u32)tk.tunnel_id & ~TUN_F_GATEWAY;
 	if (vni == cfg(CFG_VNI)) {
 		// Default network. A cross-node north-south packet to a local VPC pod's
-		// fabric IP is delivered to its veth here (to_pod does the DNAT),
-		// bypassing the kernel FORWARD chain; everything else the kernel routes.
-		// Fabric IPs are v4-only, so a v6 packet misses and the kernel routes it.
+		// fabric IP (either family; the bridges map is 128-bit) is delivered to
+		// its veth here (to_pod does the DNAT), bypassing the kernel FORWARD
+		// chain; everything else — including the north-south *reply* toward a
+		// default-network pod — is handed to the kernel, which is why
+		// EnsureForwardRules must ACCEPT overlay traffic in both families.
 		struct bridge_ep *be = bridge_of(p.dst);
 		if (be) {
 			struct endpoint *l = local_of(be->net, be->vpc_ip);

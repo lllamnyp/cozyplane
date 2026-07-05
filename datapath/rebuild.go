@@ -20,9 +20,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"path/filepath"
 	"strconv"
 	"strings"
 
+	"github.com/cilium/ebpf"
 	"github.com/vishvananda/netlink"
 )
 
@@ -116,6 +118,7 @@ func SetVethAlias(link netlink.Link, rawNet uint32, ips []net.IP, mac net.Hardwa
 type RebuildStats struct {
 	Rebuilt    int      // veths whose ports/locals/bridges entries were re-put
 	Reattached int      // veths whose tcx links were swapped to the fresh programs
+	Pruned     int      // stale map entries removed (veth died without a CNI DEL)
 	Skipped    []string // veths with no/invalid alias (pre-alias CNI) — not rebuildable
 }
 
@@ -169,7 +172,146 @@ func (m *Manager) RebuildLocalState() (RebuildStats, error) {
 		}
 		stats.Reattached++
 	}
+
+	pruned, err := pruneStaleLocalState()
+	if err != nil {
+		errs = append(errs, fmt.Errorf("prune stale entries: %w", err))
+	}
+	stats.Pruned = pruned
+
 	return stats, errors.Join(errs...)
+}
+
+// pruneStaleLocalState removes ports/locals/bridges entries whose veth died
+// without a CNI DEL (unclean pod death: the netns vanished, nothing cleaned
+// the maps). A stale locals entry is not just a leak — if its VPC IP is later
+// reallocated to a pod on another node, the dead local entry shadows the
+// remote route and blackholes same-node senders.
+//
+// Every check is per-entry against the kernel at decision time, so a pod
+// being ADDed concurrently is never falsely pruned: the CNI writes the alias
+// before any map entry, hence an entry's veth+alias witness always exists by
+// the time the entry does.
+func pruneStaleLocalState() (int, error) {
+	pruned := 0
+
+	// locals: live iff the endpoint's ifindex is a cozyplane veth whose alias
+	// vouches for (net, ip).
+	lm, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "locals"), nil)
+	if err != nil {
+		return 0, fmt.Errorf("open pinned locals map: %w", err)
+	}
+	defer lm.Close()
+	var lk overlayLocalKey
+	var lv overlayEndpoint
+	var staleLocals []overlayLocalKey
+	it := lm.Iterate()
+	for it.Next(&lk, &lv) {
+		if !aliasVouches(int(lv.Ifindex), lk.Net, lk.Ip) {
+			staleLocals = append(staleLocals, lk)
+		}
+	}
+	if err := it.Err(); err != nil {
+		return pruned, fmt.Errorf("iterate locals: %w", err)
+	}
+	for _, k := range staleLocals {
+		if err := lm.Delete(&k); err == nil {
+			pruned++
+		}
+	}
+
+	// ports: live iff the ifindex is still a cozyplane veth. No net compare —
+	// a severed pod's entry legitimately reads QuarantineNet, not its alias net.
+	pm, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "ports"), nil)
+	if err != nil {
+		return pruned, fmt.Errorf("open pinned ports map: %w", err)
+	}
+	defer pm.Close()
+	var pk, pv uint32
+	var stalePorts []uint32
+	it = pm.Iterate()
+	for it.Next(&pk, &pv) {
+		if cozyVethByIndex(int(pk)) == nil {
+			stalePorts = append(stalePorts, pk)
+		}
+	}
+	if err := it.Err(); err != nil {
+		return pruned, fmt.Errorf("iterate ports: %w", err)
+	}
+	for _, k := range stalePorts {
+		if err := pm.Delete(&k); err == nil {
+			pruned++
+		}
+	}
+
+	// bridges: live iff the fabric IP's host route points at a cozyplane veth
+	// whose alias vouches for the bridged (net, VPC IP).
+	bm, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "bridges"), nil)
+	if err != nil {
+		return pruned, fmt.Errorf("open pinned bridges map: %w", err)
+	}
+	defer bm.Close()
+	var bk overlayAddr128
+	var bv overlayBridgeEp
+	var staleBridges []overlayAddr128
+	it = bm.Iterate()
+	for it.Next(&bk, &bv) {
+		if !bridgeVouched(bk, bv) {
+			staleBridges = append(staleBridges, bk)
+		}
+	}
+	if err := it.Err(); err != nil {
+		return pruned, fmt.Errorf("iterate bridges: %w", err)
+	}
+	for _, k := range staleBridges {
+		if err := bm.Delete(&k); err == nil {
+			pruned++
+		}
+	}
+
+	return pruned, nil
+}
+
+// cozyVethByIndex returns the link at ifindex if it is a cozyplane host veth.
+func cozyVethByIndex(ifindex int) netlink.Link {
+	l, err := netlink.LinkByIndex(ifindex)
+	if err != nil {
+		return nil
+	}
+	name := l.Attrs().Name
+	if !strings.HasPrefix(name, podVethPrefix) && !strings.HasPrefix(name, gwVethPrefix) {
+		return nil
+	}
+	return l
+}
+
+// aliasVouches reports whether ifindex is a cozyplane veth whose alias record
+// covers (net, addr).
+func aliasVouches(ifindex int, net_ uint32, addr overlayAddr128) bool {
+	l := cozyVethByIndex(ifindex)
+	if l == nil {
+		return false
+	}
+	rawNet, ips, _, ok := parseVethAlias(l.Attrs().Alias)
+	if !ok || PortNet(rawNet) != net_ {
+		return false
+	}
+	for _, ip := range ips {
+		if a, err := addr128(ip); err == nil && a == addr {
+			return true
+		}
+	}
+	return false
+}
+
+// bridgeVouched reports whether a bridges entry's fabric IP still routes to a
+// cozyplane veth whose alias covers the bridged (net, VPC IP).
+func bridgeVouched(fabric overlayAddr128, ep overlayBridgeEp) bool {
+	routes, err := netlink.RouteGet(addr128ToIP(fabric))
+	if err != nil || len(routes) == 0 {
+		return false
+	}
+	return aliasVouches(routes[0].LinkIndex, ep.Net, ep.VpcIp)
 }
 
 // rebuildVeth re-puts one veth's ports/locals entries and, for a VPC pod, its

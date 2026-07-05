@@ -89,7 +89,8 @@ they're discovered rather than leaving them only in issues.
 - [x] CI: unit tests, lint, build-drift, image release, datapath e2e
 - [x] eBPF bindings check (static bpftool, libbpf-dev)
 - [x] Cross-compiled release image
-- [ ] e2e coverage for live migration and for the IPv6 north-south paths
+- [x] e2e coverage for the IPv6 north-south paths (cross-node pinned — this caught the missing ip6tables FORWARD ACCEPT)
+- [ ] e2e coverage for live migration (needs KubeVirt; kind can't host it)
 
 ---
 

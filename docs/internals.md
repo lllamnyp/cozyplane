@@ -186,8 +186,12 @@ Pod egress is encapsulated by a tc `bpf_redirect`, which **bypasses conntrack**.
 The decapsulated reply that returns on the Geneve device therefore has no
 matching conntrack entry, so kube-proxy's `KUBE-FORWARD ... ctstate INVALID -j
 DROP` discards it. The agent inserts `-i cozyplane0 -j ACCEPT` and `-o cozyplane0
--j ACCEPT` at the top of the `FORWARD` chain (via `iptables`, nft backend) so
-overlay traffic is accepted before that drop.
+-j ACCEPT` at the top of the `FORWARD` chain — **in both families** (`iptables`
+*and* `ip6tables`, nft backend) — so overlay traffic is accepted before that
+drop. kube-proxy programs the INVALID drop into ip6tables too; with only the v4
+ACCEPT, the v6 north-south *reply* toward a default-network pod (the one leg
+`from_overlay` hands to the kernel) was dropped exactly when client and server
+sat on different nodes.
 
 **This is an interim measure.** It is only needed against an iptables-mode
 kube-proxy, yet the call is fatal to agent startup, so it currently makes
@@ -629,6 +633,14 @@ rebooted to clear bpffs ([#7](../../issues/7)). The agent now handles it:
   cannot be rebuilt; after an ABI break such pods need a restart, and the agent
   logs each one. On a compatible restart they are unaffected — state lives in the
   maps, which are reused.
+- **Stale entries are pruned, not just re-put.** A pod that dies uncleanly (its
+  netns vanished, no CNI DEL) leaves `ports`/`locals`/`bridges` entries behind;
+  a stale `locals` entry is not just a leak — once its VPC IP is reallocated to
+  a pod on another node, the dead local entry shadows the remote route and
+  blackholes same-node senders. The rebuild prunes any entry whose veth+alias
+  witness is gone, checked per entry against the kernel at decision time — and
+  because the CNI writes the alias *before* the map entries, a concurrently
+  ADDed pod can never be falsely pruned.
 - `ct_fwd`/`ct_rev` across an ABI break are recreated empty: established
   bridge/floating flows reset once, like a conntrack flush. Acceptable.
 

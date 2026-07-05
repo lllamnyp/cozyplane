@@ -119,7 +119,12 @@ idpod team-a c1  "$W2" vpc-c
 idpod team-a v6a1 "$W"  vpc6a
 idpod team-a v6a2 "$W2" vpc6a
 idpod team-a v6b1 "$W2" vpc6b
-$K run cli --image=busybox:1.36 --restart=Never --command -- sleep 3600 >/dev/null 2>&1
+# cli is pinned to W2, AWAY from the W-pinned VPC pods it probes: the v6
+# north-south reply rides the kernel FORWARD path only cross-node, and an
+# unpinned cli landing on W made the ip6tables-ACCEPT regression invisible in
+# half the runs.
+$K run cli --image=busybox:1.36 --restart=Never \
+  --overrides="{\"spec\":{\"nodeName\":\"$W2\"}}" --command -- sleep 3600 >/dev/null 2>&1
 # A pod annotated for vpc-a but in a namespace with NO binding -> default-deny.
 $K create ns team-x >/dev/null 2>&1
 idpod team-x nobind "$W" team-a/vpc-a
@@ -251,6 +256,31 @@ $K -n team-a patch vpc vpc-c --type=merge -p '{"spec":{"egress":{"natGateway":tr
 check_ok "vpc-c gateway Ready despite the stale .1 claim (GC freed it)" \
   $K -n kube-system wait --for=condition=Ready pod -l "app=cozyplane-gateway,sdn.cozystack.io/vpc=vpc-c" --timeout=120s
 check "c1(vpc-c, egress on) -> internet 1.1.1.1" "" bash -c "$K -n team-a exec c1 -- ping -c2 -W3 1.1.1.1 >/dev/null 2>&1 && echo"
+
+echo "[stale locals pruning: a dead veth's entry must not shadow a reallocated IP]"
+# A pod that dies uncleanly leaves its locals/ports/bridges entries behind
+# (no CNI DEL ran). The leak turns into a blackhole when its VPC IP is later
+# reallocated to a pod on ANOTHER node: same-node senders hit the stale locals
+# entry (dead ifindex) instead of the remote route. The agent prunes stale
+# entries at start. Reproduce: kill cx's veth out-of-band, roll the agents
+# (maps intact -> rebuild + prune), free cx's IP, let cy on another node claim
+# it, and prove a same-node sender (cz) reaches cy.
+idpod team-a cx "$W" vpc-c
+idpod team-a cz "$W" vpc-c
+$K -n team-a wait --for=condition=Ready pod/cx pod/cz --timeout=120s >/dev/null
+CXIP=$(vpcip cx)
+CXVETH=$(docker exec "$W" sh -c "grep -l 'ips=${CXIP}$' /sys/class/net/cph*/ifalias 2>/dev/null" | head -1 | cut -d/ -f5)
+docker exec "$W" ip link del "$CXVETH"
+$K -n kube-system rollout restart ds/cozyplane-agent >/dev/null
+$K -n kube-system rollout status ds/cozyplane-agent --timeout=180s >/dev/null 2>&1
+sleep 3
+$K -n team-a delete pod cx --now >/dev/null 2>&1
+sleep 4
+idpod team-a cy "$W2" vpc-c
+$K -n team-a wait --for=condition=Ready pod/cy --timeout=120s >/dev/null
+CYIP=$(vpcip cy)
+[ "$CYIP" = "$CXIP" ] || echo "  note: cy got $CYIP (cx had $CXIP) — reuse not exercised"
+check "cz($W) -> $CYIP reaches cy($W2) (stale local pruned, remote wins)" "cy" httpid team-a cz "$CYIP"
 
 echo "[floating IP: external ingress, source-preserving]"
 # Bind a public IP to a1's VPC IP; an off-cluster client (a container on the
