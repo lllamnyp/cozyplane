@@ -31,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/registry/rest"
 	genericapiserver "k8s.io/apiserver/pkg/server"
@@ -47,15 +48,19 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 	return sdnopenapi.GetOpenAPIDefinitions(ref)
 }
 
-// APIGroupInfo builds the APIGroupInfo for the sdn API group.
-func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOptionsGetter genericregistry.RESTOptionsGetter) *genericapiserver.APIGroupInfo {
+// APIGroupInfo builds the APIGroupInfo for the sdn API group. auth is the
+// delegated authorizer, consumed by the strategies that enforce the virtual
+// VPC verbs (export on VPCBinding, peer on VPCPeering) — aggregated-API
+// requests bypass kube-apiserver admission, so the CRD-mode
+// ValidatingAdmissionPolicies cannot cover this server.
+func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOptionsGetter genericregistry.RESTOptionsGetter, auth authorizer.Authorizer) *genericapiserver.APIGroupInfo {
 	apiGroupInfo := genericapiserver.NewDefaultAPIGroupInfo(sdn.GroupName, scheme, metav1.ParameterCodec, codec)
 
 	vpcREST, vpcStatusREST, err := vpcstorage.NewREST(scheme, restOptionsGetter)
 	if err != nil {
 		panic(err)
 	}
-	vpcPeeringREST, vpcPeeringStatusREST, err := vpcpeeringstorage.NewREST(scheme, restOptionsGetter)
+	vpcPeeringREST, vpcPeeringStatusREST, err := vpcpeeringstorage.NewREST(scheme, restOptionsGetter, auth)
 	if err != nil {
 		panic(err)
 	}
@@ -72,7 +77,7 @@ func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOpt
 	v1alpha1storage["vpcs"] = vpcREST
 	v1alpha1storage["vpcs/status"] = vpcStatusREST
 	v1alpha1storage["ports"] = defaultregistry.RESTInPeace(portstorage.NewREST(scheme, restOptionsGetter))
-	v1alpha1storage["vpcbindings"] = defaultregistry.RESTInPeace(vpcbindingstorage.NewREST(scheme, restOptionsGetter))
+	v1alpha1storage["vpcbindings"] = defaultregistry.RESTInPeace(vpcbindingstorage.NewREST(scheme, restOptionsGetter, auth))
 	v1alpha1storage["vpcpeerings"] = vpcPeeringREST
 	v1alpha1storage["vpcpeerings/status"] = vpcPeeringStatusREST
 	v1alpha1storage["externalpools"] = externalPoolREST

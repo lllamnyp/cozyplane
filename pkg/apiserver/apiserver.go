@@ -104,7 +104,7 @@ func (c completedConfig) New() (*CozyplaneServer, error) {
 
 	apiGroupInfos := make([]*genericapiserver.APIGroupInfo, 0, 1)
 	if c.ExtraConfig.ServeSDN {
-		sdnAPIGroupInfo := sdnsetup.APIGroupInfo(Scheme, Codecs, c.GenericConfig.RESTOptionsGetter)
+		sdnAPIGroupInfo := sdnsetup.APIGroupInfo(Scheme, Codecs, c.GenericConfig.RESTOptionsGetter, c.GenericConfig.Authorization.Authorizer)
 		sdnAPIGroupInfo.NegotiatedSerializer = jsonCodecs
 		apiGroupInfos = append(apiGroupInfos, sdnAPIGroupInfo)
 	}

@@ -20,14 +20,15 @@ import (
 	"github.com/lllamnyp/cozyplane/api/sdn"
 	"github.com/lllamnyp/cozyplane/pkg/registry"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/registry/rest"
 )
 
 // NewREST returns a RESTStorage object that will work against VPCBindings.
-func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter) (*registry.REST, error) {
-	strategy := NewStrategy(scheme)
+func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter, auth authorizer.Authorizer) (*registry.REST, error) {
+	strategy := NewStrategy(scheme, auth)
 
 	store := &genericregistry.Store{
 		NewFunc:                   func() runtime.Object { return &sdn.VPCBinding{} },

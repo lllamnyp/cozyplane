@@ -260,9 +260,17 @@ other.
   CIDRs overlap) and surfaced as the `CIDRsDisjoint` condition. Overlapping
   VPCs otherwise coexist fine (net-scoped delivery); they just can't peer.
 
-Creating a half currently requires only `create vpcpeerings` in the owner
-namespace; a `peer` virtual verb on the local VPC (mirroring `export`) is
-deferred — see [#1](https://github.com/lllamnyp/cozyplane/issues/1).
+Creating a half requires `create vpcpeerings` in the owner namespace **and the
+`peer` virtual verb on the local VPC** (`spec.vpcRef`), mirroring `export`
+([#1](https://github.com/lllamnyp/cozyplane/issues/1)): verbs on a VPC express
+what a principal may do with it — `export` grants use, `peer` connects it
+outward. This enables delegating peering management in a namespace without
+authority over every VPC in it. Enforcement is dual-mode, like `export`: the
+aggregated apiserver checks the verb in the create strategy (admission never
+sees aggregated resources — which is also why both verbs are now
+strategy-enforced there; a VAP alone covers only CRD mode), and CRD mode uses
+the VAP twin. No verb is checked on the *remote* VPC — consent stays the
+reciprocal half.
 
 ### Revocation
 

@@ -65,6 +65,51 @@ spec:
   policyName: cozyplane-vpcbinding-export
   validationActions: ["Deny"]
 ---
+# Gate VPCPeering creation on the `peer` verb of the LOCAL VPC (spec.vpcRef,
+# which lives in the peering's own namespace). Verbs on a VPC express what a
+# principal may do with it: `export` = grant use, `peer` = connect it to
+# another VPC. Consent from the remote side stays the reciprocal half — no
+# verb is checked on the peer VPC. Spec is immutable (strategy-enforced), so
+# only CREATE needs the check; the refUnchanged guard keeps status/finalizer
+# UPDATEs unblocked. In aggregated-apiserver mode the same check runs in the
+# vpcpeering create strategy (admission does not see aggregated resources).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: cozyplane-vpcpeering-peer
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["sdn.cozystack.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["vpcpeerings"]
+  variables:
+    - name: refUnchanged
+      expression: >-
+        oldObject != null &&
+        oldObject.spec.vpcRef.name == object.spec.vpcRef.name
+  validations:
+    - expression: >-
+        variables.refUnchanged ||
+        authorizer.group('sdn.cozystack.io').resource('vpcs')
+          .namespace(object.metadata.namespace).name(object.spec.vpcRef.name)
+          .check('peer').allowed()
+      reason: Forbidden
+      messageExpression: >-
+        "creating a VPCPeering for VPC " + object.metadata.namespace + "/" +
+        object.spec.vpcRef.name + " requires the 'peer' verb on that VPC " +
+        "(sdn.cozystack.io vpcs)"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: cozyplane-vpcpeering-peer
+spec:
+  policyName: cozyplane-vpcpeering-peer
+  validationActions: ["Deny"]
+---
 # Sample owner role. RoleBind this into a tenant's namespace to let that tenant
 # own VPCs (including `export` them) and manage VPCBindings there. To bind a VPC
 # into a *subtenant* namespace, the owner also needs `create vpcbindings` in that
@@ -77,17 +122,19 @@ metadata:
 rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcs"]
-    # `export` is the virtual verb consumed by the ValidatingAdmissionPolicy.
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "export"]
+    # `export` and `peer` are the virtual verbs consumed by the
+    # ValidatingAdmissionPolicies (and by the aggregated apiserver's strategies).
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "export", "peer"]
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcs/status"]
     verbs: ["get"]
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcbindings"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # Peering halves live in the owner's namespace; creating one declares intent,
-  # deleting it revokes. Consent comes from the reciprocal half in the peer's
-  # namespace, so no verb on the *peer* VPC is needed.
+  # Peering halves live in the owner's namespace; creating one declares intent
+  # (gated by the `peer` verb on the LOCAL VPC above), deleting it revokes.
+  # Consent comes from the reciprocal half in the peer's namespace, so no verb
+  # on the *peer* VPC is needed.
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcpeerings"]
     verbs: ["get", "list", "watch", "create", "delete"]

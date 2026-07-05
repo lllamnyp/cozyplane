@@ -21,10 +21,12 @@ import (
 	"errors"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
+	"github.com/lllamnyp/cozyplane/pkg/registry/sdn/authz"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/names"
@@ -56,14 +58,23 @@ func SelectableFields(obj *sdn.VPCPeering) fields.Set {
 	return generic.ObjectMetaFieldsSet(&obj.ObjectMeta, true)
 }
 
+// PeerVerb is the virtual verb on the LOCAL VPC that gates creating a peering
+// half: verbs on a VPC express what a principal may do with it (`export` =
+// grant use, `peer` = connect it to another VPC). Consent from the remote side
+// is the reciprocal half, so no verb is checked on the peer VPC.
+const PeerVerb = "peer"
+
 type vpcPeeringStrategy struct {
 	runtime.ObjectTyper
 	names.NameGenerator
+	authz authorizer.Authorizer
 }
 
 // NewStrategy creates and returns a vpcPeeringStrategy instance.
-func NewStrategy(typer runtime.ObjectTyper) vpcPeeringStrategy {
-	return vpcPeeringStrategy{typer, names.SimpleNameGenerator}
+// NewStrategy builds the strategy. auth is the delegated authorizer for the
+// peer-verb check; nil skips it (CRD mode, where the VAP twin enforces).
+func NewStrategy(typer runtime.ObjectTyper, auth authorizer.Authorizer) vpcPeeringStrategy {
+	return vpcPeeringStrategy{typer, names.SimpleNameGenerator, auth}
 }
 
 func (vpcPeeringStrategy) NamespaceScoped() bool {
@@ -84,7 +95,7 @@ func (vpcPeeringStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime
 	newPeering.Status = oldPeering.Status
 }
 
-func (vpcPeeringStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
+func (s vpcPeeringStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	peering := obj.(*sdn.VPCPeering)
 	var errs field.ErrorList
 	specPath := field.NewPath("spec")
@@ -100,6 +111,14 @@ func (vpcPeeringStrategy) Validate(ctx context.Context, obj runtime.Object) fiel
 	if peering.Spec.PeerRef.Namespace == peering.Namespace && peering.Spec.PeerRef.Name == peering.Spec.VPCRef.Name {
 		errs = append(errs, field.Invalid(specPath.Child("peerRef"), peering.Spec.PeerRef,
 			"a VPC cannot peer with itself"))
+	}
+	// Creating a half connects the LOCAL VPC outward — that is what the peer
+	// verb on it authorizes (issue #1). The local VPC lives in the peering's
+	// own namespace.
+	if len(errs) == 0 {
+		if err := authz.CheckVPCVerb(ctx, s.authz, PeerVerb, peering.Namespace, peering.Spec.VPCRef.Name, specPath.Child("vpcRef")); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	return errs
 }

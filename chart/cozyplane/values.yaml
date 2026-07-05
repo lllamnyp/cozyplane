@@ -53,8 +53,9 @@ controller:
 
 # The export ValidatingAdmissionPolicy that gates VPCBinding creation on the
 # 'export' verb of the referenced VPC. Requires Kubernetes >= 1.30. Disable only
-# if your cluster predates VAP (then VPCBinding creation is governed by plain
-# 'create vpcbindings' RBAC alone, with no cross-VPC export check).
+# if your cluster predates VAP (then VPCBinding/VPCPeering creation is governed
+# by plain create RBAC alone, with no export/peer verb check). Only relevant in
+# CRD mode: the aggregated apiserver enforces both verbs in its strategies.
 exportPolicy:
   enabled: true
 

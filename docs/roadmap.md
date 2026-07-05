@@ -43,7 +43,7 @@ they're discovered rather than leaving them only in issues.
 - [x] Per-VPC egress NAT gateway (gateway-attach, per-VPC gateway pod)
 - [x] Floating IPs: eBPF bridge extension (no gateway pod), true public IP both directions
 - [x] Floating-IP advertisement in eBPF (`from_uplink` ARP responder) + readiness gated on a live target Port
-- [ ] Gate `VPCPeering` creation on a `peer` virtual verb on the local VPC — [#1](../../issues/1)
+- [x] Gate `VPCPeering` creation on a `peer` virtual verb on the local VPC — strategy-enforced in aggregated mode (which also closed the `export` gap there: admission never sees aggregated resources), VAP twin for CRD mode — [#1](../../issues/1)
 - [ ] Floating IPs: 1:1 public-address NAT anchored on the per-VPC gateway (internet-gateway equivalent) — [#5](../../issues/5)
 - [ ] Site-to-site VPN: authorized-forwarder role + per-VPC route table — [#6](../../issues/6)
 - [ ] Network policy / security groups within and across VPCs — `design.md`, `user-guide.md`

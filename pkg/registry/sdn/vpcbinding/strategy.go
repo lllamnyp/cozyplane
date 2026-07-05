@@ -19,8 +19,10 @@ package vpcbinding
 import (
 	"context"
 	"errors"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
+	"github.com/lllamnyp/cozyplane/pkg/registry/sdn/authz"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -59,11 +61,14 @@ func SelectableFields(obj *sdn.VPCBinding) fields.Set {
 type vpcBindingStrategy struct {
 	runtime.ObjectTyper
 	names.NameGenerator
+	authz authorizer.Authorizer
 }
 
 // NewStrategy creates and returns a vpcBindingStrategy instance.
-func NewStrategy(typer runtime.ObjectTyper) vpcBindingStrategy {
-	return vpcBindingStrategy{typer, names.SimpleNameGenerator}
+// NewStrategy builds the strategy. auth is the delegated authorizer for the
+// export-verb check; nil skips it (CRD mode, where the VAP enforces).
+func NewStrategy(typer runtime.ObjectTyper, auth authorizer.Authorizer) vpcBindingStrategy {
+	return vpcBindingStrategy{typer, names.SimpleNameGenerator, auth}
 }
 
 func (vpcBindingStrategy) NamespaceScoped() bool {
@@ -76,7 +81,23 @@ func (vpcBindingStrategy) PrepareForCreate(ctx context.Context, obj runtime.Obje
 func (vpcBindingStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 }
 
-func (vpcBindingStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
+// ExportVerb is the virtual verb on the referenced VPC that gates creating a
+// VPCBinding to it — the escalation gate that stops a tenant binding to a VPC
+// it doesn't own (docs/control-plane.md §6). The VAP enforces it in CRD mode;
+// this strategy enforces it in aggregated-apiserver mode, which bypasses
+// kube-apiserver admission.
+const ExportVerb = "export"
+
+func (s vpcBindingStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
+	binding := obj.(*sdn.VPCBinding)
+	ref := binding.Spec.VPCRef
+	ns := ref.Namespace
+	if ns == "" {
+		ns = binding.Namespace
+	}
+	if err := authz.CheckVPCVerb(ctx, s.authz, ExportVerb, ns, ref.Name, field.NewPath("spec", "vpcRef")); err != nil {
+		return field.ErrorList{err}
+	}
 	return field.ErrorList{}
 }
 
@@ -96,8 +117,15 @@ func (vpcBindingStrategy) AllowUnconditionalUpdate() bool {
 func (vpcBindingStrategy) Canonicalize(obj runtime.Object) {
 }
 
-func (vpcBindingStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
-	return field.ErrorList{}
+func (s vpcBindingStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+	// Retargeting vpcRef needs a fresh export check; metadata/finalizer writes
+	// (the controller's reap finalizer) must pass unchecked — the same
+	// refUnchanged guard the VAP applies.
+	newB, oldB := obj.(*sdn.VPCBinding), old.(*sdn.VPCBinding)
+	if newB.Spec.VPCRef == oldB.Spec.VPCRef {
+		return field.ErrorList{}
+	}
+	return s.Validate(ctx, obj)
 }
 
 // WarningsOnUpdate returns warnings for the given update.
