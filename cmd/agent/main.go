@@ -68,6 +68,11 @@ const (
   ]
 }
 `
+	// migrateFwdGrace is how long a former source node keeps re-encapsulating a
+	// migrated VM's traffic to its new node after cutover, covering the window in
+	// which remote agents still route to the old node. Comfortably longer than
+	// informer propagation across the fleet.
+	migrateFwdGrace = 15 * time.Second
 )
 
 func main() {
@@ -517,9 +522,59 @@ func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory,
 		log.Info("remote port set", "ip", port.Spec.IP, "nodeIP", port.Spec.NodeIP, "vpc", port.Spec.VPCRef.Namespace+"/"+port.Spec.VPCRef.Name)
 	}
 
+	// migrateAway installs the source-forward safety net (docs/live-migration.md
+	// stage 2). When a VM Port's spec.node moves off this node, remote nodes'
+	// `remotes` entries still point here until their agents catch the update.
+	// For that window this (former source) node re-encapsulates the VM's traffic
+	// to the new node from its overlay hook, so in-flight east-west traffic isn't
+	// black-holed. The entry is torn down after the propagation grace period.
+	migrateAway := func(oldObj, newObj any) {
+		oldPort, ok := oldObj.(*sdnv1alpha1.Port)
+		if !ok {
+			return
+		}
+		newPort, ok := newObj.(*sdnv1alpha1.Port)
+		if !ok {
+			return
+		}
+		if newPort.Labels[sdnv1alpha1.LabelVMName] == "" {
+			return // only VM Ports migrate
+		}
+		if oldPort.Spec.Node != selfName || newPort.Spec.Node == selfName || newPort.Spec.Node == "" {
+			return // not a move off this node
+		}
+		if newPort.Spec.IP == "" || newPort.Spec.NodeIP == "" {
+			return
+		}
+		net_, ok := vniFromPortName(newPort.Name)
+		if !ok {
+			return
+		}
+		vmIP := net.ParseIP(newPort.Spec.IP)
+		if err := mgr.SetMigrateFwd(net_, vmIP, net.ParseIP(newPort.Spec.NodeIP)); err != nil {
+			log.Error("install migration source-forward", "port", newPort.Name, "err", err)
+			return
+		}
+		log.Info("migration source-forward installed", "port", newPort.Name, "ip", newPort.Spec.IP, "target", newPort.Spec.NodeIP)
+		go func() {
+			select {
+			case <-ctx.Done():
+			case <-time.After(migrateFwdGrace):
+			}
+			if err := mgr.DelMigrateFwd(net_, vmIP); err != nil {
+				log.Error("remove migration source-forward", "port", newPort.Name, "err", err)
+			} else {
+				log.Info("migration source-forward removed", "port", newPort.Name, "ip", newPort.Spec.IP)
+			}
+		}()
+	}
+
 	_, _ = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    apply,
-		UpdateFunc: func(_, newObj any) { apply(newObj) },
+		AddFunc: apply,
+		UpdateFunc: func(oldObj, newObj any) {
+			migrateAway(oldObj, newObj)
+			apply(newObj)
+		},
 		DeleteFunc: func(obj any) {
 			port := portFromDelete(obj)
 			if port == nil || port.Spec.IP == "" {

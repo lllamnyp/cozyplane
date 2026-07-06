@@ -79,8 +79,23 @@ migration (IP+MAC preserved, cross-VPC 0% loss). Kube-OVN goes one step
 further — it delegates the *instant* of cutover to the guest's RARP via OVN's
 `activation-strategy=rarp`, so the control-plane only opens a dual-bound
 (`requested-chassis=src,target`) window and pins the winner. The cozyplane
-analogs — a source→target forward during the window, and a GARP-triggered
-datapath flip — are the planned next increments (roadmap §5).
+analogs are the source→target forward (stage 2, below) and a GARP-triggered
+datapath flip (stage 3, planned).
+
+**Source-forward window (stage 2, as built).** Cutover flips `spec.node` on the
+Port; every agent re-points its `remotes[{net,vpcIP}]` entry, but not
+simultaneously — an agent that is slow to observe the update keeps encapsulating
+to the *old* node for a few informer beats. To keep that in-flight east-west
+traffic from being black-holed, the former source node bridges the gap: when a
+VM Port's `spec.node` moves off this node, the agent installs a `migrate_fwd`
+entry keyed on `{net, vpcIP}` with the target's node IP, and the `from_overlay`
+hook — after its `locals` lookup misses (local delivery was already torn down at
+cutover) — re-encapsulates the packet to the target instead of dropping it. The
+entry is removed after a 15 s grace period (`migrateFwdGrace`), comfortably
+longer than fleet-wide informer propagation. This is one-directional and
+transient: it only catches traffic that still arrives at the old node, and only
+until every remote agent has re-pointed. The map is `LIBBPF_PIN_BY_NAME` so it
+survives an agent restart mid-window.
 
 **Staged locals (as built):** the target's `locals` entry is gated on the
 cutover, closing the overlap window v1 had. A migration-target ADD (the bound
@@ -115,10 +130,10 @@ before the Port is really removed.
   system-view DNS re-point (`control-plane.md` §5) is **later** — name-based
   addressing isn't wired yet, so nothing depends on a stable fabric A record.
 - Cutover follows the VMI's `status.nodeName` (the Kube-OVN model, stage 1 —
-  done). Planned: a source→target forward during the migration window (stage 2)
-  and a GARP-triggered datapath flip (stage 3) to drive the residual cutover
-  gap to zero, the way OVN's `requested-chassis=src,target` +
-  `activation-strategy=rarp` does.
+  done), backed by the source→target forward during the propagation window
+  (stage 2 — done). Planned: a GARP-triggered datapath flip (stage 3) to drive
+  the residual cutover gap to zero, the way OVN's `requested-chassis=src,target`
+  + `activation-strategy=rarp` does.
 - Dropped: the `/migrate` + `/bind` Port subresources — investigation of the
   callers showed the only caller is cozyplane's own controller, and Kube-OVN
   (the reference) exposes no such API (it sets OVN NB options directly). The

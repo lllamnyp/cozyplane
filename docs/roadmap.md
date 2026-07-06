@@ -22,7 +22,7 @@ they're discovered rather than leaving them only in issues.
 - [x] Default-deny VPC attachment: a `VPCBinding` authorizes use, the VPC's namespace is ownership
 - Migration cutover adopts the Kube-OVN model (replaces the `/migrate`+`/bind` subresource idea — the only caller is our own controller, and Kube-OVN exposes no such API) — `live-migration.md`
   - [x] Stage 1 — cutover follows `VMI.status.nodeName` (phase-explicit, degrades to the pod label without KubeVirt; dev4-validated with a real migration)
-  - [ ] Stage 2 — source→target forward during the migration window (close the cross-node cutover gap; OVN's `requested-chassis=src,target`)
+  - [x] Stage 2 — source→target forward during the migration window (`migrate_fwd` map + `from_overlay` re-encap; 15 s grace; closes the cross-node cutover gap; OVN's `requested-chassis=src,target`)
   - [ ] Stage 3 — GARP-triggered datapath cutover (OVN's `activation-strategy=rarp`)
 - [ ] Observability subresource(s) (e.g. `/ports`) — `control-plane.md`
 - [x] Agent token rotation: the plugin kubeconfig references a host-visible tokenFile the agent refreshes as kubelet rotates the projected SA token (the embedded-once copy only worked via the API server's expired-token grace)

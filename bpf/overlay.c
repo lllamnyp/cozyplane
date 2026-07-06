@@ -475,6 +475,23 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } node_ip6 SEC(".maps");
 
+// migrate_fwd forwards a migrated VM's traffic from its OLD node to its new
+// one during the cutover propagation window (live migration, stage 2). When a
+// VM moves, remote nodes keep delivering to the stale source location until
+// their `remotes` entry re-points (a few hundred ms of watch latency); the
+// source, which no longer hosts the VM, re-encapsulates those packets to the
+// target instead of dropping them — the cozyplane analog of OVN's
+// requested-chassis=src,target. Keyed like `locals`; value is the target node
+// IP (host order). Installed by the (old) source agent at cutover, removed
+// after a short grace once every node's `remotes` has caught up.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct local_key);
+	__type(value, __u32);
+	__uint(max_entries, 1024);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} migrate_fwd SEC(".maps");
+
 // vpc_counters meters east-west traffic per VPC (net), a metering/billing
 // foundation (#2). PERCPU so the hooks never contend — the agent sums across
 // CPUs when it reads. tx counts a VPC pod's egress (from_pod), rx its ingress
@@ -2902,6 +2919,16 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 		if (gep)
 			return deliver_local(skb, gep);
 	}
+
+	// Migration forwarding (stage 2): this was the source node of a VM that
+	// has moved. A remote node with a stale `remotes` entry still delivered
+	// here; re-encapsulate to the target so nothing drops during the cutover
+	// window. The target hosts the VM locally, so there is no loop.
+	struct local_key mk = { .net = vni, .ip = p.dst };
+	__u32 *tgt = bpf_map_lookup_elem(&migrate_fwd, &mk);
+	if (tgt)
+		return encap(skb, vni, *tgt, 0);
+
 	return TC_ACT_OK;
 }
 
