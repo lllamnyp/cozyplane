@@ -73,6 +73,14 @@ func vmi(vm, nodeName string) *unstructured.Unstructured {
 	return u
 }
 
+// vmiMigrating models the lag window: status.nodeName still names the source
+// while an in-flight migration targets another node (targetNode set, not failed).
+func vmiMigrating(vm, nodeName, targetNode string) *unstructured.Unstructured {
+	u := vmi(vm, nodeName)
+	_ = unstructured.SetNestedField(u.Object, targetNode, "status", "migrationState", "targetNode")
+	return u
+}
+
 func ppScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 	s := runtime.NewScheme()
@@ -122,6 +130,30 @@ func TestCutoverFollowsVMINode(t *testing.T) {
 	}
 	if got.Spec.FabricIP != "10.244.1.9" {
 		t.Errorf("fabric IP = %q, want the target launcher's %q", got.Spec.FabricIP, "10.244.1.9")
+	}
+	if got.Spec.NodeIP != "10.0.0.2" {
+		t.Errorf("node IP = %q, want node-b's %q", got.Spec.NodeIP, "10.0.0.2")
+	}
+}
+
+// Stage-3 anti-flap: when the target agent has already flipped spec.node to the
+// migration target on the guest's announcement, the controller must NOT revert
+// it to the (still-lagging) VMI status.nodeName source. It keeps the target.
+func TestCutoverDefersToGuestAnnouncement(t *testing.T) {
+	src := launcher("virt-launcher-vm-src", "node-a", "vm", "10.244.0.5", "uid-src")
+	dst := launcher("virt-launcher-vm-dst", "node-b", "vm", "10.244.1.9", "uid-dst")
+	// The agent already moved the Port to node-b (target). The VMI still reports
+	// node-a as the active node, with an in-flight migration targeting node-b.
+	c := fake.NewClientBuilder().WithScheme(ppScheme(t)).
+		WithObjects(persistentPort("vm", "192.168.0.2", "node-b"), src, dst,
+			node("node-a", "10.0.0.1"), node("node-b", "10.0.0.2"),
+			vmiMigrating("vm", "node-a", "node-b")).
+		Build()
+	r := &PersistentPortReconciler{Client: c, watchVMI: true}
+
+	got := reconcilePP(t, r, "v100.192.168.0.2")
+	if got.Spec.Node != "node-b" {
+		t.Fatalf("port node = %q, want node-b kept (no revert to the lagging source)", got.Spec.Node)
 	}
 	if got.Spec.NodeIP != "10.0.0.2" {
 		t.Errorf("node IP = %q, want node-b's %q", got.Spec.NodeIP, "10.0.0.2")

@@ -37,11 +37,12 @@ rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcpeerings"]
     verbs: ["get", "list", "watch"]
-  # Port claims (the plugin allocates/releases; the agent watches for remotes
-  # and updates terminating Ports to release the sever finalizer).
+  # Port claims (the plugin allocates/releases; the agent watches for remotes,
+  # releases the sever finalizer on terminating Ports, and patches spec.node to
+  # itself when a migrated guest announces on this node — stage-3 cutover).
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["ports"]
-    verbs: ["get", "list", "watch", "create", "update", "delete"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # FloatingIPs: the agent programs the floating map and advertises the address
   # for those whose target Port is on this node.
   - apiGroups: ["sdn.cozystack.io"]

@@ -111,8 +111,17 @@ func (r *PersistentPortReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// then bind to the launcher pod ON that node (for its fabric IP + identity).
 	winnerNode := ""
 	if r.watchVMI {
-		if node, ok := r.vmiActiveNode(ctx, port.Spec.PodNamespace, vmName); ok {
+		if node, target, failed, ok := r.vmiCutoverState(ctx, port.Spec.PodNamespace, vmName); ok {
 			winnerNode = node
+			// Defer to a guest-announcement cutover (stage 3): if the Port already
+			// points at the in-flight migration's target and that migration hasn't
+			// failed, the guest announced itself there — the target agent flipped
+			// spec.node ahead of VMI.status.nodeName. Don't revert it to the
+			// lagging source; that revert is the flap the announcement is meant to
+			// skip. On failure, fall through to status.nodeName (the source).
+			if !failed && target != "" && port.Spec.Node == target {
+				winnerNode = target
+			}
 		}
 	}
 	var active *corev1.Pod
@@ -195,12 +204,22 @@ func launcherOnNode(pods []corev1.Pod, node string) *corev1.Pod {
 // node the active virt-launcher runs on, flipped to the target at cutover). ok
 // is false when the VMI is absent or has no node yet, so the caller falls back.
 func (r *PersistentPortReconciler) vmiActiveNode(ctx context.Context, namespace, vmName string) (string, bool) {
+	node, _, _, ok := r.vmiCutoverState(ctx, namespace, vmName)
+	return node, ok
+}
+
+// vmiCutoverState reads the VMI's cutover signals: the active node
+// (status.nodeName), the in-flight migration's target node, and whether that
+// migration failed. ok is false when the VMI is absent or has no node yet.
+func (r *PersistentPortReconciler) vmiCutoverState(ctx context.Context, namespace, vmName string) (node, target string, failed, ok bool) {
 	vmi := newVMI()
 	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: vmName}, vmi); err != nil {
-		return "", false // no VMI (KubeVirt absent, or not this pod's VM): fall back
+		return "", "", false, false // no VMI (KubeVirt absent, or not this pod's VM): fall back
 	}
-	node, _, _ := unstructured.NestedString(vmi.Object, "status", "nodeName")
-	return node, node != ""
+	node, _, _ = unstructured.NestedString(vmi.Object, "status", "nodeName")
+	target, _, _ = unstructured.NestedString(vmi.Object, "status", "migrationState", "targetNode")
+	failed, _, _ = unstructured.NestedBool(vmi.Object, "status", "migrationState", "failed")
+	return node, target, failed, node != ""
 }
 
 func (r *PersistentPortReconciler) nodeInternalIP(ctx context.Context, name string) (string, error) {

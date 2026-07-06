@@ -45,6 +45,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -55,6 +56,7 @@ import (
 	sdnclientset "github.com/lllamnyp/cozyplane/pkg/generated/sdn/clientset/versioned"
 	sdninformers "github.com/lllamnyp/cozyplane/pkg/generated/sdn/informers/externalversions"
 	sdnv1alpha1informers "github.com/lllamnyp/cozyplane/pkg/generated/sdn/informers/externalversions/sdn/v1alpha1"
+	sdnv1alpha1listers "github.com/lllamnyp/cozyplane/pkg/generated/sdn/listers/sdn/v1alpha1"
 )
 
 const (
@@ -344,7 +346,7 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	} else {
 		factory := sdninformers.NewSharedInformerFactory(sdnClient, 0)
 		watchVPCs(factory, mgr, log)
-		watchPorts(ctx, factory, sdnClient, client, mgr, nodeName, log)
+		watchPorts(ctx, factory, sdnClient, client, mgr, nodeName, state.NodeIP, log)
 		watchPeerings(ctx, factory, mgr, log)
 		watchGateways(ctx, factory, mgr, nodeName, log)
 		watchFloatingIPs(ctx, factory, mgr, nodeName, log)
@@ -466,8 +468,13 @@ func watchVPCs(factory sdninformers.SharedInformerFactory, mgr *datapath.Manager
 // map as /32 routes to their node's Geneve endpoint, and severs a *local* pod's
 // datapath when its Port is reaped out from under it (revocation). Best-effort,
 // like watchVPCs.
-func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory, sdn sdnclientset.Interface, core kubernetes.Interface, mgr *datapath.Manager, selfName string, log *slog.Logger) {
+func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory, sdn sdnclientset.Interface, core kubernetes.Interface, mgr *datapath.Manager, selfName, selfIP string, log *slog.Logger) {
 	informer := factory.Sdn().V1alpha1().Ports().Informer()
+
+	// Guest-announcement cutover (stage 3): a reconcile loop, keyed on veth
+	// presence rather than Port events, runs a GARP/NA listener for every local
+	// VM veth whose Port is active elsewhere. It is started once here.
+	go watchGuestAnnouncements(ctx, factory.Sdn().V1alpha1().Ports().Lister(), sdn, selfName, selfIP, log)
 
 	apply := func(obj any) {
 		port, ok := obj.(*sdnv1alpha1.Port)
@@ -491,8 +498,9 @@ func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory,
 		// delivery flips exactly when cross-node delivery does.
 		if port.Labels[sdnv1alpha1.LabelVMName] != "" && port.Spec.IP != "" {
 			if net_, ok := vniFromPortName(port.Name); ok {
+				vmIP := net.ParseIP(port.Spec.IP)
 				if port.Spec.Node == selfName {
-					if programmed, err := datapath.EnsureLocalFromVeth(net_, net.ParseIP(port.Spec.IP)); err != nil {
+					if programmed, err := datapath.EnsureLocalFromVeth(net_, vmIP); err != nil {
 						log.Error("program persistent-port locals at cutover", "port", port.Name, "err", err)
 					} else if programmed {
 						log.Info("persistent port local delivery enabled (cutover)", "port", port.Name, "ip", port.Spec.IP)
@@ -501,7 +509,7 @@ func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory,
 					if err := mgr.DelRemote(net_, hostCIDR(port.Spec.IP)); err != nil {
 						log.Error("del stale remote for local persistent port", "port", port.Name, "err", err)
 					}
-				} else if err := datapath.DelLocal(net_, net.ParseIP(port.Spec.IP)); err != nil {
+				} else if err := datapath.DelLocal(net_, vmIP); err != nil {
 					log.Error("del persistent-port locals (moved away)", "port", port.Name, "err", err)
 				}
 			}
@@ -595,6 +603,105 @@ func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory,
 			}
 		},
 	})
+}
+
+// watchGuestAnnouncements drives the stage-3 cutover (docs/live-migration.md).
+// It reconciles, every couple of seconds, one GARP/NA listener per local VM
+// veth whose Port is active on another node — the set of migration-involved
+// veths on this node (a staged target waiting for the guest to arrive, or a
+// former source that would reclaim the VM if the migration rolls back). The
+// trigger is veth presence, not Port events, because a CNI ADD staging a
+// migration target emits no Port event. When the guest announces itself the
+// listener patches the Port's node to this one; the guest resumes on exactly
+// one node, so exactly one listener ever fires, and it is always the right one.
+func watchGuestAnnouncements(ctx context.Context, ports sdnv1alpha1listers.PortLister, sdn sdnclientset.Interface, selfName, selfIP string, log *slog.Logger) {
+	var mu sync.Mutex
+	running := map[string]context.CancelFunc{} // Port name -> listener cancel
+
+	fire := func(name, ip string) {
+		// The guest is live on this node. Claim the Port; the controller's
+		// VMI-watch would reach the same value, just later.
+		patch := []byte(fmt.Sprintf(`{"spec":{"node":%q,"nodeIP":%q}}`, selfName, selfIP))
+		if _, err := sdn.SdnV1alpha1().Ports().Patch(ctx, name, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
+			log.Error("flip port to self on guest announcement", "port", name, "err", err)
+			return
+		}
+		log.Info("migration cutover driven by guest announcement", "port", name, "ip", ip, "node", selfName)
+	}
+
+	reconcile := func() {
+		veths, err := datapath.ListLocalPortVeths()
+		if err != nil {
+			log.Error("list local veths for guest-announcement watch", "err", err)
+			return
+		}
+		// Index VM Ports active elsewhere by (net, ip).
+		type target struct {
+			ifindex int
+			mac     net.HardwareAddr
+			ip      net.IP
+		}
+		desired := map[string]target{} // Port name -> handle
+		all, err := ports.List(labels.Everything())
+		if err != nil {
+			return // lister not synced yet
+		}
+		portFor := map[string]*sdnv1alpha1.Port{} // "net|ip" -> Port
+		for _, p := range all {
+			if p.Labels[sdnv1alpha1.LabelVMName] == "" || p.Spec.IP == "" || p.Spec.Node == selfName {
+				continue
+			}
+			if n, ok := vniFromPortName(p.Name); ok {
+				portFor[fmt.Sprintf("%d|%s", n, p.Spec.IP)] = p
+			}
+		}
+		for _, v := range veths {
+			for _, ip := range v.IPs {
+				p := portFor[fmt.Sprintf("%d|%s", v.Net, ip.String())]
+				if p == nil {
+					continue
+				}
+				desired[p.Name] = target{ifindex: v.Ifindex, mac: v.MAC, ip: ip}
+			}
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		for name, t := range desired {
+			if _, ok := running[name]; ok {
+				continue
+			}
+			wctx, cancel := context.WithCancel(ctx)
+			running[name] = cancel
+			log.Info("watching for migrated guest announcement", "port", name, "ip", t.ip.String())
+			go func(name, ip string, t target) {
+				err := datapath.WatchGuestAnnounce(wctx, t.ifindex, t.mac, t.ip)
+				mu.Lock()
+				delete(running, name) // let reconcile restart us if still desired
+				mu.Unlock()
+				if err == nil {
+					fire(name, ip)
+				}
+			}(name, t.ip.String(), t)
+		}
+		for name, cancel := range running {
+			if _, ok := desired[name]; !ok {
+				cancel()
+				delete(running, name)
+			}
+		}
+	}
+
+	tick := time.NewTicker(2 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			reconcile()
+		}
+	}
 }
 
 // releaseSeveredPort handles a terminating Port on this node: sever the live

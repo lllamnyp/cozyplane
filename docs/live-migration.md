@@ -97,6 +97,25 @@ transient: it only catches traffic that still arrives at the old node, and only
 until every remote agent has re-pointed. The map is `LIBBPF_PIN_BY_NAME` so it
 survives an agent restart mid-window.
 
+**Guest-announcement cutover (stage 3, as built).** The tightest cutover signal
+is the guest itself: when a VM resumes on the target it emits a gratuitous ARP
+(v4) or an unsolicited Neighbor Advertisement (v6) — "I am here now" — earlier
+and more precise than `VMI.status.nodeName`, which KubeVirt updates only after
+the migration bookkeeping settles. The target agent, while a migration-target
+Port is staged on it (`spec.node` elsewhere, but the CNI ADD's veth already
+present), opens an `AF_PACKET` socket on that veth bound to the announcement's
+ethertype and waits for a frame whose sender is the pinned `{VPC IP, MAC}`.
+`from_pod` passes ARP/NDP straight to the kernel, so the announcement reaches
+the tap. On a match the agent patches the Port's `spec.node`/`spec.nodeIP` to
+itself, driving the fleet-wide cutover immediately rather than waiting out
+informer + VMI-status propagation. The controller's VMI-watch (stage 1) is the
+fallback for a missed announcement; the two writers converge on the same value
+(the target), so a merge patch races cleanly. This is the analog of OVN's
+`activation-strategy=rarp`. The listener's lifecycle is bounded by the staging
+window: it starts when the target is staged and stops the moment `spec.node`
+becomes this node (whether its own patch or the fallback drove it) or the Port
+is removed.
+
 **Staged locals (as built):** the target's `locals` entry is gated on the
 cutover, closing the overlap window v1 had. A migration-target ADD (the bound
 persistent Port's `spec.node` is another node) stages everything — interface,
@@ -131,9 +150,10 @@ before the Port is really removed.
   addressing isn't wired yet, so nothing depends on a stable fabric A record.
 - Cutover follows the VMI's `status.nodeName` (the Kube-OVN model, stage 1 —
   done), backed by the source→target forward during the propagation window
-  (stage 2 — done). Planned: a GARP-triggered datapath flip (stage 3) to drive
-  the residual cutover gap to zero, the way OVN's `requested-chassis=src,target`
-  + `activation-strategy=rarp` does.
+  (stage 2 — done) and driven to its tightest instant by the guest's own
+  gratuitous ARP / unsolicited NA (stage 3 — done), the way OVN's
+  `requested-chassis=src,target` + `activation-strategy=rarp` does. The
+  VMI-watch is the fallback when the announcement is missed.
 - Dropped: the `/migrate` + `/bind` Port subresources — investigation of the
   callers showed the only caller is cozyplane's own controller, and Kube-OVN
   (the reference) exposes no such API (it sets OVN NB options directly). The

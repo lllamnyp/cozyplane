@@ -122,26 +122,37 @@ func SetVethAlias(link netlink.Link, rawNet uint32, ips []net.IP, mac net.Hardwa
 // becomes this node. Returns false when no such veth exists (the ADD hasn't
 // happened here yet — it will program locals itself, seeing spec.node==self).
 func EnsureLocalFromVeth(net_ uint32, ip net.IP) (bool, error) {
+	ifindex, mac, ok, err := vethForAddr(net_, ip)
+	if err != nil || !ok {
+		return false, err
+	}
+	return true, SetLocal(net_, ip, ifindex, mac)
+}
+
+// vethForAddr finds the local host veth whose rebuild alias covers (net, ip),
+// returning its ifindex and the pinned MAC. ok is false when no such veth
+// exists on this node (e.g. the CNI ADD hasn't landed here).
+func vethForAddr(net_ uint32, ip net.IP) (ifindex int, mac net.HardwareAddr, ok bool, err error) {
 	links, err := netlink.LinkList()
 	if err != nil {
-		return false, fmt.Errorf("list links: %w", err)
+		return 0, nil, false, fmt.Errorf("list links: %w", err)
 	}
 	for _, l := range links {
 		name := l.Attrs().Name
 		if !strings.HasPrefix(name, podVethPrefix) && !strings.HasPrefix(name, gwVethPrefix) {
 			continue
 		}
-		rawNet, ips, mac, ok := parseVethAlias(l.Attrs().Alias)
-		if !ok || PortNet(rawNet) != net_ {
+		rawNet, ips, amac, aok := parseVethAlias(l.Attrs().Alias)
+		if !aok || PortNet(rawNet) != net_ {
 			continue
 		}
 		for _, aip := range ips {
 			if aip.Equal(ip) {
-				return true, SetLocal(net_, ip, l.Attrs().Index, mac)
+				return l.Attrs().Index, amac, true, nil
 			}
 		}
 	}
-	return false, nil
+	return 0, nil, false, nil
 }
 
 // RebuildStats reports what a local-state rebuild did.
