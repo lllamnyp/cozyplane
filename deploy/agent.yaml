@@ -113,6 +113,11 @@ spec:
           # --cluster-cidr enables node masquerade: pod traffic leaving the
           # cluster is SNATed to the node (pods get an internet return path).
           args: ["--mtu=1450", "--cluster-cidr=10.244.0.0/16,fd00:10:244::/56", "--internal-cidrs=10.244.0.0/16,10.96.0.0/16,fd00:10:244::/56,fd00:10:96::/112"]
+          ports:
+            # Per-VPC traffic metrics (#2), Prometheus text at /metrics.
+            - name: metrics
+              containerPort: 9411
+              hostPort: 9411
           env:
             - name: NODE_NAME
               valueFrom:

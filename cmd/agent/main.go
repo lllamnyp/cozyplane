@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -53,6 +54,7 @@ import (
 	"github.com/lllamnyp/cozyplane/datapath"
 	sdnclientset "github.com/lllamnyp/cozyplane/pkg/generated/sdn/clientset/versioned"
 	sdninformers "github.com/lllamnyp/cozyplane/pkg/generated/sdn/informers/externalversions"
+	sdnv1alpha1informers "github.com/lllamnyp/cozyplane/pkg/generated/sdn/informers/externalversions/sdn/v1alpha1"
 )
 
 const (
@@ -342,6 +344,9 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		watchGateways(ctx, factory, mgr, nodeName, log)
 		watchFloatingIPs(ctx, factory, mgr, nodeName, log)
 		watchServiceVIPs(ctx, factory, mgr, log)
+		// Per-VPC traffic metrics (#2): serve the datapath counters, labeled by
+		// VPC via the same VPC lister the networks map is built from.
+		serveMetrics(ctx, mgr, factory.Sdn().V1alpha1().VPCs(), nodeName, log)
 		factory.Start(ctx.Done())
 	}
 
@@ -1184,4 +1189,60 @@ func watchServiceVIPs(ctx context.Context, factory sdninformers.SharedInformerFa
 		AddFunc:    func(any) { resync() },
 		UpdateFunc: func(_, _ any) { resync() },
 	})
+}
+
+// serveMetrics exposes the per-VPC datapath traffic counters (#2) as Prometheus
+// text on :9411/metrics, labeled by the owning VPC. Hand-rolled exposition (no
+// client dependency), read fresh on each scrape from the PERCPU map and the VPC
+// lister (net id -> VPC namespace/name).
+func serveMetrics(ctx context.Context, mgr *datapath.Manager, vpcs sdnv1alpha1informers.VPCInformer, nodeName string, log *slog.Logger) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+		counters, err := mgr.VPCCounters()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		// net id -> VPC identity, from the lister.
+		names := map[uint32][2]string{}
+		if all, err := vpcs.Lister().List(labels.Everything()); err == nil {
+			for _, v := range all {
+				if v.Status.VNI != 0 {
+					names[uint32(v.Status.VNI)] = [2]string{v.Namespace, v.Name}
+				}
+			}
+		}
+
+		var b strings.Builder
+		for _, m := range []struct {
+			name, help string
+			pick       func(datapath.VPCCounter) uint64
+		}{
+			{"cozyplane_vpc_tx_bytes_total", "VPC pod egress bytes", func(c datapath.VPCCounter) uint64 { return c.TxBytes }},
+			{"cozyplane_vpc_tx_packets_total", "VPC pod egress packets", func(c datapath.VPCCounter) uint64 { return c.TxPackets }},
+			{"cozyplane_vpc_rx_bytes_total", "VPC pod east-west ingress bytes", func(c datapath.VPCCounter) uint64 { return c.RxBytes }},
+			{"cozyplane_vpc_rx_packets_total", "VPC pod east-west ingress packets", func(c datapath.VPCCounter) uint64 { return c.RxPackets }},
+		} {
+			fmt.Fprintf(&b, "# HELP %s %s (this node).\n# TYPE %s counter\n", m.name, m.help, m.name)
+			for net, c := range counters {
+				id := names[net]
+				fmt.Fprintf(&b, "%s{vni=\"%d\",vpc_namespace=\"%s\",vpc=\"%s\",node=\"%s\"} %d\n",
+					m.name, net, id[0], id[1], nodeName, m.pick(c))
+			}
+		}
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		_, _ = w.Write([]byte(b.String()))
+	})
+
+	srv := &http.Server{Addr: ":9411", Handler: mux}
+	go func() {
+		<-ctx.Done()
+		_ = srv.Close()
+	}()
+	go func() {
+		log.Info("serving per-VPC metrics", "addr", ":9411/metrics")
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Warn("metrics server", "err", err)
+		}
+	}()
 }

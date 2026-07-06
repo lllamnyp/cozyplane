@@ -161,6 +161,14 @@ type overlaySvcVal struct {
 	}
 }
 
+type overlayVpcCounter struct {
+	_         structs.HostLayout
+	TxPackets uint64
+	TxBytes   uint64
+	RxPackets uint64
+	RxBytes   uint64
+}
+
 // Names of all BPF objects in the ELF.
 //
 // Used for safe lookups in a Collection or CollectionSpec.
@@ -187,6 +195,7 @@ const (
 	overlayMapSvcRev                = "svc_rev"
 	overlayMapSvcVips               = "svc_vips"
 	overlayMapUplinkMac             = "uplink_mac"
+	overlayMapVpcCounters           = "vpc_counters"
 	overlayProgCozyplaneFromOverlay = "cozyplane_from_overlay"
 	overlayProgCozyplaneFromPod     = "cozyplane_from_pod"
 	overlayProgCozyplaneFromUplink  = "cozyplane_from_uplink"
@@ -267,6 +276,7 @@ type overlayMapSpecs struct {
 	SvcRev         *ebpf.MapSpec `ebpf:"svc_rev"`
 	SvcVips        *ebpf.MapSpec `ebpf:"svc_vips"`
 	UplinkMac      *ebpf.MapSpec `ebpf:"uplink_mac"`
+	VpcCounters    *ebpf.MapSpec `ebpf:"vpc_counters"`
 }
 
 // overlayVariableSpecs contains global variables before they are loaded into the kernel.
@@ -317,6 +327,7 @@ type overlayMaps struct {
 	SvcRev         *ebpf.Map `ebpf:"svc_rev"`
 	SvcVips        *ebpf.Map `ebpf:"svc_vips"`
 	UplinkMac      *ebpf.Map `ebpf:"uplink_mac"`
+	VpcCounters    *ebpf.Map `ebpf:"vpc_counters"`
 }
 
 func (m *overlayMaps) Close() error {
@@ -343,6 +354,7 @@ func (m *overlayMaps) Close() error {
 		m.SvcRev,
 		m.SvcVips,
 		m.UplinkMac,
+		m.VpcCounters,
 	)
 }
 

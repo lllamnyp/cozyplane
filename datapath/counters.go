@@ -1,0 +1,52 @@
+/*
+Copyright 2026 The Cozyplane Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package datapath
+
+import "fmt"
+
+// VPCCounter is the per-VPC traffic tally read from the datapath (#2): tx is a
+// VPC pod's egress, rx its east-west ingress. North-south (gateway/floating)
+// is not metered yet.
+type VPCCounter struct {
+	TxPackets uint64
+	TxBytes   uint64
+	RxPackets uint64
+	RxBytes   uint64
+}
+
+// VPCCounters reads the per-net traffic counters, summing the PERCPU values
+// each hook wrote on its own CPU. Keyed by network id (VNI).
+func (m *Manager) VPCCounters() (map[uint32]VPCCounter, error) {
+	out := map[uint32]VPCCounter{}
+	var net uint32
+	var per []overlayVpcCounter
+	it := m.objs.VpcCounters.Iterate()
+	for it.Next(&net, &per) {
+		var c VPCCounter
+		for i := range per {
+			c.TxPackets += per[i].TxPackets
+			c.TxBytes += per[i].TxBytes
+			c.RxPackets += per[i].RxPackets
+			c.RxBytes += per[i].RxBytes
+		}
+		out[net] = c
+	}
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("iterate vpc_counters: %w", err)
+	}
+	return out, nil
+}

@@ -88,7 +88,15 @@ maps and one program.
 | `gateways` | hash | net id → {gateway .1 IP, node IP (0=local)} | agent (gateway Ports) |
 | `bridges` | hash | fabric IP → {net id, VPC IP} | plugin (per VPC pod) |
 | `ct_fwd` / `ct_rev` | LRU hash | the bridge's L4 NAT connection table | datapath (in-band) |
+| `svc_vips` | hash | {net, VIP, proto, port} → backend set + flags | agent (ServiceVIPs) |
+| `vpc_counters` | PERCPU hash | net id → {tx,rx bytes/packets} | datapath (in-band) |
 | `params` | array | `[0]`=Geneve ifindex, `[1]`=default VNI | agent |
+
+Per-VPC metering (#2): `count_dir` bumps `vpc_counters` in `from_pod` (tx) and
+`to_pod` (rx, east-west only) — PERCPU so the hooks never contend; the agent
+sums across CPUs and serves them as Prometheus text on `:9411/metrics`, labeled
+by VPC. Net 0 (default) is never metered; north-south (gateway/floating) is a
+follow-up.
 
 The scoped maps use a `{prefixlen, scope_net, addr}` LPM key: the scope net
 occupies the leading 32 bits (always fully specified), so a lookup never

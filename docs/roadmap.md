@@ -34,7 +34,7 @@ they're discovered rather than leaving them only in issues.
 - [x] eBPF bridge NAT for cozyplane north-south (VPC gateways, floating IPs) — no iptables, no fwmark, no policy routing
 - [x] Cluster-egress masquerade: eBPF by default (`iptables`/`off` modes available)
 - [x] North-south ICMP through the bridge: echo, and IPv4 ICMP *errors* with embedded-header NAT — port-unreachable/traceroute outward, frag-needed (PMTU) inward, fabric + floating (e2e: UDP traceroute end-to-end) — [#3](../../issues/3)
-- [ ] Per-VPC traffic counters in the datapath hooks (metering/billing foundation) — [#2](../../issues/2)
+- [x] Per-VPC traffic counters in the datapath hooks (metering/billing foundation): a PERCPU `vpc_counters` map keyed by net, `count_dir` in `from_pod` (tx) and `to_pod` (rx east-west); the agent serves them as Prometheus text on `:9411/metrics` labeled by VPC (e2e-covered). North-south (gateway/floating) metering is a follow-up — [#2](../../issues/2)
 - [x] Netfilter made conditional (#10): cluster-egress masquerade moved to eBPF (`--masquerade=bpf` default; ct-tracked SNAT at the uplink incl. ICMP echo + errors, e2e-proved with the kernel rule absent), and the FORWARD ACCEPT installs only where kube-proxy's `KUBE-FORWARD` exists — **cozyplane touches netfilter only if the cluster's kube-proxy does**. It cannot be removed entirely under an iptables kube-proxy: ClusterIP replies must traverse the client node's conntrack — [#10](../../issues/10)
 
 ## 3. VPC features — peering, egress, floating IPs

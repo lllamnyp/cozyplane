@@ -529,6 +529,31 @@ check "affinity: 12 fresh flows from affcli pin to ONE backend" "1" \
   bash -c "for i in \$(seq 1 12); do $K -n team-a exec affcli -- wget -qO- -T4 http://vipsvc.team-a.svc.cluster.local/ 2>/dev/null; done | sort -u | grep -cE '^dns[12]\$'"
 $K patch service vipsvc -n team-a --type=merge -p '{"spec":{"sessionAffinity":"None"}}' >/dev/null
 
+echo "[per-VPC traffic counters (#2): the datapath meters east-west by VPC]"
+# The agent serves per-VPC byte/packet counters on each node's :9411 (the
+# DaemonSet is hostNetwork). Generate sustained intra-VPC traffic a1->a2 and
+# assert vpc-a's tx bytes were metered on a1's node (W).
+metrics() { docker run --rm --net "container:$1" nicolaka/netshoot curl -s -m4 http://localhost:9411/metrics 2>/dev/null; }
+txval() { printf '%s' "$1" | grep 'cozyplane_vpc_tx_bytes_total{' | grep 'vpc="vpc-a"' | awk '{print $NF}' | head -1; }
+before=$(txval "$(metrics "$W")")
+$K -n team-a exec a1 -- sh -c "for i in \$(seq 1 30); do wget -qO- -T2 http://$A2/ >/dev/null 2>&1; done"
+M=$(metrics "$W")
+after=$(txval "$M")
+if [ -n "$after" ] && [ "${after:-0}" -gt "${before:-0}" ] 2>/dev/null; then
+  pass "vpc-a tx bytes metered on $W (${before:-0} -> $after)"
+else
+  fail "vpc-a tx bytes metered on $W (before='${before:-}' after='${after:-}')"
+fi
+# The metric carries the VPC identity (name + namespace), not just the VNI.
+ns=$(printf '%s' "$M" | grep 'cozyplane_vpc_rx_bytes_total{' | grep 'vpc="vpc-a"' | grep -oE 'vpc_namespace="[^"]+"' | head -1 | cut -d'"' -f2)
+[ "$ns" = "team-a" ] && pass "metrics label vpc-a with namespace team-a" || fail "metrics label vpc-a namespace (got '$ns')"
+# The default network (net 0) is never metered — no series with vni 0.
+if printf '%s' "$M" | grep 'cozyplane_vpc_tx_bytes_total{' | grep -q 'vni="0"'; then
+  fail "default network (vni 0) is not metered (a vni=0 series exists)"
+else
+  pass "default network (vni 0) is not metered"
+fi
+
 echo "[guest autoconfiguration (#8): RA (M=1) + DHCPv6 hand out the pinned /128]"
 # Linux ignores a /128 Prefix Information Option (addrconf requires /64 on
 # ethernet), so the agent's RA sets the Managed flag and a per-veth DHCPv6

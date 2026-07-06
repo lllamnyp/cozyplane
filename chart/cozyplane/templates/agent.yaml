@@ -135,6 +135,11 @@ spec:
             # (routed to the gateway instead, which proxies DNS / denies the rest).
             - "--internal-cidrs={{ join "," $internal }}"
             {{- end }}
+          ports:
+            # Per-VPC traffic metrics (#2), Prometheus text at /metrics.
+            - name: metrics
+              containerPort: 9411
+              hostPort: 9411
           env:
             - name: NODE_NAME
               valueFrom:
