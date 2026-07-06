@@ -48,7 +48,8 @@ they're discovered rather than leaving them only in issues.
 - [ ] Site-to-site VPN: authorized-forwarder role + per-VPC route table — [#6](../../issues/6)
 - [ ] Network policy / security groups within a VPC — **design draft: [security-groups.md](security-groups.md)** (awaiting review)
 - [ ] Per-VPC metadata endpoint + guest autoconfiguration — **design draft: [vm-provisioning.md](vm-provisioning.md)** (awaiting review; also closes #8)
-- [ ] Name-based addressing / system-view DNS re-point — `control-plane.md` §5
+- [ ] Services in a VPC: per-VPC service VIPs + split-horizon DNS + net-scoped service NAT — **design draft: [services-in-vpc.md](services-in-vpc.md)** (awaiting review; prioritized ahead of the KPR work)
+- [ ] Name-based addressing / system-view DNS re-point — `control-plane.md` §5 (the split-horizon resolver in [services-in-vpc.md](services-in-vpc.md) is its first concrete piece)
 
 ## 4. IPv6 / dual-stack
 
@@ -79,7 +80,9 @@ they're discovered rather than leaving them only in issues.
 
 ## 6. Services (kube-proxy replacement)
 
-- [ ] Import Cilium's LB control plane + socket LB (`pkg/loadbalancer`, `pkg/socketlb`, pre-compiled `bpf_sock.o`) as a separate `cozyplane-kpr` component — **design draft: [kube-proxy-replacement.md](kube-proxy-replacement.md)** (awaiting review; feasibility verified empirically against Cilium v1.19.5)
+Sequenced **after** Services-in-a-VPC ([services-in-vpc.md](services-in-vpc.md), §3 above) — its net-scoped service NAT is the shared foundation.
+
+- [ ] Import Cilium's LB control plane + socket LB (`pkg/loadbalancer`, `pkg/socketlb`, pre-compiled `bpf_sock.o`) as a separate `cozyplane-kpr` component — **design draft: [kube-proxy-replacement.md](kube-proxy-replacement.md)** (feasibility verified empirically against Cilium v1.19.5)
 - [ ] Per-packet service fallback in cozyplane's hooks (external NodePort, VM-guest ClusterIP) — needed before kube-proxy can be removed
 - [ ] Retire kube-proxy on a cozyplane-only cluster — the endgame of [#10](../../issues/10): `firewall.go` then installs nothing
 

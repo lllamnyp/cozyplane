@@ -62,6 +62,7 @@ outstanding (network policy, DNS, netfilter-optional operation, and more).
 | [docs/security-groups.md](docs/security-groups.md) | *Design draft* — intra-VPC network policy (security groups) |
 | [docs/vm-provisioning.md](docs/vm-provisioning.md) | *Design draft* — metadata endpoint & guest autoconfiguration |
 | [docs/cross-family.md](docs/cross-family.md) | *Design draft* — cross-family (v4↔v6) peering & north-south |
+| [docs/services-in-vpc.md](docs/services-in-vpc.md) | *Design draft* — Services inside a VPC (per-VPC VIPs, split-horizon DNS) |
 | [docs/kube-proxy-replacement.md](docs/kube-proxy-replacement.md) | *Design draft* — own Services by importing Cilium's LB + socket-LB |
 
 Contributor invariants (never reach for iptables in the datapath, 128-bit/NAT64

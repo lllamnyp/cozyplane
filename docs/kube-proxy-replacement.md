@@ -1,6 +1,13 @@
 # Kube-proxy replacement by importing Cilium's LB (design draft)
 
-**Status: DRAFT — not implemented.** cozyplane currently requires kube-proxy
+**Status: DRAFT — not implemented; sequenced second.** Review outcome
+(2026-07-06): [services-in-vpc.md](services-in-vpc.md) lands first — the
+net-scoped per-packet service NAT designed there is the foundation this
+draft's increment 3 builds on, and it settles review Q2 below (the feed is
+StateDB tables → cozyplane maps; Cilium's map ABI cannot express net-scoped
+VPC-IP backends).
+
+cozyplane currently requires kube-proxy
 (or a full Cilium install) for ClusterIP/NodePort Services. This draft proposes
 owning Services **by importing Cilium's kube-proxy-replacement components as a
 library**, not by writing an LB from scratch. The feasibility claims below were
