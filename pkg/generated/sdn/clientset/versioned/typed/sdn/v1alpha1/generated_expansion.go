@@ -24,6 +24,8 @@ type FloatingIPExpansion interface{}
 
 type PortExpansion interface{}
 
+type SecurityGroupExpansion interface{}
+
 type ServiceVIPExpansion interface{}
 
 type VPCExpansion interface{}

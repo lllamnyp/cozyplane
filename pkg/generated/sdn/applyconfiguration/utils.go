@@ -52,6 +52,20 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &sdnv1alpha1.PortApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("PortSpec"):
 		return &sdnv1alpha1.PortSpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("PortStatus"):
+		return &sdnv1alpha1.PortStatusApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("SecurityGroup"):
+		return &sdnv1alpha1.SecurityGroupApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("SecurityGroupPeer"):
+		return &sdnv1alpha1.SecurityGroupPeerApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("SecurityGroupPort"):
+		return &sdnv1alpha1.SecurityGroupPortApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("SecurityGroupRule"):
+		return &sdnv1alpha1.SecurityGroupRuleApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("SecurityGroupSpec"):
+		return &sdnv1alpha1.SecurityGroupSpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("SecurityGroupStatus"):
+		return &sdnv1alpha1.SecurityGroupStatusApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("ServiceRef"):
 		return &sdnv1alpha1.ServiceRefApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("ServiceVIP"):

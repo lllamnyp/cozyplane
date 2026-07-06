@@ -167,6 +167,86 @@ func RegisterConversions(s *runtime.Scheme) error {
 	}); err != nil {
 		return err
 	}
+	if err := s.AddGeneratedConversionFunc((*PortStatus)(nil), (*sdn.PortStatus)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_PortStatus_To_sdn_PortStatus(a.(*PortStatus), b.(*sdn.PortStatus), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.PortStatus)(nil), (*PortStatus)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_PortStatus_To_v1alpha1_PortStatus(a.(*sdn.PortStatus), b.(*PortStatus), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*SecurityGroup)(nil), (*sdn.SecurityGroup)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_SecurityGroup_To_sdn_SecurityGroup(a.(*SecurityGroup), b.(*sdn.SecurityGroup), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.SecurityGroup)(nil), (*SecurityGroup)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_SecurityGroup_To_v1alpha1_SecurityGroup(a.(*sdn.SecurityGroup), b.(*SecurityGroup), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*SecurityGroupList)(nil), (*sdn.SecurityGroupList)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_SecurityGroupList_To_sdn_SecurityGroupList(a.(*SecurityGroupList), b.(*sdn.SecurityGroupList), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.SecurityGroupList)(nil), (*SecurityGroupList)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_SecurityGroupList_To_v1alpha1_SecurityGroupList(a.(*sdn.SecurityGroupList), b.(*SecurityGroupList), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*SecurityGroupPeer)(nil), (*sdn.SecurityGroupPeer)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_SecurityGroupPeer_To_sdn_SecurityGroupPeer(a.(*SecurityGroupPeer), b.(*sdn.SecurityGroupPeer), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.SecurityGroupPeer)(nil), (*SecurityGroupPeer)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_SecurityGroupPeer_To_v1alpha1_SecurityGroupPeer(a.(*sdn.SecurityGroupPeer), b.(*SecurityGroupPeer), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*SecurityGroupPort)(nil), (*sdn.SecurityGroupPort)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_SecurityGroupPort_To_sdn_SecurityGroupPort(a.(*SecurityGroupPort), b.(*sdn.SecurityGroupPort), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.SecurityGroupPort)(nil), (*SecurityGroupPort)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_SecurityGroupPort_To_v1alpha1_SecurityGroupPort(a.(*sdn.SecurityGroupPort), b.(*SecurityGroupPort), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*SecurityGroupRule)(nil), (*sdn.SecurityGroupRule)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_SecurityGroupRule_To_sdn_SecurityGroupRule(a.(*SecurityGroupRule), b.(*sdn.SecurityGroupRule), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.SecurityGroupRule)(nil), (*SecurityGroupRule)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_SecurityGroupRule_To_v1alpha1_SecurityGroupRule(a.(*sdn.SecurityGroupRule), b.(*SecurityGroupRule), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*SecurityGroupSpec)(nil), (*sdn.SecurityGroupSpec)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_SecurityGroupSpec_To_sdn_SecurityGroupSpec(a.(*SecurityGroupSpec), b.(*sdn.SecurityGroupSpec), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.SecurityGroupSpec)(nil), (*SecurityGroupSpec)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_SecurityGroupSpec_To_v1alpha1_SecurityGroupSpec(a.(*sdn.SecurityGroupSpec), b.(*SecurityGroupSpec), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*SecurityGroupStatus)(nil), (*sdn.SecurityGroupStatus)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_SecurityGroupStatus_To_sdn_SecurityGroupStatus(a.(*SecurityGroupStatus), b.(*sdn.SecurityGroupStatus), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.SecurityGroupStatus)(nil), (*SecurityGroupStatus)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_SecurityGroupStatus_To_v1alpha1_SecurityGroupStatus(a.(*sdn.SecurityGroupStatus), b.(*SecurityGroupStatus), scope)
+	}); err != nil {
+		return err
+	}
 	if err := s.AddGeneratedConversionFunc((*ServiceRef)(nil), (*sdn.ServiceRef)(nil), func(a, b interface{}, scope conversion.Scope) error {
 		return Convert_v1alpha1_ServiceRef_To_sdn_ServiceRef(a.(*ServiceRef), b.(*sdn.ServiceRef), scope)
 	}); err != nil {
@@ -637,6 +717,9 @@ func autoConvert_v1alpha1_Port_To_sdn_Port(in *Port, out *sdn.Port, s conversion
 	if err := Convert_v1alpha1_PortSpec_To_sdn_PortSpec(&in.Spec, &out.Spec, s); err != nil {
 		return err
 	}
+	if err := Convert_v1alpha1_PortStatus_To_sdn_PortStatus(&in.Status, &out.Status, s); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -648,6 +731,9 @@ func Convert_v1alpha1_Port_To_sdn_Port(in *Port, out *sdn.Port, s conversion.Sco
 func autoConvert_sdn_Port_To_v1alpha1_Port(in *sdn.Port, out *Port, s conversion.Scope) error {
 	out.ObjectMeta = in.ObjectMeta
 	if err := Convert_sdn_PortSpec_To_v1alpha1_PortSpec(&in.Spec, &out.Spec, s); err != nil {
+		return err
+	}
+	if err := Convert_sdn_PortStatus_To_v1alpha1_PortStatus(&in.Status, &out.Status, s); err != nil {
 		return err
 	}
 	return nil
@@ -718,6 +804,202 @@ func autoConvert_sdn_PortSpec_To_v1alpha1_PortSpec(in *sdn.PortSpec, out *PortSp
 // Convert_sdn_PortSpec_To_v1alpha1_PortSpec is an autogenerated conversion function.
 func Convert_sdn_PortSpec_To_v1alpha1_PortSpec(in *sdn.PortSpec, out *PortSpec, s conversion.Scope) error {
 	return autoConvert_sdn_PortSpec_To_v1alpha1_PortSpec(in, out, s)
+}
+
+func autoConvert_v1alpha1_PortStatus_To_sdn_PortStatus(in *PortStatus, out *sdn.PortStatus, s conversion.Scope) error {
+	out.Groups = *(*[]int32)(unsafe.Pointer(&in.Groups))
+	return nil
+}
+
+// Convert_v1alpha1_PortStatus_To_sdn_PortStatus is an autogenerated conversion function.
+func Convert_v1alpha1_PortStatus_To_sdn_PortStatus(in *PortStatus, out *sdn.PortStatus, s conversion.Scope) error {
+	return autoConvert_v1alpha1_PortStatus_To_sdn_PortStatus(in, out, s)
+}
+
+func autoConvert_sdn_PortStatus_To_v1alpha1_PortStatus(in *sdn.PortStatus, out *PortStatus, s conversion.Scope) error {
+	out.Groups = *(*[]int32)(unsafe.Pointer(&in.Groups))
+	return nil
+}
+
+// Convert_sdn_PortStatus_To_v1alpha1_PortStatus is an autogenerated conversion function.
+func Convert_sdn_PortStatus_To_v1alpha1_PortStatus(in *sdn.PortStatus, out *PortStatus, s conversion.Scope) error {
+	return autoConvert_sdn_PortStatus_To_v1alpha1_PortStatus(in, out, s)
+}
+
+func autoConvert_v1alpha1_SecurityGroup_To_sdn_SecurityGroup(in *SecurityGroup, out *sdn.SecurityGroup, s conversion.Scope) error {
+	out.ObjectMeta = in.ObjectMeta
+	if err := Convert_v1alpha1_SecurityGroupSpec_To_sdn_SecurityGroupSpec(&in.Spec, &out.Spec, s); err != nil {
+		return err
+	}
+	if err := Convert_v1alpha1_SecurityGroupStatus_To_sdn_SecurityGroupStatus(&in.Status, &out.Status, s); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Convert_v1alpha1_SecurityGroup_To_sdn_SecurityGroup is an autogenerated conversion function.
+func Convert_v1alpha1_SecurityGroup_To_sdn_SecurityGroup(in *SecurityGroup, out *sdn.SecurityGroup, s conversion.Scope) error {
+	return autoConvert_v1alpha1_SecurityGroup_To_sdn_SecurityGroup(in, out, s)
+}
+
+func autoConvert_sdn_SecurityGroup_To_v1alpha1_SecurityGroup(in *sdn.SecurityGroup, out *SecurityGroup, s conversion.Scope) error {
+	out.ObjectMeta = in.ObjectMeta
+	if err := Convert_sdn_SecurityGroupSpec_To_v1alpha1_SecurityGroupSpec(&in.Spec, &out.Spec, s); err != nil {
+		return err
+	}
+	if err := Convert_sdn_SecurityGroupStatus_To_v1alpha1_SecurityGroupStatus(&in.Status, &out.Status, s); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Convert_sdn_SecurityGroup_To_v1alpha1_SecurityGroup is an autogenerated conversion function.
+func Convert_sdn_SecurityGroup_To_v1alpha1_SecurityGroup(in *sdn.SecurityGroup, out *SecurityGroup, s conversion.Scope) error {
+	return autoConvert_sdn_SecurityGroup_To_v1alpha1_SecurityGroup(in, out, s)
+}
+
+func autoConvert_v1alpha1_SecurityGroupList_To_sdn_SecurityGroupList(in *SecurityGroupList, out *sdn.SecurityGroupList, s conversion.Scope) error {
+	out.ListMeta = in.ListMeta
+	out.Items = *(*[]sdn.SecurityGroup)(unsafe.Pointer(&in.Items))
+	return nil
+}
+
+// Convert_v1alpha1_SecurityGroupList_To_sdn_SecurityGroupList is an autogenerated conversion function.
+func Convert_v1alpha1_SecurityGroupList_To_sdn_SecurityGroupList(in *SecurityGroupList, out *sdn.SecurityGroupList, s conversion.Scope) error {
+	return autoConvert_v1alpha1_SecurityGroupList_To_sdn_SecurityGroupList(in, out, s)
+}
+
+func autoConvert_sdn_SecurityGroupList_To_v1alpha1_SecurityGroupList(in *sdn.SecurityGroupList, out *SecurityGroupList, s conversion.Scope) error {
+	out.ListMeta = in.ListMeta
+	out.Items = *(*[]SecurityGroup)(unsafe.Pointer(&in.Items))
+	return nil
+}
+
+// Convert_sdn_SecurityGroupList_To_v1alpha1_SecurityGroupList is an autogenerated conversion function.
+func Convert_sdn_SecurityGroupList_To_v1alpha1_SecurityGroupList(in *sdn.SecurityGroupList, out *SecurityGroupList, s conversion.Scope) error {
+	return autoConvert_sdn_SecurityGroupList_To_v1alpha1_SecurityGroupList(in, out, s)
+}
+
+func autoConvert_v1alpha1_SecurityGroupPeer_To_sdn_SecurityGroupPeer(in *SecurityGroupPeer, out *sdn.SecurityGroupPeer, s conversion.Scope) error {
+	out.Group = in.Group
+	out.CIDR = in.CIDR
+	return nil
+}
+
+// Convert_v1alpha1_SecurityGroupPeer_To_sdn_SecurityGroupPeer is an autogenerated conversion function.
+func Convert_v1alpha1_SecurityGroupPeer_To_sdn_SecurityGroupPeer(in *SecurityGroupPeer, out *sdn.SecurityGroupPeer, s conversion.Scope) error {
+	return autoConvert_v1alpha1_SecurityGroupPeer_To_sdn_SecurityGroupPeer(in, out, s)
+}
+
+func autoConvert_sdn_SecurityGroupPeer_To_v1alpha1_SecurityGroupPeer(in *sdn.SecurityGroupPeer, out *SecurityGroupPeer, s conversion.Scope) error {
+	out.Group = in.Group
+	out.CIDR = in.CIDR
+	return nil
+}
+
+// Convert_sdn_SecurityGroupPeer_To_v1alpha1_SecurityGroupPeer is an autogenerated conversion function.
+func Convert_sdn_SecurityGroupPeer_To_v1alpha1_SecurityGroupPeer(in *sdn.SecurityGroupPeer, out *SecurityGroupPeer, s conversion.Scope) error {
+	return autoConvert_sdn_SecurityGroupPeer_To_v1alpha1_SecurityGroupPeer(in, out, s)
+}
+
+func autoConvert_v1alpha1_SecurityGroupPort_To_sdn_SecurityGroupPort(in *SecurityGroupPort, out *sdn.SecurityGroupPort, s conversion.Scope) error {
+	out.Protocol = in.Protocol
+	out.Port = in.Port
+	return nil
+}
+
+// Convert_v1alpha1_SecurityGroupPort_To_sdn_SecurityGroupPort is an autogenerated conversion function.
+func Convert_v1alpha1_SecurityGroupPort_To_sdn_SecurityGroupPort(in *SecurityGroupPort, out *sdn.SecurityGroupPort, s conversion.Scope) error {
+	return autoConvert_v1alpha1_SecurityGroupPort_To_sdn_SecurityGroupPort(in, out, s)
+}
+
+func autoConvert_sdn_SecurityGroupPort_To_v1alpha1_SecurityGroupPort(in *sdn.SecurityGroupPort, out *SecurityGroupPort, s conversion.Scope) error {
+	out.Protocol = in.Protocol
+	out.Port = in.Port
+	return nil
+}
+
+// Convert_sdn_SecurityGroupPort_To_v1alpha1_SecurityGroupPort is an autogenerated conversion function.
+func Convert_sdn_SecurityGroupPort_To_v1alpha1_SecurityGroupPort(in *sdn.SecurityGroupPort, out *SecurityGroupPort, s conversion.Scope) error {
+	return autoConvert_sdn_SecurityGroupPort_To_v1alpha1_SecurityGroupPort(in, out, s)
+}
+
+func autoConvert_v1alpha1_SecurityGroupRule_To_sdn_SecurityGroupRule(in *SecurityGroupRule, out *sdn.SecurityGroupRule, s conversion.Scope) error {
+	if err := Convert_v1alpha1_SecurityGroupPeer_To_sdn_SecurityGroupPeer(&in.From, &out.From, s); err != nil {
+		return err
+	}
+	out.Ports = *(*[]sdn.SecurityGroupPort)(unsafe.Pointer(&in.Ports))
+	return nil
+}
+
+// Convert_v1alpha1_SecurityGroupRule_To_sdn_SecurityGroupRule is an autogenerated conversion function.
+func Convert_v1alpha1_SecurityGroupRule_To_sdn_SecurityGroupRule(in *SecurityGroupRule, out *sdn.SecurityGroupRule, s conversion.Scope) error {
+	return autoConvert_v1alpha1_SecurityGroupRule_To_sdn_SecurityGroupRule(in, out, s)
+}
+
+func autoConvert_sdn_SecurityGroupRule_To_v1alpha1_SecurityGroupRule(in *sdn.SecurityGroupRule, out *SecurityGroupRule, s conversion.Scope) error {
+	if err := Convert_sdn_SecurityGroupPeer_To_v1alpha1_SecurityGroupPeer(&in.From, &out.From, s); err != nil {
+		return err
+	}
+	out.Ports = *(*[]SecurityGroupPort)(unsafe.Pointer(&in.Ports))
+	return nil
+}
+
+// Convert_sdn_SecurityGroupRule_To_v1alpha1_SecurityGroupRule is an autogenerated conversion function.
+func Convert_sdn_SecurityGroupRule_To_v1alpha1_SecurityGroupRule(in *sdn.SecurityGroupRule, out *SecurityGroupRule, s conversion.Scope) error {
+	return autoConvert_sdn_SecurityGroupRule_To_v1alpha1_SecurityGroupRule(in, out, s)
+}
+
+func autoConvert_v1alpha1_SecurityGroupSpec_To_sdn_SecurityGroupSpec(in *SecurityGroupSpec, out *sdn.SecurityGroupSpec, s conversion.Scope) error {
+	if err := Convert_v1alpha1_LocalVPCRef_To_sdn_LocalVPCRef(&in.VPCRef, &out.VPCRef, s); err != nil {
+		return err
+	}
+	out.PodSelector = in.PodSelector
+	out.Ingress = *(*[]sdn.SecurityGroupRule)(unsafe.Pointer(&in.Ingress))
+	return nil
+}
+
+// Convert_v1alpha1_SecurityGroupSpec_To_sdn_SecurityGroupSpec is an autogenerated conversion function.
+func Convert_v1alpha1_SecurityGroupSpec_To_sdn_SecurityGroupSpec(in *SecurityGroupSpec, out *sdn.SecurityGroupSpec, s conversion.Scope) error {
+	return autoConvert_v1alpha1_SecurityGroupSpec_To_sdn_SecurityGroupSpec(in, out, s)
+}
+
+func autoConvert_sdn_SecurityGroupSpec_To_v1alpha1_SecurityGroupSpec(in *sdn.SecurityGroupSpec, out *SecurityGroupSpec, s conversion.Scope) error {
+	if err := Convert_sdn_LocalVPCRef_To_v1alpha1_LocalVPCRef(&in.VPCRef, &out.VPCRef, s); err != nil {
+		return err
+	}
+	out.PodSelector = in.PodSelector
+	out.Ingress = *(*[]SecurityGroupRule)(unsafe.Pointer(&in.Ingress))
+	return nil
+}
+
+// Convert_sdn_SecurityGroupSpec_To_v1alpha1_SecurityGroupSpec is an autogenerated conversion function.
+func Convert_sdn_SecurityGroupSpec_To_v1alpha1_SecurityGroupSpec(in *sdn.SecurityGroupSpec, out *SecurityGroupSpec, s conversion.Scope) error {
+	return autoConvert_sdn_SecurityGroupSpec_To_v1alpha1_SecurityGroupSpec(in, out, s)
+}
+
+func autoConvert_v1alpha1_SecurityGroupStatus_To_sdn_SecurityGroupStatus(in *SecurityGroupStatus, out *sdn.SecurityGroupStatus, s conversion.Scope) error {
+	out.ID = in.ID
+	out.Phase = sdn.SecurityGroupPhase(in.Phase)
+	out.Conditions = *(*[]v1.Condition)(unsafe.Pointer(&in.Conditions))
+	return nil
+}
+
+// Convert_v1alpha1_SecurityGroupStatus_To_sdn_SecurityGroupStatus is an autogenerated conversion function.
+func Convert_v1alpha1_SecurityGroupStatus_To_sdn_SecurityGroupStatus(in *SecurityGroupStatus, out *sdn.SecurityGroupStatus, s conversion.Scope) error {
+	return autoConvert_v1alpha1_SecurityGroupStatus_To_sdn_SecurityGroupStatus(in, out, s)
+}
+
+func autoConvert_sdn_SecurityGroupStatus_To_v1alpha1_SecurityGroupStatus(in *sdn.SecurityGroupStatus, out *SecurityGroupStatus, s conversion.Scope) error {
+	out.ID = in.ID
+	out.Phase = SecurityGroupPhase(in.Phase)
+	out.Conditions = *(*[]v1.Condition)(unsafe.Pointer(&in.Conditions))
+	return nil
+}
+
+// Convert_sdn_SecurityGroupStatus_To_v1alpha1_SecurityGroupStatus is an autogenerated conversion function.
+func Convert_sdn_SecurityGroupStatus_To_v1alpha1_SecurityGroupStatus(in *sdn.SecurityGroupStatus, out *SecurityGroupStatus, s conversion.Scope) error {
+	return autoConvert_sdn_SecurityGroupStatus_To_v1alpha1_SecurityGroupStatus(in, out, s)
 }
 
 func autoConvert_v1alpha1_ServiceRef_To_sdn_ServiceRef(in *ServiceRef, out *sdn.ServiceRef, s conversion.Scope) error {

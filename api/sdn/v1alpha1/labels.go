@@ -50,6 +50,13 @@ const (
 	// LabelPodUID is the attached pod's UID (stable across name reuse).
 	LabelPodUID = "sdn.cozystack.io/pod-uid"
 
+	// AnnotationPodLabels carries a copy of the attached pod's labels, stamped
+	// by the CNI plugin at ADD time. The controller evaluates every
+	// SecurityGroup.podSelector against it to resolve the Port's group
+	// membership (Port.status.groups) — membership is claim-time, so the copy
+	// need not track later pod-label edits in v1. JSON-encoded map[string]string.
+	AnnotationPodLabels = "sdn.cozystack.io/pod-labels"
+
 	// LabelVMName marks a *persistent* Port and records the VM identity it is
 	// pinned to (the KubeVirt VM name, within LabelPodNamespace). A virt-launcher
 	// pod's CNI ADD binds to the persistent Port for its VM instead of claiming a

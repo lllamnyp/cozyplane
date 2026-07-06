@@ -40,6 +40,8 @@ type PortsGetter interface {
 type PortInterface interface {
 	Create(ctx context.Context, port *sdnv1alpha1.Port, opts v1.CreateOptions) (*sdnv1alpha1.Port, error)
 	Update(ctx context.Context, port *sdnv1alpha1.Port, opts v1.UpdateOptions) (*sdnv1alpha1.Port, error)
+	// Add a +genclient:noStatus comment above the type to avoid generating UpdateStatus().
+	UpdateStatus(ctx context.Context, port *sdnv1alpha1.Port, opts v1.UpdateOptions) (*sdnv1alpha1.Port, error)
 	Delete(ctx context.Context, name string, opts v1.DeleteOptions) error
 	DeleteCollection(ctx context.Context, opts v1.DeleteOptions, listOpts v1.ListOptions) error
 	Get(ctx context.Context, name string, opts v1.GetOptions) (*sdnv1alpha1.Port, error)
@@ -47,6 +49,8 @@ type PortInterface interface {
 	Watch(ctx context.Context, opts v1.ListOptions) (watch.Interface, error)
 	Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts v1.PatchOptions, subresources ...string) (result *sdnv1alpha1.Port, err error)
 	Apply(ctx context.Context, port *applyconfigurationsdnv1alpha1.PortApplyConfiguration, opts v1.ApplyOptions) (result *sdnv1alpha1.Port, err error)
+	// Add a +genclient:noStatus comment above the type to avoid generating ApplyStatus().
+	ApplyStatus(ctx context.Context, port *applyconfigurationsdnv1alpha1.PortApplyConfiguration, opts v1.ApplyOptions) (result *sdnv1alpha1.Port, err error)
 	PortExpansion
 }
 

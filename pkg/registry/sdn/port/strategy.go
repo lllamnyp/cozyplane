@@ -71,9 +71,17 @@ func (portStrategy) NamespaceScoped() bool {
 }
 
 func (portStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
+	// Status (group membership) is controller-owned via the /status subresource.
+	port := obj.(*sdn.Port)
+	port.Status = sdn.PortStatus{}
 }
 
 func (portStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
+	// A spec update (e.g. the agent re-pointing spec.node at migration cutover)
+	// must not clobber controller-owned status.
+	newPort := obj.(*sdn.Port)
+	oldPort := old.(*sdn.Port)
+	newPort.Status = oldPort.Status
 }
 
 func (portStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
@@ -102,5 +110,30 @@ func (portStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object)
 
 // WarningsOnUpdate returns warnings for the given update.
 func (portStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
+}
+
+// portStatusStrategy is the /status update strategy: it updates status but
+// preserves spec (the mirror image of portStrategy).
+type portStatusStrategy struct {
+	portStrategy
+}
+
+// NewStatusStrategy creates a strategy for the Port status subresource.
+func NewStatusStrategy(strategy portStrategy) portStatusStrategy {
+	return portStatusStrategy{strategy}
+}
+
+func (portStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
+	newPort := obj.(*sdn.Port)
+	oldPort := old.(*sdn.Port)
+	newPort.Spec = oldPort.Spec
+}
+
+func (portStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+	return field.ErrorList{}
+}
+
+func (portStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
 	return nil
 }

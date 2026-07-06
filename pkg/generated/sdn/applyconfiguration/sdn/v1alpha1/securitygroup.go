@@ -24,33 +24,40 @@ import (
 	v1 "k8s.io/client-go/applyconfigurations/meta/v1"
 )
 
-// PortApplyConfiguration represents a declarative configuration of the Port type for use
+// SecurityGroupApplyConfiguration represents a declarative configuration of the SecurityGroup type for use
 // with apply.
 //
-// Port is a pod's realized interface on a VPC.
-type PortApplyConfiguration struct {
+// SecurityGroup is intra-VPC network policy, AWS-security-group-shaped: it
+// selects member pods by label and admits inbound traffic from other groups (in
+// the same VPC) or from north-south CIDRs. While no group selects a pod its
+// intra-VPC ingress is unrestricted (today's behavior); once any group selects
+// it, its ingress is default-deny, opened only by the union of its groups'
+// rules. Enforcement is destination-side in the eBPF datapath, so it is
+// placement-independent.
+type SecurityGroupApplyConfiguration struct {
 	v1.TypeMetaApplyConfiguration    `json:",inline"`
 	*v1.ObjectMetaApplyConfiguration `json:"metadata,omitempty"`
-	Spec                             *PortSpecApplyConfiguration   `json:"spec,omitempty"`
-	Status                           *PortStatusApplyConfiguration `json:"status,omitempty"`
+	Spec                             *SecurityGroupSpecApplyConfiguration   `json:"spec,omitempty"`
+	Status                           *SecurityGroupStatusApplyConfiguration `json:"status,omitempty"`
 }
 
-// Port constructs a declarative configuration of the Port type for use with
+// SecurityGroup constructs a declarative configuration of the SecurityGroup type for use with
 // apply.
-func Port(name string) *PortApplyConfiguration {
-	b := &PortApplyConfiguration{}
+func SecurityGroup(name, namespace string) *SecurityGroupApplyConfiguration {
+	b := &SecurityGroupApplyConfiguration{}
 	b.WithName(name)
-	b.WithKind("Port")
+	b.WithNamespace(namespace)
+	b.WithKind("SecurityGroup")
 	b.WithAPIVersion("sdn.cozystack.io/v1alpha1")
 	return b
 }
 
-func (b PortApplyConfiguration) IsApplyConfiguration() {}
+func (b SecurityGroupApplyConfiguration) IsApplyConfiguration() {}
 
 // WithKind sets the Kind field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the Kind field is set to the value of the last call.
-func (b *PortApplyConfiguration) WithKind(value string) *PortApplyConfiguration {
+func (b *SecurityGroupApplyConfiguration) WithKind(value string) *SecurityGroupApplyConfiguration {
 	b.TypeMetaApplyConfiguration.Kind = &value
 	return b
 }
@@ -58,7 +65,7 @@ func (b *PortApplyConfiguration) WithKind(value string) *PortApplyConfiguration 
 // WithAPIVersion sets the APIVersion field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the APIVersion field is set to the value of the last call.
-func (b *PortApplyConfiguration) WithAPIVersion(value string) *PortApplyConfiguration {
+func (b *SecurityGroupApplyConfiguration) WithAPIVersion(value string) *SecurityGroupApplyConfiguration {
 	b.TypeMetaApplyConfiguration.APIVersion = &value
 	return b
 }
@@ -66,7 +73,7 @@ func (b *PortApplyConfiguration) WithAPIVersion(value string) *PortApplyConfigur
 // WithName sets the Name field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the Name field is set to the value of the last call.
-func (b *PortApplyConfiguration) WithName(value string) *PortApplyConfiguration {
+func (b *SecurityGroupApplyConfiguration) WithName(value string) *SecurityGroupApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	b.ObjectMetaApplyConfiguration.Name = &value
 	return b
@@ -75,7 +82,7 @@ func (b *PortApplyConfiguration) WithName(value string) *PortApplyConfiguration 
 // WithGenerateName sets the GenerateName field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the GenerateName field is set to the value of the last call.
-func (b *PortApplyConfiguration) WithGenerateName(value string) *PortApplyConfiguration {
+func (b *SecurityGroupApplyConfiguration) WithGenerateName(value string) *SecurityGroupApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	b.ObjectMetaApplyConfiguration.GenerateName = &value
 	return b
@@ -84,7 +91,7 @@ func (b *PortApplyConfiguration) WithGenerateName(value string) *PortApplyConfig
 // WithNamespace sets the Namespace field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the Namespace field is set to the value of the last call.
-func (b *PortApplyConfiguration) WithNamespace(value string) *PortApplyConfiguration {
+func (b *SecurityGroupApplyConfiguration) WithNamespace(value string) *SecurityGroupApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	b.ObjectMetaApplyConfiguration.Namespace = &value
 	return b
@@ -93,7 +100,7 @@ func (b *PortApplyConfiguration) WithNamespace(value string) *PortApplyConfigura
 // WithUID sets the UID field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the UID field is set to the value of the last call.
-func (b *PortApplyConfiguration) WithUID(value types.UID) *PortApplyConfiguration {
+func (b *SecurityGroupApplyConfiguration) WithUID(value types.UID) *SecurityGroupApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	b.ObjectMetaApplyConfiguration.UID = &value
 	return b
@@ -102,7 +109,7 @@ func (b *PortApplyConfiguration) WithUID(value types.UID) *PortApplyConfiguratio
 // WithResourceVersion sets the ResourceVersion field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the ResourceVersion field is set to the value of the last call.
-func (b *PortApplyConfiguration) WithResourceVersion(value string) *PortApplyConfiguration {
+func (b *SecurityGroupApplyConfiguration) WithResourceVersion(value string) *SecurityGroupApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	b.ObjectMetaApplyConfiguration.ResourceVersion = &value
 	return b
@@ -111,7 +118,7 @@ func (b *PortApplyConfiguration) WithResourceVersion(value string) *PortApplyCon
 // WithGeneration sets the Generation field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the Generation field is set to the value of the last call.
-func (b *PortApplyConfiguration) WithGeneration(value int64) *PortApplyConfiguration {
+func (b *SecurityGroupApplyConfiguration) WithGeneration(value int64) *SecurityGroupApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	b.ObjectMetaApplyConfiguration.Generation = &value
 	return b
@@ -120,7 +127,7 @@ func (b *PortApplyConfiguration) WithGeneration(value int64) *PortApplyConfigura
 // WithCreationTimestamp sets the CreationTimestamp field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the CreationTimestamp field is set to the value of the last call.
-func (b *PortApplyConfiguration) WithCreationTimestamp(value metav1.Time) *PortApplyConfiguration {
+func (b *SecurityGroupApplyConfiguration) WithCreationTimestamp(value metav1.Time) *SecurityGroupApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	b.ObjectMetaApplyConfiguration.CreationTimestamp = &value
 	return b
@@ -129,7 +136,7 @@ func (b *PortApplyConfiguration) WithCreationTimestamp(value metav1.Time) *PortA
 // WithDeletionTimestamp sets the DeletionTimestamp field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the DeletionTimestamp field is set to the value of the last call.
-func (b *PortApplyConfiguration) WithDeletionTimestamp(value metav1.Time) *PortApplyConfiguration {
+func (b *SecurityGroupApplyConfiguration) WithDeletionTimestamp(value metav1.Time) *SecurityGroupApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	b.ObjectMetaApplyConfiguration.DeletionTimestamp = &value
 	return b
@@ -138,7 +145,7 @@ func (b *PortApplyConfiguration) WithDeletionTimestamp(value metav1.Time) *PortA
 // WithDeletionGracePeriodSeconds sets the DeletionGracePeriodSeconds field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the DeletionGracePeriodSeconds field is set to the value of the last call.
-func (b *PortApplyConfiguration) WithDeletionGracePeriodSeconds(value int64) *PortApplyConfiguration {
+func (b *SecurityGroupApplyConfiguration) WithDeletionGracePeriodSeconds(value int64) *SecurityGroupApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	b.ObjectMetaApplyConfiguration.DeletionGracePeriodSeconds = &value
 	return b
@@ -148,7 +155,7 @@ func (b *PortApplyConfiguration) WithDeletionGracePeriodSeconds(value int64) *Po
 // and returns the receiver, so that objects can be build by chaining "With" function invocations.
 // If called multiple times, the entries provided by each call will be put on the Labels field,
 // overwriting an existing map entries in Labels field with the same key.
-func (b *PortApplyConfiguration) WithLabels(entries map[string]string) *PortApplyConfiguration {
+func (b *SecurityGroupApplyConfiguration) WithLabels(entries map[string]string) *SecurityGroupApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	if b.ObjectMetaApplyConfiguration.Labels == nil && len(entries) > 0 {
 		b.ObjectMetaApplyConfiguration.Labels = make(map[string]string, len(entries))
@@ -163,7 +170,7 @@ func (b *PortApplyConfiguration) WithLabels(entries map[string]string) *PortAppl
 // and returns the receiver, so that objects can be build by chaining "With" function invocations.
 // If called multiple times, the entries provided by each call will be put on the Annotations field,
 // overwriting an existing map entries in Annotations field with the same key.
-func (b *PortApplyConfiguration) WithAnnotations(entries map[string]string) *PortApplyConfiguration {
+func (b *SecurityGroupApplyConfiguration) WithAnnotations(entries map[string]string) *SecurityGroupApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	if b.ObjectMetaApplyConfiguration.Annotations == nil && len(entries) > 0 {
 		b.ObjectMetaApplyConfiguration.Annotations = make(map[string]string, len(entries))
@@ -177,7 +184,7 @@ func (b *PortApplyConfiguration) WithAnnotations(entries map[string]string) *Por
 // WithOwnerReferences adds the given value to the OwnerReferences field in the declarative configuration
 // and returns the receiver, so that objects can be build by chaining "With" function invocations.
 // If called multiple times, values provided by each call will be appended to the OwnerReferences field.
-func (b *PortApplyConfiguration) WithOwnerReferences(values ...*v1.OwnerReferenceApplyConfiguration) *PortApplyConfiguration {
+func (b *SecurityGroupApplyConfiguration) WithOwnerReferences(values ...*v1.OwnerReferenceApplyConfiguration) *SecurityGroupApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	for i := range values {
 		if values[i] == nil {
@@ -191,7 +198,7 @@ func (b *PortApplyConfiguration) WithOwnerReferences(values ...*v1.OwnerReferenc
 // WithFinalizers adds the given value to the Finalizers field in the declarative configuration
 // and returns the receiver, so that objects can be build by chaining "With" function invocations.
 // If called multiple times, values provided by each call will be appended to the Finalizers field.
-func (b *PortApplyConfiguration) WithFinalizers(values ...string) *PortApplyConfiguration {
+func (b *SecurityGroupApplyConfiguration) WithFinalizers(values ...string) *SecurityGroupApplyConfiguration {
 	b.ensureObjectMetaApplyConfigurationExists()
 	for i := range values {
 		b.ObjectMetaApplyConfiguration.Finalizers = append(b.ObjectMetaApplyConfiguration.Finalizers, values[i])
@@ -199,7 +206,7 @@ func (b *PortApplyConfiguration) WithFinalizers(values ...string) *PortApplyConf
 	return b
 }
 
-func (b *PortApplyConfiguration) ensureObjectMetaApplyConfigurationExists() {
+func (b *SecurityGroupApplyConfiguration) ensureObjectMetaApplyConfigurationExists() {
 	if b.ObjectMetaApplyConfiguration == nil {
 		b.ObjectMetaApplyConfiguration = &v1.ObjectMetaApplyConfiguration{}
 	}
@@ -208,7 +215,7 @@ func (b *PortApplyConfiguration) ensureObjectMetaApplyConfigurationExists() {
 // WithSpec sets the Spec field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the Spec field is set to the value of the last call.
-func (b *PortApplyConfiguration) WithSpec(value *PortSpecApplyConfiguration) *PortApplyConfiguration {
+func (b *SecurityGroupApplyConfiguration) WithSpec(value *SecurityGroupSpecApplyConfiguration) *SecurityGroupApplyConfiguration {
 	b.Spec = value
 	return b
 }
@@ -216,29 +223,29 @@ func (b *PortApplyConfiguration) WithSpec(value *PortSpecApplyConfiguration) *Po
 // WithStatus sets the Status field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the Status field is set to the value of the last call.
-func (b *PortApplyConfiguration) WithStatus(value *PortStatusApplyConfiguration) *PortApplyConfiguration {
+func (b *SecurityGroupApplyConfiguration) WithStatus(value *SecurityGroupStatusApplyConfiguration) *SecurityGroupApplyConfiguration {
 	b.Status = value
 	return b
 }
 
 // GetKind retrieves the value of the Kind field in the declarative configuration.
-func (b *PortApplyConfiguration) GetKind() *string {
+func (b *SecurityGroupApplyConfiguration) GetKind() *string {
 	return b.TypeMetaApplyConfiguration.Kind
 }
 
 // GetAPIVersion retrieves the value of the APIVersion field in the declarative configuration.
-func (b *PortApplyConfiguration) GetAPIVersion() *string {
+func (b *SecurityGroupApplyConfiguration) GetAPIVersion() *string {
 	return b.TypeMetaApplyConfiguration.APIVersion
 }
 
 // GetName retrieves the value of the Name field in the declarative configuration.
-func (b *PortApplyConfiguration) GetName() *string {
+func (b *SecurityGroupApplyConfiguration) GetName() *string {
 	b.ensureObjectMetaApplyConfigurationExists()
 	return b.ObjectMetaApplyConfiguration.Name
 }
 
 // GetNamespace retrieves the value of the Namespace field in the declarative configuration.
-func (b *PortApplyConfiguration) GetNamespace() *string {
+func (b *SecurityGroupApplyConfiguration) GetNamespace() *string {
 	b.ensureObjectMetaApplyConfigurationExists()
 	return b.ObjectMetaApplyConfiguration.Namespace
 }

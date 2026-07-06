@@ -70,11 +70,23 @@ type PortSpec struct {
 	Gateway bool `json:"gateway,omitempty"`
 }
 
+// PortStatus is the controller-observed state of a Port.
+type PortStatus struct {
+	// Groups is the set of SecurityGroup numeric ids (1..63, within the Port's
+	// VPC) this Port is a member of, resolved by the controller from the pod's
+	// labels. The agent folds it into the datapath membership bitmap. Empty
+	// means "no groups" — legacy allow-all intra-VPC ingress.
+	// +optional
+	// +listType=atomic
+	Groups []int32 `json:"groups,omitempty"`
+}
+
 // +genclient
 // +genclient:nonNamespaced
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster
+// +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="VPC",type=string,JSONPath=`.spec.vpcRef.name`
 // +kubebuilder:printcolumn:name="VPCNamespace",type=string,JSONPath=`.spec.vpcRef.namespace`
 // +kubebuilder:printcolumn:name="IP",type=string,JSONPath=`.spec.ip`
@@ -86,7 +98,8 @@ type Port struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec PortSpec `json:"spec,omitempty"`
+	Spec   PortSpec   `json:"spec,omitempty"`
+	Status PortStatus `json:"status,omitempty"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object

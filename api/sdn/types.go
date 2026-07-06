@@ -218,6 +218,14 @@ type PortSpec struct {
 	Gateway bool
 }
 
+// PortStatus is the controller-observed state of a Port.
+type PortStatus struct {
+	// Groups is the set of SecurityGroup numeric ids this Port belongs to
+	// (resolved from the pod's labels), folded into the datapath membership
+	// bitmap by the agent. Empty means "no groups" (legacy allow).
+	Groups []int32
+}
+
 // +genclient
 // +genclient:nonNamespaced
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -227,7 +235,8 @@ type Port struct {
 	metav1.TypeMeta
 	metav1.ObjectMeta
 
-	Spec PortSpec
+	Spec   PortSpec
+	Status PortStatus
 }
 
 // ExternalPoolAdvertisement is how a pool's addresses are announced to the
@@ -469,4 +478,70 @@ type ServiceVIP struct {
 
 	Spec   ServiceVIPSpec
 	Status ServiceVIPStatus
+}
+
+// SecurityGroupPhase is the lifecycle phase of a SecurityGroup.
+type SecurityGroupPhase string
+
+const (
+	// SecurityGroupPhasePending means the group has no allocated id yet.
+	SecurityGroupPhasePending SecurityGroupPhase = "Pending"
+	// SecurityGroupPhaseReady means the group has an id and is programmed.
+	SecurityGroupPhaseReady SecurityGroupPhase = "Ready"
+)
+
+// SecurityGroupSpec declares an intra-VPC policy group.
+type SecurityGroupSpec struct {
+	VPCRef      LocalVPCRef
+	PodSelector metav1.LabelSelector
+	Ingress     []SecurityGroupRule
+}
+
+// SecurityGroupRule admits traffic from one source, optionally port-narrowed.
+type SecurityGroupRule struct {
+	From  SecurityGroupPeer
+	Ports []SecurityGroupPort
+}
+
+// SecurityGroupPeer identifies an admitted source (group or CIDR).
+type SecurityGroupPeer struct {
+	Group string
+	CIDR  string
+}
+
+// SecurityGroupPort is a protocol/port an ingress rule admits.
+type SecurityGroupPort struct {
+	Protocol string
+	Port     int32
+}
+
+// SecurityGroupStatus is the observed state of a SecurityGroup.
+type SecurityGroupStatus struct {
+	ID         int32
+	Phase      SecurityGroupPhase
+	Conditions []metav1.Condition
+}
+
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// SecurityGroup is intra-VPC network policy (AWS-security-group-shaped):
+// destination-side eBPF enforcement of label-selected membership and
+// group/CIDR ingress rules within a single VPC.
+type SecurityGroup struct {
+	metav1.TypeMeta
+	metav1.ObjectMeta
+
+	Spec   SecurityGroupSpec
+	Status SecurityGroupStatus
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// SecurityGroupList is a list of SecurityGroup objects.
+type SecurityGroupList struct {
+	metav1.TypeMeta
+	metav1.ListMeta
+
+	Items []SecurityGroup
 }

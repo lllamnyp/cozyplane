@@ -59,6 +59,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&FloatingIPList{},
 		&ServiceVIP{},
 		&ServiceVIPList{},
+		&SecurityGroup{},
+		&SecurityGroupList{},
 	)
 	metav1.AddToGroupVersion(scheme, SchemeGroupVersion)
 

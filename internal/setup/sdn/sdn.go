@@ -24,6 +24,7 @@ import (
 	externalpoolstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/externalpool"
 	floatingipstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/floatingip"
 	portstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/port"
+	securitygroupstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/securitygroup"
 	servicevipstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/servicevip"
 	vpcstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/vpc"
 	vpcbindingstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/vpcbinding"
@@ -77,11 +78,20 @@ func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOpt
 	if err != nil {
 		panic(err)
 	}
+	portREST, portStatusREST, err := portstorage.NewREST(scheme, restOptionsGetter)
+	if err != nil {
+		panic(err)
+	}
+	securityGroupREST, securityGroupStatusREST, err := securitygroupstorage.NewREST(scheme, restOptionsGetter)
+	if err != nil {
+		panic(err)
+	}
 
 	v1alpha1storage := map[string]rest.Storage{}
 	v1alpha1storage["vpcs"] = vpcREST
 	v1alpha1storage["vpcs/status"] = vpcStatusREST
-	v1alpha1storage["ports"] = defaultregistry.RESTInPeace(portstorage.NewREST(scheme, restOptionsGetter))
+	v1alpha1storage["ports"] = portREST
+	v1alpha1storage["ports/status"] = portStatusREST
 	v1alpha1storage["vpcbindings"] = defaultregistry.RESTInPeace(vpcbindingstorage.NewREST(scheme, restOptionsGetter, auth))
 	v1alpha1storage["vpcpeerings"] = vpcPeeringREST
 	v1alpha1storage["vpcpeerings/status"] = vpcPeeringStatusREST
@@ -91,6 +101,8 @@ func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOpt
 	v1alpha1storage["floatingips/status"] = floatingIPStatusREST
 	v1alpha1storage["servicevips"] = serviceVIPREST
 	v1alpha1storage["servicevips/status"] = serviceVIPStatusREST
+	v1alpha1storage["securitygroups"] = securityGroupREST
+	v1alpha1storage["securitygroups/status"] = securityGroupStatusREST
 	apiGroupInfo.VersionedResourcesStorageMap["v1alpha1"] = v1alpha1storage
 
 	return &apiGroupInfo

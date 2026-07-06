@@ -34,6 +34,14 @@ type FloatingIPNamespaceListerExpansion interface{}
 // PortLister.
 type PortListerExpansion interface{}
 
+// SecurityGroupListerExpansion allows custom methods to be added to
+// SecurityGroupLister.
+type SecurityGroupListerExpansion interface{}
+
+// SecurityGroupNamespaceListerExpansion allows custom methods to be added to
+// SecurityGroupNamespaceLister.
+type SecurityGroupNamespaceListerExpansion interface{}
+
 // ServiceVIPListerExpansion allows custom methods to be added to
 // ServiceVIPLister.
 type ServiceVIPListerExpansion interface{}

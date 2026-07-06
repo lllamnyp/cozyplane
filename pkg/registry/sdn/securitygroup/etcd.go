@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package port
+package securitygroup
 
 import (
 	"context"
@@ -28,26 +28,22 @@ import (
 	"k8s.io/apiserver/pkg/registry/rest"
 )
 
-// NewREST returns RESTStorage objects for Ports and their /status subresource.
-// The Port name encodes the VPC VNI and the IP, so creating a Port is an atomic
-// IP claim — etcd name uniqueness serializes concurrent allocators
-// (AlreadyExists on collision), no server-side allocator required. The /status
-// subresource carries controller-resolved SecurityGroup membership.
+// NewREST returns RESTStorage objects for SecurityGroups and their /status subresource.
 func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter) (*registry.REST, *StatusREST, error) {
 	strategy := NewStrategy(scheme)
 
 	store := &genericregistry.Store{
-		NewFunc:                   func() runtime.Object { return &sdn.Port{} },
-		NewListFunc:               func() runtime.Object { return &sdn.PortList{} },
-		PredicateFunc:             MatchPort,
-		DefaultQualifiedResource:  sdn.Resource("ports"),
-		SingularQualifiedResource: sdn.Resource("port"),
+		NewFunc:                   func() runtime.Object { return &sdn.SecurityGroup{} },
+		NewListFunc:               func() runtime.Object { return &sdn.SecurityGroupList{} },
+		PredicateFunc:             MatchSecurityGroup,
+		DefaultQualifiedResource:  sdn.Resource("securitygroups"),
+		SingularQualifiedResource: sdn.Resource("securitygroup"),
 
 		CreateStrategy: strategy,
 		UpdateStrategy: strategy,
 		DeleteStrategy: strategy,
 
-		TableConvertor: rest.NewDefaultTableConvertor(sdn.Resource("ports")),
+		TableConvertor: rest.NewDefaultTableConvertor(sdn.Resource("securitygroups")),
 	}
 
 	options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: GetAttrs}
@@ -61,14 +57,14 @@ func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter) (*reg
 	return &registry.REST{Store: store}, &StatusREST{store: &statusStore}, nil
 }
 
-// StatusREST implements the REST endpoint for changing the status of a Port.
+// StatusREST implements the REST endpoint for changing the status of a SecurityGroup.
 type StatusREST struct {
 	store *genericregistry.Store
 }
 
-// New returns an empty Port.
+// New returns an empty SecurityGroup.
 func (r *StatusREST) New() runtime.Object {
-	return &sdn.Port{}
+	return &sdn.SecurityGroup{}
 }
 
 // Destroy is a no-op; the store is shared with the main REST which owns teardown.

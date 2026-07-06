@@ -30,6 +30,8 @@ type Interface interface {
 	FloatingIPs() FloatingIPInformer
 	// Ports returns a PortInformer.
 	Ports() PortInformer
+	// SecurityGroups returns a SecurityGroupInformer.
+	SecurityGroups() SecurityGroupInformer
 	// ServiceVIPs returns a ServiceVIPInformer.
 	ServiceVIPs() ServiceVIPInformer
 	// VPCs returns a VPCInformer.
@@ -64,6 +66,11 @@ func (v *version) FloatingIPs() FloatingIPInformer {
 // Ports returns a PortInformer.
 func (v *version) Ports() PortInformer {
 	return &portInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
+}
+
+// SecurityGroups returns a SecurityGroupInformer.
+func (v *version) SecurityGroups() SecurityGroupInformer {
+	return &securityGroupInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
 // ServiceVIPs returns a ServiceVIPInformer.
