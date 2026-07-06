@@ -433,6 +433,12 @@ func watchVPCs(factory sdninformers.SharedInformerFactory, mgr *datapath.Manager
 			log.Error("set network", "vpc", vpc.Name, "err", err)
 			return
 		}
+		// Seed the metering counter (#2): the datapath only increments an
+		// existing entry (it can't allocate one — stack limits), so the agent
+		// creates it here.
+		if err := mgr.EnsureVPCCounter(vni); err != nil {
+			log.Warn("seed vpc counter", "vpc", vpc.Name, "err", err)
+		}
 		log.Info("network set", "vpc", vpc.Name, "cidr", vpc.Spec.CIDRs[0], "vni", vpc.Status.VNI)
 	}
 

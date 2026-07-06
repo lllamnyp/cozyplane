@@ -92,11 +92,18 @@ maps and one program.
 | `vpc_counters` | PERCPU hash | net id → {tx,rx bytes/packets} | datapath (in-band) |
 | `params` | array | `[0]`=Geneve ifindex, `[1]`=default VNI | agent |
 
-Per-VPC metering (#2): `count_dir` bumps `vpc_counters` in `from_pod` (tx) and
-`to_pod` (rx, east-west only) — PERCPU so the hooks never contend; the agent
-sums across CPUs and serves them as Prometheus text on `:9411/metrics`, labeled
-by VPC. Net 0 (default) is never metered; north-south (gateway/floating) is a
-follow-up.
+Per-VPC metering (#2): `count_dir` bumps `vpc_counters` — **both directions
+from `to_pod`** (rx for the destination net, tx for the source net), the one
+placement-independent delivery hook, so east-west is metered once. It is a
+`noinline` BPF-to-BPF subprogram that only looks up and increments (never
+allocates): inlining it blew `from_pod` past the verifier's 1M-instruction
+budget on a 6.12 kernel (6.8 accepted it — caught only on dev4), and any callee
+stack of its own overflowed the 512-byte combined-frame limit against
+`from_pod`'s already-large frame. The **agent seeds** a zeroed PERCPU entry per
+VPC net (`EnsureVPCCounter`, alongside `SetNetwork`); the datapath can't create
+one. PERCPU so the hooks never contend; the agent sums across CPUs and serves
+Prometheus text on `:9411/metrics`, labeled by VPC. Net 0 (default) is never
+metered; north-south (gateway/floating) and ServiceVIP replies are a follow-up.
 
 The scoped maps use a `{prefixlen, scope_net, addr}` LPM key: the scope net
 occupies the leading 32 bits (always fully specified), so a lookup never

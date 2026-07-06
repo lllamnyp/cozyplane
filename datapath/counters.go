@@ -16,7 +16,11 @@ limitations under the License.
 
 package datapath
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/cilium/ebpf"
+)
 
 // VPCCounter is the per-VPC traffic tally read from the datapath (#2): tx is a
 // VPC pod's egress, rx its east-west ingress. North-south (gateway/floating)
@@ -26,6 +30,30 @@ type VPCCounter struct {
 	TxBytes   uint64
 	RxPackets uint64
 	RxBytes   uint64
+}
+
+// EnsureVPCCounter creates a zeroed vpc_counters entry for a net if absent.
+// The datapath's count_dir never creates entries (a stack-free lookup+increment
+// only — from_pod/to_pod are too stack-heavy to host the init), so the agent
+// seeds one per VPC net when it programs the network. Idempotent; a net's
+// first few packets before this runs are simply uncounted.
+func (m *Manager) EnsureVPCCounter(net uint32) error {
+	if net == 0 {
+		return nil
+	}
+	var existing []overlayVpcCounter
+	if err := m.objs.VpcCounters.Lookup(net, &existing); err == nil {
+		return nil // already seeded; don't clobber live counts
+	}
+	ncpu, err := ebpf.PossibleCPU()
+	if err != nil {
+		return fmt.Errorf("possible CPUs: %w", err)
+	}
+	zero := make([]overlayVpcCounter, ncpu)
+	if err := m.objs.VpcCounters.Put(net, zero); err != nil {
+		return fmt.Errorf("seed vpc_counter for net %d: %w", net, err)
+	}
+	return nil
 }
 
 // VPCCounters reads the per-net traffic counters, summing the PERCPU values

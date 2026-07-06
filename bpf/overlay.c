@@ -497,18 +497,24 @@ struct {
 
 // count_dir bumps one direction's counters for a net (no-op for net 0). The
 // PERCPU value is this CPU's private copy, so the ++ needs no atomics.
-static __always_inline void count_dir(__u32 net, __u32 len, int rx)
+//
+// Deliberately NOT inlined and stack-free. Two verifier constraints shaped it:
+// inlining at the top of the large from_pod program pushed path exploration
+// past the 1M-instruction complexity budget (rejected on a 6.12 kernel, though
+// the CI's 6.8 verifier accepted it — so it only showed on dev4); and as a
+// BPF-to-BPF subprogram, any stack local of its own overflowed the 512-byte
+// combined-call-stack limit (from_pod's frame is already near it). So the
+// entry is NEVER created here — the agent pre-creates a zeroed vpc_counters
+// entry per VPC net — and count_dir only looks up and increments, using no
+// stack. A tenant's first packets before the agent creates the entry are
+// simply not counted (negligible for a byte meter).
+static __attribute__((noinline)) void count_dir(__u32 net, __u32 len, int rx)
 {
 	if (!net)
 		return;
 	struct vpc_counter *c = bpf_map_lookup_elem(&vpc_counters, &net);
-	if (!c) {
-		struct vpc_counter zero = {};
-		bpf_map_update_elem(&vpc_counters, &net, &zero, BPF_NOEXIST);
-		c = bpf_map_lookup_elem(&vpc_counters, &net);
-		if (!c)
-			return;
-	}
+	if (!c)
+		return;
 	if (rx) {
 		c->rx_packets++;
 		c->rx_bytes += len;
@@ -2595,9 +2601,6 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 		is_gw = *sp & PORT_F_GATEWAY;
 	}
 
-	// Meter this VPC pod's egress (#2). srcnet 0 (uplink/default) is skipped.
-	count_dir(srcnet, skb->len, 0);
-
 	// At the uplink-egress attachment only: bpf cluster-egress masquerade
 	// (#10). A kernel-forwarded pod packet leaving the cluster gets SNAT'd
 	// here instead of by an iptables MASQUERADE rule. Everything else (node
@@ -2835,9 +2838,13 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 			return TC_ACT_SHOT;
 	}
 
-	// Meter this VPC pod's ingress on the admitted east-west path (#2). The
-	// north-south bridge/floating deliveries returned earlier and aren't
-	// metered yet.
+	// Meter admitted east-west traffic (#2), both directions from this one
+	// placement-independent delivery hook: rx for the destination's net, tx
+	// for the source's (same net intra-VPC, the peer's across a peering). A
+	// VPC pod's own from_pod is too stack-heavy to host a BPF-to-BPF call, so
+	// all east-west metering happens here. North-south (bridge/floating) and
+	// ServiceVIP replies return earlier and aren't metered yet.
+	count_dir(srcnet, skb->len, 0);
 	count_dir(dstnet, skb->len, 1);
 
 	return TC_ACT_OK;
