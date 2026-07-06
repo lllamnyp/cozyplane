@@ -805,6 +805,7 @@ func autoConvert_v1alpha1_ServiceVIPSpec_To_sdn_ServiceVIPSpec(in *ServiceVIPSpe
 		return err
 	}
 	out.Ports = *(*[]sdn.VIPPort)(unsafe.Pointer(&in.Ports))
+	out.SessionAffinity = in.SessionAffinity
 	return nil
 }
 
@@ -822,6 +823,7 @@ func autoConvert_sdn_ServiceVIPSpec_To_v1alpha1_ServiceVIPSpec(in *sdn.ServiceVI
 		return err
 	}
 	out.Ports = *(*[]VIPPort)(unsafe.Pointer(&in.Ports))
+	out.SessionAffinity = in.SessionAffinity
 	return nil
 }
 

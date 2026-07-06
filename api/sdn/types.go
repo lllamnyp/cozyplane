@@ -438,6 +438,9 @@ type ServiceVIPSpec struct {
 
 	// Ports are the service ports the VIP serves.
 	Ports []VIPPort
+
+	// SessionAffinity mirrors the Service's ("ClientIP" or "None").
+	SessionAffinity string
 }
 
 // ServiceVIPStatus is the observed state of a ServiceVIP.

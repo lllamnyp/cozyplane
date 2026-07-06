@@ -1165,6 +1165,7 @@ func watchServiceVIPs(ctx context.Context, factory sdninformers.SharedInformerFa
 					Proto:    proto,
 					Port:     uint16(p.Port),
 					Backends: backends,
+					Affinity: sv.Spec.SessionAffinity == "ClientIP",
 				})
 			}
 		}

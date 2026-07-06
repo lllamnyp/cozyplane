@@ -150,9 +150,10 @@ type overlaySvcRevVal struct {
 }
 
 type overlaySvcVal struct {
-	_  structs.HostLayout
-	N  uint32
-	Be [16]struct {
+	_     structs.HostLayout
+	N     uint32
+	Flags uint32
+	Be    [16]struct {
 		_    structs.HostLayout
 		Ip   overlayAddr128
 		Port uint16

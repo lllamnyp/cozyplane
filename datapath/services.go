@@ -37,6 +37,9 @@ type SvcBackend struct {
 	Port uint16
 }
 
+// svcFAffinity mirrors SVC_F_AFFINITY in bpf/overlay.c (ClientIP affinity).
+const svcFAffinity = 1
+
 // SvcEntry is one datapath service entry: a (net, vip, proto, port) key and
 // its backends.
 type SvcEntry struct {
@@ -45,6 +48,7 @@ type SvcEntry struct {
 	Proto    uint8 // unix.IPPROTO_TCP / IPPROTO_UDP
 	Port     uint16
 	Backends []SvcBackend
+	Affinity bool // ClientIP session affinity
 }
 
 // SyncServiceVIPs makes the svc_vips map exactly `entries` (full-state diff,
@@ -74,6 +78,9 @@ func (m *Manager) SyncServiceVIPs(entries []SvcEntry) error {
 			n++
 		}
 		val.N = uint32(n)
+		if e.Affinity {
+			val.Flags = svcFAffinity
+		}
 		want[key] = val
 	}
 

@@ -879,6 +879,13 @@ func schema_cozyplane_api_sdn_v1alpha1_ServiceVIPSpec(ref common.ReferenceCallba
 							},
 						},
 					},
+					"sessionAffinity": {
+						SchemaProps: spec.SchemaProps{
+							Description: "SessionAffinity mirrors the Service's: \"ClientIP\" pins every connection from one client to the same backend; \"None\" (default) load-balances per connection.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
 				},
 				Required: []string{"vpcRef", "ip", "serviceRef"},
 			},

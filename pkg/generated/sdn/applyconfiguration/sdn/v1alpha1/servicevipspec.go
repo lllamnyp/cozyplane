@@ -41,6 +41,10 @@ type ServiceVIPSpecApplyConfiguration struct {
 	ServiceRef *ServiceRefApplyConfiguration `json:"serviceRef,omitempty"`
 	// Ports are the service ports the VIP serves.
 	Ports []VIPPortApplyConfiguration `json:"ports,omitempty"`
+	// SessionAffinity mirrors the Service's: "ClientIP" pins every connection
+	// from one client to the same backend; "None" (default) load-balances
+	// per connection.
+	SessionAffinity *string `json:"sessionAffinity,omitempty"`
 }
 
 // ServiceVIPSpecApplyConfiguration constructs a declarative configuration of the ServiceVIPSpec type for use with
@@ -83,5 +87,13 @@ func (b *ServiceVIPSpecApplyConfiguration) WithPorts(values ...*VIPPortApplyConf
 		}
 		b.Ports = append(b.Ports, *values[i])
 	}
+	return b
+}
+
+// WithSessionAffinity sets the SessionAffinity field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the SessionAffinity field is set to the value of the last call.
+func (b *ServiceVIPSpecApplyConfiguration) WithSessionAffinity(value string) *ServiceVIPSpecApplyConfiguration {
+	b.SessionAffinity = &value
 	return b
 }

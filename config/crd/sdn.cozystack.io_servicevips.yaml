@@ -104,6 +104,12 @@ spec:
                 - name
                 - namespace
                 type: object
+              sessionAffinity:
+                description: |-
+                  SessionAffinity mirrors the Service's: "ClientIP" pins every connection
+                  from one client to the same backend; "None" (default) load-balances
+                  per connection.
+                type: string
               vpcRef:
                 description: VPCRef identifies the VPC this VIP belongs to (owner
                   namespace + name).

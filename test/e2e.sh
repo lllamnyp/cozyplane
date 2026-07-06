@@ -511,6 +511,23 @@ check_fail "bw1(vpc-b, unpeered) cannot resolve vipsvc" \
 # is loopback-SNAT'd out and back in on one veth (169.254.42.1).
 check "viph -> its own service (hairpin self-dial)" "viph" \
   httpid team-a viph viphsvc.team-a.svc.cluster.local
+# Session affinity (ClientIP): with sessionAffinity set, all of ONE client's
+# fresh flows pin to a single backend (the source port drops from the hash).
+# Affinity governs only NEW flows, so use a client that has never dialed the
+# VIP — cpeer/a1 above left flow-pins that would mask it.
+idpod team-a affcli "$W2" vpc-a
+$K -n team-a wait --for=condition=Ready pod/affcli --timeout=120s >/dev/null
+$K patch service vipsvc -n team-a --type=merge -p '{"spec":{"sessionAffinity":"ClientIP"}}' >/dev/null
+# Poll for the controller to stamp affinity onto the ServiceVIP, then let the
+# agent re-sync the map flag.
+for _ in $(seq 1 10); do
+  [ "$($K get servicevips.sdn.cozystack.io -o jsonpath="{range .items[*]}{.spec.serviceRef.name}{' '}{.spec.sessionAffinity}{'\n'}{end}" 2>/dev/null | awk '$1=="vipsvc"{print $2}')" = "ClientIP" ] && break
+  sleep 2
+done
+sleep 3
+check "affinity: 12 fresh flows from affcli pin to ONE backend" "1" \
+  bash -c "for i in \$(seq 1 12); do $K -n team-a exec affcli -- wget -qO- -T4 http://vipsvc.team-a.svc.cluster.local/ 2>/dev/null; done | sort -u | grep -cE '^dns[12]\$'"
+$K patch service vipsvc -n team-a --type=merge -p '{"spec":{"sessionAffinity":"None"}}' >/dev/null
 
 echo "[guest autoconfiguration (#8): RA (M=1) + DHCPv6 hand out the pinned /128]"
 # Linux ignores a /128 Prefix Information Option (addrconf requires /64 on

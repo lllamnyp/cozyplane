@@ -96,6 +96,12 @@ type ServiceVIPSpec struct {
 	// Ports are the service ports the VIP serves.
 	// +optional
 	Ports []VIPPort `json:"ports,omitempty"`
+
+	// SessionAffinity mirrors the Service's: "ClientIP" pins every connection
+	// from one client to the same backend; "None" (default) load-balances
+	// per connection.
+	// +optional
+	SessionAffinity string `json:"sessionAffinity,omitempty"`
 }
 
 // ServiceVIPStatus is the observed state of a ServiceVIP.

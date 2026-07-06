@@ -218,11 +218,13 @@ func (r *ServiceVIPReconciler) ensureVIP(ctx context.Context, svc *corev1.Servic
 	for i := range vips.Items {
 		v := &vips.Items[i]
 		if v.Spec.VPCRef.Namespace == vpc.Namespace && v.Spec.VPCRef.Name == vpc.Name {
-			// Keep the declared ports fresh (a Service port change is a spec
-			// update, not a reallocation).
+			// Keep the declared ports and affinity fresh (a Service change is
+			// a spec update, not a reallocation).
 			ports := vipPorts(svc)
-			if !slices.Equal(v.Spec.Ports, ports) {
+			affinity := string(svc.Spec.SessionAffinity)
+			if !slices.Equal(v.Spec.Ports, ports) || v.Spec.SessionAffinity != affinity {
 				v.Spec.Ports = ports
+				v.Spec.SessionAffinity = affinity
 				if err := r.Update(ctx, v); err != nil {
 					return nil, err
 				}
@@ -246,10 +248,11 @@ func (r *ServiceVIPReconciler) ensureVIP(ctx context.Context, svc *corev1.Servic
 			},
 		},
 		Spec: sdnv1alpha1.ServiceVIPSpec{
-			VPCRef:     sdnv1alpha1.VPCRef{Namespace: vpc.Namespace, Name: vpc.Name},
-			IP:         ip,
-			ServiceRef: sdnv1alpha1.ServiceRef{Namespace: svc.Namespace, Name: svc.Name},
-			Ports:      vipPorts(svc),
+			VPCRef:          sdnv1alpha1.VPCRef{Namespace: vpc.Namespace, Name: vpc.Name},
+			IP:              ip,
+			ServiceRef:      sdnv1alpha1.ServiceRef{Namespace: svc.Namespace, Name: svc.Name},
+			Ports:           vipPorts(svc),
+			SessionAffinity: string(svc.Spec.SessionAffinity),
 		},
 	}
 	if err := r.Create(ctx, svip); err != nil {
@@ -433,6 +436,31 @@ func (r *ServiceVIPReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		})).
 		Watches(&sdnv1alpha1.ServiceVIP{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
 			return toService(obj.GetLabels()[sdnv1alpha1.LabelServiceNamespace], obj.GetLabels()[sdnv1alpha1.LabelServiceName])
+		})).
+		// A Port appearing on a VIP's address must re-trigger that VIP's
+		// reconcile promptly — the Port-always-wins repair otherwise waits for
+		// the Service to change. Map the Port to the Service of any same-VPC
+		// ServiceVIP holding its IP.
+		Watches(&sdnv1alpha1.Port{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			port, ok := obj.(*sdnv1alpha1.Port)
+			if !ok || port.Spec.IP == "" {
+				return nil
+			}
+			vips := &sdnv1alpha1.ServiceVIPList{}
+			if err := r.List(ctx, vips, client.MatchingLabels{
+				sdnv1alpha1.LabelVPC:          port.Spec.VPCRef.Name,
+				sdnv1alpha1.LabelVPCNamespace: port.Spec.VPCRef.Namespace,
+			}); err != nil {
+				return nil
+			}
+			var reqs []ctrl.Request
+			for i := range vips.Items {
+				v := &vips.Items[i]
+				if v.Spec.IP == port.Spec.IP {
+					reqs = append(reqs, toService(v.Labels[sdnv1alpha1.LabelServiceNamespace], v.Labels[sdnv1alpha1.LabelServiceName])...)
+				}
+			}
+			return reqs
 		})).
 		Named("servicevip").
 		Complete(r)

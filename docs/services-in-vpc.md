@@ -232,9 +232,21 @@ etcd pods (or VM-hosted members) in `vpc-a`, Services annotated into the VPC:
    `to_pod` rev-SNATs the reply. Self-dials hairpin via a reserved loopback
    (`169.254.42.1` / `fe80::2a01`) on the pod's own veth. v1 limits: TCP/UDP
    only (no ICMP-to-VIP, no SCTP), ≤16 backends per port (excess truncated,
-   logged), backend choice is a 5-tuple hash (no maglev/affinity yet).
-   The resolver answers attached ClusterIP services with the VIP (A/AAAA and
-   `_port._proto` SRV); the cluster ClusterIP never appears in a tenant.
+   logged), backend choice is a multiply-shift-reduced 5-tuple hash (no
+   maglev). **ClientIP session affinity** is honored — `sessionAffinity:
+   ClientIP` sets a per-`svc_vips` flag and the datapath drops the source port
+   from the selection hash, so every flow from a client picks the same backend,
+   statelessly (no per-client timeout table; a backend-set change may rebalance
+   ~1/n of clients, as with any consistent-hash LB). The resolver answers
+   attached ClusterIP services with the VIP (A/AAAA and `_port._proto` SRV);
+   the cluster ClusterIP never appears in a tenant.
+
+   **Cross-kind uniqueness, as hardened:** the registry-layer fail-closed
+   check (design layer 2) is still deferred, but the Port-always-wins repair
+   is now *prompt* — the ServiceVIP controller watches Ports and re-checks any
+   same-VPC VIP holding a new Port's IP immediately, rather than waiting for
+   the Service to change. Combined with opposite-end allocation (layer 1), a
+   collision is both improbable and repaired at watch latency.
 3. **VM resolver config** — ties into vm-provisioning's RA/DHCP so guests
    learn the resolver without manual config.
    **Implemented** — the agent's userspace RA responder
