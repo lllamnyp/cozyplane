@@ -102,6 +102,64 @@ type overlayPeerKey struct {
 	DstNet uint32
 }
 
+type overlaySvcFwdKey struct {
+	_      structs.HostLayout
+	Net    uint32
+	Proto  uint8
+	Pad    uint8
+	Cport  uint16
+	Client overlayAddr128
+	Vip    overlayAddr128
+	Vport  uint16
+	Pad2   uint16
+}
+
+type overlaySvcFwdVal struct {
+	_       structs.HostLayout
+	Backend overlayAddr128
+	Tport   uint16
+	Hairpin uint16
+}
+
+type overlaySvcKey struct {
+	_     structs.HostLayout
+	Net   uint32
+	Vip   overlayAddr128
+	Proto uint8
+	Pad   uint8
+	Port  uint16
+}
+
+type overlaySvcRevKey struct {
+	_       structs.HostLayout
+	Net     uint32
+	Proto   uint8
+	Pad     uint8
+	Cport   uint16
+	Backend overlayAddr128
+	Client  overlayAddr128
+	Tport   uint16
+	Pad2    uint16
+}
+
+type overlaySvcRevVal struct {
+	_     structs.HostLayout
+	Vip   overlayAddr128
+	Vport uint16
+	Pad   uint16
+}
+
+type overlaySvcVal struct {
+	_  structs.HostLayout
+	N  uint32
+	Be [16]struct {
+		_    structs.HostLayout
+		Ip   overlayAddr128
+		Port uint16
+		Pad  uint16
+	}
+}
+
 // Names of all BPF objects in the ELF.
 //
 // Used for safe lookups in a Collection or CollectionSpec.
@@ -124,6 +182,9 @@ const (
 	overlayMapPeers                 = "peers"
 	overlayMapPorts                 = "ports"
 	overlayMapRemotes               = "remotes"
+	overlayMapSvcFwd                = "svc_fwd"
+	overlayMapSvcRev                = "svc_rev"
+	overlayMapSvcVips               = "svc_vips"
 	overlayMapUplinkMac             = "uplink_mac"
 	overlayProgCozyplaneFromOverlay = "cozyplane_from_overlay"
 	overlayProgCozyplaneFromPod     = "cozyplane_from_pod"
@@ -201,6 +262,9 @@ type overlayMapSpecs struct {
 	Peers          *ebpf.MapSpec `ebpf:"peers"`
 	Ports          *ebpf.MapSpec `ebpf:"ports"`
 	Remotes        *ebpf.MapSpec `ebpf:"remotes"`
+	SvcFwd         *ebpf.MapSpec `ebpf:"svc_fwd"`
+	SvcRev         *ebpf.MapSpec `ebpf:"svc_rev"`
+	SvcVips        *ebpf.MapSpec `ebpf:"svc_vips"`
 	UplinkMac      *ebpf.MapSpec `ebpf:"uplink_mac"`
 }
 
@@ -248,6 +312,9 @@ type overlayMaps struct {
 	Peers          *ebpf.Map `ebpf:"peers"`
 	Ports          *ebpf.Map `ebpf:"ports"`
 	Remotes        *ebpf.Map `ebpf:"remotes"`
+	SvcFwd         *ebpf.Map `ebpf:"svc_fwd"`
+	SvcRev         *ebpf.Map `ebpf:"svc_rev"`
+	SvcVips        *ebpf.Map `ebpf:"svc_vips"`
 	UplinkMac      *ebpf.Map `ebpf:"uplink_mac"`
 }
 
@@ -271,6 +338,9 @@ func (m *overlayMaps) Close() error {
 		m.Peers,
 		m.Ports,
 		m.Remotes,
+		m.SvcFwd,
+		m.SvcRev,
+		m.SvcVips,
 		m.UplinkMac,
 	)
 }

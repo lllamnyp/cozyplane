@@ -655,6 +655,18 @@ func attachPort(client sdnclientset.Interface, vpc *sdnv1alpha1.VPC, vpcNS strin
 	for i := range list.Items {
 		used[list.Items[i].Spec.IP] = true
 	}
+	// ServiceVIPs draw from the same per-VPC keyspace (they walk from the TOP
+	// of the CIDR down; Ports walk up) — both allocators check the live union
+	// of both kinds, so neither can hand out the other's address.
+	vips, err := client.SdnV1alpha1().ServiceVIPs().List(context.TODO(), metav1.ListOptions{
+		LabelSelector: labelVPCNamespace + "=" + vpcNS + "," + labelVPC + "=" + vpc.Name,
+	})
+	if err != nil {
+		return nil, nil, nil, false, fmt.Errorf("list servicevips: %w", err)
+	}
+	for i := range vips.Items {
+		used[vips.Items[i].Spec.IP] = true
+	}
 
 	// A persistent (VM) Port carries a stable pinned MAC; an ordinary Port has
 	// none (the veth keeps its random MAC).

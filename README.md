@@ -48,8 +48,16 @@ built-in replacement that imports Cilium's LB components is
 - **Split-horizon DNS for VPCs**: the datapath steers a VPC pod's cluster-DNS
   queries to a per-node resolver that answers the *tenant's* view — headless
   Services annotated into the VPC resolve to VPC IPs, other tenants' names are
-  unprovable, external names forward upstream. (First slice of
-  [Services in a VPC](docs/services-in-vpc.md).)
+  unprovable, external names forward upstream, and names follow reachability
+  across peerings. ([Services in a VPC](docs/services-in-vpc.md).)
+- **Services inside a VPC (ServiceVIPs)**: an annotated ClusterIP Service gets
+  a VIP from the VPC's *own* address space, resolved only by the split-horizon
+  DNS and load-balanced in eBPF (flow-pinned DNAT to backend VPC IPs, hairpin
+  included) — the ClusterIP-equivalent for tenants, peered VPCs included.
+- **IPv6 guest autoconfiguration**: the agent answers Router Solicitations
+  (M=1) and runs a per-veth DHCPv6 responder handing out the exact pinned
+  `/128` — a bridge-bound VM guest learns its address, default route, and DNS
+  server with no console access.
 
 See the [roadmap](docs/roadmap.md) and the [open issues](../../issues) for what's
 outstanding (network policy, DNS, netfilter-optional operation, and more).

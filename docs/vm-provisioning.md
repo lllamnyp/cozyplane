@@ -58,6 +58,24 @@ short-circuited to `TC_ACT_OK`). Instead of passing them, answer in-datapath:
 This reuses the exact NDP-crafting code just written for `floating_ndp`
 (checksum, option layout) — the third consumer of that primitive.
 
+*As built (2026-07-06):* **review Q2 is answered empirically — option C does
+not work on Linux guests.** `addrconf_prefix_rcv` hard-requires prefix length
+64 on ethernet (RFC 4862's "prefix + IID = 128" rule), so a /128 PIO is
+silently ignored; the e2e caught it. The implementation is therefore option
+**A**: the RA sets M=1/O=1 and a **minimal per-veth DHCPv6 server** (RFC 8415
+subset: SOLICIT/ADVERTISE/REQUEST/REPLY + confirm/renew/rebind and rapid
+commit, one binding, infinite lifetimes) hands out the exact pinned address —
+the same mechanism KubeVirt's masquerade binding uses, and the precise v6
+mirror of the v4 DHCP the guest already gets. The /128 PIO is still sent for
+stacks that do honor it. Both live in **userspace** (the agent's
+`RunRAResponder`/`serveDHCPv6`, building on the announce.go machinery), not
+the eBPF hooks: RAs and leases are control-plane chatter, a handful of packets
+per pod lifetime — the eBPF tenet governs forwarding, isolation, and NAT.
+Veths are discovered from their alias records (initial scan + netlink link
+subscription); RDNSS/DNS options carry the v6 resolver when one exists.
+e2e-covered: a pod flushes its address, receives the RA (proto-ra route), and
+the stock busybox DHCPv6 client is leased the exact pinned /128.
+
 **Why not just configure the guest?** We can't — the guest OS is the tenant's.
 The network answering standard autoconf is the only tenant-agnostic path, and
 it's what every cloud does.

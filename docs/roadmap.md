@@ -50,8 +50,8 @@ they're discovered rather than leaving them only in issues.
 - [ ] Per-VPC metadata endpoint + guest autoconfiguration — **design draft: [vm-provisioning.md](vm-provisioning.md)** (awaiting review; also closes #8)
 - [ ] Services in a VPC: per-VPC service VIPs + split-horizon DNS + net-scoped service NAT — **design: [services-in-vpc.md](services-in-vpc.md)** (reviewed; prioritized ahead of the KPR work)
   - [x] Increment 1 — split-horizon resolver: DNS steering in the datapath (`dns_steer`/`dns_return` + the `dns_ct` socket-LB coexistence twist), per-node responder, annotation-gated headless answers as VPC IPs, authoritative NXDOMAIN for the rest of the cluster domain, upstream forwarding (e2e-covered; validated on dev4 under Talos + Cilium KPR)
-  - [ ] Increment 2 — `ServiceVIP` + the net-scoped `svc_vips` data plane (ClusterIP-equivalent inside a VPC)
-  - [ ] Increment 3 — VM resolver config via RA/DHCP (with [vm-provisioning.md](vm-provisioning.md))
+  - [x] Increment 2 — `ServiceVIP` + the net-scoped `svc_vips` data plane: controller-materialized VIP per attached Service (annotation + VPCBinding gate), live-union allocation walking opposite ends from the CNI, flow-pinned DNAT/rev-NAT with a hairpin loopback, resolver answers, peered clients included (e2e-covered)
+  - [x] Increment 3 — v6 guest autoconfiguration: userspace RA (M=1) + per-veth DHCPv6 server in the agent handing out the exact pinned `/128` (Linux ignores a /128 PIO — vm-provisioning.md Q2 answered empirically), closes [#8](../../issues/8) for addresses; the v6-VPC-on-v4-cluster *DNS transport* still waits on cross-family (e2e: RA route received + the stock DHCPv6 client leased the pinned address)
 - [ ] Name-based addressing / system-view DNS re-point — `control-plane.md` §5 (the split-horizon resolver in [services-in-vpc.md](services-in-vpc.md) is its first concrete piece)
 
 ## 4. IPv6 / dual-stack

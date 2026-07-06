@@ -38,6 +38,7 @@ type fakeState struct {
 	eps   map[string][]Endpoint        // ns/name -> endpoints (pre-filtered per VPC in tests via vpcOf)
 	vpcOf map[string]sdnv1alpha1.VPCRef
 	peers map[sdnv1alpha1.VPCRef][]sdnv1alpha1.VPCRef
+	svips map[string]net.IP // ns/name -> VIP
 }
 
 func (f *fakeState) PortByFabricIP(ip string) *sdnv1alpha1.Port { return f.ports[ip] }
@@ -49,6 +50,9 @@ func (f *fakeState) Endpoints(ns, name string, vpc sdnv1alpha1.VPCRef) []Endpoin
 	return append([]Endpoint(nil), f.eps[ns+"/"+name]...)
 }
 func (f *fakeState) Peers(vpc sdnv1alpha1.VPCRef) []sdnv1alpha1.VPCRef { return f.peers[vpc] }
+func (f *fakeState) ServiceVIPFor(ns, name string, vpc sdnv1alpha1.VPCRef) net.IP {
+	return f.svips[ns+"/"+name]
+}
 
 func headless(ns, name, vpcAnno string, ports ...corev1.ServicePort) *corev1.Service {
 	return &corev1.Service{
@@ -220,6 +224,45 @@ func TestExternalNameForwarded(t *testing.T) {
 	}
 	if m.Authoritative {
 		t.Fatalf("external name must not be answered authoritatively")
+	}
+}
+
+func TestClusterIPServiceAnswersVIP(t *testing.T) {
+	r := testResolver()
+	st := r.State.(*fakeState)
+	st.svcs["team-a/db"] = &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   "team-a",
+			Name:        "db",
+			Annotations: map[string]string{sdnv1alpha1.AnnotationVPC: "team-a/vpc-a"},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: "10.96.55.1", // the cluster ClusterIP must never be answered
+			Ports:     []corev1.ServicePort{{Name: "client", Protocol: corev1.ProtocolTCP, Port: 2379}},
+		},
+	}
+	st.svips = map[string]net.IP{"team-a/db": net.ParseIP("192.168.0.254")}
+	m := query(t, r, "10.244.1.5", "db.team-a.svc.cluster.local", dns.TypeA)
+	got := answers(m)
+	if len(got) != 1 || got[0] != "192.168.0.254" {
+		t.Fatalf("want the ServiceVIP, got %v", got)
+	}
+	// SRV form targets the service name with the service port.
+	m = query(t, r, "10.244.1.5", "_client._tcp.db.team-a.svc.cluster.local", dns.TypeSRV)
+	srv, ok := m.Answer[0].(*dns.SRV)
+	if !ok || srv.Port != 2379 || srv.Target != "db.team-a.svc.cluster.local." {
+		t.Fatalf("SRV answer wrong: %v", m.Answer)
+	}
+}
+
+func TestClusterIPWithoutVIPIsNXDomain(t *testing.T) {
+	r := testResolver()
+	st := r.State.(*fakeState)
+	st.svcs["team-a/pending"] = headless("team-a", "pending", "team-a/vpc-a")
+	st.svcs["team-a/pending"].Spec.ClusterIP = "10.96.55.2" // non-headless, no VIP yet
+	m := query(t, r, "10.244.1.5", "pending.team-a.svc.cluster.local", dns.TypeA)
+	if m.Rcode != dns.RcodeNameError {
+		t.Fatalf("want NXDOMAIN while no VIP is allocated, got %v", dns.RcodeToString[m.Rcode])
 	}
 }
 

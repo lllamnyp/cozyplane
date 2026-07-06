@@ -59,6 +59,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&ExternalPoolList{},
 		&FloatingIP{},
 		&FloatingIPList{},
+		&ServiceVIP{},
+		&ServiceVIPList{},
 	)
 
 	return nil

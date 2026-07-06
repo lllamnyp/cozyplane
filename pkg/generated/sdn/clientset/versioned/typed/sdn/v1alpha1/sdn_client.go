@@ -31,6 +31,7 @@ type SdnV1alpha1Interface interface {
 	ExternalPoolsGetter
 	FloatingIPsGetter
 	PortsGetter
+	ServiceVIPsGetter
 	VPCsGetter
 	VPCBindingsGetter
 	VPCPeeringsGetter
@@ -51,6 +52,10 @@ func (c *SdnV1alpha1Client) FloatingIPs(namespace string) FloatingIPInterface {
 
 func (c *SdnV1alpha1Client) Ports() PortInterface {
 	return newPorts(c)
+}
+
+func (c *SdnV1alpha1Client) ServiceVIPs() ServiceVIPInterface {
+	return newServiceVIPs(c)
 }
 
 func (c *SdnV1alpha1Client) VPCs(namespace string) VPCInterface {

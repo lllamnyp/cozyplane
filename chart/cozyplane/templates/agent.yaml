@@ -47,6 +47,12 @@ rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["floatingips"]
     verbs: ["get", "list", "watch"]
+  # ServiceVIPs: the agent programs the svc_vips datapath map from them, the
+  # resolver answers attached ClusterIP services with the VIP, and the CNI
+  # plugin counts them as used addresses when claiming a Port IP.
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["servicevips"]
+    verbs: ["get", "list", "watch"]
   # The split-horizon resolver (responder container) answers headless Services
   # annotated into a VPC from their EndpointSlices; the agent reads the
   # kube-system/kube-dns Service to discover the cluster DNS address.

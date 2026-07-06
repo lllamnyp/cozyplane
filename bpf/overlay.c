@@ -35,6 +35,13 @@
 #define TC_ACT_SHOT 2
 #define LINK_LOCAL_GW 0xA9FE0101 // 169.254.1.1 (host order)
 
+// The hairpin loopback: when a ServiceVIP backend dials its own service and
+// selects itself, the client half is SNAT'd to this address so the two
+// directions of the flow stay distinguishable inside one pod. Never routed —
+// the whole flow lives on one veth (out and straight back in).
+#define SVC_LOOPBACK 0xA9FE2A01 // 169.254.42.1 (host order)
+#define SVC_LOOPBACK6 { { 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2a, 0x01 } }
+
 // ARP over Ethernet/IPv4 (the 28-byte payload after the Ethernet header).
 struct arp_eth {
 	__be16 htype;
@@ -517,6 +524,97 @@ struct {
 	__uint(max_entries, 65536);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } dns_ct SEC(".maps");
+
+// ---- ServiceVIP maps (docs/services-in-vpc.md increment 2) ----------------
+// A ServiceVIP is the ClusterIP-equivalent inside a VPC: an address from the
+// VPC's own space that from_pod DNATs to a backend VPC IP. Keys are net-scoped
+// like everything else, so overlapping CIDRs never collide, and a peered
+// client resolves the vip under the service's net (its scope maps the peer's
+// CIDR to that net).
+
+#define SVC_MAX_BACKENDS 16
+
+struct svc_key {
+	__u32 net; // the service's net (the VPC that owns the VIP)
+	struct addr128 vip;
+	__u8 proto;
+	__u8 pad;
+	__u16 port; // service port, network order
+};
+
+struct svc_backend {
+	struct addr128 ip; // backend VPC IP
+	__u16 port;        // target port, network order
+	__u16 pad;
+};
+
+struct svc_val {
+	__u32 n;
+	struct svc_backend be[SVC_MAX_BACKENDS];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct svc_key);
+	__type(value, struct svc_val);
+	__uint(max_entries, 16384);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} svc_vips SEC(".maps");
+
+// svc_fwd pins an established flow to its backend (a rebalance must not move
+// mid-flow TCP), keyed by the client's view of the connection. Scoped to the
+// CLIENT's net: the entry is written and read only on the client's node.
+struct svc_fwd_key {
+	__u32 net; // the client's net
+	__u8 proto;
+	__u8 pad;
+	__u16 cport; // client source port, network order
+	struct addr128 client;
+	struct addr128 vip;
+	__u16 vport; // service port, network order
+	__u16 pad2;
+};
+
+struct svc_fwd_val {
+	struct addr128 backend;
+	__u16 tport;   // target port, network order
+	__u16 hairpin; // 1 when backend == client (loopback-SNAT applied)
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__type(key, struct svc_fwd_key);
+	__type(value, struct svc_fwd_val);
+	__uint(max_entries, 262144);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} svc_fwd SEC(".maps");
+
+// svc_rev reverses the reply: backend:tport -> client becomes vip:vport ->
+// client at the client's to_pod (or, hairpin, at the client's own from_pod).
+struct svc_rev_key {
+	__u32 net; // the client's net
+	__u8 proto;
+	__u8 pad;
+	__u16 cport;
+	struct addr128 backend;
+	struct addr128 client;
+	__u16 tport;
+	__u16 pad2;
+};
+
+struct svc_rev_val {
+	struct addr128 vip;
+	__u16 vport;
+	__u16 pad;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__type(key, struct svc_rev_key);
+	__type(value, struct svc_rev_val);
+	__uint(max_entries, 262144);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} svc_rev SEC(".maps");
 
 static __always_inline __u32 cfg(__u32 idx)
 {
@@ -2074,6 +2172,180 @@ static __always_inline int masq_reverse6(struct __sk_buff *skb, struct pkt *p)
 
 // cozyplane_from_pod: source-side hook (pod egress). Enforces isolation, then
 // delivers: same-node via redirect, cross-node via encap, off-VPC via gateway.
+// ---- ServiceVIP load balancing (services-in-vpc.md increment 2) -----------
+// A VPC pod's connection to a ServiceVIP is DNAT'd to a backend VPC IP at the
+// client's from_pod (after admission — same net or peered) and rev-SNAT'd back
+// to the VIP at the client's to_pod. Backend choice is pinned per flow
+// (svc_fwd) so a backend-set change never moves an established connection;
+// the reverse entry (svc_rev) lives on the client's node, where both
+// directions of the flow are guaranteed to pass.
+
+#define SVC_MISS -1
+
+static __always_inline __u32 svc_hash(const struct pkt *p, __u16 sport, __u16 dport)
+{
+	__u32 a, b;
+	__builtin_memcpy(&a, &p->src.b[12], 4);
+	__builtin_memcpy(&b, &p->dst.b[12], 4);
+	return a ^ (b << 1) ^ ((__u32)sport << 16) ^ dport ^ p->proto;
+}
+
+// svc_forward: DNAT an admitted vip:vport packet to backend:tport. On a hit
+// p->dst is updated so the caller's delivery continues toward the backend;
+// a hairpin (backend == client) additionally SNATs the source to the
+// loopback. Returns SVC_MISS when the destination is not a VIP.
+static __always_inline int svc_forward(struct __sk_buff *skb, struct pkt *p, __u32 srcnet, __u32 dstnet)
+{
+	if (p->proto != IPPROTO_TCP && p->proto != IPPROTO_UDP)
+		return SVC_MISS;
+	if (!p->is_v6) {
+		struct iphdr *ip;
+		if (parse_ipv4(skb, &ip) < 0 || ip->ihl != 5)
+			return SVC_MISS;
+	}
+	__u16 sport, dport;
+	if (p->is_v6 ? l4_ports6(skb, &sport, &dport) < 0
+		     : l4_ports(skb, &sport, &dport) < 0)
+		return SVC_MISS;
+
+	struct svc_key sk = { .net = dstnet, .vip = p->dst, .proto = p->proto, .port = dport };
+	struct svc_val *sv = bpf_map_lookup_elem(&svc_vips, &sk);
+	if (!sv || !sv->n)
+		return SVC_MISS;
+
+	struct addr128 backend;
+	__u16 tport, hairpin;
+	struct svc_fwd_key fk = { .net = srcnet, .proto = p->proto, .cport = sport,
+				  .client = p->src, .vip = p->dst, .vport = dport };
+	struct svc_fwd_val *pin = bpf_map_lookup_elem(&svc_fwd, &fk);
+	if (pin) {
+		backend = pin->backend;
+		tport = pin->tport;
+		hairpin = pin->hairpin;
+	} else {
+		__u32 n = sv->n;
+		if (!n)
+			return SVC_MISS;
+		if (n > SVC_MAX_BACKENDS)
+			n = SVC_MAX_BACKENDS;
+		__u32 idx = svc_hash(p, sport, dport) % n;
+		// Bound the index with an AND the compiler cannot elide (a plain
+		// `if (idx >= MAX)` is provably dead to clang — idx < n <= MAX — so
+		// it gets optimized out and the verifier never sees a bound on the
+		// map-value pointer math). The asm emits a real BPF instruction.
+		asm volatile("%0 &= %1" : "+r"(idx) : "i"(SVC_MAX_BACKENDS - 1));
+		backend = sv->be[idx].ip;
+		tport = sv->be[idx].port;
+		hairpin = addr128_eq(&backend, &p->src) ? 1 : 0;
+		struct svc_fwd_val fv = { .backend = backend, .tport = tport, .hairpin = hairpin };
+		bpf_map_update_elem(&svc_fwd, &fk, &fv, BPF_ANY);
+		struct svc_rev_key rk = { .net = srcnet, .proto = p->proto, .cport = sport,
+					  .backend = backend, .client = p->src, .tport = tport };
+		struct svc_rev_val rv = { .vip = p->dst, .vport = dport };
+		bpf_map_update_elem(&svc_rev, &rk, &rv, BPF_ANY);
+	}
+
+	if (p->is_v6) {
+		struct addr128 odst = p->dst, nb = backend;
+		nat_addr6(skb, p->proto, IP6_DADDR_OFF, &odst, &nb);
+		if (dport != tport)
+			nat_port6(skb, p->proto, L4_DPORT_OFF6, dport, tport);
+		if (hairpin) {
+			struct addr128 osrc = p->src, lp = SVC_LOOPBACK6;
+			nat_addr6(skb, p->proto, IP6_SADDR_OFF, &osrc, &lp);
+		}
+	} else {
+		nat_addr(skb, p->proto, IP_DADDR_OFF, v4_of_128(&p->dst), v4_of_128(&backend));
+		if (dport != tport)
+			nat_port(skb, p->proto, L4_DPORT_OFF, dport, tport);
+		if (hairpin)
+			nat_addr(skb, p->proto, IP_SADDR_OFF, v4_of_128(&p->src), bpf_htonl(SVC_LOOPBACK));
+	}
+	p->dst = backend; // delivery continues toward the backend
+	return 0;
+}
+
+// svc_return: the reply half, at the client's to_pod — backend:tport back to
+// vip:vport. A hit is sanctioned (the forward direction was admitted).
+static __always_inline int svc_return(struct __sk_buff *skb, struct pkt *p, __u32 dstnet)
+{
+	if (!dstnet)
+		return SVC_MISS;
+	if (p->proto != IPPROTO_TCP && p->proto != IPPROTO_UDP)
+		return SVC_MISS;
+	if (!p->is_v6) {
+		struct iphdr *ip;
+		if (parse_ipv4(skb, &ip) < 0 || ip->ihl != 5)
+			return SVC_MISS;
+	}
+	__u16 sport, dport;
+	if (p->is_v6 ? l4_ports6(skb, &sport, &dport) < 0
+		     : l4_ports(skb, &sport, &dport) < 0)
+		return SVC_MISS;
+
+	struct svc_rev_key rk = { .net = dstnet, .proto = p->proto, .cport = dport,
+				  .backend = p->src, .client = p->dst, .tport = sport };
+	struct svc_rev_val *rv = bpf_map_lookup_elem(&svc_rev, &rk);
+	if (!rv)
+		return SVC_MISS;
+
+	if (p->is_v6) {
+		struct addr128 osrc = p->src, vip = rv->vip;
+		nat_addr6(skb, p->proto, IP6_SADDR_OFF, &osrc, &vip);
+		if (sport != rv->vport)
+			nat_port6(skb, p->proto, L4_SPORT_OFF6, sport, rv->vport);
+	} else {
+		__u32 vip4 = v4_of_128(&rv->vip);
+		nat_addr(skb, p->proto, IP_SADDR_OFF, v4_of_128(&p->src), vip4);
+		if (sport != rv->vport)
+			nat_port(skb, p->proto, L4_SPORT_OFF, sport, rv->vport);
+	}
+	return TC_ACT_OK;
+}
+
+// svc_hairpin_reverse: the reply of a self-dial, at the pod's own from_pod —
+// the server half answers to the loopback; restore vip:vport -> client and
+// deliver straight back into the same pod.
+static __always_inline int svc_hairpin_reverse(struct __sk_buff *skb, struct pkt *p, __u32 srcnet)
+{
+	if (p->proto != IPPROTO_TCP && p->proto != IPPROTO_UDP)
+		return TC_ACT_SHOT;
+	if (!p->is_v6) {
+		struct iphdr *ip;
+		if (parse_ipv4(skb, &ip) < 0 || ip->ihl != 5)
+			return TC_ACT_SHOT;
+	}
+	__u16 sport, dport;
+	if (p->is_v6 ? l4_ports6(skb, &sport, &dport) < 0
+		     : l4_ports(skb, &sport, &dport) < 0)
+		return TC_ACT_SHOT;
+
+	// Hairpin means client == backend == this pod (the packet's source).
+	struct svc_rev_key rk = { .net = srcnet, .proto = p->proto, .cport = dport,
+				  .backend = p->src, .client = p->src, .tport = sport };
+	struct svc_rev_val *rv = bpf_map_lookup_elem(&svc_rev, &rk);
+	if (!rv)
+		return TC_ACT_SHOT; // loopback-addressed with no flow: nothing legitimate
+
+	struct addr128 client = p->src;
+	if (p->is_v6) {
+		struct addr128 osrc = p->src, vip = rv->vip, odst = p->dst, ncl = client;
+		nat_addr6(skb, p->proto, IP6_SADDR_OFF, &osrc, &vip);
+		if (sport != rv->vport)
+			nat_port6(skb, p->proto, L4_SPORT_OFF6, sport, rv->vport);
+		nat_addr6(skb, p->proto, IP6_DADDR_OFF, &odst, &ncl);
+	} else {
+		nat_addr(skb, p->proto, IP_SADDR_OFF, v4_of_128(&p->src), v4_of_128(&rv->vip));
+		if (sport != rv->vport)
+			nat_port(skb, p->proto, L4_SPORT_OFF, sport, rv->vport);
+		nat_addr(skb, p->proto, IP_DADDR_OFF, v4_of_128(&p->dst), v4_of_128(&client));
+	}
+	struct endpoint *l = local_of(srcnet, client);
+	if (!l)
+		return TC_ACT_SHOT;
+	return deliver_local(skb, l);
+}
+
 // ---- VPC DNS steering (split-horizon resolver) ----------------------------
 // A VPC pod's query to the cluster DNS address cannot be answered by kube-dns
 // (unreachable from a VPC by design); it is steered to the node-local
@@ -2271,6 +2543,12 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	if (p.is_v6 && addr128_eq(&p.dst, &gw6))
 		return bridge_reverse6(skb, &p, srcnet);
 
+	// A self-dialled ServiceVIP's reply half answers to the hairpin loopback;
+	// like fe80::1 above, checked before the link-scoped bypass.
+	struct addr128 svclp6 = SVC_LOOPBACK6;
+	if (p.is_v6 && addr128_eq(&p.dst, &svclp6))
+		return svc_hairpin_reverse(skb, &p, srcnet);
+
 	// v6 link-local / multicast (the pod resolving its on-link gateway via NDP,
 	// router solicitations, …) is link-scoped: hand it to the kernel so the host
 	// veth answers, never overlay-deliver it or subject it to isolation.
@@ -2304,6 +2582,10 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 		// the north-south bridge: un-NAT it and deliver on the default network.
 		if (ip->daddr == bpf_htonl(LINK_LOCAL_GW))
 			return bridge_reverse(skb, ip, srcnet);
+		// A self-dialled ServiceVIP's reply half answers to the hairpin
+		// loopback: restore vip -> client and re-deliver into the pod.
+		if (ip->daddr == bpf_htonl(SVC_LOOPBACK))
+			return svc_hairpin_reverse(skb, &p, srcnet);
 		// Off-net traffic from a floating pod egresses from its public IP (both
 		// its replies and the connections it originates): SNAT VPC->public and
 		// redirect out the uplink, dropping cluster-internal destinations.
@@ -2344,14 +2626,30 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 		return encap(skb, srcnet, g->node_ip, 0);
 	}
 
-	// Same-node destination: redirect through the pod's veth egress (-> to_pod).
-	struct endpoint *l = local_of(dstnet, p.dst);
-	if (l) {
-		// A gateway forwarding into its VPC may carry an off-VPC source (the
-		// internet's reply); mark it so the destination's anti-spoof admits it.
-		if (is_gw)
-			skb->mark = GW_MARK;
-		return deliver_local(skb, l);
+	// ServiceVIP: an admitted packet (same net or peered) whose destination is
+	// a VIP of the destination net is DNAT'd to a backend VPC IP here — the
+	// rewrite updates p.dst, so the delivery below simply carries on toward
+	// the backend. A miss leaves the packet untouched.
+	if (srcnet && !is_gw)
+		svc_forward(skb, &p, srcnet, dstnet);
+
+	// Same-node destination: redirect through the pod's veth egress (-> to_pod)
+	// — VPC nets only. Default-network (net 0) traffic is delivered by the
+	// kernel, as the model requires: a direct redirect would bypass netfilter,
+	// and with it kube-proxy's conntrack — a ClusterIP reply from a same-node
+	// backend then reaches the client still carrying the backend's source,
+	// never un-DNAT'd, and the client's socket discards it. (Latent since M0;
+	// surfaced whenever the scheduler co-located a client with its coredns.)
+	if (dstnet) {
+		struct endpoint *l = local_of(dstnet, p.dst);
+		if (l) {
+			// A gateway forwarding into its VPC may carry an off-VPC source
+			// (the internet's reply); mark it so the destination's anti-spoof
+			// admits it.
+			if (is_gw)
+				skb->mark = GW_MARK;
+			return deliver_local(skb, l);
+		}
 	}
 
 	// Remote destination in the same network (or a peer): encapsulate.
@@ -2413,6 +2711,10 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 		// A masqueraded reply already carries the gateway source; allow it.
 		if (ip->saddr == bpf_htonl(LINK_LOCAL_GW))
 			return TC_ACT_OK;
+		// The forward half of a hairpinned ServiceVIP self-dial carries the
+		// loopback source (from_pod SNAT'd it); it never leaves the veth.
+		if (ip->saddr == bpf_htonl(SVC_LOOPBACK))
+			return TC_ACT_OK;
 	}
 
 	// The forward half of the v6 fabric bridge: destination is a v6 fabric IP ->
@@ -2439,6 +2741,14 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 	__u32 *dp = bpf_map_lookup_elem(&ports, &ifindex);
 	if (dp)
 		dstnet = PORT_NET(*dp);
+
+	// A ServiceVIP backend's reply re-enters the client here: restore
+	// backend:tport -> vip:vport. A hit is sanctioned — the forward direction
+	// was admitted at the client's from_pod (same net or peered).
+	int sr = svc_return(skb, &p, dstnet);
+	if (sr != SVC_MISS)
+		return sr;
+
 	// Recover the source's network from the destination's scope (symmetric to
 	// from_pod): its own CIDR or a peer's under this pod's network.
 	__u32 srcnet = net_of(&networks, dstnet, p.src);

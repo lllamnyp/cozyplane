@@ -363,3 +363,107 @@ type FloatingIP struct {
 	Spec   FloatingIPSpec
 	Status FloatingIPStatus
 }
+
+// ServiceVIPPhase is the lifecycle phase of a ServiceVIP.
+type ServiceVIPPhase string
+
+const (
+	// ServiceVIPPhasePending means the VIP is allocated but has no live
+	// backends yet (or the Service has none ready).
+	ServiceVIPPhasePending ServiceVIPPhase = "Pending"
+	// ServiceVIPPhaseReady means the VIP has at least one live backend and is
+	// programmed in the datapath.
+	ServiceVIPPhaseReady ServiceVIPPhase = "Ready"
+)
+
+// ServiceRef references a Kubernetes Service by namespace and name.
+type ServiceRef struct {
+	// Namespace of the Service.
+	Namespace string
+	// Name of the Service.
+	Name string
+}
+
+// VIPPort is one service port the VIP serves.
+type VIPPort struct {
+	// Name of the service port (may be empty for a single unnamed port).
+	Name string
+	// Protocol is TCP or UDP.
+	Protocol string
+	// Port is the service port the VIP listens on.
+	Port int32
+}
+
+// VIPBackendPort is one resolved (service port -> target port) pair on a
+// backend.
+type VIPBackendPort struct {
+	// Protocol is TCP or UDP.
+	Protocol string
+	// Port is the service port on the VIP.
+	Port int32
+	// TargetPort is the resolved numeric port on the backend.
+	TargetPort int32
+}
+
+// VIPBackend is one ready backend of the service, resolved to its Port's VPC
+// address.
+type VIPBackend struct {
+	// IP is the backend's VPC IP (never the fabric IP).
+	IP string
+	// Ports are the resolved per-port targets on this backend.
+	Ports []VIPBackendPort
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// ServiceVIPList is a list of ServiceVIP objects.
+type ServiceVIPList struct {
+	metav1.TypeMeta
+	metav1.ListMeta
+
+	Items []ServiceVIP
+}
+
+// ServiceVIPSpec is the materialized ClusterIP-equivalent of a Service
+// attached to a VPC.
+type ServiceVIPSpec struct {
+	// VPCRef identifies the VPC this VIP belongs to (owner namespace + name).
+	VPCRef VPCRef
+
+	// IP is the virtual address allocated from the VPC's own address space.
+	IP string
+
+	// ServiceRef is the Kubernetes Service this VIP fronts.
+	ServiceRef ServiceRef
+
+	// Ports are the service ports the VIP serves.
+	Ports []VIPPort
+}
+
+// ServiceVIPStatus is the observed state of a ServiceVIP.
+type ServiceVIPStatus struct {
+	// Backends are the ready endpoints resolved to same-VPC Port addresses;
+	// the agents program the datapath from this list.
+	Backends []VIPBackend
+
+	// Phase is the current lifecycle phase.
+	Phase ServiceVIPPhase
+
+	// Conditions represent the latest available observations.
+	Conditions []metav1.Condition
+}
+
+// +genclient
+// +genclient:nonNamespaced
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// ServiceVIP is the ClusterIP-equivalent of a Service inside a VPC: a virtual
+// address from the VPC's own space, load-balanced to backend VPC IPs by the
+// datapath, discovered only through the split-horizon resolver.
+type ServiceVIP struct {
+	metav1.TypeMeta
+	metav1.ObjectMeta
+
+	Spec   ServiceVIPSpec
+	Status ServiceVIPStatus
+}

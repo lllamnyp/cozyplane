@@ -1,9 +1,11 @@
-# Services in a VPC — per-VPC VIPs & split-horizon DNS (design draft)
+# Services in a VPC — per-VPC VIPs & split-horizon DNS
 
-**Status: DRAFT — not implemented.** Prioritized ahead of the kube-proxy
-replacement work ([kube-proxy-replacement.md](kube-proxy-replacement.md)); the
-per-packet service NAT designed here is the foundation that draft's increment 3
-later builds on.
+**Status: IMPLEMENTED (increments 1–3).** Reviewed 2026-07-06 and built the
+same week; the per-increment as-built notes are inline below. Prioritized
+ahead of the kube-proxy replacement work
+([kube-proxy-replacement.md](kube-proxy-replacement.md)); the per-packet
+service NAT built here is the foundation that draft's increment 3 later
+builds on.
 
 ## The problem
 
@@ -89,12 +91,14 @@ Two kinds now draw from one per-net IP keyspace, and a Port and a
    live-read (APIReader, per the VNI-duplicate lesson) **union of claims
    across both kinds**, serialized per VPC where the allocation happens
    in-process.
-2. **Fail closed at the API.** In aggregated mode, the Port and ServiceVIP
-   create/update strategies share one validation helper that live-lists both
-   kinds and rejects a duplicate VPC IP — both kinds converge in the one
-   apiserver process, which makes it the natural uniqueness choke point. (CRD
-   mode gets controller-side repair only, consistent with the aggregated
-   server being the direction.)
+2. **Fail closed at the API** *(deferred as-built)*: the registry strategies
+   have no cross-kind reader today, so this layer is not implemented. In its
+   place, **both allocators check the live union** (the controller's VIP walk
+   lists Ports + ServiceVIPs; the CNI's Port claim now also counts
+   ServiceVIPs as used) and they **walk from opposite ends** of the CIDR
+   (Ports bottom-up from `.2`, VIPs top-down from the last address), so a
+   collision requires a nearly-exhausted pool plus a lost race — which layer
+   3 then repairs.
 3. **Deterministic repair backstop.** If a duplicate ever materializes (cache
    lag, CRD mode), **the Port always wins**: Port IPs are workload- and
    VM-pinned identity and immovable, while a VIP is movable *by construction*
@@ -218,8 +222,27 @@ etcd pods (or VM-hosted members) in `vpc-a`, Services annotated into the VPC:
 2. **VIP data plane** — `ServiceVIP` + cross-kind uniqueness, `svc_vips`
    map, DNAT/rev-NAT, attachment + controller. Closes the ClusterIP gap;
    etcd e2e as above.
+   **Implemented** — the controller materializes a cluster-scoped
+   `ServiceVIP` per attached non-headless Service (name `sv<vni>.<ip>` = the
+   atomic claim, VPCBinding-gated like pods), resolves ready endpoints to
+   backend VPC IPs with per-port targets in status, and the agents project
+   them into `svc_vips`. `from_pod` DNATs `vip:port → backend:target` after
+   admission (so peered clients get VIPs too), pins each flow in an LRU ct
+   (a backend-set change never moves established TCP), and the client's
+   `to_pod` rev-SNATs the reply. Self-dials hairpin via a reserved loopback
+   (`169.254.42.1` / `fe80::2a01`) on the pod's own veth. v1 limits: TCP/UDP
+   only (no ICMP-to-VIP, no SCTP), ≤16 backends per port (excess truncated,
+   logged), backend choice is a 5-tuple hash (no maglev/affinity yet).
+   The resolver answers attached ClusterIP services with the VIP (A/AAAA and
+   `_port._proto` SRV); the cluster ClusterIP never appears in a tenant.
 3. **VM resolver config** — ties into vm-provisioning's RA/DHCP so guests
    learn the resolver without manual config.
+   **Implemented** — the agent's userspace RA responder
+   (vm-provisioning.md Part 1, as-built note there): a v6 guest
+   autoconfigures its pinned `/128` by SLAAC and receives RDNSS when a v6
+   resolver path exists; v4 guests already get the cluster DNS from
+   KubeVirt's DHCP, which the steering then serves. The v6-VPC-on-v4-cluster
+   DNS *transport* remains gated on cross-family (#9 / cross-family.md).
 
 ## Review resolutions (2026-07-06)
 

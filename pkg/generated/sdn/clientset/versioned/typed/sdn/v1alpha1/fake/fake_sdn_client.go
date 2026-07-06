@@ -40,6 +40,10 @@ func (c *FakeSdnV1alpha1) Ports() v1alpha1.PortInterface {
 	return newFakePorts(c)
 }
 
+func (c *FakeSdnV1alpha1) ServiceVIPs() v1alpha1.ServiceVIPInterface {
+	return newFakeServiceVIPs(c)
+}
+
 func (c *FakeSdnV1alpha1) VPCs(namespace string) v1alpha1.VPCInterface {
 	return newFakeVPCs(c, namespace)
 }

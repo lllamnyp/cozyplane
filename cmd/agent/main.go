@@ -39,6 +39,7 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -292,6 +293,7 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	// VPC DNS steering (docs/services-in-vpc.md): publish the cluster DNS
 	// address(es) and the node-local resolver port; dns_steer in from_pod
 	// re-addresses VPC pods' queries to the responder. Zero config disables.
+	var rdnss net.IP // v6 resolver address the RA responder advertises
 	if vpcDNS {
 		dns4, dns6 := parseDNSIPs(clusterDNSIPs)
 		if dns4 == nil && dns6 == nil {
@@ -307,12 +309,19 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 				return fmt.Errorf("program resolver port: %w", err)
 			}
 			log.Info("VPC DNS steering enabled", "dnsV4", dns4, "dnsV6", dns6, "resolverPort", datapath.ResolverPort)
+			rdnss = dns6
 		}
 	} else {
 		if err := mgr.SetResolverPort(0); err != nil {
 			log.Warn("clear resolver port", "err", err)
 		}
 	}
+
+	// Router Advertisements for v6 VPC pods (#8): a bridge-bound VM guest
+	// learns its pinned /128, the fe80::1 default route, and (when a v6
+	// resolver path exists) its DNS server — no console, no DHCPv6.
+	go datapath.RunRAResponder(ctx, mtu, rdnss, log)
+
 	log.Info("published node state", "nodeIP", state.NodeIP, "podCIDR", podCIDR, "mtu", mtu)
 
 	if err := watchNodes(ctx, client, mgr, nodeName, log); err != nil {
@@ -332,6 +341,7 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		watchPeerings(ctx, factory, mgr, log)
 		watchGateways(ctx, factory, mgr, nodeName, log)
 		watchFloatingIPs(ctx, factory, mgr, nodeName, log)
+		watchServiceVIPs(ctx, factory, mgr, log)
 		factory.Start(ctx.Done())
 	}
 
@@ -1096,4 +1106,81 @@ func nodePodCIDRs(node *corev1.Node) []string {
 		return []string{node.Spec.PodCIDR}
 	}
 	return nil
+}
+
+// watchServiceVIPs projects every ServiceVIP into the svc_vips datapath map
+// (docs/services-in-vpc.md increment 2). Full-state resync on any ServiceVIP
+// or VPC change — the objects are few and the map diff is cheap.
+func watchServiceVIPs(ctx context.Context, factory sdninformers.SharedInformerFactory, mgr *datapath.Manager, log *slog.Logger) {
+	svips := factory.Sdn().V1alpha1().ServiceVIPs()
+	vpcs := factory.Sdn().V1alpha1().VPCs()
+
+	var mu sync.Mutex
+	resync := func() {
+		mu.Lock()
+		defer mu.Unlock()
+
+		all, err := svips.Lister().List(labels.Everything())
+		if err != nil {
+			log.Error("list servicevips", "err", err)
+			return
+		}
+		var entries []datapath.SvcEntry
+		for _, sv := range all {
+			vpc, err := vpcs.Lister().VPCs(sv.Spec.VPCRef.Namespace).Get(sv.Spec.VPCRef.Name)
+			if err != nil || vpc.Status.VNI == 0 {
+				continue
+			}
+			vip := net.ParseIP(sv.Spec.IP)
+			if vip == nil {
+				continue
+			}
+			for _, p := range sv.Spec.Ports {
+				var proto uint8
+				switch p.Protocol {
+				case "TCP":
+					proto = unix.IPPROTO_TCP
+				case "UDP":
+					proto = unix.IPPROTO_UDP
+				default:
+					continue
+				}
+				var backends []datapath.SvcBackend
+				for _, b := range sv.Status.Backends {
+					for _, bp := range b.Ports {
+						if bp.Protocol != p.Protocol || bp.Port != p.Port {
+							continue
+						}
+						if ip := net.ParseIP(b.IP); ip != nil {
+							backends = append(backends, datapath.SvcBackend{IP: ip, Port: uint16(bp.TargetPort)})
+						}
+					}
+				}
+				if len(backends) > datapath.SvcMaxBackends {
+					log.Warn("service VIP backends truncated", "vip", sv.Name, "have", len(backends), "max", datapath.SvcMaxBackends)
+				}
+				entries = append(entries, datapath.SvcEntry{
+					Net:      uint32(vpc.Status.VNI),
+					VIP:      vip,
+					Proto:    proto,
+					Port:     uint16(p.Port),
+					Backends: backends,
+				})
+			}
+		}
+		if err := mgr.SyncServiceVIPs(entries); err != nil {
+			log.Error("sync service VIPs", "err", err)
+			return
+		}
+	}
+
+	_, _ = svips.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(any) { resync() },
+		UpdateFunc: func(_, _ any) { resync() },
+		DeleteFunc: func(any) { resync() },
+	})
+	_, _ = vpcs.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(any) { resync() },
+		UpdateFunc: func(_, _ any) { resync() },
+	})
 }

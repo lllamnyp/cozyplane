@@ -167,6 +167,86 @@ func RegisterConversions(s *runtime.Scheme) error {
 	}); err != nil {
 		return err
 	}
+	if err := s.AddGeneratedConversionFunc((*ServiceRef)(nil), (*sdn.ServiceRef)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_ServiceRef_To_sdn_ServiceRef(a.(*ServiceRef), b.(*sdn.ServiceRef), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.ServiceRef)(nil), (*ServiceRef)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_ServiceRef_To_v1alpha1_ServiceRef(a.(*sdn.ServiceRef), b.(*ServiceRef), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*ServiceVIP)(nil), (*sdn.ServiceVIP)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_ServiceVIP_To_sdn_ServiceVIP(a.(*ServiceVIP), b.(*sdn.ServiceVIP), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.ServiceVIP)(nil), (*ServiceVIP)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_ServiceVIP_To_v1alpha1_ServiceVIP(a.(*sdn.ServiceVIP), b.(*ServiceVIP), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*ServiceVIPList)(nil), (*sdn.ServiceVIPList)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_ServiceVIPList_To_sdn_ServiceVIPList(a.(*ServiceVIPList), b.(*sdn.ServiceVIPList), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.ServiceVIPList)(nil), (*ServiceVIPList)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_ServiceVIPList_To_v1alpha1_ServiceVIPList(a.(*sdn.ServiceVIPList), b.(*ServiceVIPList), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*ServiceVIPSpec)(nil), (*sdn.ServiceVIPSpec)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_ServiceVIPSpec_To_sdn_ServiceVIPSpec(a.(*ServiceVIPSpec), b.(*sdn.ServiceVIPSpec), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.ServiceVIPSpec)(nil), (*ServiceVIPSpec)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_ServiceVIPSpec_To_v1alpha1_ServiceVIPSpec(a.(*sdn.ServiceVIPSpec), b.(*ServiceVIPSpec), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*ServiceVIPStatus)(nil), (*sdn.ServiceVIPStatus)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_ServiceVIPStatus_To_sdn_ServiceVIPStatus(a.(*ServiceVIPStatus), b.(*sdn.ServiceVIPStatus), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.ServiceVIPStatus)(nil), (*ServiceVIPStatus)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_ServiceVIPStatus_To_v1alpha1_ServiceVIPStatus(a.(*sdn.ServiceVIPStatus), b.(*ServiceVIPStatus), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*VIPBackend)(nil), (*sdn.VIPBackend)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_VIPBackend_To_sdn_VIPBackend(a.(*VIPBackend), b.(*sdn.VIPBackend), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.VIPBackend)(nil), (*VIPBackend)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_VIPBackend_To_v1alpha1_VIPBackend(a.(*sdn.VIPBackend), b.(*VIPBackend), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*VIPBackendPort)(nil), (*sdn.VIPBackendPort)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_VIPBackendPort_To_sdn_VIPBackendPort(a.(*VIPBackendPort), b.(*sdn.VIPBackendPort), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.VIPBackendPort)(nil), (*VIPBackendPort)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_VIPBackendPort_To_v1alpha1_VIPBackendPort(a.(*sdn.VIPBackendPort), b.(*VIPBackendPort), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*VIPPort)(nil), (*sdn.VIPPort)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_VIPPort_To_sdn_VIPPort(a.(*VIPPort), b.(*sdn.VIPPort), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.VIPPort)(nil), (*VIPPort)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_VIPPort_To_v1alpha1_VIPPort(a.(*sdn.VIPPort), b.(*VIPPort), scope)
+	}); err != nil {
+		return err
+	}
 	if err := s.AddGeneratedConversionFunc((*VPC)(nil), (*sdn.VPC)(nil), func(a, b interface{}, scope conversion.Scope) error {
 		return Convert_v1alpha1_VPC_To_sdn_VPC(a.(*VPC), b.(*sdn.VPC), scope)
 	}); err != nil {
@@ -638,6 +718,210 @@ func autoConvert_sdn_PortSpec_To_v1alpha1_PortSpec(in *sdn.PortSpec, out *PortSp
 // Convert_sdn_PortSpec_To_v1alpha1_PortSpec is an autogenerated conversion function.
 func Convert_sdn_PortSpec_To_v1alpha1_PortSpec(in *sdn.PortSpec, out *PortSpec, s conversion.Scope) error {
 	return autoConvert_sdn_PortSpec_To_v1alpha1_PortSpec(in, out, s)
+}
+
+func autoConvert_v1alpha1_ServiceRef_To_sdn_ServiceRef(in *ServiceRef, out *sdn.ServiceRef, s conversion.Scope) error {
+	out.Namespace = in.Namespace
+	out.Name = in.Name
+	return nil
+}
+
+// Convert_v1alpha1_ServiceRef_To_sdn_ServiceRef is an autogenerated conversion function.
+func Convert_v1alpha1_ServiceRef_To_sdn_ServiceRef(in *ServiceRef, out *sdn.ServiceRef, s conversion.Scope) error {
+	return autoConvert_v1alpha1_ServiceRef_To_sdn_ServiceRef(in, out, s)
+}
+
+func autoConvert_sdn_ServiceRef_To_v1alpha1_ServiceRef(in *sdn.ServiceRef, out *ServiceRef, s conversion.Scope) error {
+	out.Namespace = in.Namespace
+	out.Name = in.Name
+	return nil
+}
+
+// Convert_sdn_ServiceRef_To_v1alpha1_ServiceRef is an autogenerated conversion function.
+func Convert_sdn_ServiceRef_To_v1alpha1_ServiceRef(in *sdn.ServiceRef, out *ServiceRef, s conversion.Scope) error {
+	return autoConvert_sdn_ServiceRef_To_v1alpha1_ServiceRef(in, out, s)
+}
+
+func autoConvert_v1alpha1_ServiceVIP_To_sdn_ServiceVIP(in *ServiceVIP, out *sdn.ServiceVIP, s conversion.Scope) error {
+	out.ObjectMeta = in.ObjectMeta
+	if err := Convert_v1alpha1_ServiceVIPSpec_To_sdn_ServiceVIPSpec(&in.Spec, &out.Spec, s); err != nil {
+		return err
+	}
+	if err := Convert_v1alpha1_ServiceVIPStatus_To_sdn_ServiceVIPStatus(&in.Status, &out.Status, s); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Convert_v1alpha1_ServiceVIP_To_sdn_ServiceVIP is an autogenerated conversion function.
+func Convert_v1alpha1_ServiceVIP_To_sdn_ServiceVIP(in *ServiceVIP, out *sdn.ServiceVIP, s conversion.Scope) error {
+	return autoConvert_v1alpha1_ServiceVIP_To_sdn_ServiceVIP(in, out, s)
+}
+
+func autoConvert_sdn_ServiceVIP_To_v1alpha1_ServiceVIP(in *sdn.ServiceVIP, out *ServiceVIP, s conversion.Scope) error {
+	out.ObjectMeta = in.ObjectMeta
+	if err := Convert_sdn_ServiceVIPSpec_To_v1alpha1_ServiceVIPSpec(&in.Spec, &out.Spec, s); err != nil {
+		return err
+	}
+	if err := Convert_sdn_ServiceVIPStatus_To_v1alpha1_ServiceVIPStatus(&in.Status, &out.Status, s); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Convert_sdn_ServiceVIP_To_v1alpha1_ServiceVIP is an autogenerated conversion function.
+func Convert_sdn_ServiceVIP_To_v1alpha1_ServiceVIP(in *sdn.ServiceVIP, out *ServiceVIP, s conversion.Scope) error {
+	return autoConvert_sdn_ServiceVIP_To_v1alpha1_ServiceVIP(in, out, s)
+}
+
+func autoConvert_v1alpha1_ServiceVIPList_To_sdn_ServiceVIPList(in *ServiceVIPList, out *sdn.ServiceVIPList, s conversion.Scope) error {
+	out.ListMeta = in.ListMeta
+	out.Items = *(*[]sdn.ServiceVIP)(unsafe.Pointer(&in.Items))
+	return nil
+}
+
+// Convert_v1alpha1_ServiceVIPList_To_sdn_ServiceVIPList is an autogenerated conversion function.
+func Convert_v1alpha1_ServiceVIPList_To_sdn_ServiceVIPList(in *ServiceVIPList, out *sdn.ServiceVIPList, s conversion.Scope) error {
+	return autoConvert_v1alpha1_ServiceVIPList_To_sdn_ServiceVIPList(in, out, s)
+}
+
+func autoConvert_sdn_ServiceVIPList_To_v1alpha1_ServiceVIPList(in *sdn.ServiceVIPList, out *ServiceVIPList, s conversion.Scope) error {
+	out.ListMeta = in.ListMeta
+	out.Items = *(*[]ServiceVIP)(unsafe.Pointer(&in.Items))
+	return nil
+}
+
+// Convert_sdn_ServiceVIPList_To_v1alpha1_ServiceVIPList is an autogenerated conversion function.
+func Convert_sdn_ServiceVIPList_To_v1alpha1_ServiceVIPList(in *sdn.ServiceVIPList, out *ServiceVIPList, s conversion.Scope) error {
+	return autoConvert_sdn_ServiceVIPList_To_v1alpha1_ServiceVIPList(in, out, s)
+}
+
+func autoConvert_v1alpha1_ServiceVIPSpec_To_sdn_ServiceVIPSpec(in *ServiceVIPSpec, out *sdn.ServiceVIPSpec, s conversion.Scope) error {
+	if err := Convert_v1alpha1_VPCRef_To_sdn_VPCRef(&in.VPCRef, &out.VPCRef, s); err != nil {
+		return err
+	}
+	out.IP = in.IP
+	if err := Convert_v1alpha1_ServiceRef_To_sdn_ServiceRef(&in.ServiceRef, &out.ServiceRef, s); err != nil {
+		return err
+	}
+	out.Ports = *(*[]sdn.VIPPort)(unsafe.Pointer(&in.Ports))
+	return nil
+}
+
+// Convert_v1alpha1_ServiceVIPSpec_To_sdn_ServiceVIPSpec is an autogenerated conversion function.
+func Convert_v1alpha1_ServiceVIPSpec_To_sdn_ServiceVIPSpec(in *ServiceVIPSpec, out *sdn.ServiceVIPSpec, s conversion.Scope) error {
+	return autoConvert_v1alpha1_ServiceVIPSpec_To_sdn_ServiceVIPSpec(in, out, s)
+}
+
+func autoConvert_sdn_ServiceVIPSpec_To_v1alpha1_ServiceVIPSpec(in *sdn.ServiceVIPSpec, out *ServiceVIPSpec, s conversion.Scope) error {
+	if err := Convert_sdn_VPCRef_To_v1alpha1_VPCRef(&in.VPCRef, &out.VPCRef, s); err != nil {
+		return err
+	}
+	out.IP = in.IP
+	if err := Convert_sdn_ServiceRef_To_v1alpha1_ServiceRef(&in.ServiceRef, &out.ServiceRef, s); err != nil {
+		return err
+	}
+	out.Ports = *(*[]VIPPort)(unsafe.Pointer(&in.Ports))
+	return nil
+}
+
+// Convert_sdn_ServiceVIPSpec_To_v1alpha1_ServiceVIPSpec is an autogenerated conversion function.
+func Convert_sdn_ServiceVIPSpec_To_v1alpha1_ServiceVIPSpec(in *sdn.ServiceVIPSpec, out *ServiceVIPSpec, s conversion.Scope) error {
+	return autoConvert_sdn_ServiceVIPSpec_To_v1alpha1_ServiceVIPSpec(in, out, s)
+}
+
+func autoConvert_v1alpha1_ServiceVIPStatus_To_sdn_ServiceVIPStatus(in *ServiceVIPStatus, out *sdn.ServiceVIPStatus, s conversion.Scope) error {
+	out.Backends = *(*[]sdn.VIPBackend)(unsafe.Pointer(&in.Backends))
+	out.Phase = sdn.ServiceVIPPhase(in.Phase)
+	out.Conditions = *(*[]v1.Condition)(unsafe.Pointer(&in.Conditions))
+	return nil
+}
+
+// Convert_v1alpha1_ServiceVIPStatus_To_sdn_ServiceVIPStatus is an autogenerated conversion function.
+func Convert_v1alpha1_ServiceVIPStatus_To_sdn_ServiceVIPStatus(in *ServiceVIPStatus, out *sdn.ServiceVIPStatus, s conversion.Scope) error {
+	return autoConvert_v1alpha1_ServiceVIPStatus_To_sdn_ServiceVIPStatus(in, out, s)
+}
+
+func autoConvert_sdn_ServiceVIPStatus_To_v1alpha1_ServiceVIPStatus(in *sdn.ServiceVIPStatus, out *ServiceVIPStatus, s conversion.Scope) error {
+	out.Backends = *(*[]VIPBackend)(unsafe.Pointer(&in.Backends))
+	out.Phase = ServiceVIPPhase(in.Phase)
+	out.Conditions = *(*[]v1.Condition)(unsafe.Pointer(&in.Conditions))
+	return nil
+}
+
+// Convert_sdn_ServiceVIPStatus_To_v1alpha1_ServiceVIPStatus is an autogenerated conversion function.
+func Convert_sdn_ServiceVIPStatus_To_v1alpha1_ServiceVIPStatus(in *sdn.ServiceVIPStatus, out *ServiceVIPStatus, s conversion.Scope) error {
+	return autoConvert_sdn_ServiceVIPStatus_To_v1alpha1_ServiceVIPStatus(in, out, s)
+}
+
+func autoConvert_v1alpha1_VIPBackend_To_sdn_VIPBackend(in *VIPBackend, out *sdn.VIPBackend, s conversion.Scope) error {
+	out.IP = in.IP
+	out.Ports = *(*[]sdn.VIPBackendPort)(unsafe.Pointer(&in.Ports))
+	return nil
+}
+
+// Convert_v1alpha1_VIPBackend_To_sdn_VIPBackend is an autogenerated conversion function.
+func Convert_v1alpha1_VIPBackend_To_sdn_VIPBackend(in *VIPBackend, out *sdn.VIPBackend, s conversion.Scope) error {
+	return autoConvert_v1alpha1_VIPBackend_To_sdn_VIPBackend(in, out, s)
+}
+
+func autoConvert_sdn_VIPBackend_To_v1alpha1_VIPBackend(in *sdn.VIPBackend, out *VIPBackend, s conversion.Scope) error {
+	out.IP = in.IP
+	out.Ports = *(*[]VIPBackendPort)(unsafe.Pointer(&in.Ports))
+	return nil
+}
+
+// Convert_sdn_VIPBackend_To_v1alpha1_VIPBackend is an autogenerated conversion function.
+func Convert_sdn_VIPBackend_To_v1alpha1_VIPBackend(in *sdn.VIPBackend, out *VIPBackend, s conversion.Scope) error {
+	return autoConvert_sdn_VIPBackend_To_v1alpha1_VIPBackend(in, out, s)
+}
+
+func autoConvert_v1alpha1_VIPBackendPort_To_sdn_VIPBackendPort(in *VIPBackendPort, out *sdn.VIPBackendPort, s conversion.Scope) error {
+	out.Protocol = in.Protocol
+	out.Port = in.Port
+	out.TargetPort = in.TargetPort
+	return nil
+}
+
+// Convert_v1alpha1_VIPBackendPort_To_sdn_VIPBackendPort is an autogenerated conversion function.
+func Convert_v1alpha1_VIPBackendPort_To_sdn_VIPBackendPort(in *VIPBackendPort, out *sdn.VIPBackendPort, s conversion.Scope) error {
+	return autoConvert_v1alpha1_VIPBackendPort_To_sdn_VIPBackendPort(in, out, s)
+}
+
+func autoConvert_sdn_VIPBackendPort_To_v1alpha1_VIPBackendPort(in *sdn.VIPBackendPort, out *VIPBackendPort, s conversion.Scope) error {
+	out.Protocol = in.Protocol
+	out.Port = in.Port
+	out.TargetPort = in.TargetPort
+	return nil
+}
+
+// Convert_sdn_VIPBackendPort_To_v1alpha1_VIPBackendPort is an autogenerated conversion function.
+func Convert_sdn_VIPBackendPort_To_v1alpha1_VIPBackendPort(in *sdn.VIPBackendPort, out *VIPBackendPort, s conversion.Scope) error {
+	return autoConvert_sdn_VIPBackendPort_To_v1alpha1_VIPBackendPort(in, out, s)
+}
+
+func autoConvert_v1alpha1_VIPPort_To_sdn_VIPPort(in *VIPPort, out *sdn.VIPPort, s conversion.Scope) error {
+	out.Name = in.Name
+	out.Protocol = in.Protocol
+	out.Port = in.Port
+	return nil
+}
+
+// Convert_v1alpha1_VIPPort_To_sdn_VIPPort is an autogenerated conversion function.
+func Convert_v1alpha1_VIPPort_To_sdn_VIPPort(in *VIPPort, out *sdn.VIPPort, s conversion.Scope) error {
+	return autoConvert_v1alpha1_VIPPort_To_sdn_VIPPort(in, out, s)
+}
+
+func autoConvert_sdn_VIPPort_To_v1alpha1_VIPPort(in *sdn.VIPPort, out *VIPPort, s conversion.Scope) error {
+	out.Name = in.Name
+	out.Protocol = in.Protocol
+	out.Port = in.Port
+	return nil
+}
+
+// Convert_sdn_VIPPort_To_v1alpha1_VIPPort is an autogenerated conversion function.
+func Convert_sdn_VIPPort_To_v1alpha1_VIPPort(in *sdn.VIPPort, out *VIPPort, s conversion.Scope) error {
+	return autoConvert_sdn_VIPPort_To_v1alpha1_VIPPort(in, out, s)
 }
 
 func autoConvert_v1alpha1_VPC_To_sdn_VPC(in *VPC, out *sdn.VPC, s conversion.Scope) error {

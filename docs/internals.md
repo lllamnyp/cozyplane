@@ -124,9 +124,15 @@ pod's host-side veth** (a pod's egress) and at the **egress of the node uplink**
    `dstnet=0`) is handed to `gateways[srcnet]` — local gateway by redirect
    into its VPC leg, remote by encap to its node — and everything else
    (fabric→VPC, unpeered cross-VPC, no gateway) is **dropped**;
-3. if the destination is a **local pod** (`locals[dst]` hit): rewrite the dst MAC
-   to the pod's MAC and `bpf_redirect` to its veth — same-node delivery *through*
-   the destination's ingress hook, no kernel-routing shortcut;
+3. if the destination is a **local pod in a VPC net** (`dstnet != 0` and
+   `locals[dst]` hits): rewrite the dst MAC to the pod's MAC and `bpf_redirect`
+   to its veth — same-node delivery *through* the destination's ingress hook,
+   no kernel-routing shortcut. **Net 0 is deliberately excluded**: the default
+   network is delivered by the kernel, because a direct redirect bypasses
+   netfilter and with it kube-proxy's conntrack — a ClusterIP reply from a
+   same-node backend would reach the client still carrying the backend's
+   source, never un-DNAT'd (a latent M0 bug, found when the scheduler
+   co-located the e2e client with its coredns);
 4. else if **remote** (`remotes[dst]` hit): rewrite the inner dst MAC to the
    shared overlay MAC, set the Geneve tunnel key (`tunnel_id` = source net id,
    remote = node IP), `bpf_redirect` to the Geneve device;
@@ -363,6 +369,36 @@ non-cluster names forward to the node's own upstreams. The agent publishes
 from its own kubelet-written search path — present despite hostNetwork
 because the DaemonSet runs `ClusterFirstWithHostNet` — with `CLUSTER_DOMAIN`
 as the override.
+
+### ServiceVIPs (ClusterIP inside a VPC)
+
+An attached non-headless Service gets a **ServiceVIP**: an address from the
+VPC's own space (allocated top-down; Ports walk bottom-up), discovered only
+through the split-horizon resolver, and load-balanced entirely in `from_pod`
+([services-in-vpc.md](services-in-vpc.md)):
+
+- **Forward:** after admission (same net or peered — so a peered client uses
+  the peer's VIPs), a TCP/UDP packet to `svc_vips[{net, vip, proto, port}]`
+  is DNAT'd to one of ≤16 backends `{VPC IP, target port}`. The choice is a
+  5-tuple hash **pinned per flow** in `svc_fwd` (LRU) — a backend-set change
+  never moves an established connection — and the reverse entry lands in
+  `svc_rev`, both on the client's node, where both directions of the flow are
+  guaranteed to pass. Delivery then simply continues toward the rewritten
+  destination (locals/remotes/overlay — placement-independent).
+- **Reverse:** the client's `to_pod` looks up `svc_rev` and restores
+  `backend:target → vip:port`; a hit is sanctioned (the forward direction was
+  admitted).
+- **Hairpin:** a backend dialling its own service and selecting itself has
+  its client half SNAT'd to a reserved loopback (`169.254.42.1` /
+  `fe80::2a01`) so the two directions stay distinguishable inside one pod;
+  the whole flow lives on that pod's veth (out and straight back in), and
+  `from_pod` reverses it on the reply.
+
+The agents project ServiceVIPs into `svc_vips` (full-state diff); the
+controller owns allocation (live union of Ports + ServiceVIPs — the CNI's
+Port claim counts VIPs as used, too) and backend resolution (EndpointSlice →
+Port → VPC IP; fabric addresses never appear). A Port always wins an IP
+conflict: the VIP is the movable kind and reallocates.
 
 ### Floating IPs (external north-south)
 

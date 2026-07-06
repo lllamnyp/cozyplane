@@ -45,6 +45,14 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.Port":               schema_cozyplane_api_sdn_v1alpha1_Port(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortList":           schema_cozyplane_api_sdn_v1alpha1_PortList(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortSpec":           schema_cozyplane_api_sdn_v1alpha1_PortSpec(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ServiceRef":         schema_cozyplane_api_sdn_v1alpha1_ServiceRef(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ServiceVIP":         schema_cozyplane_api_sdn_v1alpha1_ServiceVIP(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ServiceVIPList":     schema_cozyplane_api_sdn_v1alpha1_ServiceVIPList(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ServiceVIPSpec":     schema_cozyplane_api_sdn_v1alpha1_ServiceVIPSpec(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ServiceVIPStatus":   schema_cozyplane_api_sdn_v1alpha1_ServiceVIPStatus(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VIPBackend":         schema_cozyplane_api_sdn_v1alpha1_VIPBackend(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VIPBackendPort":     schema_cozyplane_api_sdn_v1alpha1_VIPBackendPort(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VIPPort":            schema_cozyplane_api_sdn_v1alpha1_VIPPort(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPC":                schema_cozyplane_api_sdn_v1alpha1_VPC(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCBinding":         schema_cozyplane_api_sdn_v1alpha1_VPCBinding(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCBindingList":     schema_cozyplane_api_sdn_v1alpha1_VPCBindingList(ref),
@@ -699,6 +707,355 @@ func schema_cozyplane_api_sdn_v1alpha1_PortSpec(ref common.ReferenceCallback) co
 		},
 		Dependencies: []string{
 			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCRef"},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_ServiceRef(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "ServiceRef references a Kubernetes Service by namespace and name.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"namespace": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Namespace of the Service.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"name": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Name of the Service.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"namespace", "name"},
+			},
+		},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_ServiceVIP(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "ServiceVIP is the ClusterIP-equivalent of a Service inside a VPC: a virtual address from the VPC's own space, load-balanced to backend VPC IPs by the datapath, discovered only through the split-horizon resolver.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"metadata": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref(v1.ObjectMeta{}.OpenAPIModelName()),
+						},
+					},
+					"spec": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ServiceVIPSpec"),
+						},
+					},
+					"status": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ServiceVIPStatus"),
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ServiceVIPSpec", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ServiceVIPStatus", v1.ObjectMeta{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_ServiceVIPList(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "ServiceVIPList contains a list of ServiceVIP.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"metadata": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref(v1.ListMeta{}.OpenAPIModelName()),
+						},
+					},
+					"items": {
+						SchemaProps: spec.SchemaProps{
+							Type: []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ServiceVIP"),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"items"},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ServiceVIP", v1.ListMeta{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_ServiceVIPSpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "ServiceVIPSpec is the materialized ClusterIP-equivalent of a Service attached to a VPC (docs/services-in-vpc.md).\n\nThe controller creates one per attached non-headless Service (the pod->Port idiom: the Service carries the sdn.cozystack.io/vpc annotation, the system materializes this object). Like a Port, it is cluster-scoped and its name encodes the VPC's VNI and the VIP (sv<vni>.<ip-with-dashes>), so creating it is an atomic claim on that address among ServiceVIPs; cross-kind uniqueness against Ports is enforced by the shared allocator view and the registry (a Port always wins a conflict — the VIP is the movable kind, nothing addresses it except through a DNS answer).",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"vpcRef": {
+						SchemaProps: spec.SchemaProps{
+							Description: "VPCRef identifies the VPC this VIP belongs to (owner namespace + name).",
+							Default:     map[string]interface{}{},
+							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCRef"),
+						},
+					},
+					"ip": {
+						SchemaProps: spec.SchemaProps{
+							Description: "IP is the virtual address allocated from the VPC's own address space.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"serviceRef": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ServiceRef is the Kubernetes Service this VIP fronts.",
+							Default:     map[string]interface{}{},
+							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ServiceRef"),
+						},
+					},
+					"ports": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Ports are the service ports the VIP serves.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VIPPort"),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"vpcRef", "ip", "serviceRef"},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ServiceRef", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VIPPort", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCRef"},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_ServiceVIPStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "ServiceVIPStatus is the observed state of a ServiceVIP.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"backends": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Backends are the ready endpoints resolved to same-VPC Port addresses; the agents program the datapath from this list.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VIPBackend"),
+									},
+								},
+							},
+						},
+					},
+					"phase": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Phase is the current lifecycle phase.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"conditions": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"type",
+								},
+								"x-kubernetes-list-type": "map",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "Conditions represent the latest available observations.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref(v1.Condition{}.OpenAPIModelName()),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VIPBackend", v1.Condition{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_VIPBackend(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "VIPBackend is one ready backend of the service, resolved to its Port's VPC address.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"ip": {
+						SchemaProps: spec.SchemaProps{
+							Description: "IP is the backend's VPC IP (never the fabric IP).",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"ports": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Ports are the resolved per-port targets on this backend.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VIPBackendPort"),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"ip"},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VIPBackendPort"},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_VIPBackendPort(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "VIPBackendPort is one resolved (service port -> target port) pair on a backend.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"protocol": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Protocol is TCP or UDP.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"port": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Port is the service port on the VIP.",
+							Default:     0,
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"targetPort": {
+						SchemaProps: spec.SchemaProps{
+							Description: "TargetPort is the resolved numeric port on the backend.",
+							Default:     0,
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+				},
+				Required: []string{"protocol", "port", "targetPort"},
+			},
+		},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_VIPPort(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "VIPPort is one service port the VIP serves.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"name": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Name of the service port (may be empty for a single unnamed port).",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"protocol": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Protocol is TCP or UDP.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"port": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Port is the service port the VIP listens on.",
+							Default:     0,
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+				},
+				Required: []string{"protocol", "port"},
+			},
+		},
 	}
 }
 

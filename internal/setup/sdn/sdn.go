@@ -24,6 +24,7 @@ import (
 	externalpoolstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/externalpool"
 	floatingipstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/floatingip"
 	portstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/port"
+	servicevipstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/servicevip"
 	vpcstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/vpc"
 	vpcbindingstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/vpcbinding"
 	vpcpeeringstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/vpcpeering"
@@ -72,6 +73,10 @@ func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOpt
 	if err != nil {
 		panic(err)
 	}
+	serviceVIPREST, serviceVIPStatusREST, err := servicevipstorage.NewREST(scheme, restOptionsGetter)
+	if err != nil {
+		panic(err)
+	}
 
 	v1alpha1storage := map[string]rest.Storage{}
 	v1alpha1storage["vpcs"] = vpcREST
@@ -84,6 +89,8 @@ func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOpt
 	v1alpha1storage["externalpools/status"] = externalPoolStatusREST
 	v1alpha1storage["floatingips"] = floatingIPREST
 	v1alpha1storage["floatingips/status"] = floatingIPStatusREST
+	v1alpha1storage["servicevips"] = serviceVIPREST
+	v1alpha1storage["servicevips/status"] = serviceVIPStatusREST
 	apiGroupInfo.VersionedResourcesStorageMap["v1alpha1"] = v1alpha1storage
 
 	return &apiGroupInfo

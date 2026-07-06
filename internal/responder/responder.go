@@ -68,6 +68,9 @@ type State interface {
 	// Peers lists the VPCs actively peered with vpc (VPCPeering halves whose
 	// status is Ready — matched, both VPCs Ready, CIDRs disjoint).
 	Peers(vpc sdnv1alpha1.VPCRef) []sdnv1alpha1.VPCRef
+	// ServiceVIPFor returns the VIP materialized for an attached non-headless
+	// Service within the given VPC, or nil while none is allocated.
+	ServiceVIPFor(ns, name string, vpc sdnv1alpha1.VPCRef) net.IP
 }
 
 // Resolver serves the per-net DNS view.
@@ -150,10 +153,42 @@ func (r *Resolver) authoritative(req *dns.Msg, q dns.Question, qname string, por
 	if svcVPC != port.Spec.VPCRef && !containsVPC(r.State.Peers(port.Spec.VPCRef), svcVPC) {
 		return r.nxdomain(m)
 	}
-	// ClusterIP services await the VIP data plane (increment 2); until then
-	// the name does not resolve inside a VPC.
+	// A non-headless attached Service resolves to its ServiceVIP — the
+	// ClusterIP-equivalent allocated from the VPC's own space, load-balanced
+	// by the datapath. The cluster ClusterIP never appears inside a tenant.
 	if svc.Spec.ClusterIP != corev1.ClusterIPNone {
-		return r.nxdomain(m)
+		vip := r.State.ServiceVIPFor(ns, svcName, svcVPC)
+		if vip == nil || hostname != "" {
+			// No VIP allocated yet, or a per-hostname form (headless-only).
+			return r.nxdomain(m)
+		}
+		if srvProto != "" {
+			for _, p := range svc.Spec.Ports {
+				if !strings.EqualFold(p.Name, srvPort) || !strings.EqualFold(string(p.Protocol), srvProto) {
+					continue
+				}
+				if q.Qtype == dns.TypeSRV || q.Qtype == dns.TypeANY {
+					m.Answer = append(m.Answer, &dns.SRV{
+						Hdr:    dns.RR_Header{Name: req.Question[0].Name, Rrtype: dns.TypeSRV, Class: dns.ClassINET, Ttl: ttl},
+						Weight: 100,
+						Port:   uint16(p.Port),
+						Target: dns.Fqdn(fmt.Sprintf("%s.%s.svc.%s", svcName, ns, r.Domain)),
+					})
+				}
+				if rr := addrRecord(dns.Fqdn(fmt.Sprintf("%s.%s.svc.%s", svcName, ns, r.Domain)), dns.TypeA, vip); rr != nil {
+					m.Extra = append(m.Extra, rr)
+				}
+				if rr := addrRecord(dns.Fqdn(fmt.Sprintf("%s.%s.svc.%s", svcName, ns, r.Domain)), dns.TypeAAAA, vip); rr != nil {
+					m.Extra = append(m.Extra, rr)
+				}
+			}
+		} else {
+			addAddr(m, q, req.Question[0].Name, vip)
+		}
+		if len(m.Answer) == 0 {
+			m.Ns = append(m.Ns, r.soa())
+		}
+		return m
 	}
 
 	// Backends resolve within the service's own VPC (for a peered query, the

@@ -130,6 +130,18 @@ func run() error {
 	}); err != nil {
 		return err
 	}
+	svipInf := sdnFactory.Sdn().V1alpha1().ServiceVIPs().Informer()
+	if err := svipInf.AddIndexers(cache.Indexers{
+		svcIndex: func(obj any) ([]string, error) {
+			sv, ok := obj.(*sdnv1alpha1.ServiceVIP)
+			if !ok {
+				return nil, nil
+			}
+			return []string{sv.Spec.ServiceRef.Namespace + "/" + sv.Spec.ServiceRef.Name}, nil
+		},
+	}); err != nil {
+		return err
+	}
 	portInf := sdnFactory.Sdn().V1alpha1().Ports().Informer()
 	if err := portInf.AddIndexers(cache.Indexers{
 		fabricIPIndex: func(obj any) ([]string, error) {
@@ -171,11 +183,11 @@ func run() error {
 
 	sdnFactory.Start(stop)
 	kubeFactory.Start(stop)
-	if !cache.WaitForCacheSync(stop, portInf.HasSynced, svcInf.HasSynced, epsInf.HasSynced, peeringInf.HasSynced) {
+	if !cache.WaitForCacheSync(stop, portInf.HasSynced, svcInf.HasSynced, epsInf.HasSynced, peeringInf.HasSynced, svipInf.HasSynced) {
 		return fmt.Errorf("informer caches did not sync")
 	}
 
-	state := &informerState{ports: portInf.GetIndexer(), svcs: svcInf.GetIndexer(), eps: epsInf.GetIndexer(), peerings: peeringInf.GetIndexer()}
+	state := &informerState{ports: portInf.GetIndexer(), svcs: svcInf.GetIndexer(), eps: epsInf.GetIndexer(), peerings: peeringInf.GetIndexer(), svips: svipInf.GetIndexer()}
 	res := &responder.Resolver{Domain: domain, Upstreams: upstreams, State: state}
 
 	var wg sync.WaitGroup
@@ -247,6 +259,24 @@ type informerState struct {
 	svcs     cache.Indexer
 	eps      cache.Indexer
 	peerings cache.Indexer
+	svips    cache.Indexer
+}
+
+// ServiceVIPFor returns the VIP materialized for the service in the given
+// VPC, nil while none exists (the controller may still be allocating).
+func (s *informerState) ServiceVIPFor(ns, name string, vpc sdnv1alpha1.VPCRef) net.IP {
+	objs, err := s.svips.ByIndex(svcIndex, ns+"/"+name)
+	if err != nil {
+		return nil
+	}
+	for _, obj := range objs {
+		sv, ok := obj.(*sdnv1alpha1.ServiceVIP)
+		if !ok || sv.Spec.VPCRef != vpc {
+			continue
+		}
+		return net.ParseIP(sv.Spec.IP)
+	}
+	return nil
 }
 
 // Peers lists the VPCs actively peered with vpc: its namespace holds one half

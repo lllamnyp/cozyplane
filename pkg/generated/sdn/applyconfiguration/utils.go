@@ -52,6 +52,20 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &sdnv1alpha1.PortApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("PortSpec"):
 		return &sdnv1alpha1.PortSpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("ServiceRef"):
+		return &sdnv1alpha1.ServiceRefApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("ServiceVIP"):
+		return &sdnv1alpha1.ServiceVIPApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("ServiceVIPSpec"):
+		return &sdnv1alpha1.ServiceVIPSpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("ServiceVIPStatus"):
+		return &sdnv1alpha1.ServiceVIPStatusApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VIPBackend"):
+		return &sdnv1alpha1.VIPBackendApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VIPBackendPort"):
+		return &sdnv1alpha1.VIPBackendPortApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VIPPort"):
+		return &sdnv1alpha1.VIPPortApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPC"):
 		return &sdnv1alpha1.VPCApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPCBinding"):

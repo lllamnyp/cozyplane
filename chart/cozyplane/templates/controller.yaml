@@ -51,6 +51,20 @@ rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["externalpools"]
     verbs: ["get", "list", "watch"]
+  # ServiceVIPs: materialize one per attached Service, allocate the VIP,
+  # resolve backends from Services/EndpointSlices (services-in-vpc.md).
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["servicevips"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["servicevips/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
   # Egress gateway Deployments (spec.egress.natGateway -> per-VPC gateway pod).
   - apiGroups: ["apps"]
     resources: ["deployments"]

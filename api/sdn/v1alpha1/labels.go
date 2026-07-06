@@ -37,6 +37,12 @@ const (
 	LabelVPC = "sdn.cozystack.io/vpc"
 	// LabelVPCNamespace is the referenced VPC's (owner) namespace.
 	LabelVPCNamespace = "sdn.cozystack.io/vpc-namespace"
+	// LabelServiceNamespace and LabelServiceName identify the Kubernetes
+	// Service a ServiceVIP fronts (mirroring the pod labels on a Port), so a
+	// service's VIP is found by label selection.
+	LabelServiceNamespace = "sdn.cozystack.io/service-namespace"
+	LabelServiceName      = "sdn.cozystack.io/service-name"
+
 	// LabelPodNamespace is the attached pod's namespace (the consumer side).
 	LabelPodNamespace = "sdn.cozystack.io/pod-namespace"
 	// LabelPodName is the attached pod's name.

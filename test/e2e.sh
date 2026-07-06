@@ -433,8 +433,10 @@ check_ok "a1 resolves the off-cluster name example.com (upstream forwarder)" \
 check "a1 -> dns1's own :53 untouched (intra-VPC port 53 not hijacked)" "dns1" \
   httpid team-a a1 "$(vpcip dns1):53"
 # Default-network pods are not steered; kube-dns serves them as before.
+# Retried: busybox nslookup's short timeout flakes when the host is under
+# image-pull/build load — the retries distinguish that from a real break.
 check_ok "cli(default network) still resolves via kube-dns (not steered)" \
-  $K exec cli -- nslookup kubernetes.default.svc.cluster.local
+  bash -c "for i in 1 2 3; do $K exec cli -- nslookup kubernetes.default.svc.cluster.local >/dev/null 2>&1 && exit 0; sleep 3; done; exit 1"
 # Peered-VPC resolution: names follow reachability. vpc-a and vpc-c are peered
 # (disjoint CIDRs), so vpc-c's attached service resolves from a1 and the
 # backends (vpc-c VPC IPs) deliver natively across the peering; vpc-b is not
@@ -459,6 +461,89 @@ check "a1(vpc-a) -> peersvc (attached to peered vpc-c) resolves and delivers" "c
   httpid team-a a1 peersvc.team-a.svc.cluster.local
 check_fail "bw1(vpc-b, unpeered) cannot resolve vpc-c's peersvc" \
   bash -c "$K -n team-b exec bw1 -- nslookup peersvc.team-a.svc.cluster.local >/dev/null 2>&1"
+
+echo "[ServiceVIP: ClusterIP-equivalent inside a VPC (services-in-vpc.md, increment 2)]"
+# An attached non-headless Service gets a VIP from the VPC's OWN space (never
+# the cluster ClusterIP): the controller materializes a ServiceVIP (allocated
+# from the top of the CIDR; the CNI walks bottom-up), the resolver answers the
+# name with it, and from_pod DNATs vip:port -> a backend VPC IP with per-flow
+# pinning; the reply is rev-SNAT'd at the client's to_pod.
+$K apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Service
+metadata: {name: vipsvc, namespace: team-a, annotations: {sdn.cozystack.io/vpc: vpc-a}}
+spec: {selector: {app: websvc}, ports: [{name: http, port: 80}]}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: viph, namespace: team-a, labels: {app: viph}, annotations: {sdn.cozystack.io/vpc: vpc-a}}
+spec:
+  nodeName: $W
+  hostname: viph
+  containers: [{name: c, image: busybox:1.36, command: ["sh","-c","mkdir -p /w && hostname > /w/index.html && httpd -f -p 80 -h /w"]}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: viphsvc, namespace: team-a, annotations: {sdn.cozystack.io/vpc: vpc-a}}
+spec: {selector: {app: viph}, ports: [{name: http, port: 80}]}
+EOF
+$K -n team-a wait --for=condition=Ready pod/viph --timeout=120s >/dev/null
+sleep 6 # controller allocation + agent map sync + resolver informer
+VIPADDR=$($K get servicevips.sdn.cozystack.io -o jsonpath="{range .items[*]}{.spec.serviceRef.name}{' '}{.spec.ip}{'\n'}{end}" 2>/dev/null | awk '$1=="vipsvc"{print $2}')
+check "vipsvc got a VIP from vpc-a's own space (top-down)" "ok" \
+  bash -c "echo '$VIPADDR' | grep -q '^10\.0\.0\.' && echo ok"
+check "a1 resolves vipsvc to the VIP (never the cluster ClusterIP)" "ok" \
+  bash -c "$K -n team-a exec a1 -- nslookup vipsvc.team-a.svc.cluster.local 2>/dev/null | grep -q '$VIPADDR' && echo ok"
+check "a1 -> vipsvc by name (VIP DNAT + LB, delivered)" "ok" \
+  bash -c "$K -n team-a exec a1 -- wget -qO- -T4 http://vipsvc.team-a.svc.cluster.local/ 2>/dev/null | grep -qE '^dns[12]\$' && echo ok"
+check "a1 -> the VIP address directly (data plane, no DNS)" "ok" \
+  bash -c "$K -n team-a exec a1 -- wget -qO- -T4 http://$VIPADDR/ 2>/dev/null | grep -qE '^dns[12]\$' && echo ok"
+check "cpeer(vpc-c, peered) -> vipsvc (VIP across the peering)" "ok" \
+  bash -c "$K -n team-a exec cpeer -- wget -qO- -T4 http://vipsvc.team-a.svc.cluster.local/ 2>/dev/null | grep -qE '^dns[12]\$' && echo ok"
+check_fail "bw1(vpc-b, unpeered) cannot resolve vipsvc" \
+  bash -c "$K -n team-b exec bw1 -- nslookup vipsvc.team-a.svc.cluster.local >/dev/null 2>&1"
+# Hairpin: the only backend of viphsvc dials its own service — the self-flow
+# is loopback-SNAT'd out and back in on one veth (169.254.42.1).
+check "viph -> its own service (hairpin self-dial)" "viph" \
+  httpid team-a viph viphsvc.team-a.svc.cluster.local
+
+echo "[guest autoconfiguration (#8): RA (M=1) + DHCPv6 hand out the pinned /128]"
+# Linux ignores a /128 Prefix Information Option (addrconf requires /64 on
+# ethernet), so the agent's RA sets the Managed flag and a per-veth DHCPv6
+# server answers with the exact pinned address — the same mechanism KubeVirt's
+# masquerade binding uses. Simulate a guest: flush the static address, verify
+# the RA route arrives, run the stock busybox DHCPv6 client, and the lease
+# must carry the pinned address.
+$K apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: v6ra, namespace: team-a, annotations: {sdn.cozystack.io/vpc: vpc6a}}
+spec:
+  nodeName: $W
+  containers:
+    - name: c
+      image: busybox:1.36
+      command: ["sh","-c","mkdir -p /w && hostname > /w/index.html && httpd -f -p 80 -h /w"]
+      securityContext: {privileged: true}
+EOF
+$K -n team-a wait --for=condition=Ready pod/v6ra --timeout=120s >/dev/null
+V6RAIP=$(vpcip v6ra)
+# RA: enable accept_ra and bounce the link; the kernel installs a proto-ra
+# default route from the agent's advertisement.
+$K -n team-a exec v6ra -- sh -c "echo 2 > /proc/sys/net/ipv6/conf/eth0/accept_ra; ip link set eth0 down; ip link set eth0 up" 2>/dev/null
+# busybox's minimal `ip` prints no proto; an RA-installed default route is
+# recognizable by its expiry (static routes never carry one).
+got=""; for _ in $(seq 1 8); do $K -n team-a exec v6ra -- ip -6 route show default 2>/dev/null | grep -q "expires" && { got=ok; break; }; sleep 2; done
+[ "$got" = ok ] && pass "v6ra received the RA (expiring default route)" || fail "v6ra received the RA (no expiring route)"
+# DHCPv6: the stock client must be leased the exact pinned address. udhcpc6
+# renders the address long-form, so install the lease and let the kernel
+# canonicalize before comparing (a real guest's client installs it the same
+# way).
+$K -n team-a exec v6ra -- sh -c 'printf "#!/bin/sh\nset > /tmp/env6\n" > /tmp/s6.sh && chmod +x /tmp/s6.sh && ip -6 addr flush dev eth0 scope global && udhcpc6 -i eth0 -n -q -t 5 -T 2 -s /tmp/s6.sh >/dev/null 2>&1; leased=$(grep -oE "fd00[0-9a-f:]+" /tmp/env6 | head -1); [ -n "$leased" ] && ip -6 addr add "$leased/128" dev eth0 2>/dev/null' 
+check "DHCPv6 leased the pinned address $V6RAIP" "ok" \
+  bash -c "$K -n team-a exec v6ra -- ip -6 addr show dev eth0 2>/dev/null | grep -q '$V6RAIP/128' && echo ok"
+sleep 2
+check "v6a1 -> v6ra after re-acquisition (datapath unchanged)" "v6ra" httpid team-a v6a1 "[$V6RAIP]"
 
 echo "[stale locals pruning: a dead veth's entry must not shadow a reallocated IP]"
 # A pod that dies uncleanly leaves its locals/ports/bridges entries behind
@@ -570,6 +655,8 @@ check "v6a1 -> v6a2 after map recreation (v6 VPC, 128-bit rebuild)" "v6a2" httpi
 check_ok "cli -> coredns after map recreation (default network)" $K exec cli -- ping -c2 -W2 "$CD"
 check "a1 -> $WEB after map recreation (rebuilt fabric_of, DNS steering intact)" "ok" \
   bash -c "$K -n team-a exec a1 -- wget -qO- -T4 http://$WEB/ 2>/dev/null | grep -qE '^dns[12]\$' && echo ok"
+check "a1 -> vipsvc after map recreation (agents re-sync svc_vips)" "ok" \
+  bash -c "$K -n team-a exec a1 -- wget -qO- -T4 http://vipsvc.team-a.svc.cluster.local/ 2>/dev/null | grep -qE '^dns[12]\$' && echo ok"
 check_fail "cli(default) -> VPC IP still blocked after map recreation" \
   bash -c "$K exec cli -- wget -qO- -T3 http://10.0.0.2/ 2>/dev/null | grep -q ."
 

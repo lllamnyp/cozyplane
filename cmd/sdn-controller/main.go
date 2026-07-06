@@ -168,6 +168,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := (&sdncontroller.ServiceVIPReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Reader: mgr.GetAPIReader(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "ServiceVIP")
+		os.Exit(1)
+	}
+
 	if gatewayImage != "" {
 		if gatewayNamespace == "" {
 			setupLog.Error(nil, "--gateway-namespace (or POD_NAMESPACE) is required with --gateway-image")
