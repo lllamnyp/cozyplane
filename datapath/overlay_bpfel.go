@@ -61,6 +61,14 @@ type overlayCtRevVal struct {
 	Pad        uint16
 }
 
+type overlayDnsCtKey struct {
+	_      structs.HostLayout
+	Proto  uint8
+	Pad    uint8
+	Sport  uint16
+	Fabric overlayAddr128
+}
+
 type overlayEndpoint struct {
 	_       structs.HostLayout
 	Ifindex uint32
@@ -101,6 +109,7 @@ const (
 	overlayMapBridges               = "bridges"
 	overlayMapCtFwd                 = "ct_fwd"
 	overlayMapCtRev                 = "ct_rev"
+	overlayMapDnsCt                 = "dns_ct"
 	overlayMapDnsIps                = "dns_ips"
 	overlayMapFabricOf              = "fabric_of"
 	overlayMapFloating              = "floating"
@@ -177,6 +186,7 @@ type overlayMapSpecs struct {
 	Bridges        *ebpf.MapSpec `ebpf:"bridges"`
 	CtFwd          *ebpf.MapSpec `ebpf:"ct_fwd"`
 	CtRev          *ebpf.MapSpec `ebpf:"ct_rev"`
+	DnsCt          *ebpf.MapSpec `ebpf:"dns_ct"`
 	DnsIps         *ebpf.MapSpec `ebpf:"dns_ips"`
 	FabricOf       *ebpf.MapSpec `ebpf:"fabric_of"`
 	Floating       *ebpf.MapSpec `ebpf:"floating"`
@@ -223,6 +233,7 @@ type overlayMaps struct {
 	Bridges        *ebpf.Map `ebpf:"bridges"`
 	CtFwd          *ebpf.Map `ebpf:"ct_fwd"`
 	CtRev          *ebpf.Map `ebpf:"ct_rev"`
+	DnsCt          *ebpf.Map `ebpf:"dns_ct"`
 	DnsIps         *ebpf.Map `ebpf:"dns_ips"`
 	FabricOf       *ebpf.Map `ebpf:"fabric_of"`
 	Floating       *ebpf.Map `ebpf:"floating"`
@@ -245,6 +256,7 @@ func (m *overlayMaps) Close() error {
 		m.Bridges,
 		m.CtFwd,
 		m.CtRev,
+		m.DnsCt,
 		m.DnsIps,
 		m.FabricOf,
 		m.Floating,

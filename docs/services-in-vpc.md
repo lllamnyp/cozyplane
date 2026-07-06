@@ -189,10 +189,17 @@ etcd pods (or VM-hosted members) in `vpc-a`, Services annotated into the VPC:
    resolver (shared with metadata), DNS interception in `from_pod`, headless
    answers as VPC IPs, non-cluster names forwarded upstream. Already unblocks
    etcd *peer* traffic and all name-based intra-VPC addressing. kind-testable.
-   **Implemented** — `dns_steer`/`dns_return` in the datapath (stateless both
-   ways; the pod's fabric IP is the rewritten source and the per-Port identity
-   handle), `cmd/responder` as an unprivileged second container in the agent
-   DaemonSet, e2e-covered. As-built details: internals.md § "VPC DNS steering".
+   **Implemented and validated on dev4 (2026-07-06)** — `dns_steer`/`dns_return`
+   in the datapath (the pod's fabric IP is the rewritten source and the
+   per-Port identity handle), `cmd/responder` as an unprivileged second
+   container in the agent DaemonSet, e2e-covered on kind (kube-proxy) and
+   validated on dev4 (Talos + Cilium KPR): headless answers as VPC IPs with
+   same-node and cross-node delivery, per-hostname records, UDP + TCP, upstream
+   forwarding via the node resolvers, authoritative NXDOMAIN across tenants,
+   and the running VM untouched by the upgrade. As-built details: internals.md
+   § "VPC DNS steering" — including the `dns_ct` twist that makes steering
+   work under a socket-LB kube-proxy replacement (Cilium KPR forces socket LB
+   on, so the wire destination is a backend, not the ClusterIP).
    Known limitation: a VPC pod whose fabric IP is the *other* family (the
    fabric-family fallback) has no same-family handle and is not steered — the
    v6-VPC-on-v4-cluster case additionally needs the RA/RDNSS work (#8) before

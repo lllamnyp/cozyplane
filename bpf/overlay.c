@@ -494,6 +494,30 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } fabric_of SEC(".maps");
 
+// dns_ct records a steered query's original wire destination, keyed by the
+// rewritten flow's unambiguous half ({proto, pod sport, fabric IP}), so
+// dns_return can restore it as the reply's source. Needed because a socket-LB
+// kube-proxy replacement (Cilium KPR forces socket LB on) translates the
+// cluster DNS ClusterIP to a backend pod address *at connect() time* — the
+// wire packet carries the backend, the pod's connected socket expects the
+// reply to come from that exact backend, and the cgroup recvmsg hook
+// translates it back to the ClusterIP for the application. Under a plain
+// kube-proxy the recorded destination is simply the ClusterIP itself.
+struct dns_ct_key {
+	__u8 proto;
+	__u8 pad;
+	__u16 sport; // the pod's source port, network order
+	struct addr128 fabric;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__type(key, struct dns_ct_key);
+	__type(value, struct addr128);
+	__uint(max_entries, 65536);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} dns_ct SEC(".maps");
+
 static __always_inline __u32 cfg(__u32 idx)
 {
 	__u32 *v = bpf_map_lookup_elem(&params, &idx);
@@ -2096,15 +2120,29 @@ static __always_inline int dns_steer(struct __sk_buff *skb, struct pkt *p, __u32
 	if (dport != bpf_htons(53))
 		return DNS_MISS;
 
+	// The query's wire destination is the cluster DNS address — or, under a
+	// socket-LB kube-proxy replacement that already translated the ClusterIP
+	// at connect() time, one of its backends: any *cluster-internal* :53 the
+	// pod cannot legitimately reach is the cluster resolver in some form. A
+	// tenant's DNS to an off-cluster server (via its egress gateway) never
+	// matches; in-VPC :53 never even gets here (dstnet != 0).
 	__u32 fam = p->is_v6 ? 1 : 0;
 	struct addr128 *dns = bpf_map_lookup_elem(&dns_ips, &fam);
-	if (!dns || addr128_zero(dns) || !addr128_eq(dns, &p->dst))
+	if (!dns || addr128_zero(dns))
+		return DNS_MISS;
+	if (!addr128_eq(dns, &p->dst) && !is_internal(p->dst))
 		return DNS_MISS;
 
 	struct local_key fk = { .net = srcnet, .ip = p->src };
 	struct addr128 *fabp = bpf_map_lookup_elem(&fabric_of, &fk);
 	if (!fabp)
 		return DNS_MISS; // no same-family fabric handle: fall through (drop/gateway)
+
+	// Remember the original destination: the reply must appear to come from
+	// it (a connected socket filters on it, and the socket-LB reverse hook
+	// translates it back to the ClusterIP for the application).
+	struct dns_ct_key ck = { .proto = p->proto, .sport = sport, .fabric = *fabp };
+	bpf_map_update_elem(&dns_ct, &ck, &p->dst, BPF_ANY);
 
 	if (p->is_v6) {
 		__u32 zero = 0;
@@ -2169,20 +2207,32 @@ static __always_inline int dns_return(struct __sk_buff *skb, struct pkt *p)
 	if (!be)
 		return DNS_MISS;
 
-	__u32 fam = p->is_v6 ? 1 : 0;
-	struct addr128 *dns = bpf_map_lookup_elem(&dns_ips, &fam);
-	if (!dns || addr128_zero(dns))
-		return DNS_MISS;
+	// Restore the query's original wire destination as the reply source (the
+	// ClusterIP, or the backend a socket-LB KPR had translated it to). On an
+	// LRU eviction fall back to the cluster DNS address — correct for every
+	// non-socket-LB deployment.
+	struct addr128 orig;
+	struct dns_ct_key ck = { .proto = p->proto, .sport = dport, .fabric = p->dst };
+	struct addr128 *op = bpf_map_lookup_elem(&dns_ct, &ck);
+	if (op) {
+		orig = *op;
+	} else {
+		__u32 fam = p->is_v6 ? 1 : 0;
+		struct addr128 *dns = bpf_map_lookup_elem(&dns_ips, &fam);
+		if (!dns || addr128_zero(dns))
+			return DNS_MISS;
+		orig = *dns;
+	}
 
 	if (p->is_v6) {
-		struct addr128 dnsa = *dns, vpc = be->vpc_ip;
-		nat_addr6(skb, p->proto, IP6_SADDR_OFF, &p->src, &dnsa);
+		struct addr128 vpc = be->vpc_ip;
+		nat_addr6(skb, p->proto, IP6_SADDR_OFF, &p->src, &orig);
 		nat_addr6(skb, p->proto, IP6_DADDR_OFF, &p->dst, &vpc);
 		nat_port6(skb, p->proto, L4_SPORT_OFF6, bpf_htons(rport), bpf_htons(53));
 		return TC_ACT_OK;
 	}
 	__u32 vpc4 = v4_of_128(&be->vpc_ip);
-	nat_addr(skb, p->proto, IP_SADDR_OFF, v4_of_128(&p->src), v4_of_128(dns));
+	nat_addr(skb, p->proto, IP_SADDR_OFF, v4_of_128(&p->src), v4_of_128(&orig));
 	nat_addr(skb, p->proto, IP_DADDR_OFF, v4_of_128(&p->dst), vpc4);
 	nat_port(skb, p->proto, L4_SPORT_OFF, bpf_htons(rport), bpf_htons(53));
 	return TC_ACT_OK;

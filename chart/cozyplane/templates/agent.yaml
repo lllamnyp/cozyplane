@@ -165,6 +165,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: CLUSTER_DOMAIN
+              value: {{ .Values.clusterDomain | quote }}
             # Forward external names to the node's own upstreams, not the
             # cluster DNS the pod-level dnsPolicy would hand us.
             - name: RESOLV_CONF

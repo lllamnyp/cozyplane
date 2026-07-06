@@ -329,9 +329,24 @@ Both halves are **stateless** (no ct entry, no port allocation):
 - **`dns_return` (to_pod):** the resolver's reply (`nodeIP:15353 →
   fabricIP:sport`, routed back by the fabric `/32`) is recognized by its
   reserved source port (below the masquerade/NodePort/ephemeral ranges, so a
-  kubelet probe can never carry it), un-NAT'd via the `bridges` map to
-  `clusterDNS:53 → vpcIP`, and delivered without the ingress isolation check
-  (a sanctioned path, like the bridge).
+  kubelet probe can never carry it), un-NAT'd via the `bridges` map, and
+  delivered without the ingress isolation check (a sanctioned path, like the
+  bridge).
+
+**Socket-LB coexistence (`dns_ct`).** Under a socket-LB kube-proxy replacement
+— and Cilium KPR *forces* socket LB on (`NewKPRConfig` overrides
+`bpf-lb-sock: false`; validated live on dev4) — the ClusterIP is translated to
+a backend pod address at `connect()` time, so the wire packet `from_pod` sees
+carries the backend, not `dns_ips`. The steer therefore also matches any
+**cluster-internal** `:53` destination (`is_internal`; a tenant's DNS to an
+off-cluster server via its gateway never matches, and in-VPC `:53` never gets
+here — `dstnet != 0`), and records the original wire destination in `dns_ct`
+(LRU, keyed `{proto, pod sport, fabric IP}`). `dns_return` restores it as the
+reply's source: the pod's connected socket filters on that exact address, and
+the socket-LB `recvmsg` hook translates it back to the ClusterIP for the
+application. Under a plain kube-proxy the recorded address is simply the
+ClusterIP, so the behaviour is unchanged (LRU eviction falls back to
+`dns_ips`).
 
 The rewritten **fabric source doubles as the per-Port identity handle**: the
 responder (`cmd/responder`, an unprivileged second container in the agent

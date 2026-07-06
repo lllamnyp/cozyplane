@@ -130,6 +130,14 @@ Cilium's map ABI is not.
   (connect-time rewrite happens first; backend-addressed packets simply never
   match `KUBE-SERVICES`). Enable it, watch, then remove kube-proxy when the
   per-packet fallback lands.
+- **Proven interaction, from the DNS-steering work:** Cilium KPR *forces*
+  socket LB on (`NewKPRConfig` overrides `bpf-lb-sock: false` — observed live
+  on dev4: `cil_sock4_connect` attached at the cgroup root despite the
+  ConfigMap). Any cozyplane feature that matches on a ClusterIP at the tc
+  hooks must expect the connect()-time translation instead — the split-horizon
+  DNS steer handles it with a small LRU (`dns_ct`) recording the original wire
+  destination. The same consideration will apply to our own imported socket
+  LB.
 - **Do not enable on clusters running full Cilium** (Cozystack's default
   today): the cgroup root and the `/sys/fs/bpf` pin namespace are already
   Cilium's. This feature targets cozyplane-only clusters; the chart gates it
