@@ -60,14 +60,27 @@ re-learned in `locals` on each bind — internal, never guest-visible.
 target nodes can deliver locally. `remotes` (the cross-node location) must point
 at the **active** node — the one where the VM actually runs.
 
-The active node is the pod whose `kubevirt.io/nodeName` equals its own node. A
-**persistent-Port controller** watches virt-launcher pods and keeps the Port's
-`spec.node`/`spec.nodeIP` = the active pod's node; the agent already turns
-`spec.node` into the `remotes` entry, so the cutover is: KubeVirt sets
-`kubevirt.io/nodeName` on the target → controller flips `spec.node` → every
-agent's `remotes[{net,vpcIP}]` re-points to the target. The VPC IP/MAC never
-change, so the VM and its in-VPC peers see only a sub-second reroute — no
-gratuitous ARP (we own the forwarding tables).
+The active node is where the VM currently runs. A **persistent-Port
+controller** keeps the Port's `spec.node`/`spec.nodeIP` = that node; the agent
+already turns `spec.node` into the `remotes` entry, so the cutover is: the VM
+becomes live on the target → controller flips `spec.node` → every agent's
+`remotes[{net,vpcIP}]` re-points to the target. The VPC IP/MAC never change, so
+the VM and its in-VPC peers see only a sub-second reroute.
+
+**The cutover signal (the Kube-OVN model, as built).** The controller keys on
+the **VirtualMachineInstance's `status.nodeName`** — the phase-explicit signal
+KubeVirt flips to the target at cutover — mirroring how Kube-OVN reads
+`VMI.status.MigrationState` rather than guessing from pod labels. It reads the
+VMI as unstructured (no `kubevirt.io/api` dependency) and watches it only when
+the CRD is served; without KubeVirt it degrades to the launcher pod's
+`kubevirt.io/nodeName` label. The launcher-pod list is still consulted for the
+target's **fabric IP** and for GC. Validated on dev4 with a real `VMIM`
+migration (IP+MAC preserved, cross-VPC 0% loss). Kube-OVN goes one step
+further — it delegates the *instant* of cutover to the guest's RARP via OVN's
+`activation-strategy=rarp`, so the control-plane only opens a dual-bound
+(`requested-chassis=src,target`) window and pins the winner. The cozyplane
+analogs — a source→target forward during the window, and a GARP-triggered
+datapath flip — are the planned next increments (roadmap §5).
 
 **Staged locals (as built):** the target's `locals` entry is gated on the
 cutover, closing the overlap window v1 had. A migration-target ADD (the bound
@@ -101,8 +114,16 @@ before the Port is really removed.
 - IP + MAC preserved; fabric IP (and thus `status.podIP`) changes per pod, and the
   system-view DNS re-point (`control-plane.md` §5) is **later** — name-based
   addressing isn't wired yet, so nothing depends on a stable fabric A record.
-- Not yet: the `/migrate` + `/bind` Port subresources (the controller reconciles
-  `spec.node` directly for now).
+- Cutover follows the VMI's `status.nodeName` (the Kube-OVN model, stage 1 —
+  done). Planned: a source→target forward during the migration window (stage 2)
+  and a GARP-triggered datapath flip (stage 3) to drive the residual cutover
+  gap to zero, the way OVN's `requested-chassis=src,target` +
+  `activation-strategy=rarp` does.
+- Dropped: the `/migrate` + `/bind` Port subresources — investigation of the
+  callers showed the only caller is cozyplane's own controller, and Kube-OVN
+  (the reference) exposes no such API (it sets OVN NB options directly). The
+  authz value didn't justify the API surface; the effort went into the
+  Kube-OVN cutover model instead.
 
 ## Test (dev4, real KubeVirt)
 
