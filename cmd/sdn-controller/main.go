@@ -177,6 +177,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := (&sdncontroller.SecurityGroupReconciler{
+		Client: mgr.GetClient(),
+		Reader: mgr.GetAPIReader(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "SecurityGroup")
+		os.Exit(1)
+	}
+
+	if err := (&sdncontroller.PortMembershipReconciler{
+		Client: mgr.GetClient(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "PortMembership")
+		os.Exit(1)
+	}
+
 	if gatewayImage != "" {
 		if gatewayNamespace == "" {
 			setupLog.Error(nil, "--gateway-namespace (or POD_NAMESPACE) is required with --gateway-image")

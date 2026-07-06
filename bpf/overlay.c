@@ -541,6 +541,135 @@ static __attribute__((noinline)) void count_dir(__u32 net, __u32 len, int rx)
 	}
 }
 
+// Security groups (intra-VPC policy, #7). Enforcement is destination-side, in
+// to_pod — the one delivery hook every east-west path already traverses, so it
+// is placement-independent with no Geneve TLV yet. A port's membership is a
+// bitmap of group ids; id 0 is unused (a zero bitmap = "no groups" = legacy
+// allow-all intra-VPC), real ids run 1..SG_WORLD-1, and SG_WORLD (63) is the
+// reserved pseudo-group for north-south (bridge/floating) sources matched by a
+// cidr rule — so the same "allowed & srcmap" test covers both source kinds.
+#define SG_WORLD 63
+
+// sg_members: (net, VPC IP) -> u64 group bitmap. Absent/zero for both the
+// destination (no groups) short-circuits to allow.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct local_key);
+	__type(value, __u64);
+	__uint(max_entries, 65536);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} sg_members SEC(".maps");
+
+// sg_rules: (net, dst-group, proto, dst-port) -> u64 allowed-source bitmap. A
+// port of 0 is the any-port rule for that (group, proto). The value's bits are
+// source group ids (a group rule) and/or SG_WORLD (a cidr rule).
+struct sg_rule_key {
+	__u32 net;
+	__u16 group; // destination group id
+	__u16 port;  // destination port, network order; 0 = any port
+	__u8 proto;  // IPPROTO_TCP / IPPROTO_UDP
+	__u8 pad[3];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct sg_rule_key);
+	__type(value, __u64);
+	__uint(max_entries, 65536);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} sg_rules SEC(".maps");
+
+// sg_drops meters policy drops per VPC (net), PERCPU and agent-seeded like
+// vpc_counters — the observability the #2 metering foundation wants.
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+	__type(key, __u32); // net (VNI)
+	__type(value, __u64);
+	__uint(max_entries, 4096);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} sg_drops SEC(".maps");
+
+// count_sg_drop bumps a net's policy-drop counter. Stack-free and noinline for
+// the same verifier reasons as count_dir; the agent pre-seeds the entry.
+static __attribute__((noinline)) void count_sg_drop(__u32 net)
+{
+	if (!net)
+		return;
+	__u64 *d = bpf_map_lookup_elem(&sg_drops, &net);
+	if (d)
+		(*d)++;
+}
+
+// sg_query is the fully-initialized argument to sg_admit: a single PTR_TO_STACK
+// keeps the BPF-to-BPF call verifier-friendly (multiple scalar args tripped a
+// register-liveness check on the 6.12 verifier).
+struct sg_query {
+	struct local_key dst; // net + destination VPC IP
+	__u64 srcmap;         // the source's group bitmap (0 = ungrouped/peered)
+	__u16 dport;          // destination port, network order
+	__u8 proto;           // IPPROTO_TCP / IPPROTO_UDP
+	__u8 pad[5];
+};
+
+// sg_admit decides whether the queried packet is permitted. Returns 1 (allow)
+// when the destination is in no group (legacy) or a rule of one of its groups
+// admits the source; 0 (deny) otherwise. Noinline and near-stack-free (one key
+// at a time), so to_pod's already-heavy frame stays within the combined
+// call-stack limit — like count_dir.
+static __attribute__((noinline)) int sg_admit(struct sg_query *q)
+{
+	__u64 *dm = bpf_map_lookup_elem(&sg_members, &q->dst);
+	if (!dm || !*dm)
+		return 1; // destination is in no group -> legacy allow
+	__u64 dstmap = *dm;
+	__u64 allowed = 0;
+	struct sg_rule_key rk = { .net = q->dst.net, .proto = q->proto };
+#pragma unroll
+	for (int g = 1; g < SG_WORLD; g++) {
+		if (!(dstmap & (1ULL << g)))
+			continue;
+		rk.group = g;
+		rk.port = q->dport;
+		__u64 *r = bpf_map_lookup_elem(&sg_rules, &rk);
+		if (r)
+			allowed |= *r;
+		rk.port = 0; // any-port rule for this (group, proto)
+		__u64 *r0 = bpf_map_lookup_elem(&sg_rules, &rk);
+		if (r0)
+			allowed |= *r0;
+	}
+	return (allowed & q->srcmap) ? 1 : 0;
+}
+
+// sg_l4 reads the destination port and decides whether a packet should be gated
+// by security-group rules. TCP is gated only on a *new* connection (SYN set,
+// ACK clear): the reply direction of an admitted flow carries ACK and passes
+// without a connection table, giving AWS-stateful-shaped semantics for TCP with
+// no conntrack. UDP is always gated (stateless — intra-VPC UDP between grouped
+// pods needs symmetric rules). Other protocols are never gated in v1. l4off is
+// the L4 header offset (34 for v4, 54 for v6, no IP options — as l4_ports).
+// Returns 1 to gate (with *dport, network order, set), 0 to skip.
+static __always_inline int sg_l4(struct __sk_buff *skb, __u8 proto, __u32 l4off, __u16 *dport)
+{
+	// Load the port straight into *dport — a __u16 temp gets kept in a
+	// caller-saved register across the flags load-call, which clobbers it
+	// (verifier: R2 !read_ok on a 6.12 kernel).
+	if (proto == IPPROTO_TCP) {
+		__u8 flags;
+		if (bpf_skb_load_bytes(skb, l4off + 2, dport, 2) < 0)
+			return 0;
+		if (bpf_skb_load_bytes(skb, l4off + 13, &flags, 1) < 0)
+			return 0;
+		return (flags & 0x02) && !(flags & 0x10); // SYN && !ACK
+	}
+	if (proto == IPPROTO_UDP) {
+		if (bpf_skb_load_bytes(skb, l4off + 2, dport, 2) < 0)
+			return 0;
+		return 1;
+	}
+	return 0;
+}
+
 // dns_ips holds the cluster DNS ClusterIP per family ([0] = v4 in NAT64 form,
 // [1] = v6). A VPC pod's query to this address is steered to the node-local
 // split-horizon resolver (dns_steer/dns_return). A zero entry disables
@@ -2853,6 +2982,32 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 	if (!nets_allowed(srcnet, dstnet)) {
 		if (!(srcnet == 0 && dstnet != 0 && skb->mark == GW_MARK))
 			return TC_ACT_SHOT;
+	}
+
+	// Security-group ingress (destination-side, #7). Only genuine intra-VPC /
+	// peered pod-to-pod traffic is gated: gateway-forwarded ingress (GW_MARK —
+	// internet/DNS replies) is north-south and stateful-reply territory, left
+	// alone in v1. A peered source is in a disjoint CIDR (peering requires it),
+	// so its members entry lives under another net and misses the lookup here —
+	// srcmap 0 — so a peered source is dropped once the destination is grouped
+	// (AWS-shaped default-deny until a v2 peer-group rule admits it).
+	if (dstnet && skb->mark != GW_MARK) {
+		__u16 dport;
+		__u32 l4off = p.is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
+		if (sg_l4(skb, p.proto, l4off, &dport)) {
+			struct local_key sk = { .net = dstnet, .ip = p.src };
+			__u64 *sm = bpf_map_lookup_elem(&sg_members, &sk);
+			struct sg_query q = {
+				.dst = { .net = dstnet, .ip = p.dst },
+				.srcmap = sm ? *sm : 0,
+				.dport = dport,
+				.proto = p.proto,
+			};
+			if (!sg_admit(&q)) {
+				count_sg_drop(dstnet);
+				return TC_ACT_SHOT;
+			}
+		}
 	}
 
 	// Meter admitted east-west traffic (#2), both directions from this one

@@ -142,7 +142,7 @@ func TestClaimIP_FirstAddressAndPortShape(t *testing.T) {
 	vpc := newVPC("team-a", "tenant-a", 100, "10.10.0.0/24")
 	state := &datapath.AgentState{NodeName: "node1", NodeIP: "192.0.2.1"}
 
-	ip, _, port, _, err := attachPort(client, vpc, "team-a", state, "10.244.0.5", "team-a", "app-1", "uid-1", "")
+	ip, _, port, _, err := attachPort(client, vpc, "team-a", state, "10.244.0.5", "team-a", "app-1", "uid-1", "", "")
 	if err != nil {
 		t.Fatalf("claimIP: %v", err)
 	}
@@ -187,7 +187,7 @@ func TestClaimIP_IPv6(t *testing.T) {
 	vpc := newVPC("team-a", "tenant6", 200, "fd00:a::/64")
 	state := &datapath.AgentState{NodeName: "node1", NodeIP: "192.0.2.1"}
 
-	ip, _, port, _, err := attachPort(client, vpc, "team-a", state, "10.244.0.5", "team-a", "app6", "uid-6", "")
+	ip, _, port, _, err := attachPort(client, vpc, "team-a", state, "10.244.0.5", "team-a", "app6", "uid-6", "", "")
 	if err != nil {
 		t.Fatalf("claimIP v6: %v", err)
 	}
@@ -208,10 +208,10 @@ func TestClaimIP_SkipsUsedAddresses(t *testing.T) {
 	vpc := newVPC("team-a", "tenant-a", 100, "10.10.0.0/24")
 	state := &datapath.AgentState{NodeName: "node1", NodeIP: "192.0.2.1"}
 
-	if _, _, _, _, err := attachPort(client, vpc, "team-a", state, "10.244.0.5", "team-a", "app-1", "uid-1", ""); err != nil {
+	if _, _, _, _, err := attachPort(client, vpc, "team-a", state, "10.244.0.5", "team-a", "app-1", "uid-1", "", ""); err != nil {
 		t.Fatalf("first attachPort: %v", err)
 	}
-	ip, _, _, _, err := attachPort(client, vpc, "team-a", state, "10.244.0.6", "team-a", "app-2", "uid-2", "")
+	ip, _, _, _, err := attachPort(client, vpc, "team-a", state, "10.244.0.6", "team-a", "app-2", "uid-2", "", "")
 	if err != nil {
 		t.Fatalf("second attachPort: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestClaimIP_RetriesOnNameCollision(t *testing.T) {
 	vpc := newVPC("team-a", "tenant-a", 100, "10.10.0.0/24")
 	state := &datapath.AgentState{NodeName: "node1", NodeIP: "192.0.2.1"}
 
-	ip, _, port, _, err := attachPort(client, vpc, "team-a", state, "10.244.0.5", "team-a", "app-1", "uid-1", "")
+	ip, _, port, _, err := attachPort(client, vpc, "team-a", state, "10.244.0.5", "team-a", "app-1", "uid-1", "", "")
 	if err != nil {
 		t.Fatalf("claimIP: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestClaimIP_ExhaustionErrors(t *testing.T) {
 	vpc := newVPC("team-a", "tenant-a", 200, "10.0.0.0/30")
 	state := &datapath.AgentState{NodeName: "node1", NodeIP: "192.0.2.1"}
 
-	if _, _, _, _, err := attachPort(client, vpc, "team-a", state, "10.244.0.5", "team-a", "app-1", "uid-1", ""); err == nil {
+	if _, _, _, _, err := attachPort(client, vpc, "team-a", state, "10.244.0.5", "team-a", "app-1", "uid-1", "", ""); err == nil {
 		t.Fatal("attachPort on exhausted VPC = nil error, want exhaustion error")
 	}
 }

@@ -217,12 +217,19 @@ func cmdAdd(args *skel.CmdArgs) error {
 	// is unreachable, fall back to the default network). A virt-launcher pod also
 	// carries its VM name, which keys the persistent Port (VPC IP + MAC that
 	// survive live migration).
-	vpcAnno, gwAnno, vmName := "", "", ""
+	vpcAnno, gwAnno, vmName, podLabels := "", "", "", ""
 	if core, e := coreClient(); e == nil && podNS != "" && podName != "" {
 		if pod, e := core.CoreV1().Pods(podNS).Get(context.TODO(), podName, metav1.GetOptions{}); e == nil {
 			vpcAnno = pod.Annotations[vpcAnnotation]
 			gwAnno = pod.Annotations[gatewayAnnotation]
 			vmName = pod.Labels[sdnv1alpha1.KubeVirtLabelVMName]
+			// Snapshot the pod's labels for SecurityGroup membership: the
+			// controller resolves Port.status.groups from this claim-time copy.
+			if len(pod.Labels) > 0 {
+				if b, e := json.Marshal(pod.Labels); e == nil {
+					podLabels = string(b)
+				}
+			}
 		}
 	}
 
@@ -231,7 +238,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 			return fmt.Errorf("%s and %s are mutually exclusive: a gateway pod lives on the default network", vpcAnnotation, gatewayAnnotation)
 		}
 		vpcNS, vpcName := parseVPCRef(vpcAnno, podNS)
-		return addVPC(args, conf, vpcNS, vpcName, podNS, podName, podUID, vmName)
+		return addVPC(args, conf, vpcNS, vpcName, podNS, podName, podUID, vmName, podLabels)
 	}
 	result, err := addDefault(args, conf)
 	if err != nil {
@@ -316,7 +323,7 @@ func addDefault(args *skel.CmdArgs, conf *NetConf) (result *current.Result, err 
 // addVPC attaches the pod to a VPC using the dual-address bridge: the pod's
 // interface gets the VPC (tenant) IP, while status.podIP is a unique fabric IP
 // from the node pod CIDR that the bridge DNATs to the VPC IP.
-func addVPC(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, podUID, vmName string) (err error) {
+func addVPC(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, podUID, vmName, podLabels string) (err error) {
 	client, err := sdnClient()
 	if err != nil {
 		return fmt.Errorf("sdn client: %w", err)
@@ -389,7 +396,7 @@ func addVPC(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, p
 
 	// VPC IP + MAC: bind the VM's persistent Port (survives migration) or claim a
 	// fresh one. bound => the Port pre-existed; never delete it on our error.
-	vpcIP, pinnedMAC, port, bound, err := attachPort(client, vpc, vpcNS, state, fabricIP.String(), podNS, podName, podUID, vmName)
+	vpcIP, pinnedMAC, port, bound, err := attachPort(client, vpc, vpcNS, state, fabricIP.String(), podNS, podName, podUID, vmName, podLabels)
 	if err != nil {
 		return err
 	}
@@ -618,7 +625,7 @@ func requireVPCBinding(client sdnclientset.Interface, podNS, vpcNS, vpcName stri
 //     exists (found by the LabelVMName label, not the name) — reusing the pinned
 //     VPC IP + MAC so they survive live migration — or, on the VM's first pod,
 //     creates it (atomic IP claim as above, plus a stable MAC and the VM label).
-func attachPort(client sdnclientset.Interface, vpc *sdnv1alpha1.VPC, vpcNS string, state *datapath.AgentState, fabricIP, podNS, podName, podUID, vmName string) (net.IP, net.HardwareAddr, *sdnv1alpha1.Port, bool, error) {
+func attachPort(client sdnclientset.Interface, vpc *sdnv1alpha1.VPC, vpcNS string, state *datapath.AgentState, fabricIP, podNS, podName, podUID, vmName, podLabels string) (net.IP, net.HardwareAddr, *sdnv1alpha1.Port, bool, error) {
 	_, ipnet, err := net.ParseCIDR(vpc.Spec.CIDRs[0])
 	if err != nil {
 		return nil, nil, nil, false, fmt.Errorf("parse vpc CIDR: %w", err)
@@ -703,13 +710,18 @@ func attachPort(client sdnclientset.Interface, vpc *sdnv1alpha1.VPC, vpcNS strin
 			labels[labelVMName] = vmName
 			spec.MAC = mac.String()
 		}
+		var annotations map[string]string
+		if podLabels != "" {
+			annotations = map[string]string{sdnv1alpha1.AnnotationPodLabels: podLabels}
+		}
 		port := &sdnv1alpha1.Port{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: portName(vpc.Status.VNI, ipStr),
 				// The sever finalizer makes revocation replayable: deletion
 				// completes only after the port's node agent acknowledges.
-				Finalizers: []string{sdnv1alpha1.FinalizerSever},
-				Labels:     labels,
+				Finalizers:  []string{sdnv1alpha1.FinalizerSever},
+				Labels:      labels,
+				Annotations: annotations,
 			},
 			Spec: spec,
 		}

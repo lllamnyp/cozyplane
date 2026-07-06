@@ -102,6 +102,15 @@ type overlayPeerKey struct {
 	DstNet uint32
 }
 
+type overlaySgRuleKey struct {
+	_     structs.HostLayout
+	Net   uint32
+	Group uint16
+	Port  uint16
+	Proto uint8
+	Pad   [3]uint8
+}
+
 type overlaySvcFwdKey struct {
 	_      structs.HostLayout
 	Net    uint32
@@ -192,6 +201,9 @@ const (
 	overlayMapPeers                 = "peers"
 	overlayMapPorts                 = "ports"
 	overlayMapRemotes               = "remotes"
+	overlayMapSgDrops               = "sg_drops"
+	overlayMapSgMembers             = "sg_members"
+	overlayMapSgRules               = "sg_rules"
 	overlayMapSvcFwd                = "svc_fwd"
 	overlayMapSvcRev                = "svc_rev"
 	overlayMapSvcVips               = "svc_vips"
@@ -274,6 +286,9 @@ type overlayMapSpecs struct {
 	Peers          *ebpf.MapSpec `ebpf:"peers"`
 	Ports          *ebpf.MapSpec `ebpf:"ports"`
 	Remotes        *ebpf.MapSpec `ebpf:"remotes"`
+	SgDrops        *ebpf.MapSpec `ebpf:"sg_drops"`
+	SgMembers      *ebpf.MapSpec `ebpf:"sg_members"`
+	SgRules        *ebpf.MapSpec `ebpf:"sg_rules"`
 	SvcFwd         *ebpf.MapSpec `ebpf:"svc_fwd"`
 	SvcRev         *ebpf.MapSpec `ebpf:"svc_rev"`
 	SvcVips        *ebpf.MapSpec `ebpf:"svc_vips"`
@@ -326,6 +341,9 @@ type overlayMaps struct {
 	Peers          *ebpf.Map `ebpf:"peers"`
 	Ports          *ebpf.Map `ebpf:"ports"`
 	Remotes        *ebpf.Map `ebpf:"remotes"`
+	SgDrops        *ebpf.Map `ebpf:"sg_drops"`
+	SgMembers      *ebpf.Map `ebpf:"sg_members"`
+	SgRules        *ebpf.Map `ebpf:"sg_rules"`
 	SvcFwd         *ebpf.Map `ebpf:"svc_fwd"`
 	SvcRev         *ebpf.Map `ebpf:"svc_rev"`
 	SvcVips        *ebpf.Map `ebpf:"svc_vips"`
@@ -354,6 +372,9 @@ func (m *overlayMaps) Close() error {
 		m.Peers,
 		m.Ports,
 		m.Remotes,
+		m.SgDrops,
+		m.SgMembers,
+		m.SgRules,
 		m.SvcFwd,
 		m.SvcRev,
 		m.SvcVips,

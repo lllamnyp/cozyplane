@@ -1,8 +1,12 @@
-# Security groups — intra-VPC policy (design draft, for review)
+# Security groups — intra-VPC policy
 
-**Status: DRAFT — not implemented.** This is the buildable first increment of
-`design.md` §7 ("Network identity & security groups"). Where this doc and §7
-differ, the difference is called out and is a review question, not an accident.
+**Status: v1 implemented and dev4-validated (2026-07-06).** East-west
+(intra-VPC, group-to-group) ingress enforcement is built and validated on a real
+cluster. This is the first increment of `design.md` §7 ("Network identity &
+security groups"). The remaining §7 surface (egress, peered-group references,
+FQDN and specific-CIDR sources, the Geneve identity TLV) is v2 — the v1 shape is
+chosen so those are additive, never a reshape. What v1 does **not** yet do is
+called out inline as "v2".
 
 ## What §7 commits us to
 
@@ -44,13 +48,28 @@ Semantics, deliberately AWS-shaped:
   only by matching ingress rules of the groups it belongs to. Membership in
   multiple groups unions their rules.
 - Rules are **ingress-only in v1**. §7 wants egress too; ingress is where the
-  tenant-facing value is, and egress doubles the datapath work. (Review Q1.)
-- `from.group` references a group in the **same VPC**. Peered-VPC references
-  are v2 (the peers map admits the traffic today; policy across a peering needs
-  identity distribution across tenants — deferred, see Review Q2).
-- `from.cidr` matches the *pre-masquerade* client address for bridged/floating
-  north-south traffic (the datapath knows it — the rewrite happens at the same
-  hook that will enforce). FQDN rules from §7 are out of scope for v1.
+  tenant-facing value is, and egress doubles the datapath work. The `ingress`
+  field name leaves room for an additive `egress` in v2.
+- **Stateful-shaped without a conntrack.** Enforcement gates TCP only on a *new*
+  connection (SYN set, ACK clear); the reply direction of an admitted flow
+  carries ACK and passes untouched. So a rule that admits `client -> web:80`
+  lets `web` answer `client` even though `web`'s own group has no rule for
+  `client` — AWS-stateful semantics for TCP with no per-flow state. UDP is
+  gated statelessly (both directions), so intra-VPC UDP between grouped pods
+  needs symmetric rules; most UDP (cluster DNS) takes the resolver/gateway path
+  and never reaches this check. Non-TCP/UDP (ICMP) is not gated in v1, so PMTU
+  and ping keep working to a grouped pod (a deliberate v1 gap).
+- `from.group` references a group in the **same VPC**. Peered-VPC references are
+  v2 (identity has to cross a trust boundary — the Geneve TLV). A peered source
+  is in a disjoint CIDR (peering requires it), so it matches no group in the
+  destination's VPC and is **dropped once the destination is grouped** — the
+  AWS-shaped default-deny (chosen 2026-07-06). Until a v2 peer-group rule admits
+  it, grouping a pod closes it to peered VPCs.
+- `from.cidr` (north-south sources) is **rejected in v1** — the datapath
+  scaffolding (a reserved "world" pseudo-group, id 63) and the API field are in
+  place, but floating-path enforcement is not wired, so v1 rejects a cidr rule
+  rather than advertise one that wouldn't restrict. North-south cidr (starting
+  with `0.0.0.0/0`/`::/0`, then LPM for specific ranges) and FQDN rules are v2.
 
 ## Membership: how a pod lands in a group
 
@@ -67,36 +86,53 @@ Two consequences to be explicit about:
   Membership is claim-time, like the IP. (A controller re-evaluation on pod
   label updates is a v2 refinement; it needs a pods watch keyed to Ports, which
   the persistent-port machinery already half-built.) (Review Q3.)
-- The **numeric group id** is allocated by the controller per VPC (1..63; id 0
-  = "no groups, legacy allow"). 63 groups per VPC in v1 — a `u64` bitmap in the
-  datapath. Allocation lives in `SecurityGroup.status.id`, assigned like VNIs
-  (live-read allocator; the VNI-duplicate lesson applies).
+- The **numeric group id** is allocated by the controller per VPC. id 0 = "no
+  groups, legacy allow"; ids **1..62** are real groups; id **63 is reserved**
+  as the north-south "world" pseudo-group (v2). Membership is a `u64` bitmap in
+  the datapath. Allocation lives in `SecurityGroup.status.id`, assigned like
+  VNIs (live-read allocator with deterministic duplicate repair — the
+  VNI-duplicate lesson applies). ids are per-VPC, since the datapath keys them
+  by net, so distinct VPCs reuse the low ids freely.
 
-## Datapath
+## Datapath (as built)
 
-Two new maps, both keyed like `locals` (net-scoped, addr128):
+Three maps:
 
 | Map | Key | Value |
 |-----|-----|-------|
-| `sg_members` | {net, vpc IP} | `u64` group bitmap of the *member* |
-| `sg_rules` | {net, dst-group-id, proto, port-hi} | `u64` allowed-src-group bitmap + flags |
+| `sg_members` | {net, vpc IP} (like `locals`) | `u64` group bitmap of the *member* |
+| `sg_rules` | {net, dst-group-id, proto, dst-port} | `u64` allowed-source bitmap (`port` 0 = any-port) |
+| `sg_drops` | {net} (PERCPU) | `u64` policy-drop counter |
 
-Enforcement is **destination-side, in `to_pod`** — the hook every delivery
-already traverses (same-node redirect, from_overlay hand-off, and the bridge all
-end there), so placement independence holds with no Geneve TLV yet:
+Enforcement is **destination-side, in `to_pod`** — the hook every east-west
+delivery already traverses (same-node redirect, from_overlay hand-off), so
+placement independence holds with no Geneve TLV yet. Only genuine intra-VPC /
+peered pod-to-pod traffic is gated; gateway-forwarded ingress (`GW_MARK` —
+internet/DNS replies) is left alone (north-south, stateful-reply territory). For
+a gated packet, `sg_l4` decides whether to enforce (TCP new-connection only; UDP
+always) and reads the destination port, then `sg_admit`:
 
 1. `dstmap = sg_members[{net, dst}]`; zero ⇒ legacy allow (no groups) — done.
-2. `srcmap = sg_members[{net, src}]` (intra-VPC source), or the CIDR-rule
-   pseudo-group for bridge/floating traffic (the hook knows the original
-   client address pre-rewrite).
-3. For each group bit in `dstmap`: look up `sg_rules` for (group, proto, port);
-   admit if `rule.allowed & srcmap` (or the CIDR pseudo-group matches). Bounded
-   loop over set bits (≤63, verifier-friendly with a fixed unroll of the
-   bitmap scan — in practice a handful).
-4. Miss ⇒ drop, with a per-net drop counter (the observability hook #2 wants).
+2. `srcmap = sg_members[{net, src}]` — the intra-VPC source's groups; a peered
+   source misses (disjoint CIDR) and gets `srcmap = 0` ⇒ the AWS-shaped drop.
+3. For each set bit in `dstmap` (unrolled 1..62): union `sg_rules[{group, proto,
+   port}]` and `sg_rules[{group, proto, 0}]` (any-port) into `allowed`.
+4. Admit iff `allowed & srcmap`; else `TC_ACT_SHOT` and bump `sg_drops[net]`.
 
-The agent syncs both maps from Ports (`status.groups`) and SecurityGroups
-(`status.id` + rules), same diff-against-pinned-map pattern as peers/gateways.
+`sg_admit` is a stack-lean `noinline` subprogram taking a single
+fully-initialized `sg_query` pointer — the same shape as `count_dir`, for the
+same combined-call-stack reason. Two verifier lessons from bringing it up on the
+6.12 kernel (which CI's 6.8 didn't catch): passing multiple scalar args to a
+BPF-to-BPF call tripped a register-liveness check (fixed by the single-struct
+arg), and a `__u16` temp kept in a caller-saved register across a
+`bpf_skb_load_bytes` call was clobbered (fixed by loading the port straight into
+the out-pointer). Loop cost is fine (12.8k insns, well under the 1M budget).
+
+The agent syncs the maps: `sg_members` from Ports (`status.groups`, folded into
+a bitmap), `sg_rules` from SecurityGroups (resolving `from.group` names to
+per-VPC ids), and seeds `sg_drops` per VPC — the same diff-against-pinned-map
+pattern as ServiceVIPs. The drop counter is exposed as
+`cozyplane_sg_drops_total` on the `:9411` metrics endpoint.
 
 **Why not source-side too?** §7 wants egress rules eventually; the identity TLV
 in the Geneve header (§7) is what makes *destination trust of source identity*
@@ -105,35 +141,54 @@ source's groups from its own `sg_members` map — consistent cluster-wide becaus
 the same controller feeds every agent. The TLV becomes necessary only when
 identities must cross a trust boundary (peered VPCs, v2).
 
-## Control plane
+**Why not source-side too?** §7 wants egress rules eventually; the identity TLV
+in the Geneve header (§7) is what makes *destination trust of source identity*
+robust when source-side marking is added. In v1 the destination derives the
+source's groups from its own `sg_members` map — consistent cluster-wide because
+the same controller feeds every agent. The TLV becomes necessary only when
+identities must cross a trust boundary (peered VPCs, v2).
 
-- `SecurityGroup` CRD + aggregated-apiserver storage (both modes, like
-  everything else).
-- Controller: id allocation (live-read), selector evaluation → `Port.status.groups`,
-  rule compilation → nothing (agents read SecurityGroups directly).
-- RBAC: the VPC owner manages groups (`create securitygroups` in their
-  namespace + the object's `vpcRef` is same-namespace like VPCPeering — no new
-  virtual verb needed; owning the namespace *is* owning the VPC's policy).
-  (Review Q4.)
+## Control plane (as built)
 
-## Test plan
+- `SecurityGroup` — namespaced (VPC owner's namespace), aggregated-apiserver
+  storage + CRD (both modes). Port gains a `/status` subresource for
+  `status.groups`.
+- **`SecurityGroupReconciler`**: per-VPC id allocation (live-read, ids 1..62,
+  deterministic duplicate repair) → `status.id`/`phase`.
+- **`PortMembershipReconciler`**: evaluates every SecurityGroup's `podSelector`
+  in the Port's VPC against the pod-labels the CNI stamped (annotation
+  `sdn.cozystack.io/pod-labels`, a claim-time snapshot) → `Port.status.groups`.
+  Re-runs when a Port is created or any SecurityGroup in its VPC changes; **not**
+  on later pod-label edits (v2 — a Ports-keyed pods watch, which the
+  persistent-port machinery already half-built).
+- The **agent** compiles SecurityGroups directly into `sg_rules` (it does not
+  read a controller-compiled form).
+- **AuthZ**: the VPC owner manages groups — the object is namespaced in the VPC
+  owner's namespace and its `vpcRef` is same-namespace (like VPCPeering), so
+  owning the namespace *is* owning the VPC's policy. No new virtual verb.
 
-kind e2e: group two pods, assert allowed port passes / other port drops / an
-ungrouped pod in the same VPC still reaches everything (legacy) / a bridged
-north-south client hits the CIDR rule / policy survives the map-recreation
-phase (rebuild must restore `sg_members` — the Port carries the groups, so the
-agent resync covers it; no new alias field needed).
+## Validated on dev4 (2026-07-06)
 
-## Open questions (review)
+Two groups in `vpc-a` (`client`, `web`; `web` admits `client` on TCP 80). With
+labeled pods `sgcli` (role=client), `sgweb` (role=web), `sgnone` (unlabeled):
+ids allocated 1/2, membership resolved from the stamped labels, and enforcement
+matched intent on all four cases — `sgcli→sgweb:80` open, `sgcli→sgweb:81`
+dropped, `sgnone→sgweb:80` dropped (ungrouped source, default-deny),
+`sgweb→sgcli:*` dropped (`client` has no ingress). Baseline (no groups) was
+allow-all. `cozyplane_sg_drops_total` incremented per drop.
 
-1. **Ingress-only v1** — acceptable, or is egress a hard requirement for the
-   first cut?
-2. **Peered-VPC group references** — v2 as proposed, or must v1 at least
-   *close* peered traffic when the destination has groups (currently peered
-   traffic would be subject to the same ingress rules via the CIDR/group-miss
-   path — i.e., peered sources simply won't match any group and get dropped
-   once the dst is grouped; is that the right default)?
-3. **Claim-time membership** — is label-change-follows v2 acceptable?
-4. **AuthZ shape** — owner-namespace-implies-policy-authority, or do you want a
-   `policy` virtual verb on the VPC (mirroring `export`/`peer`)?
-5. **Naming** — `SecurityGroup` (AWS familiarity) vs `VPCPolicy`?
+## Decisions (were review questions)
+
+1. **Ingress-only v1** — accepted; `egress` is additive.
+2. **Peered-VPC** — v1 **drops** peered traffic once the destination is grouped
+   (AWS-shaped default-deny). Peer-group *rules* are v2 (need the identity TLV).
+3. **Claim-time membership** — accepted; label-change-follows is v2.
+4. **AuthZ** — owner-namespace-implies-policy-authority; no `policy` verb.
+5. **Naming** — `SecurityGroup` (AWS familiarity).
+
+## v2 backlog
+
+Egress rules; peered-VPC group references + the Geneve identity TLV; north-south
+`from.cidr` (world pseudo-group is reserved; needs floating-path enforcement,
+then an LPM map for specific ranges); FQDN sources; label-change-follows
+membership; ICMP rules; a real conntrack to replace the TCP SYN-gate.

@@ -90,6 +90,9 @@ maps and one program.
 | `ct_fwd` / `ct_rev` | LRU hash | the bridge's L4 NAT connection table | datapath (in-band) |
 | `svc_vips` | hash | {net, VIP, proto, port} → backend set + flags | agent (ServiceVIPs) |
 | `vpc_counters` | PERCPU hash | net id → {tx,rx bytes/packets} | datapath (in-band) |
+| `sg_members` | hash | {net, VPC IP} → `u64` group bitmap | agent (Ports' `status.groups`) |
+| `sg_rules` | hash | {net, dst group, proto, port} → `u64` allowed-source bitmap | agent (SecurityGroups) |
+| `sg_drops` | PERCPU hash | net id → policy-drop count | datapath (in-band) |
 | `params` | array | `[0]`=Geneve ifindex, `[1]`=default VNI | agent |
 
 Per-VPC metering (#2): `count_dir` bumps `vpc_counters` — **both directions
@@ -104,6 +107,18 @@ VPC net (`EnsureVPCCounter`, alongside `SetNetwork`); the datapath can't create
 one. PERCPU so the hooks never contend; the agent sums across CPUs and serves
 Prometheus text on `:9411/metrics`, labeled by VPC. Net 0 (default) is never
 metered; north-south (gateway/floating) and ServiceVIP replies are a follow-up.
+
+Security groups (#7, intra-VPC policy — see [security-groups.md](security-groups.md)):
+`to_pod`, right after the isolation check, gates admitted east-west traffic
+destination-side. `sg_admit` (another stack-lean `noinline` subprogram, single
+`sg_query` pointer arg) looks up the destination's group bitmap in `sg_members`;
+if it is grouped, it unions the `sg_rules` allowed-source bitmaps for the
+destination's groups and admits only if that intersects the source's bitmap,
+else drops and bumps `sg_drops`. TCP is gated on new connections only (SYN,
+no ACK) so replies pass without a conntrack; UDP always. Gateway-forwarded
+(`GW_MARK`) ingress is exempt. A peered source is in a disjoint CIDR, so it
+misses `sg_members[{dst net, src}]` and is dropped once the destination is
+grouped (the AWS-shaped default-deny).
 
 The scoped maps use a `{prefixlen, scope_net, addr}` LPM key: the scope net
 occupies the leading 32 bits (always fully specified), so a lookup never

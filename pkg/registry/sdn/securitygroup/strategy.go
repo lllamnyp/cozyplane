@@ -102,6 +102,13 @@ func validateSecurityGroup(sg *sdn.SecurityGroup) field.ErrorList {
 			errs = append(errs, field.Invalid(p, r.From, "set exactly one of group or cidr"))
 		case !hasGroup && !hasCIDR:
 			errs = append(errs, field.Required(p, "one of group or cidr is required"))
+		case hasCIDR:
+			// v1 enforces east-west (group) rules only. North-south cidr sources
+			// are the next increment — the datapath scaffolding (world
+			// pseudo-group) is in place, but the floating-path enforcement is
+			// not wired yet, so a cidr rule would silently not restrict. Reject
+			// it rather than advertise an unenforced rule.
+			errs = append(errs, field.Forbidden(p.Child("cidr"), "cidr sources are not yet supported; reference another group instead"))
 		}
 	}
 	return errs

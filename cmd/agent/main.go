@@ -351,6 +351,7 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		watchGateways(ctx, factory, mgr, nodeName, log)
 		watchFloatingIPs(ctx, factory, mgr, nodeName, log)
 		watchServiceVIPs(ctx, factory, mgr, log)
+		watchSecurityGroups(ctx, factory, mgr, log)
 		// Per-VPC traffic metrics (#2): serve the datapath counters, labeled by
 		// VPC via the same VPC lister the networks map is built from.
 		serveMetrics(ctx, mgr, factory.Sdn().V1alpha1().VPCs(), nodeName, log)
@@ -1284,6 +1285,167 @@ func nodePodCIDRs(node *corev1.Node) []string {
 // watchServiceVIPs projects every ServiceVIP into the svc_vips datapath map
 // (docs/services-in-vpc.md increment 2). Full-state resync on any ServiceVIP
 // or VPC change — the objects are few and the map diff is cheap.
+// watchSecurityGroups projects intra-VPC policy into the datapath
+// (docs/security-groups.md): SecurityGroups' ingress rules become sg_rules
+// (resolving from.group names to per-VPC ids and cidr 0.0.0.0/0 to the reserved
+// world pseudo-group), and Ports' resolved membership (status.groups) becomes
+// sg_members. Both are full-state resyncs, keyed on SecurityGroup, Port, and
+// VPC (for the VNI) changes — the same shape as watchServiceVIPs.
+func watchSecurityGroups(ctx context.Context, factory sdninformers.SharedInformerFactory, mgr *datapath.Manager, log *slog.Logger) {
+	sgs := factory.Sdn().V1alpha1().SecurityGroups()
+	ports := factory.Sdn().V1alpha1().Ports()
+	vpcs := factory.Sdn().V1alpha1().VPCs()
+
+	type vpcKey struct{ ns, name string }
+
+	var mu sync.Mutex
+	resync := func() {
+		mu.Lock()
+		defer mu.Unlock()
+
+		allSGs, err := sgs.Lister().List(labels.Everything())
+		if err != nil {
+			log.Error("list securitygroups", "err", err)
+			return
+		}
+		// Per-VPC name -> id, for resolving from.group references (same VPC).
+		nameID := map[vpcKey]map[string]int32{}
+		for _, sg := range allSGs {
+			if sg.Status.ID == 0 {
+				continue
+			}
+			k := vpcKey{sg.Namespace, sg.Spec.VPCRef.Name}
+			if nameID[k] == nil {
+				nameID[k] = map[string]int32{}
+			}
+			nameID[k][sg.Name] = sg.Status.ID
+		}
+
+		var rules []datapath.SGRule
+		nets := map[uint32]bool{}
+		for _, sg := range allSGs {
+			if sg.Status.ID == 0 {
+				continue
+			}
+			vpc, err := vpcs.Lister().VPCs(sg.Namespace).Get(sg.Spec.VPCRef.Name)
+			if err != nil || vpc.Status.VNI == 0 {
+				continue
+			}
+			net_ := uint32(vpc.Status.VNI)
+			nets[net_] = true
+			k := vpcKey{sg.Namespace, sg.Spec.VPCRef.Name}
+			for _, ing := range sg.Spec.Ingress {
+				var allowed uint64
+				switch {
+				case ing.From.Group != "":
+					id, ok := nameID[k][ing.From.Group]
+					if !ok {
+						continue // unknown/unallocated source group admits nothing yet
+					}
+					allowed = 1 << uint(id)
+				case isAnyCIDR(ing.From.CIDR):
+					allowed = 1 << uint(datapath.SGWorldGroup)
+				case ing.From.CIDR != "":
+					log.Warn("security group: specific cidr not supported in v1 (use 0.0.0.0/0 or ::/0); rule ignored",
+						"group", sg.Name, "cidr", ing.From.CIDR)
+					continue
+				default:
+					continue
+				}
+				for _, r := range compileRulePorts(net_, uint16(sg.Status.ID), allowed, ing.Ports) {
+					rules = append(rules, r)
+				}
+			}
+		}
+		if err := mgr.SyncSGRules(rules); err != nil {
+			log.Error("sync sg_rules", "err", err)
+		}
+		for n := range nets {
+			if err := mgr.EnsureSGDrop(n); err != nil {
+				log.Error("seed sg_drops", "net", n, "err", err)
+			}
+		}
+
+		allPorts, err := ports.Lister().List(labels.Everything())
+		if err != nil {
+			log.Error("list ports for sg_members", "err", err)
+			return
+		}
+		var members []datapath.SGMember
+		for _, p := range allPorts {
+			if len(p.Status.Groups) == 0 || p.Spec.IP == "" {
+				continue
+			}
+			net_, ok := vniFromPortName(p.Name)
+			if !ok {
+				continue
+			}
+			var bitmap uint64
+			for _, id := range p.Status.Groups {
+				if id > 0 && id < datapath.SGWorldGroup {
+					bitmap |= 1 << uint(id)
+				}
+			}
+			if bitmap == 0 {
+				continue
+			}
+			members = append(members, datapath.SGMember{Net: net_, IP: net.ParseIP(p.Spec.IP), Groups: bitmap})
+		}
+		if err := mgr.SyncSGMembers(members); err != nil {
+			log.Error("sync sg_members", "err", err)
+		}
+	}
+
+	_, _ = sgs.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(any) { resync() },
+		UpdateFunc: func(_, _ any) { resync() },
+		DeleteFunc: func(any) { resync() },
+	})
+	_, _ = ports.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(any) { resync() },
+		UpdateFunc: func(_, _ any) { resync() },
+		DeleteFunc: func(any) { resync() },
+	})
+	_, _ = vpcs.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(any) { resync() },
+		UpdateFunc: func(_, _ any) { resync() },
+	})
+}
+
+// compileRulePorts expands an ingress rule's port list into datapath rules for
+// (net, dst group, allowed sources). No ports means every protocol and port
+// (an any-port rule per protocol); a listed port with no protocol match is
+// skipped.
+func compileRulePorts(net_ uint32, group uint16, allowed uint64, ports []sdnv1alpha1.SecurityGroupPort) []datapath.SGRule {
+	var out []datapath.SGRule
+	if len(ports) == 0 {
+		for _, proto := range []uint8{unix.IPPROTO_TCP, unix.IPPROTO_UDP} {
+			out = append(out, datapath.SGRule{Net: net_, Group: group, Proto: proto, Port: 0, Allowed: allowed})
+		}
+		return out
+	}
+	for _, pp := range ports {
+		var proto uint8
+		switch pp.Protocol {
+		case "TCP":
+			proto = unix.IPPROTO_TCP
+		case "UDP":
+			proto = unix.IPPROTO_UDP
+		default:
+			continue
+		}
+		out = append(out, datapath.SGRule{Net: net_, Group: group, Proto: proto, Port: uint16(pp.Port), Allowed: allowed})
+	}
+	return out
+}
+
+// isAnyCIDR reports whether c is the all-addresses CIDR of either family — the
+// only cidr form v1 enforces (compiled to the world pseudo-group). Specific
+// CIDRs need an LPM match, a later increment.
+func isAnyCIDR(c string) bool {
+	return c == "0.0.0.0/0" || c == "::/0"
+}
+
 func watchServiceVIPs(ctx context.Context, factory sdninformers.SharedInformerFactory, mgr *datapath.Manager, log *slog.Logger) {
 	svips := factory.Sdn().V1alpha1().ServiceVIPs()
 	vpcs := factory.Sdn().V1alpha1().VPCs()
@@ -1396,6 +1558,16 @@ func serveMetrics(ctx context.Context, mgr *datapath.Manager, vpcs sdnv1alpha1in
 				id := names[net]
 				fmt.Fprintf(&b, "%s{vni=\"%d\",vpc_namespace=\"%s\",vpc=\"%s\",node=\"%s\"} %d\n",
 					m.name, net, id[0], id[1], nodeName, m.pick(c))
+			}
+		}
+
+		// Security-group policy drops (#7), same per-VPC labeling.
+		if drops, err := mgr.SGDrops(); err == nil {
+			fmt.Fprintf(&b, "# HELP cozyplane_sg_drops_total Packets dropped by security-group policy (this node).\n# TYPE cozyplane_sg_drops_total counter\n")
+			for net, d := range drops {
+				id := names[net]
+				fmt.Fprintf(&b, "cozyplane_sg_drops_total{vni=\"%d\",vpc_namespace=\"%s\",vpc=\"%s\",node=\"%s\"} %d\n",
+					net, id[0], id[1], nodeName, d)
 			}
 		}
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")

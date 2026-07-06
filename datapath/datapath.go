@@ -71,6 +71,10 @@ func (m *Manager) Load(vni uint32) error {
 
 	opts := &ebpf.CollectionOptions{Maps: ebpf.MapOptions{PinPath: PinRoot}}
 	if err := loadOverlayObjects(&m.objs, opts); err != nil {
+		var ve *ebpf.VerifierError
+		if errors.As(err, &ve) {
+			return fmt.Errorf("load bpf objects: %+v", ve)
+		}
 		return fmt.Errorf("load bpf objects: %w", err)
 	}
 
