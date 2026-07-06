@@ -500,6 +500,11 @@ check "a1 -> the VIP address directly (data plane, no DNS)" "ok" \
   bash -c "$K -n team-a exec a1 -- wget -qO- -T4 http://$VIPADDR/ 2>/dev/null | grep -qE '^dns[12]\$' && echo ok"
 check "cpeer(vpc-c, peered) -> vipsvc (VIP across the peering)" "ok" \
   bash -c "$K -n team-a exec cpeer -- wget -qO- -T4 http://vipsvc.team-a.svc.cluster.local/ 2>/dev/null | grep -qE '^dns[12]\$' && echo ok"
+# Load balancing: 12 fresh flows from one client must reach BOTH backends
+# (found live: a hash that only mixed the source port into the high bits made
+# every flow from a client sticky to one backend).
+check "VIP load-balances across backends (12 flows hit both)" "2" \
+  bash -c "for i in \$(seq 1 12); do $K -n team-a exec cpeer -- wget -qO- -T4 http://vipsvc.team-a.svc.cluster.local/ 2>/dev/null; done | sort -u | grep -cE '^dns[12]\$'"
 check_fail "bw1(vpc-b, unpeered) cannot resolve vipsvc" \
   bash -c "$K -n team-b exec bw1 -- nslookup vipsvc.team-a.svc.cluster.local >/dev/null 2>&1"
 # Hairpin: the only backend of viphsvc dials its own service — the self-flow

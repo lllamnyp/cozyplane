@@ -2187,7 +2187,15 @@ static __always_inline __u32 svc_hash(const struct pkt *p, __u16 sport, __u16 dp
 	__u32 a, b;
 	__builtin_memcpy(&a, &p->src.b[12], 4);
 	__builtin_memcpy(&b, &p->dst.b[12], 4);
-	return a ^ (b << 1) ^ ((__u32)sport << 16) ^ dport ^ p->proto;
+	// The caller reduces this with `% n` for tiny n, and the raw 5-tuple has
+	// almost no low-bit entropy across a client's successive flows: the
+	// kernel steps ephemeral source ports by a fixed stride (commonly 2), so
+	// any XOR-only mix keeps `% 2` CONSTANT per client (found live — every
+	// flow stuck to one backend). Knuth's multiplicative hash + a fold
+	// avalanches the stride into the low bits.
+	__u32 h = a ^ (b << 1) ^ sport ^ ((__u32)dport << 16) ^ p->proto;
+	h *= 2654435761u;
+	return h ^ (h >> 16);
 }
 
 // svc_forward: DNAT an admitted vip:vport packet to backend:tport. On a hit
