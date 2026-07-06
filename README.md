@@ -3,7 +3,9 @@
 A multi-tenant, eBPF-based CNI for [Cozystack](https://cozystack.io), built so
 that cloud-style tenancy — not a flat cluster network — is the backbone. It
 replaces kube-ovn for VPC networking; ClusterIP/Service load-balancing stays with
-kube-proxy or Cilium's kube-proxy replacement, which cozyplane coexists with.
+kube-proxy or Cilium's kube-proxy replacement, which cozyplane coexists with (a
+built-in replacement that imports Cilium's LB components is
+[under design](docs/kube-proxy-replacement.md)).
 
 > **Status: functional, pre-production.** The default pod network and the full VPC
 > datapath — tenant isolation, overlapping CIDRs, peering, egress, floating public
@@ -60,6 +62,7 @@ outstanding (network policy, DNS, netfilter-optional operation, and more).
 | [docs/security-groups.md](docs/security-groups.md) | *Design draft* — intra-VPC network policy (security groups) |
 | [docs/vm-provisioning.md](docs/vm-provisioning.md) | *Design draft* — metadata endpoint & guest autoconfiguration |
 | [docs/cross-family.md](docs/cross-family.md) | *Design draft* — cross-family (v4↔v6) peering & north-south |
+| [docs/kube-proxy-replacement.md](docs/kube-proxy-replacement.md) | *Design draft* — own Services by importing Cilium's LB + socket-LB |
 
 Contributor invariants (never reach for iptables in the datapath, 128-bit/NAT64
 address form, etc.) live in [CLAUDE.md](CLAUDE.md).

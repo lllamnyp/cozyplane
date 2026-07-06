@@ -77,7 +77,13 @@ they're discovered rather than leaving them only in issues.
 - [x] Gratuitous ARP / unsolicited NA when a floating IP is programmed locally (fixes external L2 caches on a node move; e2e observes both frames on the wire)
 - [ ] VM-migration e2e test (cozystack has none)
 
-## 6. Deployment robustness
+## 6. Services (kube-proxy replacement)
+
+- [ ] Import Cilium's LB control plane + socket LB (`pkg/loadbalancer`, `pkg/socketlb`, pre-compiled `bpf_sock.o`) as a separate `cozyplane-kpr` component — **design draft: [kube-proxy-replacement.md](kube-proxy-replacement.md)** (awaiting review; feasibility verified empirically against Cilium v1.19.5)
+- [ ] Per-packet service fallback in cozyplane's hooks (external NodePort, VM-guest ClusterIP) — needed before kube-proxy can be removed
+- [ ] Retire kube-proxy on a cozyplane-only cluster — the endgame of [#10](../../issues/10): `firewall.go` then installs nothing
+
+## 7. Deployment robustness
 
 - [x] Cozystack chart integration (aggregated-apiserver mode, operator etcd, RBAC/CRDs)
 - [x] Image digest-pinning in the chart
@@ -85,7 +91,7 @@ they're discovered rather than leaving them only in issues.
 - [x] Gateway `.1` Port reuse after an unclean death: the controller GCs live Ports whose claimant pod is gone (VM persistent Ports exempt), so the replacement's ADD retry claims the freed `.1` (e2e-covered)
 - [x] Digest-reproducible release images: attestations off, SOURCE_DATE_EPOCH + rewrite-timestamp, digest-pinned bases — verified identical across CI reruns, and the pin-commit-rebuild loop converges — [#4](../../issues/4)
 
-## 7. CI & testing
+## 8. CI & testing
 
 - [x] CI: unit tests, lint, build-drift, image release, datapath e2e
 - [x] eBPF bindings check (static bpftool, libbpf-dev)
