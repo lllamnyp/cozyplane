@@ -58,36 +58,77 @@ essentially all modern charts qualify.)
 
 ### Attachment — which Services project into a net
 
-Explicit, mirroring how pods attach: the Service carries the same annotation
-(`sdn.cozystack.io/vpc: <name>`), authorized by the same `VPCBinding` gate in
-the Service's namespace. The controller validates that ready endpoints resolve
-to Ports of that VPC (mixed/foreign backends are ignored and surfaced as a
-condition). Nothing auto-projects: another tenant's Services, kube-system
-Services, and the API server simply do not exist inside a net.
+Explicit — nothing auto-projects: another tenant's Services, kube-system
+Services, and the API server simply do not exist inside a net. The mechanism
+is the one remaining open question (Q1 below), two candidates:
 
-### VIP allocation
+- **(A) Annotation on the Service** (`sdn.cozystack.io/vpc: <name>`),
+  authorized by the `VPCBinding` in the Service's namespace — the exact
+  pod-attach idiom; the controller materializes the `ServiceVIP` the way the
+  system materializes Ports for annotated pods.
+- **(B) A user-created attachment object** (spec: `vpcRef` + `serviceRef`)
+  whose **status** carries the VIP — one object instead of
+  annotation-plus-materialized-object, with typed spec room and separable
+  RBAC, at the cost of a second user-facing kind and a two-manifest UX.
 
-By the existing per-VPC IPAM — a VIP is an allocation with no pod, recorded on
-a small `ServiceVIP`-shaped status (exact object TBD, review Q2), one per
-family present in the VPC. The allocator already guarantees non-collision with
-Port IPs and gateway `.1`s; deterministic choice is unnecessary because DNS is
-the only advertised path to it.
+Either way the controller validates that ready endpoints resolve to Ports of
+that VPC (mixed/foreign backends are ignored and surfaced as a condition).
+
+### VIP allocation — `ServiceVIP`, and cross-kind uniqueness
+
+A VIP is an allocation with no pod, held by a new small object (working name
+`ServiceVIP`; **decided against** modeling it as a special Port — Port
+semantics stay clean), one per family present in the VPC. Deterministic
+choice is unnecessary because DNS is the only advertised path to it.
+
+Two kinds now draw from one per-net IP keyspace, and a Port and a
+`ServiceVIP` must never hold the same VPC IP. Layered design:
+
+1. **One allocator view.** Every allocator of net-scoped IPs (VIP allocation,
+   the CNI's Port claim at ADD, the gateway `.1`) allocates against the
+   live-read (APIReader, per the VNI-duplicate lesson) **union of claims
+   across both kinds**, serialized per VPC where the allocation happens
+   in-process.
+2. **Fail closed at the API.** In aggregated mode, the Port and ServiceVIP
+   create/update strategies share one validation helper that live-lists both
+   kinds and rejects a duplicate VPC IP — both kinds converge in the one
+   apiserver process, which makes it the natural uniqueness choke point. (CRD
+   mode gets controller-side repair only, consistent with the aggregated
+   server being the direction.)
+3. **Deterministic repair backstop.** If a duplicate ever materializes (cache
+   lag, CRD mode), **the Port always wins**: Port IPs are workload- and
+   VM-pinned identity and immovable, while a VIP is movable *by construction*
+   — nothing addresses it except through a DNS answer, so the loser VIP
+   re-allocates and the resolver's next answer carries the new address.
+
+Rejected simplification: a tenant-declared `serviceCIDR` sub-range (disjoint
+pools, no race by partitioning) — it adds required per-VPC configuration to
+dodge a problem the layers above close; kept only as an escape hatch if the
+shared pool proves fragile in practice.
 
 ### DNS — split-horizon resolver
 
-A per-node responder (same placement pattern as the metadata responder in
-[vm-provisioning.md](vm-provisioning.md), plausibly the same process):
+A per-node responder, **the same process as the metadata responder** in
+[vm-provisioning.md](vm-provisioning.md) (decided in review): one node-local,
+less-privileged-than-the-agent service with two listeners (DNS + metadata
+HTTP), sharing the datapath steering and the per-net source identification.
 
 - `from_pod` intercepts `dst == cluster DNS IP, port 53` from VPC pods and
   redirects to the node-local resolver, identifying the querying net the same
   way the metadata design does (rewritten per-Port source). Zero guest/pod
   config: kubelet's `resolv.conf` and a VM's RA/DHCP-provided resolver both
   keep pointing at the address they already use.
-- Answers, per net: attached ClusterIP services → the per-VPC VIP; headless
-  services of the VPC → member **VPC IPs** (A/AAAA and SRV targets); names the
-  VPC has no claim on → NXDOMAIN; external names → forwarded upstream (a
-  deliberate, documented system service — like metadata, not an isolation
-  hole: answers are data, reachability still requires an egress path).
+- **Cluster-domain names are answered authoritatively, never forwarded**:
+  attached ClusterIP services → the per-VPC VIP; headless services of the VPC
+  → member **VPC IPs** (A/AAAA and SRV targets); every other cluster-domain
+  name → NXDOMAIN. Not forwarding these to the real kube-dns both prevents
+  probing other tenants' existence and avoids handing out dead-end cluster
+  ClusterIPs.
+- **Everything else defers upstream, kube-dns-style** (decided in review):
+  non-cluster names forward to the node's upstream resolvers — the same
+  upstreams kube-dns itself uses — from day one. A deliberate, documented
+  system service, like metadata; not an isolation hole: answers are data,
+  reachability still requires an egress path.
 
 ### Datapath — net-scoped service NAT in `from_pod`
 
@@ -144,28 +185,38 @@ etcd pods (or VM-hosted members) in `vpc-a`, Services annotated into the VPC:
 
 ## Increments
 
-1. **Resolver + headless** — per-node split-horizon resolver, DNS interception
-   in `from_pod`, headless answers as VPC IPs. Already unblocks etcd *peer*
-   traffic and all name-based intra-VPC addressing. kind-testable.
-2. **VIP data plane** — allocation, `svc_vips`, DNAT/rev-NAT, the Service
-   annotation + controller. Closes the ClusterIP gap; etcd e2e as above.
-3. **Upstream forwarding + VM resolver config** — external names via the
-   resolver; ties into vm-provisioning's RA/DHCP so guests learn the resolver
-   without manual config.
+1. **Resolver + headless + upstream forwarding** — per-node split-horizon
+   resolver (shared with metadata), DNS interception in `from_pod`, headless
+   answers as VPC IPs, non-cluster names forwarded upstream. Already unblocks
+   etcd *peer* traffic and all name-based intra-VPC addressing. kind-testable.
+2. **VIP data plane** — `ServiceVIP` + cross-kind uniqueness, `svc_vips`
+   map, DNAT/rev-NAT, attachment + controller. Closes the ClusterIP gap;
+   etcd e2e as above.
+3. **VM resolver config** — ties into vm-provisioning's RA/DHCP so guests
+   learn the resolver without manual config.
 
-## Open questions (review)
+## Review resolutions (2026-07-06)
 
-1. **Attachment UX** — Service annotation gated by the existing `VPCBinding`
-   (proposed), or a dedicated `ServiceAttachment` object (more explicit, more
-   API surface)?
-2. **Where the VIP lives in the API** — status on a new small object, or
-   modeled as a special Port (reusing IPAM/GC machinery at the cost of Port
-   semantics getting muddier)?
-3. **Resolver scope** — is upstream forwarding for external names in from day
-   one (VMs and pods both want `pypi.org`), or increment 3 as proposed?
-4. **Same process as the metadata responder?** Both are per-node,
-   datapath-steered, per-net-identified services. One binary/DaemonSet with
-   two listeners is operationally simpler; two components are independently
-   shippable.
-5. **Ordering confirmation** — this draft before any KPR increment, and
-   within it, increment 1 (resolver+headless) as the first shippable slice?
+- **VIP in the API**: a new `ServiceVIP`-shaped object, not a special Port.
+  The uniqueness hurdle (a Port and a ServiceVIP must never hold the same VPC
+  IP) is addressed by the three-layer design above: one live-read allocator
+  view over both kinds, fail-closed cross-kind validation in the aggregated
+  registry, and Port-always-wins repair (VIPs are the movable kind).
+- **Resolver scope**: kube-dns-parity — authoritative for the cluster domain
+  (answer or NXDOMAIN, never forward), everything else defers to the upstream
+  forwarder, from day one.
+- **Responder packaging**: one per-node process serves both split-horizon DNS
+  and the metadata endpoint.
+- **Ordering**: confirmed — this draft precedes all KPR work; increment 1 is
+  the first shippable slice.
+
+## Open question (review)
+
+1. **Attachment UX** — annotation + controller-materialized `ServiceVIP` (the
+   pod→Port idiom; `VPCBinding` is the authz gate, as for pods), or a
+   user-created attachment object carrying the VIP in its status (typed spec
+   room, separable RBAC verb, strategy-level SAR gating; second user-facing
+   kind, two-manifest UX, dangling-`serviceRef` GC)? Note the annotation path
+   keeps an escape hatch by precedent: persistent Ports are user-created while
+   ordinary Ports are materialized — a `ServiceVIP` could grow the same dual
+   pattern if per-attachment knobs ever become real.

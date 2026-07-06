@@ -99,6 +99,10 @@ This is the one part that genuinely wants a small userspace service (HTTP +
 KubeVirt Secret proxy). It is **not** the VPC gateway — decoupling metadata from
 egress is the main departure from §10's wording. (Review Q1.)
 
+*Update (2026-07-06):* per the [services-in-vpc.md](services-in-vpc.md) review,
+this responder and the split-horizon DNS resolver are **one per-node process**
+(two listeners, shared datapath steering and per-net source identification).
+
 ## What this unblocks
 
 - The IPv6 VM migration demo becomes **zero-touch**: boot, and the guest has its
