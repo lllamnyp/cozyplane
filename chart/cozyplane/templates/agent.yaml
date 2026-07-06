@@ -47,6 +47,15 @@ rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["floatingips"]
     verbs: ["get", "list", "watch"]
+  # The split-horizon resolver (responder container) answers headless Services
+  # annotated into a VPC from their EndpointSlices; the agent reads the
+  # kube-system/kube-dns Service to discover the cluster DNS address.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -144,6 +153,26 @@ spec:
               mountPath: /run/cozyplane
             - name: cni-cache
               mountPath: /var/lib/cni
+        # The split-horizon DNS resolver for VPC pods (docs/services-in-vpc.md).
+        # Unprivileged: a DNS socket on the node address (reserved port 15353,
+        # reached only via the datapath's steering) and informers.
+        - name: responder
+          image: {{ .Values.image }}
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          command: ["/usr/local/bin/cozyplane-responder"]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Forward external names to the node's own upstreams, not the
+            # cluster DNS the pod-level dnsPolicy would hand us.
+            - name: RESOLV_CONF
+              value: /host/etc/resolv.conf
+          volumeMounts:
+            - name: host-resolv
+              mountPath: /host/etc/resolv.conf
+              readOnly: true
       volumes:
         - name: cni-bin
           hostPath:
@@ -165,3 +194,7 @@ spec:
           hostPath:
             path: /var/lib/cni
             type: DirectoryOrCreate
+        - name: host-resolv
+          hostPath:
+            path: /etc/resolv.conf
+            type: File

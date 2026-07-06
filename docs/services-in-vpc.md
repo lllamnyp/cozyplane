@@ -189,6 +189,14 @@ etcd pods (or VM-hosted members) in `vpc-a`, Services annotated into the VPC:
    resolver (shared with metadata), DNS interception in `from_pod`, headless
    answers as VPC IPs, non-cluster names forwarded upstream. Already unblocks
    etcd *peer* traffic and all name-based intra-VPC addressing. kind-testable.
+   **Implemented** — `dns_steer`/`dns_return` in the datapath (stateless both
+   ways; the pod's fabric IP is the rewritten source and the per-Port identity
+   handle), `cmd/responder` as an unprivileged second container in the agent
+   DaemonSet, e2e-covered. As-built details: internals.md § "VPC DNS steering".
+   Known limitation: a VPC pod whose fabric IP is the *other* family (the
+   fabric-family fallback) has no same-family handle and is not steered — the
+   v6-VPC-on-v4-cluster case additionally needs the RA/RDNSS work (#8) before
+   guests even have a usable v6 resolver address.
 2. **VIP data plane** — `ServiceVIP` + cross-kind uniqueness, `svc_vips`
    map, DNAT/rev-NAT, attachment + controller. Closes the ClusterIP gap;
    etcd e2e as above.
@@ -210,13 +218,15 @@ etcd pods (or VM-hosted members) in `vpc-a`, Services annotated into the VPC:
 - **Ordering**: confirmed — this draft precedes all KPR work; increment 1 is
   the first shippable slice.
 
-## Open question (review)
+- **Attachment UX (resolved 2026-07-06): option A** — annotation on the
+  Service (`sdn.cozystack.io/vpc: <name>`) + controller-materialized
+  `ServiceVIP`, the pod→Port idiom; the `VPCBinding` is the authz gate, as
+  for pods. One idiom for tenants: "annotate the thing into the VPC."
+  Escape hatch by precedent if per-attachment knobs ever become real:
+  persistent Ports are user-created while ordinary Ports are materialized —
+  `ServiceVIP` can grow the same dual pattern.
 
-1. **Attachment UX** — annotation + controller-materialized `ServiceVIP` (the
-   pod→Port idiom; `VPCBinding` is the authz gate, as for pods), or a
-   user-created attachment object carrying the VIP in its status (typed spec
-   room, separable RBAC verb, strategy-level SAR gating; second user-facing
-   kind, two-manifest UX, dangling-`serviceRef` GC)? Note the annotation path
-   keeps an escape hatch by precedent: persistent Ports are user-created while
-   ordinary Ports are materialized — a `ServiceVIP` could grow the same dual
-   pattern if per-attachment knobs ever become real.
+**Projection is annotation-gated for headless Services too** — nothing
+auto-projects, and the resolver's authz proof is structural: it only answers
+with backends that are Ports of the *querying* net, so a stray annotation
+without a real binding yields nothing (Ports of that net wouldn't exist).

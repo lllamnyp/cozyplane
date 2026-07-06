@@ -300,6 +300,50 @@ bypassing the kernel FORWARD chain entirely. The NAT itself is keyed by
 `{net, vpcIP}`, so the two same-IP pods stay distinct. Like the overlay, the
 bridge delivers by identity, never by a shared address.
 
+**The fabric neighbour.** The `/32` route alone cannot carry node-*originated*
+traffic: the kernel must resolve the fabric IP's L2 address on the veth, and
+nothing answers — the pod's interface carries only the VPC IP (only
+default-network pods, which *are* their fabric identity, answer that ARP). So
+CNI ADD pins a **permanent neighbour** (`fabricIP lladdr <podMAC> dev <veth>`,
+both families) next to the route, and the agent's rebuild heals it on veths
+ADDed by older releases. Without it, kubelet-probe-style traffic and the DNS
+resolver's replies die in FAILED ARP/NDP before ever reaching `to_pod`'s DNAT
+(the eBPF-redirected paths never noticed — they carry the MAC from `locals`).
+Like the route, the entry lives and dies with the veth.
+
+### VPC DNS steering (split-horizon resolver)
+
+A VPC pod's `resolv.conf` points at the cluster DNS ClusterIP, which the
+isolation rule makes unreachable — so `from_pod` **steers** those queries to a
+node-local split-horizon resolver instead ([services-in-vpc.md](services-in-vpc.md)).
+Both halves are **stateless** (no ct entry, no port allocation):
+
+- **`dns_steer` (from_pod):** for a non-gateway VPC pod whose destination
+  resolved off-VPC (`dstnet == 0` — so a tenant whose own CIDR covers the
+  service range shadows it, and intra-VPC `:53` is never hijacked), a TCP/UDP
+  packet to `dns_ips[family]:53` is rewritten: source → the pod's **fabric IP**
+  (via `fabric_of`, the `bridges` inverse — programmed only for same-family
+  pairs), destination → `nodeIP:15353` (`CFG_RESOLVER_PORT`; 0 disables), and
+  passed to the host stack. The pod's ephemeral source port is preserved —
+  fabric IPs are unique, so the 5-tuple stays unambiguous.
+- **`dns_return` (to_pod):** the resolver's reply (`nodeIP:15353 →
+  fabricIP:sport`, routed back by the fabric `/32`) is recognized by its
+  reserved source port (below the masquerade/NodePort/ephemeral ranges, so a
+  kubelet probe can never carry it), un-NAT'd via the `bridges` map to
+  `clusterDNS:53 → vpcIP`, and delivered without the ingress isolation check
+  (a sanctioned path, like the bridge).
+
+The rewritten **fabric source doubles as the per-Port identity handle**: the
+responder (`cmd/responder`, an unprivileged second container in the agent
+DaemonSet) maps it to the querying Port and answers that VPC's view —
+annotation-attached headless Services resolve to backend **VPC IPs**
+(A/AAAA/per-hostname/SRV), every other cluster-domain name is authoritative
+NXDOMAIN (never forwarded: other tenants stay unprovable, and cluster
+ClusterIPs would be dead ends anyway), and non-cluster names forward to the
+node's own upstreams. The agent publishes `dns_ips` from the
+`kube-system/kube-dns` Service (`--cluster-dns` overrides, `--vpc-dns=false`
+disables).
+
 ### Floating IPs (external north-south)
 
 Floating IPs are dual-family: a v4 address advertises via the `from_uplink`

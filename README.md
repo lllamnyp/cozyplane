@@ -45,6 +45,11 @@ built-in replacement that imports Cilium's LB components is
 - **VM live migration**: a persistent `Port` pins `{VPC IP, MAC}` to a VM NIC
   identity; a KubeVirt bridge-bound VM keeps its VPC IP and MAC across a node move
   (sub-second cutover), validated on a real cluster.
+- **Split-horizon DNS for VPCs**: the datapath steers a VPC pod's cluster-DNS
+  queries to a per-node resolver that answers the *tenant's* view — headless
+  Services annotated into the VPC resolve to VPC IPs, other tenants' names are
+  unprovable, external names forward upstream. (First slice of
+  [Services in a VPC](docs/services-in-vpc.md).)
 
 See the [roadmap](docs/roadmap.md) and the [open issues](../../issues) for what's
 outstanding (network policy, DNS, netfilter-optional operation, and more).

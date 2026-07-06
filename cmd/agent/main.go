@@ -77,6 +77,8 @@ func main() {
 		clusterCIDR   string
 		internalCIDRs string
 		masqMode      string
+		vpcDNS        bool
+		clusterDNSIPs string
 	)
 	flag.IntVar(&mtu, "mtu", 1450, "pod MTU (underlay MTU minus Geneve overhead)")
 	flag.UintVar(&vni, "vni", uint(datapath.DefaultVNI), "VNI for the default network")
@@ -90,6 +92,10 @@ func main() {
 		"cluster-egress masquerade implementation: bpf (eBPF SNAT at the uplink, no netfilter), iptables (kernel MASQUERADE rule), off (the environment masquerades elsewhere)")
 	flag.StringVar(&internalCIDRs, "internal-cidrs", "",
 		"comma-separated cluster-internal CIDRs (pod, service, node networks) a floating pod's public-IP egress must not reach")
+	flag.BoolVar(&vpcDNS, "vpc-dns", true,
+		"steer VPC pods' cluster-DNS queries to the node-local split-horizon resolver (docs/services-in-vpc.md)")
+	flag.StringVar(&clusterDNSIPs, "cluster-dns", "",
+		"comma-separated cluster DNS ClusterIP(s) to steer; empty auto-discovers from the kube-system/kube-dns Service")
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
@@ -99,13 +105,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(nodeName, mtu, uint32(vni), cniConfName, uint16(genevePort), clusterCIDR, internalCIDRs, masqMode, log); err != nil {
+	if err := run(nodeName, mtu, uint32(vni), cniConfName, uint16(genevePort), clusterCIDR, internalCIDRs, masqMode, vpcDNS, clusterDNSIPs, log); err != nil {
 		log.Error("agent failed", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort uint16, clusterCIDR, internalCIDRs, masqMode string, log *slog.Logger) error {
+func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort uint16, clusterCIDR, internalCIDRs, masqMode string, vpcDNS bool, clusterDNSIPs string, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -156,9 +162,9 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		datapath.RemoveMasquerade(v4cidr)
 	}
 	if masqMode != "bpf" {
-		if err := mgr.SetNodeIP(nil); err != nil {
-			log.Warn("clear bpf masquerade", "err", err)
-		}
+		// Clearing the sources alone disables the masquerade (masq_snat gates
+		// on masq_srcs before anything else); the node IPs stay programmed —
+		// the DNS steer addresses its resolver rewrites to them.
 		if err := mgr.SyncMasqSources(nil); err != nil {
 			log.Warn("clear bpf masquerade sources", "err", err)
 		}
@@ -259,22 +265,53 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	if err := datapath.WritePluginKubeconfig(); err != nil {
 		log.Warn("write plugin kubeconfig (VPC attachment unavailable)", "err", err)
 	}
+	// The node addresses are programmed unconditionally: the bpf masquerade
+	// (gated separately on masq_srcs) SNATs to them, and the DNS steer
+	// re-addresses VPC pods' resolver queries to them (dns_steer/dns_return).
+	if v4 := internalIPv4(self); v4 != "" {
+		if err := mgr.SetNodeIP(net.ParseIP(v4)); err != nil {
+			return fmt.Errorf("program node IP: %w", err)
+		}
+	}
+	// Without a node v6 address the v6 masquerade and v6 DNS steering stay
+	// off — pod v6 egress has no off-cluster return path (matching v4-only
+	// nodes), and a v6 cluster-DNS query has no resolver to be steered to.
+	nodeV6 := internalIPv6(self)
+	if nodeV6 != "" {
+		if err := mgr.SetNodeIP6(net.ParseIP(nodeV6)); err != nil {
+			return fmt.Errorf("program node IPv6: %w", err)
+		}
+	}
 	if masqMode == "bpf" && clusterCIDR != "" {
 		if err := mgr.SyncMasqSources(splitCIDRs(clusterCIDR)); err != nil {
 			return fmt.Errorf("program masquerade sources: %w", err)
 		}
-		if err := mgr.SetNodeIP(net.ParseIP(state.NodeIP)); err != nil {
-			return fmt.Errorf("program masquerade node IP: %w", err)
-		}
-		// v6 masquerade needs a node v6 address; without one it stays off and
-		// pod v6 egress has no off-cluster return path (matching v4-only nodes).
-		nodeV6 := internalIPv6(self)
-		if nodeV6 != "" {
-			if err := mgr.SetNodeIP6(net.ParseIP(nodeV6)); err != nil {
-				return fmt.Errorf("program masquerade node IPv6: %w", err)
-			}
-		}
 		log.Info("bpf cluster-egress masquerade enabled", "sources", clusterCIDR, "nodeIP", state.NodeIP, "nodeIPv6", nodeV6)
+	}
+
+	// VPC DNS steering (docs/services-in-vpc.md): publish the cluster DNS
+	// address(es) and the node-local resolver port; dns_steer in from_pod
+	// re-addresses VPC pods' queries to the responder. Zero config disables.
+	if vpcDNS {
+		dns4, dns6 := parseDNSIPs(clusterDNSIPs)
+		if dns4 == nil && dns6 == nil {
+			dns4, dns6 = discoverClusterDNS(ctx, client)
+		}
+		if dns4 == nil && dns6 == nil {
+			log.Warn("VPC DNS steering disabled: no cluster DNS address found (set --cluster-dns)")
+		} else {
+			if err := mgr.SetClusterDNS(dns4, dns6); err != nil {
+				return fmt.Errorf("program cluster DNS: %w", err)
+			}
+			if err := mgr.SetResolverPort(datapath.ResolverPort); err != nil {
+				return fmt.Errorf("program resolver port: %w", err)
+			}
+			log.Info("VPC DNS steering enabled", "dnsV4", dns4, "dnsV6", dns6, "resolverPort", datapath.ResolverPort)
+		}
+	} else {
+		if err := mgr.SetResolverPort(0); err != nil {
+			log.Warn("clear resolver port", "err", err)
+		}
 	}
 	log.Info("published node state", "nodeIP", state.NodeIP, "podCIDR", podCIDR, "mtu", mtu)
 
@@ -993,6 +1030,48 @@ func firstV4CIDR(cidrs string) string {
 		}
 	}
 	return ""
+}
+
+// internalIPv4 returns the node's v4 InternalIP, if it has one.
+func internalIPv4(node *corev1.Node) string {
+	for _, a := range node.Status.Addresses {
+		if a.Type == corev1.NodeInternalIP {
+			if ip := net.ParseIP(a.Address); ip != nil && ip.To4() != nil {
+				return a.Address
+			}
+		}
+	}
+	return ""
+}
+
+// parseDNSIPs splits an explicit --cluster-dns list into per-family addresses.
+func parseDNSIPs(s string) (v4, v6 net.IP) {
+	for _, part := range strings.Split(s, ",") {
+		ip := net.ParseIP(strings.TrimSpace(part))
+		if ip == nil {
+			continue
+		}
+		if ip.To4() != nil {
+			v4 = ip
+		} else {
+			v6 = ip
+		}
+	}
+	return v4, v6
+}
+
+// discoverClusterDNS reads the kube-system/kube-dns Service's ClusterIPs (the
+// conventional name CoreDNS deployments keep for compatibility).
+func discoverClusterDNS(ctx context.Context, client kubernetes.Interface) (v4, v6 net.IP) {
+	svc, err := client.CoreV1().Services("kube-system").Get(ctx, "kube-dns", metav1.GetOptions{})
+	if err != nil {
+		return nil, nil
+	}
+	ips := svc.Spec.ClusterIPs
+	if len(ips) == 0 && svc.Spec.ClusterIP != "" {
+		ips = []string{svc.Spec.ClusterIP}
+	}
+	return parseDNSIPs(strings.Join(ips, ","))
 }
 
 // internalIPv6 returns the node's v6 InternalIP, if it has one (dual-stack).

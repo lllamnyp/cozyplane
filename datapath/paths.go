@@ -50,7 +50,17 @@ const (
 	// cfgNodeIP is the node's v4 address (raw network-order bytes, native
 	// read) for the bpf cluster-egress masquerade; 0 disables it.
 	cfgNodeIP = uint32(3)
+	// cfgResolverPort is the node-local split-horizon resolver's port (host
+	// order); 0 disables VPC DNS steering. Set alongside SetClusterDNS.
+	cfgResolverPort = uint32(4)
 )
+
+// ResolverPort is the port the split-horizon resolver binds on the node
+// address. Deliberately below the masquerade range (16384+), the NodePort
+// range (30000+), and the host ephemeral range (32768+), so no node-originated
+// flow toward a pod's fabric IP can carry it as a source port by accident —
+// dns_return in bpf/overlay.c keys the reply rewrite on it.
+const ResolverPort = 15353
 
 // DefaultVNI is the VNI used for the default (flat) pod network in M0.
 const DefaultVNI uint32 = 1

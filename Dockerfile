@@ -20,7 +20,8 @@ RUN CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -trimpath -buildvcs=false -o /ou
     CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -trimpath -buildvcs=false -o /out/cozyplane ./cmd/cni && \
     CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -trimpath -buildvcs=false -o /out/sdn-controller ./cmd/sdn-controller && \
     CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -trimpath -buildvcs=false -o /out/cozyplane-apiserver ./cmd/apiserver && \
-    CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -trimpath -buildvcs=false -o /out/cozyplane-gateway ./cmd/gateway
+    CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -trimpath -buildvcs=false -o /out/cozyplane-gateway ./cmd/gateway && \
+    CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -trimpath -buildvcs=false -o /out/cozyplane-responder ./cmd/responder
 
 # Fetch the upstream host-local and loopback CNI plugins.
 FROM --platform=$BUILDPLATFORM curlimages/curl:8.11.0@sha256:83a505ba2ba62f208ed6e410c268b7b9aa48f0f7b403c8108b9773b44199dbba AS cni
@@ -44,6 +45,7 @@ COPY --from=build /out/cozyplane-agent /usr/local/bin/cozyplane-agent
 COPY --from=build /out/sdn-controller /usr/local/bin/sdn-controller
 COPY --from=build /out/cozyplane-apiserver /usr/local/bin/cozyplane-apiserver
 COPY --from=build /out/cozyplane-gateway /usr/local/bin/cozyplane-gateway
+COPY --from=build /out/cozyplane-responder /usr/local/bin/cozyplane-responder
 COPY --from=build /out/cozyplane /opt/cni/bin/cozyplane
 COPY --from=cni /tmp/cni/bin/host-local /opt/cni/bin/host-local
 COPY --from=cni /tmp/cni/bin/loopback /opt/cni/bin/loopback

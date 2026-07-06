@@ -101,6 +101,8 @@ const (
 	overlayMapBridges               = "bridges"
 	overlayMapCtFwd                 = "ct_fwd"
 	overlayMapCtRev                 = "ct_rev"
+	overlayMapDnsIps                = "dns_ips"
+	overlayMapFabricOf              = "fabric_of"
 	overlayMapFloating              = "floating"
 	overlayMapFloatingEgress        = "floating_egress"
 	overlayMapGateways              = "gateways"
@@ -175,6 +177,8 @@ type overlayMapSpecs struct {
 	Bridges        *ebpf.MapSpec `ebpf:"bridges"`
 	CtFwd          *ebpf.MapSpec `ebpf:"ct_fwd"`
 	CtRev          *ebpf.MapSpec `ebpf:"ct_rev"`
+	DnsIps         *ebpf.MapSpec `ebpf:"dns_ips"`
+	FabricOf       *ebpf.MapSpec `ebpf:"fabric_of"`
 	Floating       *ebpf.MapSpec `ebpf:"floating"`
 	FloatingEgress *ebpf.MapSpec `ebpf:"floating_egress"`
 	Gateways       *ebpf.MapSpec `ebpf:"gateways"`
@@ -219,6 +223,8 @@ type overlayMaps struct {
 	Bridges        *ebpf.Map `ebpf:"bridges"`
 	CtFwd          *ebpf.Map `ebpf:"ct_fwd"`
 	CtRev          *ebpf.Map `ebpf:"ct_rev"`
+	DnsIps         *ebpf.Map `ebpf:"dns_ips"`
+	FabricOf       *ebpf.Map `ebpf:"fabric_of"`
 	Floating       *ebpf.Map `ebpf:"floating"`
 	FloatingEgress *ebpf.Map `ebpf:"floating_egress"`
 	Gateways       *ebpf.Map `ebpf:"gateways"`
@@ -239,6 +245,8 @@ func (m *overlayMaps) Close() error {
 		m.Bridges,
 		m.CtFwd,
 		m.CtRev,
+		m.DnsIps,
+		m.FabricOf,
 		m.Floating,
 		m.FloatingEgress,
 		m.Gateways,

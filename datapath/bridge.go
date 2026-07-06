@@ -46,14 +46,55 @@ const GatewayIP = "169.254.1.1"
 // Because fabric IPs are unique, the /32 route never collides even when two
 // same-node pods share a VPC IP (overlapping CIDRs).
 
-// AddBridge routes the fabric IP to the pod's veth and records the pod's
-// (net, VPC IP) in the bridges map. net is the pod's network id (its VNI).
-func AddBridge(fabricIP, vpcIP, hostVeth string, net_ uint32) error {
+// AddBridge routes the fabric IP to the pod's veth, records the pod's
+// (net, VPC IP) in the bridges map, and pins the fabric IP's neighbour to the
+// pod MAC. net is the pod's network id (its VNI).
+//
+// The permanent neighbour entry exists because nothing else can answer for the
+// fabric address: the pod's interface carries only the VPC IP, so the kernel's
+// ARP/NDP for `fabricIP dev veth` would stay FAILED and node-originated
+// traffic (kubelet probes, the split-horizon resolver's replies) would die in
+// resolution before ever reaching to_pod's fabric->VPC DNAT. Like the fabric
+// route, the entry lives and dies with the veth — the rebuild path never needs
+// to restore it.
+func AddBridge(fabricIP, vpcIP, hostVeth string, net_ uint32, podMAC net.HardwareAddr) error {
 	if err := addFabricRoute(fabricIP, hostVeth); err != nil {
+		return err
+	}
+	if err := addFabricNeigh(fabricIP, hostVeth, podMAC); err != nil {
 		return err
 	}
 	if err := setBridge(fabricIP, vpcIP, net_); err != nil {
 		return err
+	}
+	return nil
+}
+
+// addFabricNeigh pins fabricIP -> podMAC as a permanent neighbour on the veth.
+func addFabricNeigh(fabricIP, hostVeth string, podMAC net.HardwareAddr) error {
+	if len(podMAC) != 6 {
+		return fmt.Errorf("fabric neighbour for %s: no pod MAC", fabricIP)
+	}
+	link, err := netlink.LinkByName(hostVeth)
+	if err != nil {
+		return fmt.Errorf("lookup %s: %w", hostVeth, err)
+	}
+	ip := net.ParseIP(fabricIP)
+	if ip == nil {
+		return fmt.Errorf("fabric IP %q is not an IP", fabricIP)
+	}
+	family := netlink.FAMILY_V4
+	if ip.To4() == nil {
+		family = netlink.FAMILY_V6
+	}
+	if err := netlink.NeighSet(&netlink.Neigh{
+		LinkIndex:    link.Attrs().Index,
+		Family:       family,
+		State:        netlink.NUD_PERMANENT,
+		IP:           ip,
+		HardwareAddr: podMAC,
+	}); err != nil {
+		return fmt.Errorf("pin fabric neighbour %s: %w", fabricIP, err)
 	}
 	return nil
 }
@@ -123,7 +164,10 @@ func fabricRoute(fabricIP string, ifindex int) (*netlink.Route, error) {
 }
 
 // setBridge writes bridges[fabricIP] = {net, vpcIP} in the pinned map (used by
-// the CNI plugin, like SetLocal).
+// the CNI plugin, like SetLocal) and, when the two addresses share a family,
+// the fabric_of inverse ({net, vpcIP} -> fabricIP) the DNS steer keys on. A
+// cross-family pair (fabric-family fallback) gets no inverse: there is no
+// same-family fabric handle to rewrite a source to.
 func setBridge(fabricIP, vpcIP string, net_ uint32) error {
 	m, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "bridges"), nil)
 	if err != nil {
@@ -143,10 +187,23 @@ func setBridge(fabricIP, vpcIP string, net_ uint32) error {
 	if err := m.Put(fip, &ep); err != nil {
 		return fmt.Errorf("set bridge: %w", err)
 	}
+
+	if sameFamily(fabricIP, vpcIP) {
+		fm, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "fabric_of"), nil)
+		if err != nil {
+			return fmt.Errorf("open pinned fabric_of map: %w", err)
+		}
+		defer fm.Close()
+		fk := overlayLocalKey{Net: net_, Ip: vip}
+		if err := fm.Put(&fk, &fip); err != nil {
+			return fmt.Errorf("set fabric_of: %w", err)
+		}
+	}
 	return nil
 }
 
-// delBridge removes a fabric IP from the bridges map.
+// delBridge removes a fabric IP from the bridges map and its fabric_of
+// inverse (looked up from the entry before it goes).
 func delBridge(fabricIP string) error {
 	m, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "bridges"), nil)
 	if err != nil {
@@ -158,8 +215,30 @@ func delBridge(fabricIP string) error {
 	if err != nil {
 		return fmt.Errorf("fabric IP: %w", err)
 	}
+	var ep overlayBridgeEp
+	if err := m.Lookup(fip, &ep); err == nil {
+		if fm, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "fabric_of"), nil); err == nil {
+			fk := overlayLocalKey{Net: ep.Net, Ip: ep.VpcIp}
+			var cur overlayAddr128
+			// Only remove the inverse if it still points at this fabric IP —
+			// a re-ADD may already have re-pointed it.
+			if err := fm.Lookup(&fk, &cur); err == nil && cur == fip {
+				_ = fm.Delete(&fk)
+			}
+			fm.Close()
+		}
+	}
 	if err := m.Delete(fip); err != nil && !isNotExist(err) {
 		return fmt.Errorf("del bridge: %w", err)
 	}
 	return nil
+}
+
+// sameFamily reports whether two textual IPs are both v4 or both v6.
+func sameFamily(a, b string) bool {
+	pa, pb := net.ParseIP(a), net.ParseIP(b)
+	if pa == nil || pb == nil {
+		return false
+	}
+	return (pa.To4() == nil) == (pb.To4() == nil)
 }

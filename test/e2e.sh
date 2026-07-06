@@ -169,6 +169,12 @@ check "cli -> bw1.fabric ($(fabric bw1))" "bw1" bash -c "$K exec cli -- wget -qO
 check "cli -> a2.fabric  ($(fabric a2))"  "a2"  bash -c "$K exec cli -- wget -qO- -T4 http://$(fabric a2)/  2>/dev/null"
 # ICMP echo through the bridge (the id stands in for the L4 port).
 check_ok "cli -> a1.fabric ping (north-south ICMP)" $K exec cli -- ping -c2 -W3 "$(fabric a1)"
+# Genuinely NODE-originated (host netns, not a pod): needs the fabric IP's
+# permanent neighbour — the pod's interface carries only the VPC IP, so
+# nothing answers ARP for the fabric address and, without the pinned entry,
+# kubelet-probe-style traffic dies in FAILED resolution before to_pod's DNAT.
+check "node($W) -> a1.fabric (node-originated bridge, fabric neighbour)" "a1" \
+  bash -c "docker run --rm --net container:$W curlimages/curl:8.11.0 -s -m4 http://$(fabric a1)/"
 
 echo "[isolation]"
 check_fail "cli(default) -> VPC IP 10.0.0.2 directly" bash -c "$K exec cli -- wget -qO- -T3 http://10.0.0.2/ 2>/dev/null | grep -q ."
@@ -368,6 +374,68 @@ V6FAB=$(fabric v6a1)
 check "cli UDP-traceroute6 reaches v6a1's v6 fabric (v6 bridge error un-NAT)" "ok" \
   bash -c "$K exec cli -- traceroute6 -q1 -w3 -m4 $V6FAB 2>/dev/null | grep -q \"($V6FAB)\" && echo ok"
 
+echo "[VPC DNS: split-horizon resolver (services-in-vpc.md, increment 1)]"
+# A VPC pod can't reach kube-dns (default-deny precedes everything), so the
+# datapath steers its cluster-DNS queries to the node-local resolver: src ->
+# the pod's fabric IP (the per-Port identity handle), dst -> node:15353, both
+# halves stateless. The resolver answers headless Services annotated into the
+# querying VPC with backend VPC IPs, NXDOMAINs every other cluster-domain name
+# (never forwarded: tenants must stay unprovable), and forwards non-cluster
+# names to the node's own upstreams.
+dnspod() { # dnspod <name> <node> — labeled + hostname'd, an extra httpd on :53
+  $K apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: $1, namespace: team-a, labels: {app: websvc}, annotations: {sdn.cozystack.io/vpc: vpc-a}}
+spec:
+  nodeName: $2
+  hostname: $1
+  containers: [{name: c, image: busybox:1.36, command: ["sh","-c","mkdir -p /w && hostname > /w/index.html && httpd -p 53 -h /w && httpd -f -p 80 -h /w"]}]
+EOF
+}
+dnspod dns1 "$W"
+dnspod dns2 "$W2"
+$K apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Service
+metadata: {name: websvc, namespace: team-a, annotations: {sdn.cozystack.io/vpc: vpc-a}}
+spec: {clusterIP: None, selector: {app: websvc}, ports: [{name: http, port: 80}]}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: plainsvc, namespace: team-a}
+spec: {clusterIP: None, selector: {app: websvc}, ports: [{name: http, port: 80}]}
+EOF
+$K -n team-a wait --for=condition=Ready pod/dns1 pod/dns2 --timeout=120s >/dev/null
+sleep 3 # endpointslice + resolver informer settle
+WEB=websvc.team-a.svc.cluster.local
+check "a1 -> $WEB (headless A -> VPC IPs, delivered end-to-end)" "ok" \
+  bash -c "$K -n team-a exec a1 -- wget -qO- -T4 http://$WEB/ 2>/dev/null | grep -qE '^dns[12]\$' && echo ok"
+check "a1 -> dns1.$WEB (per-hostname record)" "dns1" httpid team-a a1 "dns1.$WEB"
+check "a1 -> dns2.$WEB (per-hostname record, cross-node)" "dns2" httpid team-a a1 "dns2.$WEB"
+# The answer must be the VPC IP, not the fabric IP — the whole point of the
+# split horizon (a fabric answer would leak the underlay and need the bridge).
+check "dns1.$WEB resolves to the VPC IP $(vpcip dns1)" "ok" \
+  bash -c "$K -n team-a exec a1 -- nslookup dns1.$WEB 2>/dev/null | grep -q '$(vpcip dns1)' && echo ok"
+check_fail "bw1(vpc-b) cannot resolve vpc-a's $WEB (split horizon)" \
+  bash -c "$K -n team-b exec bw1 -- nslookup $WEB >/dev/null 2>&1"
+check_fail "a1 cannot resolve the unannotated plainsvc (nothing auto-projects)" \
+  bash -c "$K -n team-a exec a1 -- nslookup plainsvc.team-a.svc.cluster.local >/dev/null 2>&1"
+check_fail "a1 cannot resolve kube-dns.kube-system (cluster domain is authoritative, never forwarded)" \
+  bash -c "$K -n team-a exec a1 -- nslookup kube-dns.kube-system.svc.cluster.local >/dev/null 2>&1"
+# Non-cluster names defer upstream (the node's own resolv.conf). Must be a
+# dotted name: busybox nslookup never queries a bare single-label name. The
+# suite already requires internet (image pulls, the 1.1.1.1 egress checks).
+check_ok "a1 resolves the off-cluster name example.com (upstream forwarder)" \
+  $K -n team-a exec a1 -- nslookup example.com
+# Steering matches only the cluster DNS address: a tenant's own :53 (here an
+# httpd on 53 behind a VPC IP) is never hijacked — dstnet != 0 skips the steer.
+check "a1 -> dns1's own :53 untouched (intra-VPC port 53 not hijacked)" "dns1" \
+  httpid team-a a1 "$(vpcip dns1):53"
+# Default-network pods are not steered; kube-dns serves them as before.
+check_ok "cli(default network) still resolves via kube-dns (not steered)" \
+  $K exec cli -- nslookup kubernetes.default.svc.cluster.local
+
 echo "[stale locals pruning: a dead veth's entry must not shadow a reallocated IP]"
 # A pod that dies uncleanly leaves its locals/ports/bridges entries behind
 # (no CNI DEL ran). The leak turns into a blackhole when its VPC IP is later
@@ -466,7 +534,7 @@ echo "[map recreation: agent restart heals existing pods (no reboot)]"
 # the classifiers, so the EXISTING pods — not recreated — keep full
 # connectivity, isolation included (issue #7).
 for n in $(kind get nodes --name "$CLUSTER" 2>/dev/null); do
-  docker exec "$n" sh -c 'rm -f /sys/fs/bpf/cozyplane/locals /sys/fs/bpf/cozyplane/bridges /sys/fs/bpf/cozyplane/ports'
+  docker exec "$n" sh -c 'rm -f /sys/fs/bpf/cozyplane/locals /sys/fs/bpf/cozyplane/bridges /sys/fs/bpf/cozyplane/ports /sys/fs/bpf/cozyplane/fabric_of'
 done
 $K -n kube-system rollout restart ds/cozyplane-agent >/dev/null
 $K -n kube-system rollout status ds/cozyplane-agent --timeout=180s >/dev/null 2>&1
@@ -476,6 +544,8 @@ check "$BSRC -> $A2 still reaches $BPEER (net scoping survived the ports rebuild
 check "cli -> a1.fabric after map recreation (rebuilt bridges)" "a1" bash -c "$K exec cli -- wget -qO- -T4 http://$(fabric a1)/ 2>/dev/null"
 check "v6a1 -> v6a2 after map recreation (v6 VPC, 128-bit rebuild)" "v6a2" httpid team-a v6a1 "[$V6A2]"
 check_ok "cli -> coredns after map recreation (default network)" $K exec cli -- ping -c2 -W2 "$CD"
+check "a1 -> $WEB after map recreation (rebuilt fabric_of, DNS steering intact)" "ok" \
+  bash -c "$K -n team-a exec a1 -- wget -qO- -T4 http://$WEB/ 2>/dev/null | grep -qE '^dns[12]\$' && echo ok"
 check_fail "cli(default) -> VPC IP still blocked after map recreation" \
   bash -c "$K exec cli -- wget -qO- -T3 http://10.0.0.2/ 2>/dev/null | grep -q ."
 

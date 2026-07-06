@@ -63,9 +63,11 @@ func (m *Manager) SyncMasqSources(cidrs []string) error {
 	return nil
 }
 
-// SetNodeIP publishes the node's v4 address for the bpf masquerade (0 clears
-// it, disabling both masq hooks). Stored as the raw network-order bytes read
-// natively, matching how the datapath compares it against header addresses.
+// SetNodeIP publishes the node's v4 address. The bpf masquerade SNATs to it
+// (though its gate is masq_srcs — empty sources disable it regardless) and
+// the DNS steer re-addresses VPC pods' resolver queries to it. Stored as the
+// raw network-order bytes read natively, matching how the datapath compares
+// it against header addresses.
 func (m *Manager) SetNodeIP(ip net.IP) error {
 	var v uint32
 	if ip != nil {

@@ -427,6 +427,7 @@ struct {
 #define CFG_VNI            1
 #define CFG_UPLINK_IFINDEX 2
 #define CFG_NODE_IP        3 // v4, network order in the low 32 bits
+#define CFG_RESOLVER_PORT  4 // host order; 0 disables VPC DNS steering
 
 // bpf-masquerade port range for cluster-egress SNAT (#10): disjoint from the
 // host ephemeral range (32768+) so a reverse lookup can never capture the
@@ -443,7 +444,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__type(key, __u32);
 	__type(value, __u32);
-	__uint(max_entries, 4);
+	__uint(max_entries, 8);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } params SEC(".maps");
 
@@ -466,6 +467,32 @@ struct {
 	__uint(max_entries, 1);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } node_ip6 SEC(".maps");
+
+// dns_ips holds the cluster DNS ClusterIP per family ([0] = v4 in NAT64 form,
+// [1] = v6). A VPC pod's query to this address is steered to the node-local
+// split-horizon resolver (dns_steer/dns_return). A zero entry disables
+// interception for that family.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, struct addr128);
+	__uint(max_entries, 2);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} dns_ips SEC(".maps");
+
+// fabric_of: (net, VPC IP) -> the pod's fabric IP, the inverse of `bridges`,
+// programmed only when the two addresses are the same family (the fabric
+// family can differ under the fabric-family fallback, in which case a
+// same-family handle does not exist and the entry is absent). The DNS steer
+// uses it as the pod's unique, node-routable source on the default network —
+// the per-Port handle the resolver keys the tenant view on.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct local_key);
+	__type(value, struct addr128);
+	__uint(max_entries, 65536);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} fabric_of SEC(".maps");
 
 static __always_inline __u32 cfg(__u32 idx)
 {
@@ -2023,6 +2050,144 @@ static __always_inline int masq_reverse6(struct __sk_buff *skb, struct pkt *p)
 
 // cozyplane_from_pod: source-side hook (pod egress). Enforces isolation, then
 // delivers: same-node via redirect, cross-node via encap, off-VPC via gateway.
+// ---- VPC DNS steering (split-horizon resolver) ----------------------------
+// A VPC pod's query to the cluster DNS address cannot be answered by kube-dns
+// (unreachable from a VPC by design); it is steered to the node-local
+// split-horizon resolver instead. Both halves are stateless — no ct entry, no
+// port allocation: the forward half rewrites {VPC src -> the pod's fabric IP,
+// clusterDNS:53 -> node:resolver_port} (sport preserved; fabric IPs are unique,
+// so the 5-tuple stays unambiguous), and the reverse half recovers everything
+// from the bridges map + config. The fabric source doubles as the per-Port
+// handle the resolver keys the tenant view on.
+
+#define DNS_MISS -1
+
+static __always_inline int addr128_zero(const struct addr128 *a)
+{
+#pragma unroll
+	for (int i = 0; i < 16; i++)
+		if (a->b[i])
+			return 0;
+	return 1;
+}
+
+// dns_steer: from_pod's forward half. Called only for a non-gateway VPC pod
+// whose destination resolved off-VPC (dstnet == 0) — so a tenant whose own
+// CIDR covers the cluster service range keeps its :53 traffic to itself, and
+// pod-to-pod DNS inside a VPC is never hijacked.
+static __always_inline int dns_steer(struct __sk_buff *skb, struct pkt *p, __u32 srcnet)
+{
+	__u16 rport = (__u16)cfg(CFG_RESOLVER_PORT);
+	if (!rport)
+		return DNS_MISS;
+	if (p->proto != IPPROTO_UDP && p->proto != IPPROTO_TCP)
+		return DNS_MISS;
+	if (!p->is_v6) {
+		// The fixed offsets below assume an options-free v4 header,
+		// like the rest of the bridge NAT.
+		struct iphdr *ip;
+		if (parse_ipv4(skb, &ip) < 0 || ip->ihl != 5)
+			return DNS_MISS;
+	}
+	__u16 sport, dport;
+	if (p->is_v6 ? l4_ports6(skb, &sport, &dport) < 0
+		     : l4_ports(skb, &sport, &dport) < 0)
+		return DNS_MISS;
+	if (dport != bpf_htons(53))
+		return DNS_MISS;
+
+	__u32 fam = p->is_v6 ? 1 : 0;
+	struct addr128 *dns = bpf_map_lookup_elem(&dns_ips, &fam);
+	if (!dns || addr128_zero(dns) || !addr128_eq(dns, &p->dst))
+		return DNS_MISS;
+
+	struct local_key fk = { .net = srcnet, .ip = p->src };
+	struct addr128 *fabp = bpf_map_lookup_elem(&fabric_of, &fk);
+	if (!fabp)
+		return DNS_MISS; // no same-family fabric handle: fall through (drop/gateway)
+
+	if (p->is_v6) {
+		__u32 zero = 0;
+		struct addr128 *n6 = bpf_map_lookup_elem(&node_ip6, &zero);
+		if (!n6 || addr128_zero(n6))
+			return DNS_MISS;
+		struct addr128 fab = *fabp, node = *n6;
+		nat_addr6(skb, p->proto, IP6_SADDR_OFF, &p->src, &fab);
+		nat_addr6(skb, p->proto, IP6_DADDR_OFF, &p->dst, &node);
+		nat_port6(skb, p->proto, L4_DPORT_OFF6, bpf_htons(53), bpf_htons(rport));
+		return TC_ACT_OK; // up the host stack to the resolver socket
+	}
+
+	__u32 node4 = cfg(CFG_NODE_IP);
+	if (!node4)
+		return DNS_MISS;
+	__u32 fab4 = v4_of_128(fabp);
+	nat_addr(skb, p->proto, IP_SADDR_OFF, v4_of_128(&p->src), fab4);
+	nat_addr(skb, p->proto, IP_DADDR_OFF, v4_of_128(&p->dst), node4);
+	nat_port(skb, p->proto, L4_DPORT_OFF, bpf_htons(53), bpf_htons(rport));
+	return TC_ACT_OK;
+}
+
+// dns_return: to_pod's reverse half. The resolver's reply —
+// node:resolver_port -> fabric:sport, routed here by the fabric /32 — is
+// rewritten back to clusterDNS:53 -> VPC IP before delivery, so the pod's stub
+// resolver sees the answer come from the address it queried. Sanctioned path:
+// on a hit the packet is delivered without the ingress isolation check, like
+// the bridge. Kubelet probes to the same fabric IP never match: their source
+// port is ephemeral, not the reserved resolver port.
+static __always_inline int dns_return(struct __sk_buff *skb, struct pkt *p)
+{
+	__u16 rport = (__u16)cfg(CFG_RESOLVER_PORT);
+	if (!rport)
+		return DNS_MISS;
+	if (p->proto != IPPROTO_UDP && p->proto != IPPROTO_TCP)
+		return DNS_MISS;
+	if (!p->is_v6) {
+		struct iphdr *ip;
+		if (parse_ipv4(skb, &ip) < 0 || ip->ihl != 5)
+			return DNS_MISS;
+	}
+	__u16 sport, dport;
+	if (p->is_v6 ? l4_ports6(skb, &sport, &dport) < 0
+		     : l4_ports(skb, &sport, &dport) < 0)
+		return DNS_MISS;
+	if (sport != bpf_htons(rport))
+		return DNS_MISS;
+
+	// Source must be this node (the resolver binds the node address).
+	if (p->is_v6) {
+		__u32 zero = 0;
+		struct addr128 *n6 = bpf_map_lookup_elem(&node_ip6, &zero);
+		if (!n6 || addr128_zero(n6) || !addr128_eq(n6, &p->src))
+			return DNS_MISS;
+	} else {
+		if (v4_of_128(&p->src) != cfg(CFG_NODE_IP))
+			return DNS_MISS;
+	}
+
+	struct bridge_ep *be = bridge_of(p->dst);
+	if (!be)
+		return DNS_MISS;
+
+	__u32 fam = p->is_v6 ? 1 : 0;
+	struct addr128 *dns = bpf_map_lookup_elem(&dns_ips, &fam);
+	if (!dns || addr128_zero(dns))
+		return DNS_MISS;
+
+	if (p->is_v6) {
+		struct addr128 dnsa = *dns, vpc = be->vpc_ip;
+		nat_addr6(skb, p->proto, IP6_SADDR_OFF, &p->src, &dnsa);
+		nat_addr6(skb, p->proto, IP6_DADDR_OFF, &p->dst, &vpc);
+		nat_port6(skb, p->proto, L4_SPORT_OFF6, bpf_htons(rport), bpf_htons(53));
+		return TC_ACT_OK;
+	}
+	__u32 vpc4 = v4_of_128(&be->vpc_ip);
+	nat_addr(skb, p->proto, IP_SADDR_OFF, v4_of_128(&p->src), v4_of_128(dns));
+	nat_addr(skb, p->proto, IP_DADDR_OFF, v4_of_128(&p->dst), vpc4);
+	nat_port(skb, p->proto, L4_SPORT_OFF, bpf_htons(rport), bpf_htons(53));
+	return TC_ACT_OK;
+}
+
 SEC("tc")
 int cozyplane_from_pod(struct __sk_buff *skb)
 {
@@ -2066,6 +2231,17 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	// CIDR or a peer's. Overlapping CIDRs in other VPCs are invisible here.
 	// Family-agnostic — the addresses are already 128-bit map keys.
 	__u32 dstnet = net_of(&networks, srcnet, p.dst);
+
+	// VPC DNS: a pod's off-VPC query to the cluster DNS address is steered to
+	// the node-local split-horizon resolver — checked before the floating/
+	// gateway/isolation logic so every VPC pod (floating, gateway'd, or plain)
+	// gets DNS the same way, and only when the destination resolved off-VPC,
+	// so a tenant whose CIDR covers the service range shadows it (sovereignty).
+	if (srcnet && !is_gw && !dstnet) {
+		int d = dns_steer(skb, &p, srcnet);
+		if (d != DNS_MISS)
+			return d;
+	}
 
 	// The north-south bridge and floating IPs are v4-only today (v6 fabric IPs
 	// and an NDP responder are later phases), so a v6 packet skips straight to
@@ -2156,6 +2332,12 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 	struct pkt p;
 	if (parse_ip(skb, &p) < 0)
 		return TC_ACT_OK;
+
+	// The split-horizon resolver's DNS reply re-enters the pod here; un-NAT it
+	// before the bridge below would masquerade it to the gateway address.
+	int dr = dns_return(skb, &p);
+	if (dr != DNS_MISS)
+		return dr;
 
 	// The north-south bridge and floating IPs are v4-only today; a v6 packet
 	// goes straight to the family-agnostic isolation check below.

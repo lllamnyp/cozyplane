@@ -36,3 +36,4 @@ test: fmt vet ## Run Go unit tests.
 build: fmt vet ## Build all binaries.
 	go build -o bin/cozyplane-apiserver ./cmd/apiserver
 	go build -o bin/sdn-controller ./cmd/sdn-controller
+	go build -o bin/cozyplane-responder ./cmd/responder

@@ -338,6 +338,32 @@ func pruneStaleLocalState() (int, error) {
 		}
 	}
 
+	// fabric_of: the inverse of bridges — live iff its bridges counterpart
+	// (just pruned above) still maps the fabric IP back to this (net, VPC IP).
+	fm, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "fabric_of"), nil)
+	if err != nil {
+		return pruned, fmt.Errorf("open pinned fabric_of map: %w", err)
+	}
+	defer fm.Close()
+	var fk overlayLocalKey
+	var fv overlayAddr128
+	var staleFabric []overlayLocalKey
+	it = fm.Iterate()
+	for it.Next(&fk, &fv) {
+		var ep overlayBridgeEp
+		if err := bm.Lookup(&fv, &ep); err != nil || ep.Net != fk.Net || ep.VpcIp != fk.Ip {
+			staleFabric = append(staleFabric, fk)
+		}
+	}
+	if err := it.Err(); err != nil {
+		return pruned, fmt.Errorf("iterate fabric_of: %w", err)
+	}
+	for _, k := range staleFabric {
+		if err := fm.Delete(&k); err == nil {
+			pruned++
+		}
+	}
+
 	return pruned, nil
 }
 
@@ -414,6 +440,12 @@ func rebuildVeth(l netlink.Link, idx int, rawNet uint32, ips []net.IP, mac net.H
 	}
 	if fabric == "" {
 		return fmt.Errorf("no fabric route on VPC pod veth")
+	}
+	// Heal the fabric IP's permanent neighbour (pods ADDed by a pre-neighbour
+	// CNI release lack it, and node-originated traffic — kubelet probes, DNS
+	// resolver replies — dies in FAILED ARP/NDP without it). Idempotent.
+	if err := addFabricNeigh(fabric, l.Attrs().Name, mac); err != nil {
+		return err
 	}
 	return setBridge(fabric, ips[0].String(), PortNet(rawNet))
 }

@@ -302,7 +302,7 @@ func addDefault(args *skel.CmdArgs, conf *NetConf) (result *current.Result, err 
 		podIPs = append(podIPs, ipc.Address.IP)
 	}
 
-	result, err = setupVeth(args, conf.CNIVersion, podIPs, nil, mtu, 0)
+	result, _, err = setupVeth(args, conf.CNIVersion, podIPs, nil, mtu, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -401,7 +401,7 @@ func addVPC(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, p
 
 	// The pod interface carries the VPC IP + pinned MAC (nil for an ordinary pod);
 	// tag the veth with the VPC net id.
-	result, err := setupVeth(args, conf.CNIVersion, []net.IP{vpcIP}, pinnedMAC, mtu, uint32(vpc.Status.VNI))
+	result, podMAC, err := setupVeth(args, conf.CNIVersion, []net.IP{vpcIP}, pinnedMAC, mtu, uint32(vpc.Status.VNI))
 	if err != nil {
 		return err
 	}
@@ -410,7 +410,12 @@ func addVPC(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, p
 	// fabric -> {net, VPC IP} mapping; the eBPF datapath does the NAT. Both
 	// families are handled — the v6 fabric bridge (bridge_forward6/reverse6)
 	// mirrors the v4 one, and the fabric IP's family matches the VPC IP's.
-	if err = datapath.AddBridge(fabricIP.String(), vpcIP.String(), hostVethNameFor(args.ContainerID), uint32(vpc.Status.VNI)); err != nil {
+	// The pod MAC becomes the fabric IP's permanent neighbour: the pod's
+	// interface carries only the VPC IP, so nothing would ever answer ARP/NDP
+	// for the fabric address — without the entry, node-originated traffic
+	// (kubelet probes, the DNS resolver's replies) dies in FAILED resolution
+	// before it can even reach to_pod's DNAT.
+	if err = datapath.AddBridge(fabricIP.String(), vpcIP.String(), hostVethNameFor(args.ContainerID), uint32(vpc.Status.VNI), podMAC); err != nil {
 		return err
 	}
 
@@ -731,10 +736,12 @@ func portName(vni int32, ip string) string {
 
 // setupVeth creates the pod veth, configures the pod-side address and routes,
 // configures the host side, and attaches the classifier with the given net id.
-func setupVeth(args *skel.CmdArgs, cniVersion string, podIPs []net.IP, pinnedMAC net.HardwareAddr, mtu int, netID uint32) (*current.Result, error) {
+// It also returns the pod interface MAC (the pinned one for a VM) — the bridge
+// records it as the fabric IP's permanent neighbour.
+func setupVeth(args *skel.CmdArgs, cniVersion string, podIPs []net.IP, pinnedMAC net.HardwareAddr, mtu int, netID uint32) (*current.Result, net.HardwareAddr, error) {
 	hostNS, err := ns.GetCurrentNS()
 	if err != nil {
-		return nil, fmt.Errorf("get host netns: %w", err)
+		return nil, nil, fmt.Errorf("get host netns: %w", err)
 	}
 	defer hostNS.Close()
 
@@ -750,17 +757,17 @@ func setupVeth(args *skel.CmdArgs, cniVersion string, podIPs []net.IP, pinnedMAC
 		podMAC = mac
 		return e
 	}); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if err := configureHostVeth(hostVethName, podIPs, netID, podMAC); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	return &current.Result{
 		CNIVersion: cniVersion,
 		Interfaces: []*current.Interface{{Name: contVethName, Sandbox: args.Netns}},
-	}, nil
+	}, podMAC, nil
 }
 
 // ipamStdin rewrites the plugin config so host-local allocates from the node pod
