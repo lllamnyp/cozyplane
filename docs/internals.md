@@ -379,11 +379,17 @@ through the split-horizon resolver, and load-balanced entirely in `from_pod`
 
 - **Forward:** after admission (same net or peered — so a peered client uses
   the peer's VIPs), a TCP/UDP packet to `svc_vips[{net, vip, proto, port}]`
-  is DNAT'd to one of ≤16 backends `{VPC IP, target port}`. The choice is a
+  is DNAT'd to one of ≤16 backends `{VPC IP, target port}`. The backend is a
   5-tuple hash **pinned per flow** in `svc_fwd` (LRU) — a backend-set change
   never moves an established connection — and the reverse entry lands in
   `svc_rev`, both on the client's node, where both directions of the flow are
-  guaranteed to pass. Delivery then simply continues toward the rewritten
+  guaranteed to pass. Two hash subtleties, both found live: the mix must
+  **avalanche** (a plain XOR left `% n` constant because the kernel strides
+  ephemeral ports), and the reduction must be **multiply-shift**
+  (`hash * n >> 32`), not modulo — Talos hands out single-parity ports in a
+  burst, starving the low bits `% n` reads, so a whole client collapsed onto
+  one backend even with avalanching. Multiply-shift buckets on the
+  fully-mixed high bits. Delivery then simply continues toward the rewritten
   destination (locals/remotes/overlay — placement-independent).
 - **Reverse:** the client's `to_pod` looks up `svc_rev` and restores
   `backend:target → vip:port`; a hit is sanctioned (the forward direction was
