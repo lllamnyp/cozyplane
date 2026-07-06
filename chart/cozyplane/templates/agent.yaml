@@ -165,8 +165,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            {{- if .Values.clusterDomain }}
+            # Explicit override; unset, the resolver autodetects the domain
+            # from its own kubelet-written search path.
             - name: CLUSTER_DOMAIN
               value: {{ .Values.clusterDomain | quote }}
+            {{- end }}
             # Forward external names to the node's own upstreams, not the
             # cluster DNS the pod-level dnsPolicy would hand us.
             - name: RESOLV_CONF

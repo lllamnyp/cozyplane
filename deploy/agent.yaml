@@ -141,9 +141,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            # kubelet's clusterDomain; kind uses the default cluster.local.
-            - name: CLUSTER_DOMAIN
-              value: cluster.local
+            # CLUSTER_DOMAIN is autodetected from the kubelet-written search
+            # path (dnsPolicy: ClusterFirstWithHostNet); set it to override.
             # Forward external names to the node's own upstreams, not the
             # cluster DNS the pod-level dnsPolicy would hand us.
             - name: RESOLV_CONF

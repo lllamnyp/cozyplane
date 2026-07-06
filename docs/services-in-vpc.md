@@ -124,6 +124,17 @@ HTTP), sharing the datapath steering and the per-net source identification.
   name → NXDOMAIN. Not forwarding these to the real kube-dns both prevents
   probing other tenants' existence and avoids handing out dead-end cluster
   ClusterIPs.
+- **Names follow reachability across peerings**: a service attached to a VPC
+  the querier's VPC is *actively* peered with (a Ready `VPCPeering` half —
+  mutually created, disjoint CIDRs) resolves too, answered with the peer's
+  backend VPC IPs, which the peered datapath delivers natively. Disjointness
+  makes the answers unambiguous; anything short of a Ready peering stays
+  NXDOMAIN.
+- **The cluster domain is autodetected** from the responder's own
+  kubelet-written search path (the DaemonSet runs `ClusterFirstWithHostNet`,
+  so the cluster search domains are present despite hostNetwork — distinct
+  from the *node's* resolv.conf it forwards upstream to); the `clusterDomain`
+  chart value overrides.
 - **Everything else defers upstream, kube-dns-style** (decided in review):
   non-cluster names forward to the node's upstream resolvers — the same
   upstreams kube-dns itself uses — from day one. A deliberate, documented

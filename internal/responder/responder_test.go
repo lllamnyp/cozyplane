@@ -37,6 +37,7 @@ type fakeState struct {
 	svcs  map[string]*corev1.Service   // ns/name -> Service
 	eps   map[string][]Endpoint        // ns/name -> endpoints (pre-filtered per VPC in tests via vpcOf)
 	vpcOf map[string]sdnv1alpha1.VPCRef
+	peers map[sdnv1alpha1.VPCRef][]sdnv1alpha1.VPCRef
 }
 
 func (f *fakeState) PortByFabricIP(ip string) *sdnv1alpha1.Port { return f.ports[ip] }
@@ -47,6 +48,7 @@ func (f *fakeState) Endpoints(ns, name string, vpc sdnv1alpha1.VPCRef) []Endpoin
 	}
 	return append([]Endpoint(nil), f.eps[ns+"/"+name]...)
 }
+func (f *fakeState) Peers(vpc sdnv1alpha1.VPCRef) []sdnv1alpha1.VPCRef { return f.peers[vpc] }
 
 func headless(ns, name, vpcAnno string, ports ...corev1.ServicePort) *corev1.Service {
 	return &corev1.Service{
@@ -218,6 +220,31 @@ func TestExternalNameForwarded(t *testing.T) {
 	}
 	if m.Authoritative {
 		t.Fatalf("external name must not be answered authoritatively")
+	}
+}
+
+func TestPeeredVPCServiceResolves(t *testing.T) {
+	r := testResolver()
+	st := r.State.(*fakeState)
+	// vpc-a is actively peered with vpc-b: vpc-b's attached service becomes
+	// resolvable from vpc-a, answered with vpc-b's backend VPC IPs.
+	st.peers = map[sdnv1alpha1.VPCRef][]sdnv1alpha1.VPCRef{vpcA: {vpcB}}
+	m := query(t, r, "10.244.1.5", "secret.team-b.svc.cluster.local", dns.TypeA)
+	got := answers(m)
+	if len(got) != 1 || got[0] != "172.16.0.4" {
+		t.Fatalf("want the peer's backend VPC IP, got %v (rcode %v)", got, dns.RcodeToString[m.Rcode])
+	}
+}
+
+func TestPeeringIsDirectional(t *testing.T) {
+	r := testResolver()
+	st := r.State.(*fakeState)
+	// The peering is recorded for vpc-b only (its own Ready half); vpc-a has
+	// none — vpc-b's service must stay invisible to vpc-a.
+	st.peers = map[sdnv1alpha1.VPCRef][]sdnv1alpha1.VPCRef{vpcB: {vpcA}}
+	m := query(t, r, "10.244.1.5", "secret.team-b.svc.cluster.local", dns.TypeA)
+	if m.Rcode != dns.RcodeNameError {
+		t.Fatalf("want NXDOMAIN without an active peering on the querier's side, got %v", dns.RcodeToString[m.Rcode])
 	}
 }
 

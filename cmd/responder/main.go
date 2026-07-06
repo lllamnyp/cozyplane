@@ -51,6 +51,7 @@ const (
 	fabricIPIndex = "fabricIP"
 	podIndex      = "pod"
 	svcIndex      = "service"
+	localVPCIndex = "localVPC"
 )
 
 func main() {
@@ -64,7 +65,15 @@ func run() error {
 	if nodeName == "" {
 		return fmt.Errorf("NODE_NAME must be set (downward API)")
 	}
+	// The cluster domain: explicit env wins; otherwise autodetect from this
+	// container's own kubelet-written resolv.conf. The DaemonSet runs
+	// dnsPolicy: ClusterFirstWithHostNet, so despite hostNetwork the file
+	// carries the cluster search path (…, svc.<domain>, <domain>) — distinct
+	// from the *node's* resolv.conf mounted at RESOLV_CONF for upstreams.
 	domain := os.Getenv("CLUSTER_DOMAIN")
+	if domain == "" {
+		domain = detectClusterDomain("/etc/resolv.conf")
+	}
 	if domain == "" {
 		domain = "cluster.local"
 	}
@@ -109,6 +118,18 @@ func run() error {
 	defer close(stop)
 
 	sdnFactory := sdninformers.NewSharedInformerFactory(sdn, 0)
+	peeringInf := sdnFactory.Sdn().V1alpha1().VPCPeerings().Informer()
+	if err := peeringInf.AddIndexers(cache.Indexers{
+		localVPCIndex: func(obj any) ([]string, error) {
+			p, ok := obj.(*sdnv1alpha1.VPCPeering)
+			if !ok {
+				return nil, nil
+			}
+			return []string{p.Namespace + "/" + p.Spec.VPCRef.Name}, nil
+		},
+	}); err != nil {
+		return err
+	}
 	portInf := sdnFactory.Sdn().V1alpha1().Ports().Informer()
 	if err := portInf.AddIndexers(cache.Indexers{
 		fabricIPIndex: func(obj any) ([]string, error) {
@@ -150,11 +171,11 @@ func run() error {
 
 	sdnFactory.Start(stop)
 	kubeFactory.Start(stop)
-	if !cache.WaitForCacheSync(stop, portInf.HasSynced, svcInf.HasSynced, epsInf.HasSynced) {
+	if !cache.WaitForCacheSync(stop, portInf.HasSynced, svcInf.HasSynced, epsInf.HasSynced, peeringInf.HasSynced) {
 		return fmt.Errorf("informer caches did not sync")
 	}
 
-	state := &informerState{ports: portInf.GetIndexer(), svcs: svcInf.GetIndexer(), eps: epsInf.GetIndexer()}
+	state := &informerState{ports: portInf.GetIndexer(), svcs: svcInf.GetIndexer(), eps: epsInf.GetIndexer(), peerings: peeringInf.GetIndexer()}
 	res := &responder.Resolver{Domain: domain, Upstreams: upstreams, State: state}
 
 	var wg sync.WaitGroup
@@ -222,9 +243,46 @@ func upstreamsFromResolvConf(path string) ([]string, error) {
 
 // informerState implements responder.State over the shared informer indexes.
 type informerState struct {
-	ports cache.Indexer
-	svcs  cache.Indexer
-	eps   cache.Indexer
+	ports    cache.Indexer
+	svcs     cache.Indexer
+	eps      cache.Indexer
+	peerings cache.Indexer
+}
+
+// Peers lists the VPCs actively peered with vpc: its namespace holds one half
+// of each of its peerings; a half whose status is Ready is matched by its
+// reciprocal, both VPCs are Ready, and the CIDRs are disjoint (the status
+// controller owns those semantics — one source of truth with the datapath).
+func (s *informerState) Peers(vpc sdnv1alpha1.VPCRef) []sdnv1alpha1.VPCRef {
+	objs, err := s.peerings.ByIndex(localVPCIndex, vpc.Namespace+"/"+vpc.Name)
+	if err != nil {
+		return nil
+	}
+	var out []sdnv1alpha1.VPCRef
+	for _, obj := range objs {
+		p, ok := obj.(*sdnv1alpha1.VPCPeering)
+		if !ok || p.Status.Phase != sdnv1alpha1.VPCPeeringPhaseReady {
+			continue
+		}
+		out = append(out, p.Spec.PeerRef)
+	}
+	return out
+}
+
+// detectClusterDomain parses kubelet's search path for the "svc.<domain>"
+// entry. Empty when the file has no cluster search path (e.g. dnsPolicy
+// Default), in which case the caller falls back.
+func detectClusterDomain(path string) string {
+	cc, err := dns.ClientConfigFromFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, s := range cc.Search {
+		if rest, ok := strings.CutPrefix(s, "svc."); ok && rest != "" {
+			return rest
+		}
+	}
+	return ""
 }
 
 func (s *informerState) PortByFabricIP(ip string) *sdnv1alpha1.Port {

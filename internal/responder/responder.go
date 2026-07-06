@@ -32,6 +32,7 @@ package responder
 import (
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"time"
 
@@ -61,9 +62,12 @@ type State interface {
 	// Service returns a Service, or nil.
 	Service(ns, name string) *corev1.Service
 	// Endpoints lists a Service's endpoints resolved to Ports of the given
-	// VPC — the structural authz: backends outside the querier's VPC do not
-	// exist here, whatever the annotation claims.
+	// VPC — the structural authz: backends outside the service's attached VPC
+	// do not exist here, whatever the annotation claims.
 	Endpoints(ns, svcName string, vpc sdnv1alpha1.VPCRef) []Endpoint
+	// Peers lists the VPCs actively peered with vpc (VPCPeering halves whose
+	// status is Ready — matched, both VPCs Ready, CIDRs disjoint).
+	Peers(vpc sdnv1alpha1.VPCRef) []sdnv1alpha1.VPCRef
 }
 
 // Resolver serves the per-net DNS view.
@@ -130,8 +134,20 @@ func (r *Resolver) authoritative(req *dns.Msg, q dns.Question, qname string, por
 		return r.nxdomain(m)
 	}
 
+	// The service must be attached to the querier's VPC — or to a VPC the
+	// querier's is actively peered with: a peering explicitly connects the two
+	// networks (mutually created, disjoint CIDRs), so names follow
+	// reachability. Anything else stays NXDOMAIN, indistinguishable from
+	// not existing.
 	svc := r.State.Service(ns, svcName)
-	if svc == nil || !annotatedInto(svc, port.Spec.VPCRef) {
+	if svc == nil {
+		return r.nxdomain(m)
+	}
+	svcVPC, attached := attachedVPC(svc)
+	if !attached {
+		return r.nxdomain(m)
+	}
+	if svcVPC != port.Spec.VPCRef && !containsVPC(r.State.Peers(port.Spec.VPCRef), svcVPC) {
 		return r.nxdomain(m)
 	}
 	// ClusterIP services await the VIP data plane (increment 2); until then
@@ -140,7 +156,10 @@ func (r *Resolver) authoritative(req *dns.Msg, q dns.Question, qname string, por
 		return r.nxdomain(m)
 	}
 
-	eps := r.State.Endpoints(ns, svcName, port.Spec.VPCRef)
+	// Backends resolve within the service's own VPC (for a peered query, the
+	// peer's Ports — reachable natively, and unambiguous because peered CIDRs
+	// are disjoint by construction).
+	eps := r.State.Endpoints(ns, svcName, svcVPC)
 	if !svc.Spec.PublishNotReadyAddresses {
 		ready := eps[:0]
 		for _, e := range eps {
@@ -258,20 +277,23 @@ func hasHostname(eps []Endpoint, hostname string) bool {
 	return false
 }
 
-// annotatedInto reports whether the Service is explicitly attached to the
-// given VPC (nothing auto-projects). The annotation value is the same
-// "[<owner-ns>/]<vpc>" syntax pods use, defaulting to the Service's own
-// namespace.
-func annotatedInto(svc *corev1.Service, vpc sdnv1alpha1.VPCRef) bool {
+// attachedVPC resolves the Service's explicit VPC attachment (nothing
+// auto-projects). The annotation value is the same "[<owner-ns>/]<vpc>"
+// syntax pods use, defaulting to the Service's own namespace.
+func attachedVPC(svc *corev1.Service) (sdnv1alpha1.VPCRef, bool) {
 	anno, ok := svc.Annotations[sdnv1alpha1.AnnotationVPC]
 	if !ok || anno == "" {
-		return false
+		return sdnv1alpha1.VPCRef{}, false
 	}
 	ns, name := svc.Namespace, anno
 	if owner, rest, found := strings.Cut(anno, "/"); found {
 		ns, name = owner, rest
 	}
-	return ns == vpc.Namespace && name == vpc.Name
+	return sdnv1alpha1.VPCRef{Namespace: ns, Name: name}, true
+}
+
+func containsVPC(refs []sdnv1alpha1.VPCRef, want sdnv1alpha1.VPCRef) bool {
+	return slices.Contains(refs, want)
 }
 
 // forward relays a non-cluster name to the node's upstream resolvers over the

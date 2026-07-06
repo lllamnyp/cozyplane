@@ -435,6 +435,30 @@ check "a1 -> dns1's own :53 untouched (intra-VPC port 53 not hijacked)" "dns1" \
 # Default-network pods are not steered; kube-dns serves them as before.
 check_ok "cli(default network) still resolves via kube-dns (not steered)" \
   $K exec cli -- nslookup kubernetes.default.svc.cluster.local
+# Peered-VPC resolution: names follow reachability. vpc-a and vpc-c are peered
+# (disjoint CIDRs), so vpc-c's attached service resolves from a1 and the
+# backends (vpc-c VPC IPs) deliver natively across the peering; vpc-b is not
+# peered and must keep getting NXDOMAIN — indistinguishable from nonexistence.
+$K apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: cpeer, namespace: team-a, labels: {app: peersvc}, annotations: {sdn.cozystack.io/vpc: vpc-c}}
+spec:
+  nodeName: $W2
+  hostname: cpeer
+  containers: [{name: c, image: busybox:1.36, command: ["sh","-c","mkdir -p /w && hostname > /w/index.html && httpd -f -p 80 -h /w"]}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: peersvc, namespace: team-a, annotations: {sdn.cozystack.io/vpc: vpc-c}}
+spec: {clusterIP: None, selector: {app: peersvc}, ports: [{name: http, port: 80}]}
+EOF
+$K -n team-a wait --for=condition=Ready pod/cpeer --timeout=120s >/dev/null
+sleep 3
+check "a1(vpc-a) -> peersvc (attached to peered vpc-c) resolves and delivers" "cpeer" \
+  httpid team-a a1 peersvc.team-a.svc.cluster.local
+check_fail "bw1(vpc-b, unpeered) cannot resolve vpc-c's peersvc" \
+  bash -c "$K -n team-b exec bw1 -- nslookup peersvc.team-a.svc.cluster.local >/dev/null 2>&1"
 
 echo "[stale locals pruning: a dead veth's entry must not shadow a reallocated IP]"
 # A pod that dies uncleanly leaves its locals/ports/bridges entries behind

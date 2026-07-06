@@ -17,10 +17,11 @@ genevePort: 6081
 cniConfName: "10-cozyplane.conflist"
 
 # The cluster DNS domain (kubelet's clusterDomain) — the zone the split-horizon
-# resolver answers authoritatively for VPC pods. Not discoverable in-cluster
-# (it is kubelet configuration), so declared here. Cozystack clusters use
-# "cozy.local".
-clusterDomain: "cluster.local"
+# resolver answers authoritatively for VPC pods. Empty (the default)
+# autodetects it from the resolver's own kubelet-written search path (the
+# DaemonSet runs ClusterFirstWithHostNet, so the cluster domain is present
+# despite hostNetwork); set explicitly only to override.
+clusterDomain: ""
 
 # Cluster networking facts for pod egress to the outside world. Not reliably
 # discoverable in-cluster, so declared here.

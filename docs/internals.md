@@ -352,12 +352,17 @@ The rewritten **fabric source doubles as the per-Port identity handle**: the
 responder (`cmd/responder`, an unprivileged second container in the agent
 DaemonSet) maps it to the querying Port and answers that VPC's view —
 annotation-attached headless Services resolve to backend **VPC IPs**
-(A/AAAA/per-hostname/SRV), every other cluster-domain name is authoritative
-NXDOMAIN (never forwarded: other tenants stay unprovable, and cluster
-ClusterIPs would be dead ends anyway), and non-cluster names forward to the
-node's own upstreams. The agent publishes `dns_ips` from the
-`kube-system/kube-dns` Service (`--cluster-dns` overrides, `--vpc-dns=false`
-disables).
+(A/AAAA/per-hostname/SRV), services attached to an *actively peered* VPC
+(a Ready `VPCPeering` half; peered CIDRs are disjoint, so the answers are
+unambiguous and natively reachable) resolve the same way, every other
+cluster-domain name is authoritative NXDOMAIN (never forwarded: other tenants
+stay unprovable, and cluster ClusterIPs would be dead ends anyway), and
+non-cluster names forward to the node's own upstreams. The agent publishes
+`dns_ips` from the `kube-system/kube-dns` Service (`--cluster-dns` overrides,
+`--vpc-dns=false` disables); the responder autodetects the cluster domain
+from its own kubelet-written search path — present despite hostNetwork
+because the DaemonSet runs `ClusterFirstWithHostNet` — with `CLUSTER_DOMAIN`
+as the override.
 
 ### Floating IPs (external north-south)
 
