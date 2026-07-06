@@ -2236,7 +2236,13 @@ static __always_inline int svc_forward(struct __sk_buff *skb, struct pkt *p, __u
 			return SVC_MISS;
 		if (n > SVC_MAX_BACKENDS)
 			n = SVC_MAX_BACKENDS;
-		__u32 idx = svc_hash(p, sport, dport) % n;
+		// Multiply-shift reduction (idx = hash * n >> 32), NOT `% n`. Modulo
+		// depends on the hash's LOW bits, and the kernel hands out ephemeral
+		// source ports of one parity in a burst (Talos: all-even) — starving
+		// the low bits so every flow from a client collapsed onto one backend
+		// (found live on dev4). The high 32 bits of the 64-bit product carry
+		// the full avalanche, so this is uniform for any n and any port stride.
+		__u32 idx = (__u32)(((__u64)svc_hash(p, sport, dport) * n) >> 32);
 		// Bound the index with an AND the compiler cannot elide (a plain
 		// `if (idx >= MAX)` is provably dead to clang — idx < n <= MAX — so
 		// it gets optimized out and the verifier never sees a bound on the
