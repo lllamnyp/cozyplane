@@ -61,6 +61,13 @@ rules:
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
+  # VirtualMachineInstances: the migration controller reads status.nodeName /
+  # status.migrationState as the cutover signal (the Kube-OVN model). Optional —
+  # only present when KubeVirt is installed; the controller degrades to the
+  # launcher-pod signal without it.
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachineinstances"]
+    verbs: ["get", "list", "watch"]
   # Egress gateway Deployments (spec.egress.natGateway -> per-VPC gateway pod).
   - apiGroups: ["apps"]
     resources: ["deployments"]

@@ -22,7 +22,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -49,6 +51,22 @@ type PersistentPortReconciler struct {
 	client.Client
 
 	Scheme *runtime.Scheme
+
+	// watchVMI is set when the cluster serves KubeVirt's VirtualMachineInstance
+	// (kubevirt.io/v1). When true the cutover keys on the VMI's migration
+	// lifecycle (status.nodeName + status.migrationState — the Kube-OVN model);
+	// otherwise it falls back to the launcher pod's kubevirt.io/nodeName label.
+	watchVMI bool
+}
+
+// vmiGVK is the KubeVirt VirtualMachineInstance kind, read as unstructured to
+// avoid importing the (heavy) kubevirt.io/api module.
+var vmiGVK = schema.GroupVersionKind{Group: "kubevirt.io", Version: "v1", Kind: "VirtualMachineInstance"}
+
+func newVMI() *unstructured.Unstructured {
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(vmiGVK)
+	return u
 }
 
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=ports,verbs=get;list;watch;update;patch;delete
@@ -86,12 +104,25 @@ func (r *PersistentPortReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, nil
 	}
 
-	// The active pod is the running launcher whose kubevirt.io/nodeName equals its
-	// own node. During a migration only the source has it until cutover, when
-	// KubeVirt moves it to the target — which is exactly the flip we mirror.
-	active := activeLauncher(pods.Items)
+	// Determine the node the VM runs on now — the cutover signal. Preferred
+	// source (the Kube-OVN model): the VMI's status.nodeName, which KubeVirt
+	// flips to the target at cutover. Fallback (no KubeVirt, or VMI not yet
+	// readable): the launcher pod's kubevirt.io/nodeName label. Either way we
+	// then bind to the launcher pod ON that node (for its fabric IP + identity).
+	winnerNode := ""
+	if r.watchVMI {
+		if node, ok := r.vmiActiveNode(ctx, port.Spec.PodNamespace, vmName); ok {
+			winnerNode = node
+		}
+	}
+	var active *corev1.Pod
+	if winnerNode != "" {
+		active = launcherOnNode(pods.Items, winnerNode)
+	} else {
+		active = activeLauncher(pods.Items)
+	}
 	if active == nil {
-		return ctrl.Result{}, nil // all pods still starting; keep the current binding
+		return ctrl.Result{}, nil // no active launcher yet; keep the current binding
 	}
 
 	nodeIP, err := r.nodeInternalIP(ctx, active.Spec.NodeName)
@@ -132,7 +163,8 @@ func (r *PersistentPortReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 }
 
 // activeLauncher returns the running virt-launcher pod that currently owns the
-// VM (kubevirt.io/nodeName == its node), or nil if none is active yet.
+// VM (kubevirt.io/nodeName == its node), or nil if none is active yet. The
+// fallback signal when the VMI is not available.
 func activeLauncher(pods []corev1.Pod) *corev1.Pod {
 	for i := range pods {
 		p := &pods[i]
@@ -144,6 +176,31 @@ func activeLauncher(pods []corev1.Pod) *corev1.Pod {
 		}
 	}
 	return nil
+}
+
+// launcherOnNode returns the running virt-launcher pod scheduled on node — the
+// pod that realizes the VM on the VMI's current node (its status.podIP is the
+// fabric IP the Port must point at).
+func launcherOnNode(pods []corev1.Pod, node string) *corev1.Pod {
+	for i := range pods {
+		p := &pods[i]
+		if p.DeletionTimestamp == nil && p.Status.Phase == corev1.PodRunning && p.Spec.NodeName == node {
+			return p
+		}
+	}
+	return nil
+}
+
+// vmiActiveNode reads the VM's current node from the VMI: status.nodeName (the
+// node the active virt-launcher runs on, flipped to the target at cutover). ok
+// is false when the VMI is absent or has no node yet, so the caller falls back.
+func (r *PersistentPortReconciler) vmiActiveNode(ctx context.Context, namespace, vmName string) (string, bool) {
+	vmi := newVMI()
+	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: vmName}, vmi); err != nil {
+		return "", false // no VMI (KubeVirt absent, or not this pod's VM): fall back
+	}
+	node, _, _ := unstructured.NestedString(vmi.Object, "status", "nodeName")
+	return node, node != ""
 }
 
 func (r *PersistentPortReconciler) nodeInternalIP(ctx context.Context, name string) (string, error) {
@@ -160,14 +217,40 @@ func (r *PersistentPortReconciler) nodeInternalIP(ctx context.Context, name stri
 }
 
 // SetupWithManager registers the reconciler: persistent Ports drive it, and a
-// virt-launcher pod change re-enqueues the persistent Port of its VM (so the
-// cutover fires when KubeVirt sets kubevirt.io/nodeName on the target).
+// virt-launcher pod change re-enqueues the persistent Port of its VM. When
+// KubeVirt is installed it also watches VirtualMachineInstances, whose
+// status.nodeName / status.migrationState is the phase-explicit cutover signal
+// (the Kube-OVN model); otherwise it keys on the launcher pod's
+// kubevirt.io/nodeName label as before.
 func (r *PersistentPortReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&sdnv1alpha1.Port{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.mapPodToPort)).
-		Named("persistentport").
-		Complete(r)
+		Named("persistentport")
+
+	// Watch VMIs only when the CRD is served — a cache informer on an absent
+	// GVK would fail to start (cozyplane runs on clusters without KubeVirt).
+	if _, err := mgr.GetRESTMapper().RESTMapping(vmiGVK.GroupKind(), vmiGVK.Version); err == nil {
+		r.watchVMI = true
+		b = b.Watches(newVMI(), handler.EnqueueRequestsFromMapFunc(r.mapVMIToPort))
+	}
+	return b.Complete(r)
+}
+
+// mapVMIToPort re-enqueues the persistent Port(s) of the VM a VMI describes
+// (its name is the VM name; namespace matches the Port's pod namespace).
+func (r *PersistentPortReconciler) mapVMIToPort(ctx context.Context, obj client.Object) []ctrl.Request {
+	var ports sdnv1alpha1.PortList
+	if err := r.List(ctx, &ports, client.MatchingLabels{sdnv1alpha1.LabelVMName: obj.GetName()}); err != nil {
+		return nil
+	}
+	var reqs []ctrl.Request
+	for i := range ports.Items {
+		if ports.Items[i].Spec.PodNamespace == obj.GetNamespace() {
+			reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{Name: ports.Items[i].Name}})
+		}
+	}
+	return reqs
 }
 
 func (r *PersistentPortReconciler) mapPodToPort(ctx context.Context, obj client.Object) []ctrl.Request {
