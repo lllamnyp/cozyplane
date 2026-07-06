@@ -707,6 +707,54 @@ check "a1 -> vipsvc after map recreation (agents re-sync svc_vips)" "ok" \
 check_fail "cli(default) -> VPC IP still blocked after map recreation" \
   bash -c "$K exec cli -- wget -qO- -T3 http://10.0.0.2/ 2>/dev/null | grep -q ."
 
+echo "[security groups: intra-VPC policy (#7)]"
+# Labeled pods in vpc-a (all run the identity httpd on :80). Membership is
+# claim-time from the pod labels the CNI stamps, so the labels must be set here.
+sglpod() { # sglpod <name> <label-yaml>
+  $K -n team-a apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: $1, namespace: team-a, labels: {$2}, annotations: {sdn.cozystack.io/vpc: vpc-a}}
+spec:
+  nodeName: $W
+  containers: [{name: c, image: busybox:1.36, command: ["sh","-c","$SRV"]}]
+EOF
+}
+sglpod sgweb  "role: web"
+sglpod sgcli  "role: client"
+sglpod sgnone "sg: none"
+$K -n team-a wait --for=condition=Ready pod/sgweb pod/sgcli pod/sgnone --timeout=60s >/dev/null 2>&1
+SGWEB=$(vpcip sgweb)
+# Baseline: no groups yet -> legacy allow-all intra-VPC.
+check "sgcli -> sgweb (baseline, no groups: allow)"  "sgweb" httpid team-a sgcli  "$SGWEB"
+check "sgnone -> sgweb (baseline, no groups: allow)" "sgweb" httpid team-a sgnone "$SGWEB"
+# Apply policy: web admits client on TCP 80 only.
+$K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: SecurityGroup
+metadata: {name: client, namespace: team-a}
+spec: {vpcRef: {name: vpc-a}, podSelector: {matchLabels: {role: client}}}
+---
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: SecurityGroup
+metadata: {name: web, namespace: team-a}
+spec:
+  vpcRef: {name: vpc-a}
+  podSelector: {matchLabels: {role: web}}
+  ingress: [{from: {group: client}, ports: [{protocol: TCP, port: 80}]}]
+EOF
+# Wait for id allocation + membership resolution.
+for i in $(seq 1 20); do
+  g=$($K get ports -o jsonpath="{range .items[*]}{.spec.podName}{'='}{.status.groups}{'\n'}{end}" | awk -F= '$1=="sgweb"{print $2}')
+  [ -n "$g" ] && [ "$g" != "[]" ] && break; sleep 1
+done
+check "web/client groups allocated distinct ids" "1" bash -c "$K -n team-a get securitygroups -o jsonpath='{.items[*].status.id}' | tr ' ' '\n' | sort -u | wc -l | grep -q 2 && echo 1"
+check "sgcli -> sgweb:80 (client admitted by rule)"        "sgweb" httpid team-a sgcli "$SGWEB"
+check_fail "sgnone -> sgweb (ungrouped source, default-deny)" \
+  bash -c "$K -n team-a exec sgnone -- wget -qO- -T3 http://$SGWEB/ 2>/dev/null | grep -q ."
+check_fail "sgweb -> sgcli (client has no ingress, default-deny)" \
+  bash -c "$K -n team-a exec sgweb -- wget -qO- -T3 http://$(vpcip sgcli)/ 2>/dev/null | grep -q ."
+
 echo "[revocation]"
 $K -n team-a delete vpcbinding vpc-a >/dev/null
 sleep 6
