@@ -300,10 +300,76 @@ colliding with vpc-a `web`'s own id 2) is dropped (the `src_net` key keeps the
 id spaces distinct); an ungrouped vpc-b pod is dropped; same-VPC rules keep
 working alongside.
 
+## v2: north-south `from.cidr` (stage 1 built + dev4-validated)
+
+**Goal:** a security group can admit *north-south* callers by source CIDR —
+`from: {cidr: 0.0.0.0/0, ports: [{protocol: TCP, port: 443}]}` — so a grouped
+pod can be exposed to (or restricted from) external / cluster-external clients.
+
+**Semantics (decided 2026-07-06): AWS-strict default-deny.** Grouping closes a
+pod's north-south ingress just as it closes east-west — once *any* group selects
+it, north-south is default-deny, opened only by matching `from: {cidr}` rules.
+So a grouped pod that should stay world-reachable adds `from: {cidr: 0.0.0.0/0}`.
+Ungrouped pods are unaffected (today's open behavior).
+
+**The one thing that stays exempt: Kubernetes plumbing.** Invariant #7 —
+"probes reach a pod on `status.podIP`" — is non-negotiable. Kubelet health
+probes, the split-horizon DNS resolver's replies, and node-originated traffic
+must never be subject to tenant SG policy.
+
+The exemption is by **path, not source IP**. A first cut that exempted "source ==
+the node IP" was tried on dev4 and **broke** — a grouped pod with a TCP readiness
+probe went NotReady, because kubelet's probe to a pod's fabric IP does not carry
+the node's own address as source (the `/32` route to the veth has no host IP to
+borrow). What *is* reliable: kubelet reaches `bridge_forward` via the **kernel
+`/32` route**, never passing a cozyplane source hook, whereas pod-originated
+north-south is **eBPF-redirected** through `from_pod`/`from_overlay`. So those
+redirect points stamp an `NS_MARK` bit, and `bridge_forward` gates only marked
+traffic — host-originated kubelet probes arrive unmarked and are never checked.
+`skb->mark` survives the redirect (the mechanism `GW_MARK` already relies on).
+Floating IPs are gated unconditionally (external clients are never
+node-originated — the fabric IP carries kubelet). The DNS-return path already
+returns before any ingress check (reserved resolver port).
+
+### What gets gated, and where
+
+North-south to a VPC pod arrives at `to_pod` as traffic to a **fabric IP**
+(`bridge_forward`, the `/32`/redirect path) or a **floating IP**
+(`floating_forward`) — both currently return *before* the SG check, which is why
+north-south is open today. Enforcement moves *into* those functions (v4 and v6),
+right after the client address is known and **before** the `ct_fwd` gateway-port
+allocation (so a denied packet leaks no connection state):
+
+1. For the bridge path: gate only if `skb->mark & NS_MARK` (pod-originated);
+   unmarked kubelet traffic is delivered untouched. Floating IPs gate always.
+2. `sg_admit` with the destination pod, the packet's L4 port, and a **north-south
+   source identity** — `srcmap = 1 << SG_WORLD` (the reserved pseudo-group, id
+   63) for the world case, plus an LPM lookup for specific ranges (stage 2). A
+   `from: {cidr: 0.0.0.0/0}` rule compiles to the `SG_WORLD` bit (the agent
+   already does this), so `allowed & srcmap` admits it. An ungrouped pod
+   short-circuits to allow. No rule ⇒ drop (+ `sg_drops`). Stateless in the
+   client IP, so every packet of a flow decides the same way — no SYN-gate.
+
+The east-west `to_pod` check is unchanged (it runs only for non-bridge,
+non-floating traffic — those paths return earlier).
+
+### Stages
+
+- **Stage 1 — world + kubelet exemption (built, dev4-validated).**
+  `from: {cidr: 0.0.0.0/0}` / `::/0` via the reserved `SG_WORLD` pseudo-group
+  (scaffolding from v1); enforcement in `bridge_forward`/`floating_forward`
+  (+ v6) with the `NS_MARK` path exemption. The apiserver un-rejects the
+  all-addresses CIDR (specific ranges still rejected until stage 2). Validated:
+  a grouped pod with a TCP readiness probe stays Ready (kubelet exempt); a
+  default-network pod is dropped reaching it (N-S default-deny); adding
+  `from: {cidr: 0.0.0.0/0}` reopens it; an ungrouped pod is unaffected.
+- **Stage 2 — specific ranges (planned).** An `sg_cidr` LPM map keyed by
+  `{net, dst group, proto, port, client prefix}`; the agent compiles specific
+  `from: {cidr: 203.0.113.0/24}` rules into it; the datapath consults it beside
+  the world bit. The apiserver un-rejects specific CIDRs.
+
 ## v2 backlog (remaining)
 
-Egress rules; north-south `from.cidr` (world pseudo-group is reserved; needs
-floating-path enforcement, then an LPM map for specific ranges); FQDN sources;
-label-change-follows membership; ICMP rules; a real conntrack to replace the TCP
-SYN-gate; `from_pod` source-IP RPF (authoritative source group + general
-anti-spoof); peer-existence validation for peer refs.
+Egress rules; FQDN sources; label-change-follows membership; ICMP rules; a real
+conntrack to replace the TCP SYN-gate; `from_pod` source-IP RPF (authoritative
+source group + general anti-spoof); peer-existence validation for peer refs.

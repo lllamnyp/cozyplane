@@ -103,11 +103,12 @@ func validateSecurityGroup(sg *sdn.SecurityGroup) field.ErrorList {
 		case !hasGroup && !hasCIDR:
 			errs = append(errs, field.Required(p, "one of group or cidr is required"))
 		case hasCIDR:
-			// North-south cidr sources are a later increment — the datapath
-			// scaffolding (world pseudo-group) is in place, but floating-path
-			// enforcement is not wired yet, so a cidr rule would silently not
-			// restrict. Reject it rather than advertise an unenforced rule.
-			errs = append(errs, field.Forbidden(p.Child("cidr"), "cidr sources are not yet supported; reference another group instead"))
+			// v2 north-south: the all-addresses CIDR is enforced (SG_WORLD
+			// pseudo-group). Specific ranges need the LPM map (a later
+			// increment) — reject them rather than advertise an unenforced rule.
+			if r.From.CIDR != "0.0.0.0/0" && r.From.CIDR != "::/0" {
+				errs = append(errs, field.Forbidden(p.Child("cidr"), "only 0.0.0.0/0 and ::/0 are supported yet; specific ranges are a later increment"))
+			}
 		}
 		// A peer-VPC reference must name a group in that VPC.
 		if r.From.VPC != nil {

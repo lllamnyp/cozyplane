@@ -127,6 +127,15 @@ sets an `SG_OK` mark so `to_pod` skips the (spoofable) inference. So a
 mutually-peered tenant can't wear another peer's *net*. (docs/security-groups.md
 has the trust model and its intra-VPC RPF caveat.)
 
+**North-south** (`from.cidr`): grouping closes a pod's north-south too — the
+`bridge_forward`/`floating_forward` DNAT points enforce SG before the `ct_fwd`
+alloc, `from: {cidr: 0.0.0.0/0}` reopening it via the `SG_WORLD` pseudo-group.
+Kubelet stays exempt by *path*: pod-originated north-south is eBPF-redirected
+(from_pod/from_overlay stamp `NS_MARK`) and gated, while kubelet reaches
+`bridge_forward` via the kernel `/32` route unmarked and untouched — a first cut
+that keyed on "source == node IP" broke readiness probes and was replaced.
+Floating IPs gate unconditionally (never node-originated).
+
 The scoped maps use a `{prefixlen, scope_net, addr}` LPM key: the scope net
 occupies the leading 32 bits (always fully specified), so a lookup never
 crosses scopes. `networks` doubles as delivery *and* isolation resolution — a

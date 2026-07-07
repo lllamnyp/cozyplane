@@ -151,6 +151,8 @@ struct cozy_mac {
 // Tenants cannot forge either.
 #define GW_MARK        0x100000  // bit 20: clear of kube-proxy (0x4000/0x8000) and Cilium magic
 #define SG_OK          0x200000  // bit 21: from_overlay already enforced security groups (TLV)
+#define NS_MARK        0x400000  // bit 22: pod-originated north-south (subject to SG); host-
+                                 // originated (kubelet) reaches the bridge unmarked and exempt
 #define TUN_F_GATEWAY  (1 << 23) // top bit of the Geneve VNI; real VNIs are < 2^23
 
 // Security-group identity TLV (docs/security-groups.md, v2 stage B). The source
@@ -688,6 +690,27 @@ static __always_inline int sg_l4(struct __sk_buff *skb, __u8 proto, __u32 l4off,
 		return 1;
 	}
 	return 0;
+}
+
+// ns_sg_admit decides whether a north-south (bridge/floating) TCP/UDP packet to
+// a grouped VPC pod is permitted (security groups v2, from.cidr). Grouping makes
+// north-south default-deny like east-west; a `from: {cidr}` rule reopens it. The
+// source identity is the reserved SG_WORLD pseudo-group (0.0.0.0/0), so a
+// `from: {cidr: 0.0.0.0/0}` rule (which the agent compiles to the SG_WORLD bit)
+// admits it. An ungrouped pod always passes (sg_admit short-circuits on an empty
+// member bitmap). The caller gates on NS_MARK, so node-originated plumbing
+// (kubelet probes — invariant #7), which never carries the mark, is never
+// reached. dport is network order.
+static __always_inline int ns_sg_admit(__u32 net, struct addr128 vpc_ip, __u8 proto, __u16 dport)
+{
+	struct sg_query q = {
+		.dst = { .net = net, .ip = vpc_ip },
+		.src_net = net,
+		.srcmap = (1ULL << SG_WORLD),
+		.dport = dport,
+		.proto = proto,
+	};
+	return sg_admit(&q);
 }
 
 // dns_ips holds the cluster DNS ClusterIP per family ([0] = v4 in NAT64 form,
@@ -1514,6 +1537,17 @@ static __always_inline int bridge_forward(struct __sk_buff *skb, struct iphdr *i
 	v4_to_128(&client128, client);
 	v4_to_128(&fabric128, fabric);
 
+	// North-south security groups (v2): a grouped pod is default-deny to
+	// pod/external north-south, reopened by a from.cidr rule. Only NS_MARK'd
+	// (eBPF-redirected, pod-originated) traffic is gated; host-originated
+	// kubelet probes reach here via the kernel /32 route unmarked and stay
+	// exempt (invariant #7). Checked before the ct_fwd allocation so a denied
+	// packet leaves no connection state.
+	if ((skb->mark & NS_MARK) && !ns_sg_admit(net, vpc_ip, proto, pport)) {
+		count_sg_drop(net);
+		return TC_ACT_SHOT;
+	}
+
 	struct ct_fwd_key fk = {
 		.proto = proto,
 		.net = net,
@@ -1775,6 +1809,12 @@ static __always_inline int bridge_forward6(struct __sk_buff *skb, struct pkt *p,
 	__u16 cport, pport;
 	if (l4_ports6(skb, &cport, &pport) < 0)
 		return TC_ACT_SHOT;
+	// North-south security groups (v2), the v6 twin of bridge_forward: only
+	// NS_MARK'd pod-originated traffic is gated; kubelet stays exempt.
+	if ((skb->mark & NS_MARK) && !ns_sg_admit(net, vpc_ip, proto, pport)) {
+		count_sg_drop(net);
+		return TC_ACT_SHOT;
+	}
 	struct ct_fwd_key fk = {
 		.proto = proto,
 		.net = net,
@@ -1887,6 +1927,17 @@ static __always_inline int floating_forward(struct __sk_buff *skb, struct iphdr 
 			return TC_ACT_SHOT;
 	} else if (proto != IPPROTO_TCP && proto != IPPROTO_UDP) {
 		return TC_ACT_SHOT;
+	}
+	// North-south security groups (v2): a floating IP is a deliberate external
+	// surface, so it is gated unconditionally (external clients are never
+	// kubelet/node-originated — the fabric IP carries those). Default-deny for a
+	// grouped pod, reopened by a from.cidr rule.
+	if (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
+		__u16 sp, dp;
+		if (l4_ports(skb, &sp, &dp) == 0 && !ns_sg_admit(net, vpc_ip, proto, dp)) {
+			count_sg_drop(net);
+			return TC_ACT_SHOT;
+		}
 	}
 	nat_addr(skb, proto, IP_DADDR_OFF, ip->daddr, vpc);
 	return TC_ACT_OK; // delivered to the pod, the real client still its source
@@ -2134,6 +2185,15 @@ static __always_inline int floating_forward6(struct __sk_buff *skb, struct pkt *
 			return TC_ACT_SHOT;
 	} else if (proto != IPPROTO_TCP && proto != IPPROTO_UDP) {
 		return TC_ACT_SHOT;
+	}
+	// North-south security groups (v2), the v6 twin of floating_forward: gated
+	// unconditionally (external surface, never node-originated).
+	if (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
+		__u16 sp, dp;
+		if (l4_ports6(skb, &sp, &dp) == 0 && !ns_sg_admit(net, vpc_ip, proto, dp)) {
+			count_sg_drop(net);
+			return TC_ACT_SHOT;
+		}
 	}
 	nat_addr6(skb, proto, IP6_DADDR_OFF, &p->dst, &vpc_ip);
 	return TC_ACT_OK;
@@ -2936,8 +2996,10 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	struct bridge_ep *be = bridge_of(p.dst);
 	if (be) {
 		struct endpoint *l = local_of(be->net, be->vpc_ip);
-		if (l)
+		if (l) {
+			skb->mark |= NS_MARK; // pod-originated north-south -> subject to SG
 			return deliver_local(skb, l);
+		}
 	}
 
 	return TC_ACT_OK; // off-cluster / node: kernel handles it
@@ -3109,8 +3171,10 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 		struct bridge_ep *be = bridge_of(p.dst);
 		if (be) {
 			struct endpoint *l = local_of(be->net, be->vpc_ip);
-			if (l)
+			if (l) {
+				skb->mark |= NS_MARK; // pod-originated north-south -> subject to SG
 				return deliver_local(skb, l);
+			}
 		}
 		return TC_ACT_OK;
 	}

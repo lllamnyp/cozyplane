@@ -796,6 +796,45 @@ done
 check "cpeer(vpc-c) -> sgweb:80 admitted by peer rule (cross-node, TLV authoritative)" "sgweb" httpid team-a cpeer "$SGWEB"
 check "same-VPC sgcli -> sgweb:80 still admitted alongside the peer rule" "sgweb" httpid team-a sgcli "$SGWEB"
 
+echo "[security groups: north-south from.cidr (v2)]"
+SGWEBFAB="$(fabric sgweb)"
+# sgweb (grouped, no cidr rule) is default-denied to a default-network client.
+check_fail "cli(default) -> sgweb.fabric before a cidr rule (N-S default-deny)" \
+  bash -c "$K exec cli -- wget -qO- -T3 http://$SGWEBFAB/ 2>/dev/null | grep -q ."
+# Invariant #7: a grouped pod with a TCP readiness probe must still go Ready —
+# the kubelet probe reaches the fabric IP via the kernel route (unmarked), exempt.
+$K -n team-a apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: probed, namespace: team-a, labels: {role: web}, annotations: {sdn.cozystack.io/vpc: vpc-a}}
+spec:
+  nodeName: $W
+  containers:
+  - {name: c, image: busybox:1.36, command: ["sh","-c","$SRV"], readinessProbe: {tcpSocket: {port: 80}, initialDelaySeconds: 2, periodSeconds: 2, failureThreshold: 3}}
+EOF
+$K -n team-a wait --for=condition=Ready pod/probed --timeout=40s >/dev/null 2>&1
+check "grouped pod with a readiness probe stays Ready (kubelet exempt, invariant #7)" "true" \
+  $K -n team-a get pod probed -o jsonpath='{.status.containerStatuses[0].ready}'
+# Reopen north-south with from: {cidr: 0.0.0.0/0}.
+$K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: SecurityGroup
+metadata: {name: web, namespace: team-a}
+spec:
+  vpcRef: {name: vpc-a}
+  podSelector: {matchLabels: {role: web}}
+  ingress:
+  - from: {group: client}
+    ports: [{protocol: TCP, port: 80}]
+  - from: {group: cpeer, vpc: {namespace: team-a, name: vpc-c}}
+    ports: [{protocol: TCP, port: 80}]
+  - from: {cidr: 0.0.0.0/0}
+    ports: [{protocol: TCP, port: 80}]
+EOF
+sleep 4
+check "cli(default) -> sgweb.fabric after from:{cidr:0.0.0.0/0} (north-south reopened)" "sgweb" \
+  bash -c "$K exec cli -- wget -qO- -T4 http://$SGWEBFAB/ 2>/dev/null"
+
 echo "[revocation]"
 $K -n team-a delete vpcbinding vpc-a >/dev/null
 sleep 6
