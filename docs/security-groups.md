@@ -381,8 +381,72 @@ non-floating traffic — those paths return earlier).
   (unioned in the value bitmap), and a pod in a single group (the common case)
   are exact; a true union would need a per-group LPM or a prefix-walk.
 
+## v2: egress rules (built + dev4-validated)
+
+**Goal:** a group controls where its members may *send*, the mirror of ingress —
+`egress: [{to: {group: db}, ports: [{protocol: TCP, port: 5432}]}]`.
+
+**Semantics (decided 2026-07-06): symmetric default-deny.** Any group selecting a
+pod closes its east-west egress just as it closes ingress: a grouped pod may
+reach another VPC pod only if one of its groups' egress rules admits that pod's
+group. A flow A→B is delivered only when **both** B's ingress admits A **and**
+A's egress admits B (AWS ANDs the two directions). The peer form
+`to: {group, vpc: {...}}` reaches a peered VPC's group, exactly like ingress.
+
+Consequence to be explicit about: since v1 egress references *groups* only, a
+grouped pod cannot egress to an **ungrouped** destination (there is no group to
+name) — grouped and ungrouped pods become mutually isolated, which is the strict
+reading of default-deny-both-ways. `to: {cidr}` egress (reaching ungrouped /
+external destinations) is a later increment; it needs source-side / gateway
+enforcement, unlike the group case.
+
+### Datapath
+
+`sg_egress` mirrors `sg_rules`, keyed from the **source** side:
+`{src_net, dst_net, src_group, proto, port}` → the bitmap of destination groups
+(in `dst_net`'s id space) that the source group may reach. Enforcement stays in
+`to_pod` — it already has both identities — right beside the ingress check and
+under the same TCP SYN-gate (only new connections are checked; replies pass):
+
+- **Ingress** (existing): `sg_admit` iterates the *destination's* groups and
+  admits if a rule's allowed-source bitmap intersects the source's groups.
+- **Egress** (new): `sg_egress_admit` iterates the *source's* groups and admits
+  if a rule's allowed-destination bitmap intersects the destination's groups.
+- Both short-circuit to allow when their subject is ungrouped, and a flow is
+  delivered only if both pass.
+
+The source identity is the same one ingress already uses (the `sg_members`
+inference, or the authoritative Geneve TLV for a cross-node peered source), so
+egress inherits the peered-group anti-spoof for free. Two group-loops now run on
+a gated SYN (ingress over the dst's groups, egress over the src's) — bounded and
+verifier-checked like the ingress loop.
+
+### Control plane
+
+`SecurityGroupSpec` gains `egress []{to: SecurityGroupPeer, ports}`. The apiserver
+validates a `to.group` is set (and, for v1, rejects `to.cidr`). The agent
+compiles each egress rule into `sg_egress` by resolving the destination group's
+id and VNI (same lister walk as a peered ingress ref). Membership and id
+allocation are unchanged.
+
+**Validated on dev4 (2026-07-06).** A grouped `client` pod with no egress rule
+can't reach `web` even though `web`'s ingress admits `client` (egress
+default-deny); adding `client` `egress: {to: web, TCP 80}` opens `:80` (both
+directions now allow) while `:81` stays closed; both same-node (inference) and
+cross-node (the Geneve TLV carries the source's groups to `from_overlay`, which
+now runs the egress check too) confirmed; removing the egress rule closes it
+again. Loads clean on the 6.12 verifier with the second group-loop.
+
+**Note on adopting egress:** because grouping now closes east-west egress,
+existing ingress-only configs must add egress rules on the *source* groups for
+their flows to keep working (a `client` group that reaches `web` needs
+`egress: {to: web}`). This is the deliberate consequence of symmetric
+default-deny.
+
 ## v2 backlog (remaining)
 
-Egress rules; FQDN sources; label-change-follows membership; ICMP rules; a real
-conntrack to replace the TCP SYN-gate; `from_pod` source-IP RPF (authoritative
-source group + general anti-spoof); peer-existence validation for peer refs.
+North-south / external egress (`to: {cidr}`, source-side); FQDN sources;
+label-change-follows membership; ICMP rules; a real conntrack to replace the TCP
+SYN-gate; `from_pod` source-IP RPF (authoritative source group + general
+anti-spoof); peer-existence validation for peer refs;
+[#11](../../issues/11) (overlapping north-south cidr union).

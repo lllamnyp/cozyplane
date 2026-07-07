@@ -61,12 +61,86 @@ spec:
               SecurityGroupSpec declares an intra-VPC policy group: which ports are members
               and, for a member, which sources may reach it.
             properties:
+              egress:
+                description: |-
+                  Egress is the list of allowed east-west destinations (the mirror of
+                  Ingress). When any group selects a pod, its east-west egress is also
+                  default-deny: it may reach another VPC pod only if a group it belongs to
+                  admits that pod's group here. A flow is delivered only when both the
+                  destination's ingress and the source's egress admit it. `to.cidr`
+                  (north-south/external egress) is a later increment.
+                items:
+                  description: |-
+                    SecurityGroupEgressRule admits traffic from the group's members to a
+                    destination, optionally narrowed to specific ports.
+                  properties:
+                    ports:
+                      description: |-
+                        Ports narrows the rule to specific destination ports. Empty means every
+                        port and protocol.
+                      items:
+                        description: SecurityGroupPort is a protocol/port an ingress
+                          rule admits.
+                        properties:
+                          port:
+                            description: |-
+                              Port is the destination port. Zero (or omitted) means every port for the
+                              protocol.
+                            format: int32
+                            type: integer
+                          protocol:
+                            description: Protocol is TCP or UDP.
+                            enum:
+                            - TCP
+                            - UDP
+                            type: string
+                        required:
+                        - protocol
+                        type: object
+                      type: array
+                      x-kubernetes-list-type: atomic
+                    to:
+                      description: To is the admitted destination (a group, optionally
+                        in a peered VPC).
+                      properties:
+                        cidr:
+                          description: |-
+                            CIDR admits north-south (bridge/floating) callers by their pre-masquerade
+                            client address. It does not match intra-VPC sources — those are identified
+                            by group. FQDN sources are a later increment.
+                          type: string
+                        group:
+                          description: |-
+                            Group is the name of another SecurityGroup — in this VPC, or in the VPC
+                            named by VPC.
+                          type: string
+                        vpc:
+                          description: |-
+                            VPC, when set, makes Group reference a group in that peered VPC (owner
+                            namespace + name). The referenced VPC must be a declared peer.
+                          properties:
+                            name:
+                              description: Name is the VPC name within that namespace.
+                              type: string
+                            namespace:
+                              description: Namespace is the namespace that owns the
+                                VPC.
+                              type: string
+                          required:
+                          - name
+                          - namespace
+                          type: object
+                      type: object
+                  required:
+                  - to
+                  type: object
+                type: array
+                x-kubernetes-list-type: atomic
               ingress:
                 description: |-
                   Ingress is the list of allowed inbound sources. When *any* group selects a
                   pod, that pod's ingress becomes default-deny and is opened only by the
-                  union of the ingress rules of the groups it belongs to. v1 is ingress-only;
-                  egress is a later increment (the field is additive).
+                  union of the ingress rules of the groups it belongs to.
                 items:
                   description: |-
                     SecurityGroupRule admits traffic from one source to the group's members,

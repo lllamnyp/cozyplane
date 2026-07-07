@@ -495,11 +495,19 @@ type SecurityGroupSpec struct {
 	VPCRef      LocalVPCRef
 	PodSelector metav1.LabelSelector
 	Ingress     []SecurityGroupRule
+	Egress      []SecurityGroupEgressRule
 }
 
 // SecurityGroupRule admits traffic from one source, optionally port-narrowed.
 type SecurityGroupRule struct {
 	From  SecurityGroupPeer
+	Ports []SecurityGroupPort
+}
+
+// SecurityGroupEgressRule admits traffic to one destination, optionally
+// port-narrowed.
+type SecurityGroupEgressRule struct {
+	To    SecurityGroupPeer
 	Ports []SecurityGroupPort
 }
 

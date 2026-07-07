@@ -60,11 +60,33 @@ type SecurityGroupSpec struct {
 
 	// Ingress is the list of allowed inbound sources. When *any* group selects a
 	// pod, that pod's ingress becomes default-deny and is opened only by the
-	// union of the ingress rules of the groups it belongs to. v1 is ingress-only;
-	// egress is a later increment (the field is additive).
+	// union of the ingress rules of the groups it belongs to.
 	// +optional
 	// +listType=atomic
 	Ingress []SecurityGroupRule `json:"ingress,omitempty"`
+
+	// Egress is the list of allowed east-west destinations (the mirror of
+	// Ingress). When any group selects a pod, its east-west egress is also
+	// default-deny: it may reach another VPC pod only if a group it belongs to
+	// admits that pod's group here. A flow is delivered only when both the
+	// destination's ingress and the source's egress admit it. `to.cidr`
+	// (north-south/external egress) is a later increment.
+	// +optional
+	// +listType=atomic
+	Egress []SecurityGroupEgressRule `json:"egress,omitempty"`
+}
+
+// SecurityGroupEgressRule admits traffic from the group's members to a
+// destination, optionally narrowed to specific ports.
+type SecurityGroupEgressRule struct {
+	// To is the admitted destination (a group, optionally in a peered VPC).
+	To SecurityGroupPeer `json:"to"`
+
+	// Ports narrows the rule to specific destination ports. Empty means every
+	// port and protocol.
+	// +optional
+	// +listType=atomic
+	Ports []SecurityGroupPort `json:"ports,omitempty"`
 }
 
 // SecurityGroupRule admits traffic from one source to the group's members,

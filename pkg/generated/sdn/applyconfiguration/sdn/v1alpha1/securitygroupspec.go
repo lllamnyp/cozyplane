@@ -37,9 +37,15 @@ type SecurityGroupSpecApplyConfiguration struct {
 	PodSelector *v1.LabelSelectorApplyConfiguration `json:"podSelector,omitempty"`
 	// Ingress is the list of allowed inbound sources. When *any* group selects a
 	// pod, that pod's ingress becomes default-deny and is opened only by the
-	// union of the ingress rules of the groups it belongs to. v1 is ingress-only;
-	// egress is a later increment (the field is additive).
+	// union of the ingress rules of the groups it belongs to.
 	Ingress []SecurityGroupRuleApplyConfiguration `json:"ingress,omitempty"`
+	// Egress is the list of allowed east-west destinations (the mirror of
+	// Ingress). When any group selects a pod, its east-west egress is also
+	// default-deny: it may reach another VPC pod only if a group it belongs to
+	// admits that pod's group here. A flow is delivered only when both the
+	// destination's ingress and the source's egress admit it. `to.cidr`
+	// (north-south/external egress) is a later increment.
+	Egress []SecurityGroupEgressRuleApplyConfiguration `json:"egress,omitempty"`
 }
 
 // SecurityGroupSpecApplyConfiguration constructs a declarative configuration of the SecurityGroupSpec type for use with
@@ -73,6 +79,19 @@ func (b *SecurityGroupSpecApplyConfiguration) WithIngress(values ...*SecurityGro
 			panic("nil value passed to WithIngress")
 		}
 		b.Ingress = append(b.Ingress, *values[i])
+	}
+	return b
+}
+
+// WithEgress adds the given value to the Egress field in the declarative configuration
+// and returns the receiver, so that objects can be build by chaining "With" function invocations.
+// If called multiple times, values provided by each call will be appended to the Egress field.
+func (b *SecurityGroupSpecApplyConfiguration) WithEgress(values ...*SecurityGroupEgressRuleApplyConfiguration) *SecurityGroupSpecApplyConfiguration {
+	for i := range values {
+		if values[i] == nil {
+			panic("nil value passed to WithEgress")
+		}
+		b.Egress = append(b.Egress, *values[i])
 	}
 	return b
 }

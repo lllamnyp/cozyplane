@@ -111,6 +111,16 @@ type overlaySgCidrKey struct {
 	Client    overlayAddr128
 }
 
+type overlaySgEgressKey struct {
+	_      structs.HostLayout
+	SrcNet uint32
+	DstNet uint32
+	Group  uint16
+	Port   uint16
+	Proto  uint8
+	Pad    [3]uint8
+}
+
 type overlaySgRuleKey struct {
 	_      structs.HostLayout
 	Net    uint32
@@ -213,6 +223,7 @@ const (
 	overlayMapRemotes               = "remotes"
 	overlayMapSgCidr                = "sg_cidr"
 	overlayMapSgDrops               = "sg_drops"
+	overlayMapSgEgress              = "sg_egress"
 	overlayMapSgMembers             = "sg_members"
 	overlayMapSgRules               = "sg_rules"
 	overlayMapSvcFwd                = "svc_fwd"
@@ -299,6 +310,7 @@ type overlayMapSpecs struct {
 	Remotes        *ebpf.MapSpec `ebpf:"remotes"`
 	SgCidr         *ebpf.MapSpec `ebpf:"sg_cidr"`
 	SgDrops        *ebpf.MapSpec `ebpf:"sg_drops"`
+	SgEgress       *ebpf.MapSpec `ebpf:"sg_egress"`
 	SgMembers      *ebpf.MapSpec `ebpf:"sg_members"`
 	SgRules        *ebpf.MapSpec `ebpf:"sg_rules"`
 	SvcFwd         *ebpf.MapSpec `ebpf:"svc_fwd"`
@@ -355,6 +367,7 @@ type overlayMaps struct {
 	Remotes        *ebpf.Map `ebpf:"remotes"`
 	SgCidr         *ebpf.Map `ebpf:"sg_cidr"`
 	SgDrops        *ebpf.Map `ebpf:"sg_drops"`
+	SgEgress       *ebpf.Map `ebpf:"sg_egress"`
 	SgMembers      *ebpf.Map `ebpf:"sg_members"`
 	SgRules        *ebpf.Map `ebpf:"sg_rules"`
 	SvcFwd         *ebpf.Map `ebpf:"svc_fwd"`
@@ -387,6 +400,7 @@ func (m *overlayMaps) Close() error {
 		m.Remotes,
 		m.SgCidr,
 		m.SgDrops,
+		m.SgEgress,
 		m.SgMembers,
 		m.SgRules,
 		m.SvcFwd,

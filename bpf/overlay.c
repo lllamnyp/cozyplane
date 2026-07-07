@@ -600,6 +600,28 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } sg_rules SEC(".maps");
 
+// sg_egress is the mirror of sg_rules keyed from the SOURCE side (v2 egress):
+// (src-net, dst-net, src-group, proto, dst-port) -> the bitmap of destination
+// groups (in dst-net's id space) that source group may reach. Grouping makes a
+// pod's east-west egress default-deny too, so a flow A->B is delivered only when
+// B's ingress admits A (sg_rules) AND A's egress admits B (sg_egress).
+struct sg_egress_key {
+	__u32 src_net; // source net
+	__u32 dst_net; // destination net (peer VNI for a peer egress rule)
+	__u16 group;   // source group id
+	__u16 port;    // destination port, network order; 0 = any port
+	__u8 proto;    // IPPROTO_TCP / IPPROTO_UDP
+	__u8 pad[3];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct sg_egress_key);
+	__type(value, __u64);
+	__uint(max_entries, 65536);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} sg_egress SEC(".maps");
+
 // sg_drops meters policy drops per VPC (net), PERCPU and agent-seeded like
 // vpc_counters — the observability the #2 metering foundation wants.
 struct {
@@ -685,6 +707,45 @@ static __attribute__((noinline)) int sg_admit(struct sg_query *q)
 			allowed |= *r0;
 	}
 	return (allowed & q->srcmap) ? 1 : 0;
+}
+
+// sg_egress_query is the argument to sg_egress_admit: the source's groups (to
+// iterate) and the destination's groups (to intersect the rules against).
+struct sg_egress_query {
+	__u32 src_net;
+	__u32 dst_net;
+	__u64 srcmap; // source's group bitmap (the subject)
+	__u64 dstmap; // destination's group bitmap
+	__u16 dport;
+	__u8 proto;
+	__u8 pad[5];
+};
+
+// sg_egress_admit is the mirror of sg_admit for the egress direction: it iterates
+// the SOURCE's groups and admits if one of their egress rules names a group the
+// destination is in. An ungrouped source is unrestricted (legacy allow), like an
+// ungrouped destination is for ingress. Same noinline/one-key shape as sg_admit.
+static __attribute__((noinline)) int sg_egress_admit(struct sg_egress_query *q)
+{
+	if (!q->srcmap)
+		return 1; // ungrouped source -> egress unrestricted
+	__u64 allowed = 0;
+	struct sg_egress_key rk = { .src_net = q->src_net, .dst_net = q->dst_net, .proto = q->proto };
+#pragma unroll
+	for (int g = 1; g < SG_WORLD; g++) {
+		if (!(q->srcmap & (1ULL << g)))
+			continue;
+		rk.group = g;
+		rk.port = q->dport;
+		__u64 *r = bpf_map_lookup_elem(&sg_egress, &rk);
+		if (r)
+			allowed |= *r;
+		rk.port = 0; // any-port rule for this (group, proto)
+		__u64 *r0 = bpf_map_lookup_elem(&sg_egress, &rk);
+		if (r0)
+			allowed |= *r0;
+	}
+	return (allowed & q->dstmap) ? 1 : 0;
 }
 
 // sg_l4 reads the destination port and decides whether a packet should be gated
@@ -3163,14 +3224,29 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 			// rules are keyed by that src_net — so a peered group matches.
 			struct local_key sk = { .net = srcnet, .ip = p.src };
 			__u64 *sm = bpf_map_lookup_elem(&sg_members, &sk);
+			__u64 srcmap = sm ? *sm : 0;
+			struct local_key dk = { .net = dstnet, .ip = p.dst };
+			__u64 *dmp = bpf_map_lookup_elem(&sg_members, &dk);
+			__u64 dstmap = dmp ? *dmp : 0;
+			// Ingress: the destination's groups must admit the source.
 			struct sg_query q = {
 				.dst = { .net = dstnet, .ip = p.dst },
 				.src_net = srcnet,
-				.srcmap = sm ? *sm : 0,
+				.srcmap = srcmap,
 				.dport = dport,
 				.proto = p.proto,
 			};
-			if (!sg_admit(&q)) {
+			// Egress: the source's groups must admit the destination (v2). A flow
+			// is delivered only if both directions allow.
+			struct sg_egress_query eq = {
+				.src_net = srcnet,
+				.dst_net = dstnet,
+				.srcmap = srcmap,
+				.dstmap = dstmap,
+				.dport = dport,
+				.proto = p.proto,
+			};
+			if (!sg_admit(&q) || !sg_egress_admit(&eq)) {
 				count_sg_drop(dstnet);
 				return TC_ACT_SHOT;
 			}
@@ -3246,6 +3322,10 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 				__u16 dport;
 				__u32 l4off = p.is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
 				if (sg_l4(skb, p.proto, l4off, &dport)) {
+					struct local_key dk = { .net = vni, .ip = p.dst };
+					__u64 *dmp = bpf_map_lookup_elem(&sg_members, &dk);
+					__u64 dstmap = dmp ? *dmp : 0;
+					// Ingress: dst's groups admit the (TLV-authoritative) source.
 					struct sg_query q = {
 						.dst = { .net = vni, .ip = p.dst },
 						.src_net = opt.src_net,
@@ -3253,7 +3333,16 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 						.dport = dport,
 						.proto = p.proto,
 					};
-					if (!sg_admit(&q)) {
+					// Egress: the source's groups admit the destination (v2).
+					struct sg_egress_query eq = {
+						.src_net = opt.src_net,
+						.dst_net = vni,
+						.srcmap = opt.srcmap,
+						.dstmap = dstmap,
+						.dport = dport,
+						.proto = p.proto,
+					};
+					if (!sg_admit(&q) || !sg_egress_admit(&eq)) {
 						count_sg_drop(vni);
 						return TC_ACT_SHOT;
 					}

@@ -128,6 +128,30 @@ func (m *Manager) SyncSGRules(rules []SGRule) error {
 	return syncMap(m.objs.SgRules, want)
 }
 
+// SGEgress is one compiled datapath egress rule: for a source group in src net,
+// the bitmap of destination groups (in dst net's id space) it may reach on
+// (proto, port). SrcNet == DstNet for a same-VPC rule, the peer VNI for a
+// peered destination. Port 0 is the any-port rule.
+type SGEgress struct {
+	SrcNet  uint32
+	DstNet  uint32
+	Group   uint16 // source group id
+	Proto   uint8
+	Port    uint16 // host order; stored network order
+	Allowed uint64 // destination-group bitmap
+}
+
+// SyncSGEgress makes sg_egress exactly `rules` (full-state diff), the mirror of
+// SyncSGRules for the egress direction.
+func (m *Manager) SyncSGEgress(rules []SGEgress) error {
+	want := map[overlaySgEgressKey]uint64{}
+	for _, r := range rules {
+		key := overlaySgEgressKey{SrcNet: r.SrcNet, DstNet: r.DstNet, Group: r.Group, Port: htons(r.Port), Proto: r.Proto}
+		want[key] |= r.Allowed
+	}
+	return syncMap(m.objs.SgEgress, want)
+}
+
 // syncMap makes a hash map exactly `want` (prune stale, put desired).
 func syncMap[K comparable](mp *ebpf.Map, want map[K]uint64) error {
 	var key K

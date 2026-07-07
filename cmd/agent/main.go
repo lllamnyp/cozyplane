@@ -1323,6 +1323,7 @@ func watchSecurityGroups(ctx context.Context, factory sdninformers.SharedInforme
 
 		var rules []datapath.SGRule
 		var cidrRules []datapath.SGCidr
+		var egressRules []datapath.SGEgress
 		nets := map[uint32]bool{}
 		for _, sg := range allSGs {
 			if sg.Status.ID == 0 {
@@ -1376,12 +1377,41 @@ func watchSecurityGroups(ctx context.Context, factory sdninformers.SharedInforme
 					rules = append(rules, r)
 				}
 			}
+			// Egress rules (v2): resolve the destination group's id + VNI (same
+			// VPC by default, or a peered VPC) and key the entry from the source
+			// side. cidr egress destinations are not supported yet.
+			for _, eg := range sg.Spec.Egress {
+				if eg.To.Group == "" {
+					continue
+				}
+				dstKey := k
+				dstNet := net_
+				if v := eg.To.VPC; v != nil {
+					dstKey = vpcKey{v.Namespace, v.Name}
+					dvpc, err := vpcs.Lister().VPCs(v.Namespace).Get(v.Name)
+					if err != nil || dvpc.Status.VNI == 0 {
+						continue
+					}
+					dstNet = uint32(dvpc.Status.VNI)
+				}
+				dstID, ok := nameID[dstKey][eg.To.Group]
+				if !ok {
+					continue
+				}
+				allowedDst := uint64(1) << uint(dstID)
+				for _, e := range compileEgressPorts(net_, dstNet, uint16(sg.Status.ID), allowedDst, eg.Ports) {
+					egressRules = append(egressRules, e)
+				}
+			}
 		}
 		if err := mgr.SyncSGRules(rules); err != nil {
 			log.Error("sync sg_rules", "err", err)
 		}
 		if err := mgr.SyncSGCidr(cidrRules); err != nil {
 			log.Error("sync sg_cidr", "err", err)
+		}
+		if err := mgr.SyncSGEgress(egressRules); err != nil {
+			log.Error("sync sg_egress", "err", err)
 		}
 		for n := range nets {
 			if err := mgr.EnsureSGDrop(n); err != nil {
@@ -1458,6 +1488,31 @@ func compileRulePorts(net_, srcNet uint32, group uint16, allowed uint64, ports [
 			continue
 		}
 		out = append(out, datapath.SGRule{Net: net_, SrcNet: srcNet, Group: group, Proto: proto, Port: uint16(pp.Port), Allowed: allowed})
+	}
+	return out
+}
+
+// compileEgressPorts expands an egress rule's port list into sg_egress entries
+// for (src net, dst net, source group) admitting the destination group bitmap.
+func compileEgressPorts(srcNet, dstNet uint32, group uint16, allowedDst uint64, ports []sdnv1alpha1.SecurityGroupPort) []datapath.SGEgress {
+	var out []datapath.SGEgress
+	if len(ports) == 0 {
+		for _, proto := range []uint8{unix.IPPROTO_TCP, unix.IPPROTO_UDP} {
+			out = append(out, datapath.SGEgress{SrcNet: srcNet, DstNet: dstNet, Group: group, Proto: proto, Port: 0, Allowed: allowedDst})
+		}
+		return out
+	}
+	for _, pp := range ports {
+		var proto uint8
+		switch pp.Protocol {
+		case "TCP":
+			proto = unix.IPPROTO_TCP
+		case "UDP":
+			proto = unix.IPPROTO_UDP
+		default:
+			continue
+		}
+		out = append(out, datapath.SGEgress{SrcNet: srcNet, DstNet: dstNet, Group: group, Proto: proto, Port: uint16(pp.Port), Allowed: allowedDst})
 	}
 	return out
 }

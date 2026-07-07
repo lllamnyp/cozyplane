@@ -92,6 +92,7 @@ maps and one program.
 | `vpc_counters` | PERCPU hash | net id → {tx,rx bytes/packets} | datapath (in-band) |
 | `sg_members` | hash | {net, VPC IP} → `u64` group bitmap | agent (Ports' `status.groups`) |
 | `sg_rules` | hash | {dst net, src net, dst group, proto, port} → `u64` allowed-source bitmap | agent (SecurityGroups) |
+| `sg_egress` | hash | {src net, dst net, src group, proto, port} → allowed-dst-group bitmap | agent (SecurityGroups) |
 | `sg_cidr` | LPM trie | {net, proto, port, client CIDR} → allowed-group bitmap | agent (SecurityGroups) |
 | `sg_drops` | PERCPU hash | net id → policy-drop count | datapath (in-band) |
 | `params` | array | `[0]`=Geneve ifindex, `[1]`=default VNI | agent |
@@ -116,8 +117,13 @@ destination-side. `sg_admit` (another stack-lean `noinline` subprogram, single
 if it is grouped, it unions the `sg_rules` allowed-source bitmaps for the
 destination's groups and admits only if that intersects the source's bitmap,
 else drops and bumps `sg_drops`. TCP is gated on new connections only (SYN,
-no ACK) so replies pass without a conntrack; UDP always. Gateway-forwarded
-(`GW_MARK`) ingress is exempt. The source's groups come from its *own* net
+no ACK) so replies pass without a conntrack; UDP always. **Egress** is the
+mirror (`sg_egress_admit` over the *source's* groups against `sg_egress`): a
+grouped pod's east-west egress is default-deny too, so a flow is delivered only
+if the destination's ingress admits the source **and** the source's egress
+admits the destination — both loops run on the same gated SYN, in `to_pod` and
+in the `from_overlay` TLV path. Gateway-forwarded (`GW_MARK`) ingress is exempt.
+The source's groups come from its *own* net
 (`sg_members[{srcnet, src}]`) and rules are keyed by `src_net` too, so a
 **peered** group can be admitted (`from: {group, vpc}`) while an unreferenced
 peer still hits the default-deny. Cross-peer identity is made authoritative by a

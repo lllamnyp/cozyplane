@@ -733,7 +733,11 @@ $K apply -f - >/dev/null <<EOF
 apiVersion: sdn.cozystack.io/v1alpha1
 kind: SecurityGroup
 metadata: {name: client, namespace: team-a}
-spec: {vpcRef: {name: vpc-a}, podSelector: {matchLabels: {role: client}}}
+spec:
+  vpcRef: {name: vpc-a}
+  podSelector: {matchLabels: {role: client}}
+  # Egress is symmetric default-deny (v2): client must be allowed to reach web.
+  egress: [{to: {group: web}, ports: [{protocol: TCP, port: 80}]}]
 ---
 apiVersion: sdn.cozystack.io/v1alpha1
 kind: SecurityGroup
@@ -755,6 +759,31 @@ check_fail "sgnone -> sgweb (ungrouped source, default-deny)" \
 check_fail "sgweb -> sgcli (client has no ingress, default-deny)" \
   bash -c "$K -n team-a exec sgweb -- wget -qO- -T3 http://$(vpcip sgcli)/ 2>/dev/null | grep -q ."
 
+echo "[security groups: egress (v2, symmetric default-deny)]"
+# Drop client's egress rule: sgcli can no longer reach web even though web's
+# ingress still admits client (both directions must allow).
+$K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: SecurityGroup
+metadata: {name: client, namespace: team-a}
+spec: {vpcRef: {name: vpc-a}, podSelector: {matchLabels: {role: client}}}
+EOF
+sleep 3
+check_fail "sgcli -> sgweb:80 with no client egress rule (egress default-deny)" \
+  bash -c "$K -n team-a exec sgcli -- wget -qO- -T3 http://$SGWEB/ 2>/dev/null | grep -q ."
+# Restore client's egress to web:80.
+$K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: SecurityGroup
+metadata: {name: client, namespace: team-a}
+spec:
+  vpcRef: {name: vpc-a}
+  podSelector: {matchLabels: {role: client}}
+  egress: [{to: {group: web}, ports: [{protocol: TCP, port: 80}]}]
+EOF
+sleep 3
+check "sgcli -> sgweb:80 after restoring client egress (both directions allow)" "sgweb" httpid team-a sgcli "$SGWEB"
+
 echo "[security groups: peered-group reference (v2, Geneve TLV)]"
 # A labeled pod in the peered vpc-c, on the OTHER worker so its traffic to sgweb
 # ($W) crosses a node and exercises the TLV path (from_pod stamps, from_overlay
@@ -769,7 +798,11 @@ $K apply -f - >/dev/null <<EOF
 apiVersion: sdn.cozystack.io/v1alpha1
 kind: SecurityGroup
 metadata: {name: cpeer, namespace: team-a}
-spec: {vpcRef: {name: vpc-c}, podSelector: {matchLabels: {role: cpeer}}}
+spec:
+  vpcRef: {name: vpc-c}
+  podSelector: {matchLabels: {role: cpeer}}
+  # Peer egress: cpeer (vpc-c) must be allowed to reach web in the peered vpc-a.
+  egress: [{to: {group: web, vpc: {namespace: team-a, name: vpc-a}}, ports: [{protocol: TCP, port: 80}]}]
 EOF
 $K -n team-a wait --for=condition=Ready pod/cpeer --timeout=60s >/dev/null 2>&1
 # Before a peer rule: peered traffic to grouped sgweb is default-denied.

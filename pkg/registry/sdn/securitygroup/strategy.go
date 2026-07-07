@@ -120,6 +120,21 @@ func validateSecurityGroup(sg *sdn.SecurityGroup) field.ErrorList {
 			}
 		}
 	}
+	for i, r := range sg.Spec.Egress {
+		p := specPath.Child("egress").Index(i).Child("to")
+		if r.To.Group == "" {
+			// v1 egress is group-only (east-west). to.cidr (external egress) is
+			// a later increment.
+			if r.To.CIDR != "" {
+				errs = append(errs, field.Forbidden(p.Child("cidr"), "egress cidr destinations are not yet supported; reference a group"))
+			} else {
+				errs = append(errs, field.Required(p.Child("group"), "an egress rule must name a destination group"))
+			}
+		}
+		if r.To.VPC != nil && (r.To.VPC.Namespace == "" || r.To.VPC.Name == "") {
+			errs = append(errs, field.Invalid(p.Child("vpc"), r.To.VPC, "peer vpc ref needs both namespace and name"))
+		}
+	}
 	return errs
 }
 
