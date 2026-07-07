@@ -197,9 +197,57 @@ Cilium's map ABI is not.
    manifest (a scoped role is a follow-up). In-cluster NodePort and the
    VM/external gaps move to increment 3.
 3. **Per-packet fallback** — external NodePort + VM-guest ClusterIP in
-   `from_uplink`/`from_pod`, fed from the StateDB tables. Needs its own design
-   pass on the ct-table interaction (the masquerade tables are close but
-   service NAT needs backend selection on the forward path).
+   `from_uplink`/`from_pod`, fed from the StateDB tables.
+
+   ### Design pass (2026-07-07)
+
+   Two flows bypass socket-LB and must be caught per-packet, and cozyplane
+   already has the datapath for one of them:
+
+   - **VM-guest ClusterIP** enters `from_pod` on the guest's veth with
+     `dst = ClusterIP` (a KubeVirt guest is raw ethernet — no host socket, so
+     socket-LB never fired). cozyplane's **existing `svc_forward`** already does
+     ClusterIP DNAT + ClientIP affinity + `svc_fwd`/`svc_rev` connection
+     tracking + hairpin — it is the ServiceVIP datapath. **The one gap:**
+     `svc_forward` is called `if (srcnet && !is_gw)`, i.e. **VPC pods only**;
+     net-0 default-network traffic is deliberately left to the kernel (so
+     kube-proxy's conntrack sees ClusterIP replies — overlay.c ~L3124). Once
+     kube-proxy is gone that reason evaporates, so increment 3 calls
+     `svc_forward` for **net 0** as well. It composes safely with socket-LB: a
+     socket-LB'd pod already carries `dst = backend`, so the `svc_vips` lookup
+     misses and the packet is untouched; only un-rewritten (VM-guest) ClusterIP
+     packets hit. `dstnet` for a `10.96.x` ClusterIP is `net_of(0, vip) = 0`
+     (the service CIDR is not a VPC CIDR), so the `svc_vips` key is `{net:0, …}`.
+
+   - **External NodePort** arrives at the NIC → `from_uplink` with
+     `dst = nodeIP:nodePort`. This is **new**: a NodePort DNAT (a small
+     `nodeports` map keyed `{proto, nodePort}` → the same backend set) + the
+     established `svc_fwd`/`svc_rev` tracking, **plus a masquerade** of the
+     client to this node's IP so the reply returns here (external clients route
+     asymmetrically) — the uplink masquerade ct tables (#10) already exist and
+     are the natural home. Whether Cozystack needs external NodePort at all is
+     open question 5 (LoadBalancer VIPs usually arrive via a separate LB layer),
+     so this half ships second; VM-guest ClusterIP is the hard KubeVirt blocker
+     and ships first.
+
+   **Feeding `svc_vips` from cozyplane-kpr.** kpr reconciles the imported
+   `Table[Frontend]`/`Table[Backend]` (or watches Services/EndpointSlices
+   directly) into `svc_vips` at **net 0** (default-network ClusterIP) and into
+   `nodeports`. Because kpr is a separate module it can't import the agent's
+   `datapath` package; it opens the **pinned** `svc_vips`/`nodeports` maps and
+   writes them with a locally-replicated key/value layout (the same commit-the-
+   struct-shape contract as the socket-LB map adoption). **Ownership is
+   partitioned by net:** the agent's `SyncServiceVIPs` owns `net != 0` (VPC
+   ServiceVIPs) and must be made to **not prune net-0 keys**; kpr owns net 0.
+   One map, one DNAT path, no double-write.
+
+   **Testing.** VM-guest ClusterIP is provable on a cozyplane-CNI kind cluster
+   (`from_pod` exists) without a real VM by exercising the un-socket-LB'd path:
+   populate `svc_vips` at net 0 and drive a ClusterIP connection that isn't
+   connect()-rewritten (socket-LB detached, or a raw send), asserting the
+   `from_pod` DNAT reaches a backend. NodePort is driven from the host against
+   `nodeIP:nodePort`. Both fold into `test/e2e.sh` (the cozyplane-CNI harness),
+   not `kpr-e2e.sh` (which has no `from_pod`).
 4. **Retire kube-proxy on dev4** — at which point `firewall.go` detects no
    `KUBE-FORWARD` and installs nothing: #10 reaches its true end state.
 
@@ -208,9 +256,12 @@ Cilium's map ABI is not.
 1. **Packaging** — separate `kpr/` Go module + `cozyplane-kpr` DaemonSet
    (proposed), or fold the attach into the agent and accept the dependency
    blast radius in one shared module?
-2. **Increment-3 boundary** — feed cozyplane's per-packet fallback from the
-   imported StateDB tables (proposed), or have `overlay.c` read Cilium's lb
-   maps directly (couples our BPF to their map ABI, saves a reconciler)?
+2. **Increment-3 boundary** — RESOLVED (increment-3 design pass, above): feed
+   from the StateDB tables into the **existing `svc_vips`** at net 0, reusing
+   `svc_forward`/`svc_return` — `overlay.c` never reads Cilium's lb maps. The
+   only new datapath is un-gating `svc_forward`/`svc_return` for net 0 and a
+   `from_uplink` NodePort DNAT; ownership of `svc_vips` is partitioned by net
+   (agent `!= 0`, kpr `== 0`).
 3. **Feature dial for v1** — plain random backend selection, or turn on
    maglev/affinity/topology from day one? (All come along for free in lbcell;
    the question is test surface, not code.)
