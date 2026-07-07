@@ -91,14 +91,14 @@ features can never coexist, and upstreaming is blocked. The clean long-term fix 
 to move cozyplane to its own API group (e.g. `sdn.cozyplane.io`). Deferred by
 choice for now.
 
-## 5. Admission webhooks fail cross-node — node-origin → remote-pod (OPEN)
+## 5. Admission webhooks fail cross-node — pod→node reply un-encapsulated (FIXED)
 
-**This is the real blocker, and it is a cozyplane datapath gap, not a packaging
-one.** It is why the platform stops converging above the CNI+kpr layer:
-`cert-manager-issuers` fails its Helm upgrade on `failed calling webhook
+**This was the real blocker, and it was a cozyplane datapath bug, not a packaging
+one.** It was why the platform stopped converging above the CNI+kpr layer:
+`cert-manager-issuers` failed its Helm upgrade on `failed calling webhook
 "webhook.cert-manager.io": ... context deadline exceeded`, and ~60 downstream
 HelmReleases (kubevirt, cluster-api, kamaji, linstor, every operator with a
-webhook) cascade to `False` behind it.
+webhook) cascaded to `False` behind it.
 
 **Root cause, isolated on the cluster.** The kube-apiserver is hostNetwork; the
 cert-manager webhook is an ordinary **pod**, one replica, on one node. A webhook
@@ -112,29 +112,45 @@ the webhook (pod IP `…2.8` / ClusterIP `…1.180`) on the node that hosts it:
 | pod-network (control) | 404 in 6 ms | 404 in 6 ms |
 | hostNetwork on the webhook's *own* node | 404 | 404 |
 
-So: pod→pod east-west over the Geneve overlay works; socket-LB works; **same-node**
-host→pod works; **cross-node host→pod does not** — node-originated traffic to a
-remote pod is never encapsulated into the overlay. With three apiservers and one
-webhook pod, ~2/3 of webhook calls land on an apiserver that cannot reach it.
+**The first diagnosis was wrong, and the capture proved it.** It looked like the
+forward (node→pod) wasn't encapsulated. In fact a capture on the *webhook's* node
+showed the forward SYN arriving decapsulated, the pod **SYN-ACKing**, and the
+reply leaving `eth0` as `pod-IP → node-IP` — **un-encapsulated, with a pod source
+on the bare underlay.** dev4 is OCI, whose fabric drops any frame whose source is
+not its VNIC's assigned address (anti-spoofing). So node→pod worked (encapsulated,
+node-source outer); **pod→node — the reply — did not** (`from_pod` fell to
+`TC_ACT_OK`, the kernel routed it out `eth0` pod-sourced, OCI dropped it). Result:
+retransmitting SYNs, no connection, on ~2/3 of webhook calls. pod→pod works because
+*both* directions are encapsulated (`remote_of` resolves for pod CIDRs).
 
-By design ([internals.md](internals.md#the-dual-address-bridge)) the datapath
-steers node-originated traffic (kubelet probes) to `to_pod` via a `/32
-fabricIP → veth` route — which only exists for a **local** pod. The design assumed
-node-origin is always same-node (kubelet only probes local pods). Admission
-webhooks break that assumption: the apiserver probes pods anywhere in the cluster.
+**The fix (`node_remotes`, committed).** Encapsulate pod→node traffic over the
+overlay too, so the underlay only ever carries node source IPs. A `node_remotes`
+map (node address → that node's Geneve endpoint); `from_pod` encapsulates a
+default-network pod's traffic to a node — but **only on the pod-veth path**, since
+at the uplink egress the same hook sees the Geneve *outer* frames and encapsulating
+those would loop. The agent learns node addresses from Node InternalIPs plus a
+`cozyplane.io/node-addresses` annotation each agent publishes (its default-route
+source), which is what covers the **multi-NIC** case: on dev4 the host sources
+from `eth0` (10.4.0.x), *not* the InternalIP (10.4.100.x / the Geneve+floating-IP
+NIC), so the reply is addressed to `eth0` and cozyplane must know that address
+belongs to a node. On a single-NIC node the two coincide and it is a no-op.
 
-**What it would take to fix.** A node-originated egress path to remote pods: a
-host-sourced packet to a remote pod's fabric/VPC identity has to enter the Geneve
-overlay (and its reply come back), the same encapsulation `from_pod`/`from_overlay`
-already do for pod→pod — but for the host netns as the source. Until then, any
-webhook-backed component is only reachable from the apiserver co-located with its
-(single) backing pod; spreading replicas across all control-plane nodes is a
-per-component band-aid, not a fix. Tracked in [roadmap.md](roadmap.md).
+### 5b. Pod internet egress — masquerade from the wrong NIC (FIXED, same root)
+
+Same OCI anti-spoofing, exposed once webhooks worked: the node reached the internet
+but **pods could not** (ACME ClusterIssuers `i/o timeout` to Let's Encrypt). The
+cluster-egress masquerade SNAT'd pod→internet to the **InternalIP** (`eth1`), but
+the packet egresses the **default-route link** (`eth0`) — so the source was invalid
+for the egress VNIC and OCI dropped it. Fix: a separate `CFG_MASQ_IP` = the
+default-route source address, distinct from `CFG_NODE_IP` (still the InternalIP,
+which the Geneve endpoint and DNS-steer handle need). Single-NIC: the two coincide.
 
 ## What works today
 
-CNI (default network + VPC), cozyplane-kpr socket-LB (in-cluster ClusterIP + DNS
-from **pods**), east-west overlay, same-node host→pod, and the underlay path to
-hostNetwork ClusterIPs (e.g. `kubernetes.default`). The open item above (#5) is the
-gate on running the *full* Cozystack platform, whose operators lean on admission
-webhooks.
+**Everything, end to end.** With the two datapath fixes above the full Cozystack
+platform converges on cozyplane — all HelmReleases Ready, cross-node admission
+webhooks (cert-manager, kubevirt, cluster-api, kamaji, …), pod internet egress, in
+addition to the CNI, cozyplane-kpr socket-LB (ClusterIP + DNS from pods), the
+east-west overlay, and same-node host→pod. (Stock components that embed
+`CiliumNetworkPolicy`/`CiliumClusterwideNetworkPolicy` also need those CRDs present
+— shipped inert in the variant, since cozyplane enforces no NetworkPolicy yet.)
