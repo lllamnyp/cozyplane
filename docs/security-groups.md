@@ -373,12 +373,13 @@ non-floating traffic — those paths return earlier).
   after the world check. Validated: an exact `/32`, a covering `/24`, and
   non-matching ranges all resolve correctly.
 
-  *Limitation:* LPM returns the **longest** matching prefix only, so overlapping
-  CIDR rules from *different* groups on the same `{net, proto, port}` don't union
-  — a client covered by both a `/16` (group A) and a `/24` (group B) is admitted
-  only if it belongs to group... the /24's. Non-overlapping rules and a pod in a
-  single group (the common case) are exact; a true union would need a
-  prefix-walk. Noted, not solved.
+  *Limitation ([#11](../../issues/11)):* LPM returns the **longest** matching
+  prefix only, so overlapping CIDR rules from *different* groups on the same
+  `{net, proto, port}` don't union — a client covered by both a `/16` (group A)
+  and a `/24` (group B) resolves to the `/24`'s bitmap alone, so a pod in group A
+  only is wrongly denied. Non-overlapping rules, identical CIDRs across groups
+  (unioned in the value bitmap), and a pod in a single group (the common case)
+  are exact; a true union would need a per-group LPM or a prefix-walk.
 
 ## v2 backlog (remaining)
 
