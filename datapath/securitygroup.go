@@ -40,10 +40,13 @@ type SGMember struct {
 	Groups uint64
 }
 
-// SGRule is one compiled datapath rule: for (net, dst group, proto, port), the
-// bitmap of source groups allowed to reach it. Port 0 is the any-port rule.
+// SGRule is one compiled datapath rule: for (net, src net, dst group, proto,
+// port), the bitmap of source groups (in src net's id space) allowed to reach
+// it. SrcNet == Net for a same-VPC rule, the peer VNI for a peer-group rule.
+// Port 0 is the any-port rule.
 type SGRule struct {
 	Net     uint32
+	SrcNet  uint32
 	Group   uint16
 	Proto   uint8
 	Port    uint16 // host order; stored network order
@@ -72,7 +75,7 @@ func (m *Manager) SyncSGMembers(members []SGMember) error {
 func (m *Manager) SyncSGRules(rules []SGRule) error {
 	want := map[overlaySgRuleKey]uint64{}
 	for _, r := range rules {
-		key := overlaySgRuleKey{Net: r.Net, Group: r.Group, Port: htons(r.Port), Proto: r.Proto}
+		key := overlaySgRuleKey{Net: r.Net, SrcNet: r.SrcNet, Group: r.Group, Port: htons(r.Port), Proto: r.Proto}
 		want[key] |= r.Allowed // union rules that share a key
 	}
 	return syncMap(m.objs.SgRules, want)

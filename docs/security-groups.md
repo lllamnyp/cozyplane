@@ -186,9 +186,96 @@ allow-all. `cozyplane_sg_drops_total` incremented per drop.
 4. **AuthZ** — owner-namespace-implies-policy-authority; no `policy` verb.
 5. **Naming** — `SecurityGroup` (AWS familiarity).
 
-## v2 backlog
+## v2: peered-group references + the Geneve identity TLV (design)
 
-Egress rules; peered-VPC group references + the Geneve identity TLV; north-south
-`from.cidr` (world pseudo-group is reserved; needs floating-path enforcement,
-then an LPM map for specific ranges); FQDN sources; label-change-follows
-membership; ICMP rules; a real conntrack to replace the TCP SYN-gate.
+**Goal:** a group in one VPC can admit a group in a *peered* VPC —
+`from: {group: web, vpc: {namespace: team-b, name: vpc-b}}` — enforced
+correctly and safely across the tenant trust boundary.
+
+### Why v1 can't do this, and why the TLV
+
+v1 keys everything by net: `sg_members[{net, ip}]` is the pod's bitmap in *that
+net's* id space, and a destination infers the source's bitmap from
+`sg_members[{dst net, src ip}]`. Two problems for a peered source (a different
+net, disjoint CIDR):
+
+1. **Id-space collision.** Group id 3 in vpc-a and id 3 in vpc-b are different
+   groups; a single `u64` allowed-bitmap can't mix "vpc-a group 3" and "vpc-b
+   group 3". A rule that admits a peer group must name *which VPC's* id space.
+2. **Spoofable identity.** Among mutually-peered tenants (a peers b and c), a
+   pod in c can put a source IP from b's CIDR on its packet. At a's destination,
+   `net_of(src_ip)` resolves it to b, and the inference reads *b's* membership —
+   c impersonates b's groups. The source net must be **authoritative**, not
+   inferred from a tenant-controlled field.
+
+The **Geneve identity TLV** solves (2): the source *node* (trusted
+infrastructure) stamps the real `{source net, source group bitmap}` — taken from
+the source pod's own veth, not the packet — into a Geneve option on encap. The
+destination reads it instead of guessing. (1) is solved by keying rules on the
+source net too.
+
+### Rule model (both stages)
+
+`sg_rules` key gains **`src_net`**: `{dst_net, dst_group, src_net, proto, port}`
+→ allowed-source bitmap *in `src_net`'s id space*. A same-VPC rule has
+`src_net == dst_net` (unchanged behavior); a peer rule has `src_net = the peer
+VPC's VNI` and the bitmap holds the peer group's id. This is an ABI change to
+`sg_rules`, handled by the agent's recreate-incompatible-pinned-map path (#7).
+The agent compiles a peer rule by resolving the peer VPC's VNI (VPC lister) and
+the peer group's id (it already lists SecurityGroups cluster-wide).
+
+API: `SecurityGroupPeer` gains `VPC *VPCRef` (namespace+name). When set, `group`
+names a group in that peer VPC. Validation requires the referenced VPC to be a
+declared peer (a `VPCPeering` half exists) — else the rule can never match and
+is a silent footgun.
+
+### Stage A — destination-side inference (functional, non-adversarial)
+
+`to_pod` already computes `srcnet = net_of(src)` for both same-node and
+overlay-delivered traffic. Change the membership lookup from
+`sg_members[{dst_net, src}]` to `sg_members[{srcnet, src}]` (the source's *own*
+net) and pass `srcnet` into `sg_admit`, which now looks up
+`sg_rules[{dst_net, group, srcnet, proto, port}]`. This makes peer-group rules
+match with **no TLV, no `from_overlay`/`from_pod` change** — correct whenever
+source IPs aren't spoofed. It is the functional increment; it does not yet close
+the cross-peer spoofing hole.
+
+### Stage B — the TLV (authoritative, anti-spoof)
+
+The tunnel metadata is only readable in `from_overlay` (the geneve device
+ingress); once `deliver_local` redirects into the pod, `to_pod` sees a bare
+inner packet. So enforcement splits by path:
+
+- **Encap (`from_pod`)**: for a *grouped* source pod (bitmap ≠ 0 — the common
+  ungrouped case stamps nothing, so no hot-path cost), stamp a Geneve option
+  carrying `{srcnet (u32), srcmap (u64)}` — 12 bytes of option data — alongside
+  the existing tunnel key. `srcnet`/`srcmap` come from the source node's own
+  `ports`/`sg_members` (the pod's veth identity), so they're authoritative.
+- **`from_overlay` (cross-node)**: read the option
+  (`bpf_skb_get_tunnel_opt`). If present, use its `{srcnet, srcmap}`
+  authoritatively; enforce with `sg_admit` *before* `deliver_local`; on admit
+  set an `SG_OK` mark bit; on deny drop + count. If absent (ungrouped source or
+  a pre-TLV peer), fall through to `to_pod`'s inference.
+- **`to_pod`**: if the `SG_OK` bit is set, skip (already enforced authoritatively
+  upstream — `skb->mark` survives the redirect, the same mechanism `GW_MARK`
+  relies on). Otherwise enforce via inference (same-node traffic, and the
+  no-TLV fall-through). Same-node has no over-the-wire spoofing surface, so
+  inference is safe there.
+
+This keeps `sg_admit` a single shared subprogram. The risk is the `from_pod`
+stack/complexity budget (already tight — see `count_dir`): stamping adds one map
+lookup and a `bpf_skb_set_tunnel_opt` with a ~16-byte opt buffer. Load-verified
+on the 6.12 kernel; if it overflows, the fallback is to gate stamping behind the
+grouped-source check (already planned) and, worst case, a dedicated encap
+variant.
+
+**Trust result:** a peer's group identity crossing into another VPC is what the
+source node vouched for, not what the packet claimed — c can no longer wear b's
+groups. Intra-VPC and same-node keep inference (same trust domain).
+
+## v2 backlog (remaining)
+
+Egress rules; north-south `from.cidr` (world pseudo-group is reserved; needs
+floating-path enforcement, then an LPM map for specific ranges); FQDN sources;
+label-change-follows membership; ICMP rules; a real conntrack to replace the TCP
+SYN-gate.

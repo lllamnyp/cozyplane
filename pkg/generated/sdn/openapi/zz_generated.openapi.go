@@ -857,14 +857,20 @@ func schema_cozyplane_api_sdn_v1alpha1_SecurityGroupPeer(ref common.ReferenceCal
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "SecurityGroupPeer identifies an admitted source. Exactly one of Group or CIDR is set. Group references another group in the *same* VPC; peered-VPC group references are a later increment (they need identity to cross a trust boundary — the Geneve TLV).",
+				Description: "SecurityGroupPeer identifies an admitted source. Exactly one of Group or CIDR is set. Group names another SecurityGroup — in the same VPC by default, or in a peered VPC when VPC is set (the source identity crosses the trust boundary authoritatively via the Geneve TLV; see docs/security-groups.md).",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"group": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Group is the name of another SecurityGroup in the same VPC.",
+							Description: "Group is the name of another SecurityGroup — in this VPC, or in the VPC named by VPC.",
 							Type:        []string{"string"},
 							Format:      "",
+						},
+					},
+					"vpc": {
+						SchemaProps: spec.SchemaProps{
+							Description: "VPC, when set, makes Group reference a group in that peered VPC (owner namespace + name). The referenced VPC must be a declared peer.",
+							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCRef"),
 						},
 					},
 					"cidr": {
@@ -877,6 +883,8 @@ func schema_cozyplane_api_sdn_v1alpha1_SecurityGroupPeer(ref common.ReferenceCal
 				},
 			},
 		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCRef"},
 	}
 }
 

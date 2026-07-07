@@ -882,6 +882,7 @@ func Convert_sdn_SecurityGroupList_To_v1alpha1_SecurityGroupList(in *sdn.Securit
 
 func autoConvert_v1alpha1_SecurityGroupPeer_To_sdn_SecurityGroupPeer(in *SecurityGroupPeer, out *sdn.SecurityGroupPeer, s conversion.Scope) error {
 	out.Group = in.Group
+	out.VPC = (*sdn.VPCRef)(unsafe.Pointer(in.VPC))
 	out.CIDR = in.CIDR
 	return nil
 }
@@ -893,6 +894,7 @@ func Convert_v1alpha1_SecurityGroupPeer_To_sdn_SecurityGroupPeer(in *SecurityGro
 
 func autoConvert_sdn_SecurityGroupPeer_To_v1alpha1_SecurityGroupPeer(in *sdn.SecurityGroupPeer, out *SecurityGroupPeer, s conversion.Scope) error {
 	out.Group = in.Group
+	out.VPC = (*VPCRef)(unsafe.Pointer(in.VPC))
 	out.CIDR = in.CIDR
 	return nil
 }

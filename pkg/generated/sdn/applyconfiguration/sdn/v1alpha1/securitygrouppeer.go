@@ -22,12 +22,16 @@ package v1alpha1
 // with apply.
 //
 // SecurityGroupPeer identifies an admitted source. Exactly one of Group or CIDR
-// is set. Group references another group in the *same* VPC; peered-VPC group
-// references are a later increment (they need identity to cross a trust
-// boundary — the Geneve TLV).
+// is set. Group names another SecurityGroup — in the same VPC by default, or in
+// a peered VPC when VPC is set (the source identity crosses the trust boundary
+// authoritatively via the Geneve TLV; see docs/security-groups.md).
 type SecurityGroupPeerApplyConfiguration struct {
-	// Group is the name of another SecurityGroup in the same VPC.
+	// Group is the name of another SecurityGroup — in this VPC, or in the VPC
+	// named by VPC.
 	Group *string `json:"group,omitempty"`
+	// VPC, when set, makes Group reference a group in that peered VPC (owner
+	// namespace + name). The referenced VPC must be a declared peer.
+	VPC *VPCRefApplyConfiguration `json:"vpc,omitempty"`
 	// CIDR admits north-south (bridge/floating) callers by their pre-masquerade
 	// client address. It does not match intra-VPC sources — those are identified
 	// by group. FQDN sources are a later increment.
@@ -45,6 +49,14 @@ func SecurityGroupPeer() *SecurityGroupPeerApplyConfiguration {
 // If called multiple times, the Group field is set to the value of the last call.
 func (b *SecurityGroupPeerApplyConfiguration) WithGroup(value string) *SecurityGroupPeerApplyConfiguration {
 	b.Group = &value
+	return b
+}
+
+// WithVPC sets the VPC field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the VPC field is set to the value of the last call.
+func (b *SecurityGroupPeerApplyConfiguration) WithVPC(value *VPCRefApplyConfiguration) *SecurityGroupPeerApplyConfiguration {
+	b.VPC = value
 	return b
 }
 

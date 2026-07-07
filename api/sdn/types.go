@@ -503,9 +503,11 @@ type SecurityGroupRule struct {
 	Ports []SecurityGroupPort
 }
 
-// SecurityGroupPeer identifies an admitted source (group or CIDR).
+// SecurityGroupPeer identifies an admitted source (group, optionally in a peer
+// VPC, or CIDR).
 type SecurityGroupPeer struct {
 	Group string
+	VPC   *VPCRef
 	CIDR  string
 }
 

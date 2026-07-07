@@ -103,12 +103,13 @@ type overlayPeerKey struct {
 }
 
 type overlaySgRuleKey struct {
-	_     structs.HostLayout
-	Net   uint32
-	Group uint16
-	Port  uint16
-	Proto uint8
-	Pad   [3]uint8
+	_      structs.HostLayout
+	Net    uint32
+	SrcNet uint32
+	Group  uint16
+	Port   uint16
+	Proto  uint8
+	Pad    [3]uint8
 }
 
 type overlaySvcFwdKey struct {

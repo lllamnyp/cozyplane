@@ -1336,9 +1336,22 @@ func watchSecurityGroups(ctx context.Context, factory sdninformers.SharedInforme
 			k := vpcKey{sg.Namespace, sg.Spec.VPCRef.Name}
 			for _, ing := range sg.Spec.Ingress {
 				var allowed uint64
+				srcNet := net_ // same-VPC by default
 				switch {
 				case ing.From.Group != "":
-					id, ok := nameID[k][ing.From.Group]
+					// A peer-VPC ref resolves the group's id in the peer VPC's id
+					// space, keyed by the peer's VNI so it can't collide with a
+					// same-VPC id.
+					srcKey := k
+					if v := ing.From.VPC; v != nil {
+						srcKey = vpcKey{v.Namespace, v.Name}
+						pvpc, err := vpcs.Lister().VPCs(v.Namespace).Get(v.Name)
+						if err != nil || pvpc.Status.VNI == 0 {
+							continue // peer VPC unknown/not ready yet
+						}
+						srcNet = uint32(pvpc.Status.VNI)
+					}
+					id, ok := nameID[srcKey][ing.From.Group]
 					if !ok {
 						continue // unknown/unallocated source group admits nothing yet
 					}
@@ -1352,7 +1365,7 @@ func watchSecurityGroups(ctx context.Context, factory sdninformers.SharedInforme
 				default:
 					continue
 				}
-				for _, r := range compileRulePorts(net_, uint16(sg.Status.ID), allowed, ing.Ports) {
+				for _, r := range compileRulePorts(net_, srcNet, uint16(sg.Status.ID), allowed, ing.Ports) {
 					rules = append(rules, r)
 				}
 			}
@@ -1416,11 +1429,11 @@ func watchSecurityGroups(ctx context.Context, factory sdninformers.SharedInforme
 // (net, dst group, allowed sources). No ports means every protocol and port
 // (an any-port rule per protocol); a listed port with no protocol match is
 // skipped.
-func compileRulePorts(net_ uint32, group uint16, allowed uint64, ports []sdnv1alpha1.SecurityGroupPort) []datapath.SGRule {
+func compileRulePorts(net_, srcNet uint32, group uint16, allowed uint64, ports []sdnv1alpha1.SecurityGroupPort) []datapath.SGRule {
 	var out []datapath.SGRule
 	if len(ports) == 0 {
 		for _, proto := range []uint8{unix.IPPROTO_TCP, unix.IPPROTO_UDP} {
-			out = append(out, datapath.SGRule{Net: net_, Group: group, Proto: proto, Port: 0, Allowed: allowed})
+			out = append(out, datapath.SGRule{Net: net_, SrcNet: srcNet, Group: group, Proto: proto, Port: 0, Allowed: allowed})
 		}
 		return out
 	}
@@ -1434,7 +1447,7 @@ func compileRulePorts(net_ uint32, group uint16, allowed uint64, ports []sdnv1al
 		default:
 			continue
 		}
-		out = append(out, datapath.SGRule{Net: net_, Group: group, Proto: proto, Port: uint16(pp.Port), Allowed: allowed})
+		out = append(out, datapath.SGRule{Net: net_, SrcNet: srcNet, Group: group, Proto: proto, Port: uint16(pp.Port), Allowed: allowed})
 	}
 	return out
 }

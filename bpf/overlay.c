@@ -560,14 +560,17 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } sg_members SEC(".maps");
 
-// sg_rules: (net, dst-group, proto, dst-port) -> u64 allowed-source bitmap. A
-// port of 0 is the any-port rule for that (group, proto). The value's bits are
-// source group ids (a group rule) and/or SG_WORLD (a cidr rule).
+// sg_rules: (dst-net, src-net, dst-group, proto, dst-port) -> u64 allowed-source
+// bitmap, in src-net's id space. src_net == net for a same-VPC rule; for a
+// peered-group rule it is the peer VPC's VNI (so peer group ids don't collide
+// with same-VPC ids). port 0 is the any-port rule. The value's bits are source
+// group ids (a group rule) and/or SG_WORLD (a cidr rule).
 struct sg_rule_key {
-	__u32 net;
-	__u16 group; // destination group id
-	__u16 port;  // destination port, network order; 0 = any port
-	__u8 proto;  // IPPROTO_TCP / IPPROTO_UDP
+	__u32 net;     // destination net
+	__u32 src_net; // source net (peer VNI for a peer rule)
+	__u16 group;   // destination group id
+	__u16 port;    // destination port, network order; 0 = any port
+	__u8 proto;    // IPPROTO_TCP / IPPROTO_UDP
 	__u8 pad[3];
 };
 
@@ -605,10 +608,11 @@ static __attribute__((noinline)) void count_sg_drop(__u32 net)
 // register-liveness check on the 6.12 verifier).
 struct sg_query {
 	struct local_key dst; // net + destination VPC IP
-	__u64 srcmap;         // the source's group bitmap (0 = ungrouped/peered)
+	__u32 src_net;        // the source's net (peer VNI across a peering)
+	__u64 srcmap;         // the source's group bitmap (0 = ungrouped)
 	__u16 dport;          // destination port, network order
 	__u8 proto;           // IPPROTO_TCP / IPPROTO_UDP
-	__u8 pad[5];
+	__u8 pad[1];
 };
 
 // sg_admit decides whether the queried packet is permitted. Returns 1 (allow)
@@ -623,7 +627,7 @@ static __attribute__((noinline)) int sg_admit(struct sg_query *q)
 		return 1; // destination is in no group -> legacy allow
 	__u64 dstmap = *dm;
 	__u64 allowed = 0;
-	struct sg_rule_key rk = { .net = q->dst.net, .proto = q->proto };
+	struct sg_rule_key rk = { .net = q->dst.net, .src_net = q->src_net, .proto = q->proto };
 #pragma unroll
 	for (int g = 1; g < SG_WORLD; g++) {
 		if (!(dstmap & (1ULL << g)))
@@ -2995,10 +2999,14 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 		__u16 dport;
 		__u32 l4off = p.is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
 		if (sg_l4(skb, p.proto, l4off, &dport)) {
-			struct local_key sk = { .net = dstnet, .ip = p.src };
+			// The source's groups live under the source's OWN net (srcnet ==
+			// dstnet intra-VPC; the peer's VNI across a peering), and peer-group
+			// rules are keyed by that src_net — so a peered group matches.
+			struct local_key sk = { .net = srcnet, .ip = p.src };
 			__u64 *sm = bpf_map_lookup_elem(&sg_members, &sk);
 			struct sg_query q = {
 				.dst = { .net = dstnet, .ip = p.dst },
+				.src_net = srcnet,
 				.srcmap = sm ? *sm : 0,
 				.dport = dport,
 				.proto = p.proto,

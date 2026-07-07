@@ -544,9 +544,26 @@ spec:
                             by group. FQDN sources are a later increment.
                           type: string
                         group:
-                          description: Group is the name of another SecurityGroup
-                            in the same VPC.
+                          description: |-
+                            Group is the name of another SecurityGroup — in this VPC, or in the VPC
+                            named by VPC.
                           type: string
+                        vpc:
+                          description: |-
+                            VPC, when set, makes Group reference a group in that peered VPC (owner
+                            namespace + name). The referenced VPC must be a declared peer.
+                          properties:
+                            name:
+                              description: Name is the VPC name within that namespace.
+                              type: string
+                            namespace:
+                              description: Namespace is the namespace that owns the
+                                VPC.
+                              type: string
+                          required:
+                          - name
+                          - namespace
+                          type: object
                       type: object
                     ports:
                       description: |-

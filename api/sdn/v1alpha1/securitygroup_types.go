@@ -81,13 +81,19 @@ type SecurityGroupRule struct {
 }
 
 // SecurityGroupPeer identifies an admitted source. Exactly one of Group or CIDR
-// is set. Group references another group in the *same* VPC; peered-VPC group
-// references are a later increment (they need identity to cross a trust
-// boundary — the Geneve TLV).
+// is set. Group names another SecurityGroup — in the same VPC by default, or in
+// a peered VPC when VPC is set (the source identity crosses the trust boundary
+// authoritatively via the Geneve TLV; see docs/security-groups.md).
 type SecurityGroupPeer struct {
-	// Group is the name of another SecurityGroup in the same VPC.
+	// Group is the name of another SecurityGroup — in this VPC, or in the VPC
+	// named by VPC.
 	// +optional
 	Group string `json:"group,omitempty"`
+
+	// VPC, when set, makes Group reference a group in that peered VPC (owner
+	// namespace + name). The referenced VPC must be a declared peer.
+	// +optional
+	VPC *VPCRef `json:"vpc,omitempty"`
 
 	// CIDR admits north-south (bridge/floating) callers by their pre-masquerade
 	// client address. It does not match intra-VPC sources — those are identified

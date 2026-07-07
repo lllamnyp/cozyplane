@@ -103,12 +103,20 @@ func validateSecurityGroup(sg *sdn.SecurityGroup) field.ErrorList {
 		case !hasGroup && !hasCIDR:
 			errs = append(errs, field.Required(p, "one of group or cidr is required"))
 		case hasCIDR:
-			// v1 enforces east-west (group) rules only. North-south cidr sources
-			// are the next increment — the datapath scaffolding (world
-			// pseudo-group) is in place, but the floating-path enforcement is
-			// not wired yet, so a cidr rule would silently not restrict. Reject
-			// it rather than advertise an unenforced rule.
+			// North-south cidr sources are a later increment — the datapath
+			// scaffolding (world pseudo-group) is in place, but floating-path
+			// enforcement is not wired yet, so a cidr rule would silently not
+			// restrict. Reject it rather than advertise an unenforced rule.
 			errs = append(errs, field.Forbidden(p.Child("cidr"), "cidr sources are not yet supported; reference another group instead"))
+		}
+		// A peer-VPC reference must name a group in that VPC.
+		if r.From.VPC != nil {
+			if r.From.VPC.Namespace == "" || r.From.VPC.Name == "" {
+				errs = append(errs, field.Invalid(p.Child("vpc"), r.From.VPC, "peer vpc ref needs both namespace and name"))
+			}
+			if !hasGroup {
+				errs = append(errs, field.Required(p.Child("group"), "a peer-VPC reference must name a group"))
+			}
 		}
 	}
 	return errs
