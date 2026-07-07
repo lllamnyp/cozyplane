@@ -610,6 +610,30 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } sg_drops SEC(".maps");
 
+// sg_cidr admits north-south (bridge/floating) callers by a specific source CIDR
+// (security groups v2 stage 2). LPM on the client address, with the destination
+// (net, proto, port) fully specified ahead of it — the same composite-LPM shape
+// as `remotes`/`networks` (a fully-matched entry has prefixlen 64 + client
+// prefix). The value is the bitmap of destination groups that admit the matched
+// CIDR for that (net, proto, port); the datapath ANDs it with the pod's own
+// group bitmap. The all-addresses CIDR keeps its stage-1 SG_WORLD path.
+struct sg_cidr_key {
+	__u32 prefixlen; // 64 (net+port+proto) + client prefix bits
+	__u32 net;       // destination net
+	__u16 port;      // destination port, network order
+	__u16 proto;     // low byte = IPPROTO_TCP / IPPROTO_UDP
+	struct addr128 client;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__type(key, struct sg_cidr_key);
+	__type(value, __u64);
+	__uint(max_entries, 16384);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} sg_cidr SEC(".maps");
+
 // count_sg_drop bumps a net's policy-drop counter. Stack-free and noinline for
 // the same verifier reasons as count_dir; the agent pre-seeds the entry.
 static __attribute__((noinline)) void count_sg_drop(__u32 net)
@@ -701,8 +725,11 @@ static __always_inline int sg_l4(struct __sk_buff *skb, __u8 proto, __u32 l4off,
 // member bitmap). The caller gates on NS_MARK, so node-originated plumbing
 // (kubelet probes — invariant #7), which never carries the mark, is never
 // reached. dport is network order.
-static __always_inline int ns_sg_admit(__u32 net, struct addr128 vpc_ip, __u8 proto, __u16 dport)
+static __always_inline int ns_sg_admit(__u32 net, struct addr128 vpc_ip, struct addr128 client, __u8 proto, __u16 dport)
 {
+	// The all-addresses CIDR (stage 1): sg_admit with the SG_WORLD pseudo-group.
+	// Returns 1 for an ungrouped pod too, so the specific-CIDR path below only
+	// runs for a grouped pod with no 0.0.0.0/0 rule.
 	struct sg_query q = {
 		.dst = { .net = net, .ip = vpc_ip },
 		.src_net = net,
@@ -710,7 +737,26 @@ static __always_inline int ns_sg_admit(__u32 net, struct addr128 vpc_ip, __u8 pr
 		.dport = dport,
 		.proto = proto,
 	};
-	return sg_admit(&q);
+	if (sg_admit(&q))
+		return 1;
+
+	// Specific ranges (stage 2): an sg_cidr LPM entry whose group bitmap
+	// intersects the pod's own groups admits this client. Two lookups: the exact
+	// destination port and the any-port (0) rule.
+	struct local_key mk = { .net = net, .ip = vpc_ip };
+	__u64 *dm = bpf_map_lookup_elem(&sg_members, &mk);
+	if (!dm)
+		return 0;
+	__u64 dstmap = *dm;
+	struct sg_cidr_key ck = { .prefixlen = 64 + 128, .net = net, .port = dport, .proto = proto, .client = client };
+	__u64 *b = bpf_map_lookup_elem(&sg_cidr, &ck);
+	if (b && (*b & dstmap))
+		return 1;
+	ck.port = 0;
+	b = bpf_map_lookup_elem(&sg_cidr, &ck);
+	if (b && (*b & dstmap))
+		return 1;
+	return 0;
 }
 
 // dns_ips holds the cluster DNS ClusterIP per family ([0] = v4 in NAT64 form,
@@ -1543,7 +1589,7 @@ static __always_inline int bridge_forward(struct __sk_buff *skb, struct iphdr *i
 	// kubelet probes reach here via the kernel /32 route unmarked and stay
 	// exempt (invariant #7). Checked before the ct_fwd allocation so a denied
 	// packet leaves no connection state.
-	if ((skb->mark & NS_MARK) && !ns_sg_admit(net, vpc_ip, proto, pport)) {
+	if ((skb->mark & NS_MARK) && !ns_sg_admit(net, vpc_ip, client128, proto, pport)) {
 		count_sg_drop(net);
 		return TC_ACT_SHOT;
 	}
@@ -1811,7 +1857,7 @@ static __always_inline int bridge_forward6(struct __sk_buff *skb, struct pkt *p,
 		return TC_ACT_SHOT;
 	// North-south security groups (v2), the v6 twin of bridge_forward: only
 	// NS_MARK'd pod-originated traffic is gated; kubelet stays exempt.
-	if ((skb->mark & NS_MARK) && !ns_sg_admit(net, vpc_ip, proto, pport)) {
+	if ((skb->mark & NS_MARK) && !ns_sg_admit(net, vpc_ip, p->src, proto, pport)) {
 		count_sg_drop(net);
 		return TC_ACT_SHOT;
 	}
@@ -1934,7 +1980,9 @@ static __always_inline int floating_forward(struct __sk_buff *skb, struct iphdr 
 	// grouped pod, reopened by a from.cidr rule.
 	if (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
 		__u16 sp, dp;
-		if (l4_ports(skb, &sp, &dp) == 0 && !ns_sg_admit(net, vpc_ip, proto, dp)) {
+		struct addr128 client128;
+		v4_to_128(&client128, ip->saddr);
+		if (l4_ports(skb, &sp, &dp) == 0 && !ns_sg_admit(net, vpc_ip, client128, proto, dp)) {
 			count_sg_drop(net);
 			return TC_ACT_SHOT;
 		}
@@ -2190,7 +2238,7 @@ static __always_inline int floating_forward6(struct __sk_buff *skb, struct pkt *
 	// unconditionally (external surface, never node-originated).
 	if (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
 		__u16 sp, dp;
-		if (l4_ports6(skb, &sp, &dp) == 0 && !ns_sg_admit(net, vpc_ip, proto, dp)) {
+		if (l4_ports6(skb, &sp, &dp) == 0 && !ns_sg_admit(net, vpc_ip, p->src, proto, dp)) {
 			count_sg_drop(net);
 			return TC_ACT_SHOT;
 		}

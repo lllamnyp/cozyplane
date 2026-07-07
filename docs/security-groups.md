@@ -300,7 +300,7 @@ colliding with vpc-a `web`'s own id 2) is dropped (the `src_net` key keeps the
 id spaces distinct); an ungrouped vpc-b pod is dropped; same-VPC rules keep
 working alongside.
 
-## v2: north-south `from.cidr` (stage 1 built + dev4-validated)
+## v2: north-south `from.cidr` (built + dev4-validated)
 
 **Goal:** a security group can admit *north-south* callers by source CIDR —
 `from: {cidr: 0.0.0.0/0, ports: [{protocol: TCP, port: 443}]}` — so a grouped
@@ -363,10 +363,22 @@ non-floating traffic — those paths return earlier).
   a grouped pod with a TCP readiness probe stays Ready (kubelet exempt); a
   default-network pod is dropped reaching it (N-S default-deny); adding
   `from: {cidr: 0.0.0.0/0}` reopens it; an ungrouped pod is unaffected.
-- **Stage 2 — specific ranges (planned).** An `sg_cidr` LPM map keyed by
-  `{net, dst group, proto, port, client prefix}`; the agent compiles specific
-  `from: {cidr: 203.0.113.0/24}` rules into it; the datapath consults it beside
-  the world bit. The apiserver un-rejects specific CIDRs.
+- **Stage 2 — specific ranges (built, dev4-validated).** An `sg_cidr` LPM map
+  keyed by `{net, proto, port, client prefix}` → the bitmap of destination
+  groups that admit that CIDR; the datapath ANDs it with the pod's own groups.
+  A v4 range is stored in the NAT64 form (`/N` → `/(96+N)` in the 128-bit client
+  space, behind the 64 fixed bits — a fully-matched key is prefixlen `64+96+N`).
+  The agent compiles specific `from: {cidr: 203.0.113.0/24}` rules; the apiserver
+  validates the CIDR parses. Two LPM lookups per packet (exact port + any-port),
+  after the world check. Validated: an exact `/32`, a covering `/24`, and
+  non-matching ranges all resolve correctly.
+
+  *Limitation:* LPM returns the **longest** matching prefix only, so overlapping
+  CIDR rules from *different* groups on the same `{net, proto, port}` don't union
+  — a client covered by both a `/16` (group A) and a `/24` (group B) is admitted
+  only if it belongs to group... the /24's. Non-overlapping rules and a pod in a
+  single group (the common case) are exact; a true union would need a
+  prefix-walk. Noted, not solved.
 
 ## v2 backlog (remaining)
 

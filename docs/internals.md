@@ -92,6 +92,7 @@ maps and one program.
 | `vpc_counters` | PERCPU hash | net id → {tx,rx bytes/packets} | datapath (in-band) |
 | `sg_members` | hash | {net, VPC IP} → `u64` group bitmap | agent (Ports' `status.groups`) |
 | `sg_rules` | hash | {dst net, src net, dst group, proto, port} → `u64` allowed-source bitmap | agent (SecurityGroups) |
+| `sg_cidr` | LPM trie | {net, proto, port, client CIDR} → allowed-group bitmap | agent (SecurityGroups) |
 | `sg_drops` | PERCPU hash | net id → policy-drop count | datapath (in-band) |
 | `params` | array | `[0]`=Geneve ifindex, `[1]`=default VNI | agent |
 

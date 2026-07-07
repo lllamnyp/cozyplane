@@ -1322,6 +1322,7 @@ func watchSecurityGroups(ctx context.Context, factory sdninformers.SharedInforme
 		}
 
 		var rules []datapath.SGRule
+		var cidrRules []datapath.SGCidr
 		nets := map[uint32]bool{}
 		for _, sg := range allSGs {
 			if sg.Status.ID == 0 {
@@ -1359,8 +1360,14 @@ func watchSecurityGroups(ctx context.Context, factory sdninformers.SharedInforme
 				case isAnyCIDR(ing.From.CIDR):
 					allowed = 1 << uint(datapath.SGWorldGroup)
 				case ing.From.CIDR != "":
-					log.Warn("security group: specific cidr not supported in v1 (use 0.0.0.0/0 or ::/0); rule ignored",
-						"group", sg.Name, "cidr", ing.From.CIDR)
+					// A specific north-south range compiles into the sg_cidr LPM
+					// map (v2 stage 2), not the group-bitmap sg_rules.
+					_, ipnet, err := net.ParseCIDR(ing.From.CIDR)
+					if err != nil {
+						log.Warn("security group: bad cidr; rule ignored", "group", sg.Name, "cidr", ing.From.CIDR, "err", err)
+						continue
+					}
+					cidrRules = append(cidrRules, compileCidrPorts(net_, ipnet, 1<<uint(sg.Status.ID), ing.Ports)...)
 					continue
 				default:
 					continue
@@ -1372,6 +1379,9 @@ func watchSecurityGroups(ctx context.Context, factory sdninformers.SharedInforme
 		}
 		if err := mgr.SyncSGRules(rules); err != nil {
 			log.Error("sync sg_rules", "err", err)
+		}
+		if err := mgr.SyncSGCidr(cidrRules); err != nil {
+			log.Error("sync sg_cidr", "err", err)
 		}
 		for n := range nets {
 			if err := mgr.EnsureSGDrop(n); err != nil {
@@ -1452,11 +1462,36 @@ func compileRulePorts(net_, srcNet uint32, group uint16, allowed uint64, ports [
 	return out
 }
 
-// isAnyCIDR reports whether c is the all-addresses CIDR of either family — the
-// only cidr form v1 enforces (compiled to the world pseudo-group). Specific
-// CIDRs need an LPM match, a later increment.
+// isAnyCIDR reports whether c is the all-addresses CIDR of either family, which
+// takes the SG_WORLD pseudo-group path rather than the sg_cidr LPM.
 func isAnyCIDR(c string) bool {
 	return c == "0.0.0.0/0" || c == "::/0"
+}
+
+// compileCidrPorts expands a specific-CIDR ingress rule into sg_cidr entries for
+// (net, proto, port) admitting the given destination group. No ports means
+// every protocol and port (an any-port entry per protocol).
+func compileCidrPorts(net_ uint32, cidr *net.IPNet, allowedGroups uint64, ports []sdnv1alpha1.SecurityGroupPort) []datapath.SGCidr {
+	var out []datapath.SGCidr
+	if len(ports) == 0 {
+		for _, proto := range []uint8{unix.IPPROTO_TCP, unix.IPPROTO_UDP} {
+			out = append(out, datapath.SGCidr{Net: net_, Proto: proto, Port: 0, CIDR: cidr, AllowedGroups: allowedGroups})
+		}
+		return out
+	}
+	for _, pp := range ports {
+		var proto uint8
+		switch pp.Protocol {
+		case "TCP":
+			proto = unix.IPPROTO_TCP
+		case "UDP":
+			proto = unix.IPPROTO_UDP
+		default:
+			continue
+		}
+		out = append(out, datapath.SGCidr{Net: net_, Proto: proto, Port: uint16(pp.Port), CIDR: cidr, AllowedGroups: allowedGroups})
+	}
+	return out
 }
 
 func watchServiceVIPs(ctx context.Context, factory sdninformers.SharedInformerFactory, mgr *datapath.Manager, log *slog.Logger) {

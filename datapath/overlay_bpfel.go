@@ -102,6 +102,15 @@ type overlayPeerKey struct {
 	DstNet uint32
 }
 
+type overlaySgCidrKey struct {
+	_         structs.HostLayout
+	Prefixlen uint32
+	Net       uint32
+	Port      uint16
+	Proto     uint16
+	Client    overlayAddr128
+}
+
 type overlaySgRuleKey struct {
 	_      structs.HostLayout
 	Net    uint32
@@ -202,6 +211,7 @@ const (
 	overlayMapPeers                 = "peers"
 	overlayMapPorts                 = "ports"
 	overlayMapRemotes               = "remotes"
+	overlayMapSgCidr                = "sg_cidr"
 	overlayMapSgDrops               = "sg_drops"
 	overlayMapSgMembers             = "sg_members"
 	overlayMapSgRules               = "sg_rules"
@@ -287,6 +297,7 @@ type overlayMapSpecs struct {
 	Peers          *ebpf.MapSpec `ebpf:"peers"`
 	Ports          *ebpf.MapSpec `ebpf:"ports"`
 	Remotes        *ebpf.MapSpec `ebpf:"remotes"`
+	SgCidr         *ebpf.MapSpec `ebpf:"sg_cidr"`
 	SgDrops        *ebpf.MapSpec `ebpf:"sg_drops"`
 	SgMembers      *ebpf.MapSpec `ebpf:"sg_members"`
 	SgRules        *ebpf.MapSpec `ebpf:"sg_rules"`
@@ -342,6 +353,7 @@ type overlayMaps struct {
 	Peers          *ebpf.Map `ebpf:"peers"`
 	Ports          *ebpf.Map `ebpf:"ports"`
 	Remotes        *ebpf.Map `ebpf:"remotes"`
+	SgCidr         *ebpf.Map `ebpf:"sg_cidr"`
 	SgDrops        *ebpf.Map `ebpf:"sg_drops"`
 	SgMembers      *ebpf.Map `ebpf:"sg_members"`
 	SgRules        *ebpf.Map `ebpf:"sg_rules"`
@@ -373,6 +385,7 @@ func (m *overlayMaps) Close() error {
 		m.Peers,
 		m.Ports,
 		m.Remotes,
+		m.SgCidr,
 		m.SgDrops,
 		m.SgMembers,
 		m.SgRules,

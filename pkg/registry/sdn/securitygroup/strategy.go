@@ -19,6 +19,7 @@ package securitygroup
 import (
 	"context"
 	"errors"
+	"net"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
 	"k8s.io/apimachinery/pkg/fields"
@@ -103,11 +104,10 @@ func validateSecurityGroup(sg *sdn.SecurityGroup) field.ErrorList {
 		case !hasGroup && !hasCIDR:
 			errs = append(errs, field.Required(p, "one of group or cidr is required"))
 		case hasCIDR:
-			// v2 north-south: the all-addresses CIDR is enforced (SG_WORLD
-			// pseudo-group). Specific ranges need the LPM map (a later
-			// increment) — reject them rather than advertise an unenforced rule.
-			if r.From.CIDR != "0.0.0.0/0" && r.From.CIDR != "::/0" {
-				errs = append(errs, field.Forbidden(p.Child("cidr"), "only 0.0.0.0/0 and ::/0 are supported yet; specific ranges are a later increment"))
+			// v2 north-south: the all-addresses CIDR (SG_WORLD) and specific
+			// ranges (sg_cidr LPM) are both enforced. Validate it parses.
+			if _, _, err := net.ParseCIDR(r.From.CIDR); err != nil {
+				errs = append(errs, field.Invalid(p.Child("cidr"), r.From.CIDR, "not a valid CIDR"))
 			}
 		}
 		// A peer-VPC reference must name a group in that VPC.

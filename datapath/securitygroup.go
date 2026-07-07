@@ -71,6 +71,53 @@ func (m *Manager) SyncSGMembers(members []SGMember) error {
 	return syncMap(m.objs.SgMembers, want)
 }
 
+// SGCidr is one compiled north-south cidr rule: for (net, proto, port), a client
+// CIDR and the bitmap of destination groups that admit it (security groups v2
+// stage 2). The all-addresses CIDR takes the SG_WORLD path (SyncSGRules), not
+// this map.
+type SGCidr struct {
+	Net           uint32
+	Proto         uint8
+	Port          uint16 // host order; stored network order
+	CIDR          *net.IPNet
+	AllowedGroups uint64
+}
+
+// SyncSGCidr makes the sg_cidr LPM map exactly `entries` (full-state diff). A v4
+// CIDR is encoded in the datapath's NAT64 form (client addresses are v4_to_128),
+// so its /N becomes /(96+N) in the 128-bit client space; the map key prefix is
+// the 64 fixed bits (net+port+proto) plus that client prefix.
+func (m *Manager) SyncSGCidr(entries []SGCidr) error {
+	want := map[overlaySgCidrKey]uint64{}
+	for _, e := range entries {
+		if e.CIDR == nil {
+			continue
+		}
+		ones, _ := e.CIDR.Mask.Size()
+		ip := e.CIDR.IP
+		var clientPrefix uint32
+		if v4 := ip.To4(); v4 != nil {
+			ip = v4
+			clientPrefix = 96 + uint32(ones) // NAT64 96-bit prefix ahead of the v4
+		} else {
+			clientPrefix = uint32(ones)
+		}
+		a, err := addr128(ip)
+		if err != nil {
+			return fmt.Errorf("sg_cidr client %q: %w", e.CIDR, err)
+		}
+		key := overlaySgCidrKey{
+			Prefixlen: 64 + clientPrefix,
+			Net:       e.Net,
+			Port:      htons(e.Port),
+			Proto:     uint16(e.Proto),
+			Client:    a,
+		}
+		want[key] |= e.AllowedGroups
+	}
+	return syncMap(m.objs.SgCidr, want)
+}
+
 // SyncSGRules makes sg_rules exactly `rules` (full-state diff).
 func (m *Manager) SyncSGRules(rules []SGRule) error {
 	want := map[overlaySgRuleKey]uint64{}

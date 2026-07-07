@@ -835,6 +835,25 @@ sleep 4
 check "cli(default) -> sgweb.fabric after from:{cidr:0.0.0.0/0} (north-south reopened)" "sgweb" \
   bash -c "$K exec cli -- wget -qO- -T4 http://$SGWEBFAB/ 2>/dev/null"
 
+# Specific CIDR (LPM): admit only cli's own /32, deny an unrelated /32.
+CLIIP="$($K get pod cli -o jsonpath='{.status.podIP}')"
+websg() { $K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: SecurityGroup
+metadata: {name: web, namespace: team-a}
+spec:
+  vpcRef: {name: vpc-a}
+  podSelector: {matchLabels: {role: web}}
+  ingress: [{from: {cidr: $1}, ports: [{protocol: TCP, port: 80}]}]
+EOF
+}
+websg "$CLIIP/32"; sleep 4
+check "cli -> sgweb.fabric with from:{cidr:cli/32} (specific CIDR admits)" "sgweb" \
+  bash -c "$K exec cli -- wget -qO- -T4 http://$SGWEBFAB/ 2>/dev/null"
+websg "10.255.255.0/24"; sleep 4
+check_fail "cli -> sgweb.fabric with from:{cidr:unrelated/24} (specific CIDR denies)" \
+  bash -c "$K exec cli -- wget -qO- -T3 http://$SGWEBFAB/ 2>/dev/null | grep -q ."
+
 echo "[revocation]"
 $K -n team-a delete vpcbinding vpc-a >/dev/null
 sleep 6
