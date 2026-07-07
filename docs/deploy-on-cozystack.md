@@ -49,6 +49,17 @@ cozyplane's etcd is **memory-backed** (`etcd-operator.cozystack.io/v1alpha2`,
 2. **cozyplane apiserver + memory etcd** come up (no PVC → no wait on storage).
 3. **Linstor** installs (as usual).
 
+There is a second bootstrap cycle to break: the hostNetwork **agent** needs the
+kube-apiserver, but with no kube-proxy the `kubernetes.default` ClusterIP
+(10.96.0.1) is unserved until cozyplane-kpr is up — and kpr needs the agent. So
+the agent must dial a *real* apiserver endpoint, not the ClusterIP. On Talos
+that is **KubePrism** (a node-local apiserver load balancer at `localhost:7445`);
+`values-talos.yaml` sets `kubeApiServer.{host,port}` to it, wired into the agent
+and responder as `KUBERNETES_SERVICE_HOST/PORT`. On a non-Talos cluster, point
+`kubeApiServer` at whatever node-local apiserver reachability you have (e.g. a
+per-node HAProxy, or a control-plane VIP). Leave it empty only where a service
+proxy already serves the ClusterIP at agent start.
+
 Trade-off: the memory etcd's `sdn.cozystack.io` objects (VPCs, Ports, …) survive
 single-pod restarts (3-replica raft) but **not a full-cluster restart**. A
 persistent (`storageClassName`) mode is a follow-up once storage is sequenced
@@ -68,7 +79,7 @@ platform source at the cozyplane fork** (built from cozystack#3149):
 
 ```
 oci://ghcr.io/lllamnyp/cozystack-packages
-digest = sha256:b60d5176c33ca326f9df5f2e907d3edd54d727ae42426f4718de551ef860def2   # tag: feat-cozyplane
+digest = sha256:aee0d62537e45eb908e4c14c4ae79e5c4690e7a9a10884cca6dd3e2a41a5d1e4   # tag: feat-cozyplane
 ```
 
 Set the operator deploy args `--platform-source-url=oci://ghcr.io/lllamnyp/cozystack-packages`
