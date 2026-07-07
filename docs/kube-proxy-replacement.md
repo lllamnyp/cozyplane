@@ -149,6 +149,23 @@ Cilium's map ABI is not.
    socketlb + committed `bpf_sock.o`; e2e: ClusterIP from a pod and from the
    host netns resolves to backends with kube-proxy still present (verify
    bypass via iptables counters staying flat).
+
+   **Started (`kpr/`, scaffold builds).** The separate module (`kpr/go.mod`,
+   `github.com/cilium/cilium v1.19.5`) imports `pkg/loadbalancer/cell` +
+   support cells, mirroring `pkg/loadbalancer/repl` — `main.go` assembles the
+   LB control-plane hive and runs it. `kpr/bpf_sock.o` is committed
+   (`kpr/build-bpf.sh` rebuilds it from the pinned tag; the seven core
+   socket-LB programs — `cil_sock{4,6}_{connect,sendmsg,recvmsg}` +
+   `cil_sock_release` — verified present), `go:embed`-ed, and attached at the
+   cgroup root by `socketlb.go` (mirrors `pkg/socketlb` `attachCgroup`: raw
+   cgroup link + pin; LB maps resolve by their bpffs pin path, no map-ABI
+   coupling in our code). `go build`/`go vet` clean; binary links at ~117 MB
+   (confirms the separate-module packaging call). **Next:** stand up the kind
+   e2e (ClusterIP from a pod and hostns with kube-proxy present, bypass proved
+   by flat iptables counters) and validate the maps actually join at runtime —
+   the real-vs-`TestConfig` cell wiring (`loadbalancer.Config`,
+   `node.LocalNodeStoreCell`) needs runtime confirmation, and the cgroup-root /
+   bpffs-pin paths need to match the deployment.
 2. **kube-proxy-less kind e2e** — kind supports `kubeProxyMode: none`; prove
    ClusterIP (pods + hostns) and in-cluster NodePort; document the VM/external
    gaps as expected failures.

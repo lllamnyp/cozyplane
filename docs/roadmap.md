@@ -88,7 +88,7 @@ they're discovered rather than leaving them only in issues.
 
 Sequenced **after** Services-in-a-VPC ([services-in-vpc.md](services-in-vpc.md), §3 above) — its net-scoped service NAT is the shared foundation.
 
-- [ ] Import Cilium's LB control plane + socket LB (`pkg/loadbalancer`, `pkg/socketlb`, pre-compiled `bpf_sock.o`) as a separate `cozyplane-kpr` component — **design draft: [kube-proxy-replacement.md](kube-proxy-replacement.md)** (feasibility verified empirically against Cilium v1.19.5)
+- [ ] Import Cilium's LB control plane + socket LB (`pkg/loadbalancer`, `pkg/socketlb`, pre-compiled `bpf_sock.o`) as a separate `cozyplane-kpr` component — **design: [kube-proxy-replacement.md](kube-proxy-replacement.md)**; **increment 1 started (`kpr/` scaffold builds: lbcell hive + committed `bpf_sock.o` + cgroup attach, ~117 MB binary)**. Forcing function: retaining Cilium only for KPR/host-policy keeps a *second IPAM authority* on the podCIDR — it collided a system pod's IP with Cilium's `reserved:health` (cross-node-unreachable; [#12](../../issues/12)) and its unmanaged-pod-watcher churns cozyplane pods. Dropping Cilium (KPR here + host-firewall/NetworkPolicy follow-ups) removes that whole class.
 - [ ] Per-packet service fallback in cozyplane's hooks (external NodePort, VM-guest ClusterIP) — needed before kube-proxy can be removed
 - [ ] Retire kube-proxy on a cozyplane-only cluster — the endgame of [#10](../../issues/10): `firewall.go` then installs nothing
 
