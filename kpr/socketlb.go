@@ -38,10 +38,19 @@ type socketLBConfig struct {
 }
 
 func defaultSocketLBConfig() socketLBConfig {
-	return socketLBConfig{
+	c := socketLBConfig{
 		CgroupRoot: "/run/cilium/cgroupv2",
 		BPFFSRoot:  "/sys/fs/bpf",
 	}
+	// Env overrides for environments whose cgroup2/bpffs layout differs (kind
+	// nodes mount cgroup2 at /sys/fs/cgroup). A flag-cell is the eventual home.
+	if v := os.Getenv("KPR_CGROUP_ROOT"); v != "" {
+		c.CgroupRoot = v
+	}
+	if v := os.Getenv("KPR_BPFFS_ROOT"); v != "" {
+		c.BPFFSRoot = v
+	}
+	return c
 }
 
 // socketLBCell attaches the committed socket-LB object at the cgroup root. It
@@ -50,7 +59,7 @@ func defaultSocketLBConfig() socketLBConfig {
 // control plane and datapath join with no map-ABI coupling in our code.
 var socketLBCell = cell.Module(
 	"socketlb",
-	"cozyplane socket load-balancer attach (committed bpf_sock.o)",
+	"cozyplane socket load-balancer attach",
 	cell.Invoke(func(lc cell.Lifecycle, logger *slog.Logger) {
 		cfg := defaultSocketLBConfig()
 		var coll *ebpf.Collection
@@ -89,11 +98,38 @@ func attachSocketLB(logger *slog.Logger, cfg socketLBConfig, obj []byte) (*ebpf.
 		return nil, nil, fmt.Errorf("load spec: %w", err)
 	}
 
-	// Maps carrying LIBBPF_PIN_BY_NAME (the LB service/backend maps the
-	// reconciler owns) resolve to their existing pins under the bpffs root;
-	// object-private maps (e.g. cilium_ipcache_v2, cilium_metrics) are created
-	// empty, which is acceptable for east-west (verified in the design draft).
+	// The LB service/backend maps are OWNED and pinned by lbcell's reconciler,
+	// and it sizes them from its own config — so bpf_sock.o's compile-time
+	// MaxEntries won't match. Adopt the existing pins via MapReplacements (the
+	// loader then uses the reconciler's map fd verbatim, skipping the spec's
+	// size/flags check); this is how the datapath joins the control plane by
+	// pin path with no map-ABI coupling. Maps the object declares but the
+	// reconciler didn't pin (object-private: cilium_ipcache_v2, cilium_metrics)
+	// aren't found and fall through to be created+pinned empty — acceptable for
+	// east-west (design draft).
+	// For every map the reconciler already pinned, adopt its actual geometry
+	// (MaxEntries/Flags) onto the spec so the loader opens the existing pin
+	// instead of rejecting bpf_sock.o's compile-time sizing — the reconciler is
+	// the owner and sizes these from its own config. The loader then opens the
+	// pins by PinByName+PinPath; maps the object declares but the reconciler
+	// didn't pin (object-private: cilium_ipcache_v2, cilium_metrics) fall
+	// through and are created+pinned empty (acceptable east-west, design draft).
 	pinDir := filepath.Join(cfg.BPFFSRoot, "tc", "globals")
+	for name, m := range spec.Maps {
+		if m.Pinning != ebpf.PinByName {
+			continue
+		}
+		pinned, err := ebpf.LoadPinnedMap(filepath.Join(pinDir, name), nil)
+		if err != nil {
+			continue // not pinned by the reconciler; created below
+		}
+		info, err := pinned.Info()
+		if err == nil {
+			m.MaxEntries = info.MaxEntries
+			m.Flags = info.Flags
+		}
+		_ = pinned.Close()
+	}
 	coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{
 		Maps: ebpf.MapOptions{PinPath: pinDir},
 	})

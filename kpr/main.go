@@ -37,7 +37,6 @@ import (
 	"github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/kpr"
 	"github.com/cilium/cilium/pkg/lbipamconfig"
-	"github.com/cilium/cilium/pkg/loadbalancer"
 	lbcell "github.com/cilium/cilium/pkg/loadbalancer/cell"
 	"github.com/cilium/cilium/pkg/maglev"
 	"github.com/cilium/cilium/pkg/metrics"
@@ -71,7 +70,8 @@ func main() {
 		lbipamconfig.Cell,
 		nodeipamconfig.Cell,
 
-		cell.Config(loadbalancer.Config{}),
+		// loadbalancer.Config is provided by lbcell.Cell itself — do not declare
+		// it here or its bpf-lb-* flags register twice.
 		cell.Config(envoyCfg.SecretSyncConfig{}),
 		cell.Provide(
 			func() cmtypes.ClusterInfo { return cmtypes.ClusterInfo{} },

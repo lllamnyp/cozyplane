@@ -160,12 +160,31 @@ Cilium's map ABI is not.
    cgroup root by `socketlb.go` (mirrors `pkg/socketlb` `attachCgroup`: raw
    cgroup link + pin; LB maps resolve by their bpffs pin path, no map-ABI
    coupling in our code). `go build`/`go vet` clean; binary links at ~117 MB
-   (confirms the separate-module packaging call). **Next:** stand up the kind
-   e2e (ClusterIP from a pod and hostns with kube-proxy present, bypass proved
-   by flat iptables counters) and validate the maps actually join at runtime —
-   the real-vs-`TestConfig` cell wiring (`loadbalancer.Config`,
-   `node.LocalNodeStoreCell`) needs runtime confirmation, and the cgroup-root /
-   bpffs-pin paths need to match the deployment.
+   (confirms the separate-module packaging call).
+
+   **MVP proven on kind (2026-07-07).** Run inside a vanilla kind node
+   (kube-proxy + default CNI present), `cozyplane-kpr` connects to the
+   apiserver, `lbcell` reconciles Services/EndpointSlices into the pinned
+   `cilium_lb4_services_v2`/`_backends_v3`, and all seven socket-LB programs
+   attach at the cgroup root. A `connect()` to a ClusterIP — **from the host
+   netns *and* from a pod** — is load-balanced across both backends while
+   **kube-proxy's `KUBE-SERVICES` counter for the VIP stays flat** (`[1:60]`
+   across nine curls): the connect-time rewrite lands before iptables sees the
+   VIP, so socket-LB bypasses kube-proxy exactly as intended. Three fixes made
+   it run: (1) `loadbalancer.Config` must **not** be re-declared — `lbcell.Cell`
+   provides it, a second `cell.Config` panics on duplicate `bpf-lb-*` flags;
+   (2) the datapath joins the control plane by bpffs pin path only if
+   `socketlb.go` adopts each reconciler map's actual geometry
+   (`MaxEntries`/`Flags`) onto the spec before loading — `bpf_sock.o`'s
+   compile-time sizing (`cilium_lb4_source_range` 65536) must not fight the
+   reconciler's config-driven size (1000); (3) env overrides (`KPR_CGROUP_ROOT`,
+   `KPR_BPFFS_ROOT`) cover kind's `/sys/fs/cgroup` cgroup2 root — a flag-cell is
+   the eventual home.
+
+   **Next:** package it (image + DaemonSet with the cgroup2/bpffs mounts), fold
+   the manual kind steps into `test/` as increment 2's `kubeProxyMode: none`
+   e2e, and exercise the UDP/DNS path (`sendmsg`/`recvmsg` + the reverse
+   translation) alongside TCP.
 2. **kube-proxy-less kind e2e** — kind supports `kubeProxyMode: none`; prove
    ClusterIP (pods + hostns) and in-cluster NodePort; document the VM/external
    gaps as expected failures.
