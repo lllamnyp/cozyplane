@@ -656,6 +656,29 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } sg_cidr SEC(".maps");
 
+// sg_egress_cidr is the egress twin of sg_cidr (v2 north-south egress): a grouped
+// pod's off-VPC (gateway) egress is default-deny, and a `to: {cidr}` rule opens
+// specific external destinations. LPM on the DESTINATION address, with
+// {src_net, proto, dst_port} fully specified ahead of it; the value is the
+// bitmap of SOURCE groups that may egress to that CIDR. Enforced source-side in
+// from_pod (the destination is off-VPC — no to_pod to check at).
+struct sg_egress_cidr_key {
+	__u32 prefixlen; // 64 (src_net+port+proto) + destination prefix bits
+	__u32 src_net;   // source net
+	__u16 port;      // destination port, network order
+	__u16 proto;     // low byte = IPPROTO_TCP / IPPROTO_UDP
+	struct addr128 dest;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__type(key, struct sg_egress_cidr_key);
+	__type(value, __u64);
+	__uint(max_entries, 16384);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} sg_egress_cidr SEC(".maps");
+
 // count_sg_drop bumps a net's policy-drop counter. Stack-free and noinline for
 // the same verifier reasons as count_dir; the agent pre-seeds the entry.
 static __attribute__((noinline)) void count_sg_drop(__u32 net)
@@ -816,6 +839,34 @@ static __always_inline int ns_sg_admit(__u32 net, struct addr128 vpc_ip, struct 
 	ck.port = 0;
 	b = bpf_map_lookup_elem(&sg_cidr, &ck);
 	if (b && (*b & dstmap))
+		return 1;
+	return 0;
+}
+
+// ns_egress_ok decides whether a grouped source pod may egress off-VPC to p->dst
+// (v2 north-south egress). Default-deny for a grouped pod; a `to: {cidr}` rule
+// (an sg_egress_cidr entry whose group bitmap intersects the pod's groups) opens
+// it. Ungrouped pods and non-gated packets (a reply — TCP with ACK — or a
+// non-TCP/UDP packet) pass. Inlined and loop-free (one sg_members lookup + up to
+// two LPM lookups) because from_pod cannot host a BPF-to-BPF call.
+static __always_inline int ns_egress_ok(struct __sk_buff *skb, __u32 srcnet, int is_v6, __u8 proto, struct addr128 src, struct addr128 dst)
+{
+	struct local_key sk = { .net = srcnet, .ip = src };
+	__u64 *sm = bpf_map_lookup_elem(&sg_members, &sk);
+	if (!sm || !*sm)
+		return 1; // ungrouped source -> egress unrestricted
+	__u16 dport;
+	__u32 l4off = is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
+	if (!sg_l4(skb, proto, l4off, &dport))
+		return 1; // a reply or non-TCP/UDP -> not gated
+	__u64 srcmap = *sm;
+	struct sg_egress_cidr_key ck = { .prefixlen = 64 + 128, .src_net = srcnet, .port = dport, .proto = proto, .dest = dst };
+	__u64 *b = bpf_map_lookup_elem(&sg_egress_cidr, &ck);
+	if (b && (*b & srcmap))
+		return 1;
+	ck.port = 0;
+	b = bpf_map_lookup_elem(&sg_egress_cidr, &ck);
+	if (b && (*b & srcmap))
 		return 1;
 	return 0;
 }
@@ -3042,6 +3093,13 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	if (!nets_allowed(srcnet, dstnet)) {
 		if (!srcnet || dstnet)
 			return TC_ACT_SHOT;
+		// North-south egress (v2): a grouped pod's off-VPC egress to the gateway
+		// is default-deny, opened by a to:{cidr} rule. DNS already returned via
+		// dns_steer; a grouped pod's replies pass (SYN-gated inside). No
+		// sg_drops bump here — from_pod is too stack-heavy to host the
+		// count_sg_drop BPF-to-BPF call (the reason metering lives in to_pod).
+		if (!ns_egress_ok(skb, srcnet, p.is_v6, p.proto, p.src, p.dst))
+			return TC_ACT_SHOT;
 		struct gw_entry *g = bpf_map_lookup_elem(&gateways, &srcnet);
 		if (!g)
 			return TC_ACT_SHOT; // closed island: no gateway for this VPC
@@ -3215,7 +3273,16 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 	// SG_OK means from_overlay already enforced this cross-node packet
 	// authoritatively from the source's Geneve TLV (stage B) — skip the
 	// (spoofable) inference here rather than re-check it.
-	if (dstnet && !(skb->mark & (GW_MARK | SG_OK))) {
+	//
+	// A VPC pod acting as its net's gateway transits off-VPC egress: the packet
+	// arrives on the gateway's veth (dstnet is the gateway's net) but its
+	// destination is *not* a VPC address (the internet/cluster). That is
+	// north-south egress, gated at the true source's from_pod by ns_egress_ok —
+	// it must not be re-gated as east-west here, or sg_egress_admit would drop
+	// every grouped source (the off-VPC dst is ungrouped) and break all TCP/UDP
+	// north-south egress. A normal east-west delivery always has an in-VPC dst.
+	int ns_transit = net_of(&networks, dstnet, p.dst) == 0;
+	if (dstnet && !ns_transit && !(skb->mark & (GW_MARK | SG_OK))) {
 		__u16 dport;
 		__u32 l4off = p.is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
 		if (sg_l4(skb, p.proto, l4off, &dport)) {

@@ -784,6 +784,42 @@ EOF
 sleep 3
 check "sgcli -> sgweb:80 after restoring client egress (both directions allow)" "sgweb" httpid team-a sgcli "$SGWEB"
 
+echo "[security groups: north-south egress to.cidr (v2)]"
+# sgcli is grouped (client) with only an east-west egress rule, so its off-VPC
+# egress (through vpc-a's NAT gateway, enabled far above) is default-denied.
+# This is the hop the off-VPC-transit fix rescued: the pod->gateway delivery
+# lands on the gateway pod's veth with a non-VPC destination, and without the
+# fix the east-west egress check dropped it (grouped source -> ungrouped dst) —
+# breaking all TCP/UDP north-south egress. TCP, not ICMP: ICMP is never gated.
+check_fail "sgcli -> 1.1.1.1:80 TCP with no egress cidr rule (north-south default-deny)" \
+  bash -c "$K -n team-a exec sgcli -- nc -w3 1.1.1.1 80 </dev/null"
+# Open external egress for the client group with a to:{cidr} rule.
+$K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: SecurityGroup
+metadata: {name: client, namespace: team-a}
+spec:
+  vpcRef: {name: vpc-a}
+  podSelector: {matchLabels: {role: client}}
+  egress:
+  - {to: {group: web}, ports: [{protocol: TCP, port: 80}]}
+  - {to: {cidr: 0.0.0.0/0}, ports: [{protocol: TCP, port: 80}]}
+EOF
+sleep 3
+check_ok "sgcli -> 1.1.1.1:80 TCP after to:{cidr:0.0.0.0/0} (north-south egress opens)" \
+  bash -c "$K -n team-a exec sgcli -- nc -w3 1.1.1.1 80 </dev/null"
+# Restore client to east-west-only egress for the assertions that follow.
+$K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: SecurityGroup
+metadata: {name: client, namespace: team-a}
+spec:
+  vpcRef: {name: vpc-a}
+  podSelector: {matchLabels: {role: client}}
+  egress: [{to: {group: web}, ports: [{protocol: TCP, port: 80}]}]
+EOF
+sleep 3
+
 echo "[security groups: peered-group reference (v2, Geneve TLV)]"
 # A labeled pod in the peered vpc-c, on the OTHER worker so its traffic to sgweb
 # ($W) crosses a node and exercises the TLV path (from_pod stamps, from_overlay

@@ -421,6 +421,21 @@ egress inherits the peered-group anti-spoof for free. Two group-loops now run on
 a gated SYN (ingress over the dst's groups, egress over the src's) — bounded and
 verifier-checked like the ingress loop.
 
+**Off-VPC transit is exempt from the egress check.** A grouped pod's off-VPC
+egress transits its VPC gateway: the packet is delivered onto the *gateway pod's*
+veth, so `to_pod` sees `dstnet` = the gateway's net (the gateway is a VPC pod)
+but the packet's destination is *not* a VPC address (it is the internet/cluster
+IP). A naive east-west egress check treats this as `grouped source → ungrouped
+destination` and drops it — silently breaking **all** TCP/UDP north-south egress
+(ICMP is never gated, so it kept working, which is what made this subtle). The
+fix: `to_pod` skips the SG block when the packet's destination is off-VPC
+(`net_of(dstnet, p.dst) == 0`) — that is north-south transit, gated at the true
+source's `from_pod` by `ns_egress_ok` (below), never a genuine east-west
+delivery (which always targets an in-VPC address). The cross-node gateway path is
+delivered through `from_overlay`'s gateway branch (the destination is not a local
+VPC pod, so `local_of` misses and the TLV egress check is never reached), so it
+needs no equivalent guard.
+
 ### Control plane
 
 `SecurityGroupSpec` gains `egress []{to: SecurityGroupPeer, ports}`. The apiserver
@@ -443,9 +458,60 @@ their flows to keep working (a `client` group that reaches `web` needs
 `egress: {to: web}`). This is the deliberate consequence of symmetric
 default-deny.
 
+## v2: north-south / external egress (`to: {cidr}`) (built + dev4-validated)
+
+**Goal:** a group controls where its members may reach *off-VPC* — the internet
+and cluster, via the VPC's NAT gateway — by destination CIDR:
+`egress: [{to: {cidr: 8.8.8.8/32}, ports: [{protocol: UDP, port: 53}]}]`.
+
+**Semantics.** Consistent with east-west egress (symmetric default-deny): a
+grouped pod's off-VPC egress is default-deny; a `to: {cidr}` rule opens specific
+external destinations (`0.0.0.0/0` for "any"). Ungrouped pods are unaffected.
+
+**Where it's enforced — and why source-side.** Unlike east-west egress, the
+destination is not a cozyplane pod, so there is no `to_pod` to check at. The one
+point every off-VPC flow passes is the source pod's `from_pod`, specifically the
+**gateway path**: a VPC pod's off-net (`dstnet == 0`) traffic routes to the VPC's
+NAT gateway, and the check sits right before that routing. Two things stay
+exempt because they return *earlier* in `from_pod`:
+
+- **Cluster DNS** — `dns_steer` redirects it to the node-local resolver before
+  this point (plumbing, like kubelet ingress).
+- **A grouped pod's replies** — the SYN-gate: only a new outbound TCP connection
+  (SYN, no ACK) is gated; established/reply packets pass. UDP is gated per
+  packet (stateless in the destination, so consistent).
+
+`from_pod` is the tightest hook (it cannot host a BPF-to-BPF call), so the check
+is **inlined and loop-free**: `ns_egress_ok` does one `sg_members` lookup for the
+source's groups, then up to two `sg_egress_cidr` LPM lookups (exact port +
+any-port) on the destination address, and admits if the returned source-group
+bitmap intersects the pod's groups. `sg_egress_cidr` is keyed
+`{src_net, proto, dst_port, destination CIDR}` → the bitmap of source groups that
+may egress there (v4 in NAT64 form, like `sg_cidr`); `0.0.0.0/0` is just a `/0`
+entry, so no pseudo-group is needed. No group-loop, so `from_pod`'s budget is
+safe.
+
+**v1 scope:** the check gates the **gateway** path. A *floating* pod's egress
+(`floating_egress_snat`, which returns before the gateway path) is not yet gated
+— a documented follow-up, since floating egress is a distinct deliberate surface.
+The `from_pod` source is `p.src` (the pod's claimed address); a co-VPC pod could
+spoof a same-VPC IP to borrow its egress groups — the same intra-VPC RPF gap
+noted for ingress, closed by the same future `from_pod` RPF.
+
+**Validated on dev4 (2026-07-07).** A grouped `client` pod's off-VPC egress to a
+node IP (`10.4.100.13:6443`, reached through the vpc-a NAT gateway) is
+default-denied with no egress rule; `egress: {to: {cidr: 0.0.0.0/0}, TCP 6443}`
+opens it, as do a covering `10.4.100.0/24` and an exact `10.4.100.13/32`, while an
+unrelated `10.99.0.0/16` stays closed; removing the rule re-closes it; an
+ungrouped pod is unaffected throughout. **The off-VPC-transit fix was essential**
+(see the egress-rules section): before it, the pod→gateway hop was dropped by the
+east-west egress check — grouped TCP/UDP north-south egress was fully broken (only
+ICMP, never gated, worked). East-west enforcement is unchanged by the fix (an
+in-VPC destination is still gated: `client`→`web` needs both directions).
+
 ## v2 backlog (remaining)
 
-North-south / external egress (`to: {cidr}`, source-side); FQDN sources;
+Floating-pod egress gating; FQDN sources;
 label-change-follows membership; ICMP rules; a real conntrack to replace the TCP
 SYN-gate; `from_pod` source-IP RPF (authoritative source group + general
 anti-spoof); peer-existence validation for peer refs;

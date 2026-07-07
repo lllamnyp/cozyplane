@@ -1324,6 +1324,7 @@ func watchSecurityGroups(ctx context.Context, factory sdninformers.SharedInforme
 		var rules []datapath.SGRule
 		var cidrRules []datapath.SGCidr
 		var egressRules []datapath.SGEgress
+		var egressCidrRules []datapath.SGEgressCidr
 		nets := map[uint32]bool{}
 		for _, sg := range allSGs {
 			if sg.Status.ID == 0 {
@@ -1381,6 +1382,17 @@ func watchSecurityGroups(ctx context.Context, factory sdninformers.SharedInforme
 			// VPC by default, or a peered VPC) and key the entry from the source
 			// side. cidr egress destinations are not supported yet.
 			for _, eg := range sg.Spec.Egress {
+				// A cidr destination (north-south egress) compiles into the
+				// sg_egress_cidr LPM, keyed from the source side.
+				if eg.To.CIDR != "" {
+					_, ipnet, err := net.ParseCIDR(eg.To.CIDR)
+					if err != nil {
+						log.Warn("security group: bad egress cidr; rule ignored", "group", sg.Name, "cidr", eg.To.CIDR, "err", err)
+						continue
+					}
+					egressCidrRules = append(egressCidrRules, compileEgressCidrPorts(net_, ipnet, 1<<uint(sg.Status.ID), eg.Ports)...)
+					continue
+				}
 				if eg.To.Group == "" {
 					continue
 				}
@@ -1412,6 +1424,9 @@ func watchSecurityGroups(ctx context.Context, factory sdninformers.SharedInforme
 		}
 		if err := mgr.SyncSGEgress(egressRules); err != nil {
 			log.Error("sync sg_egress", "err", err)
+		}
+		if err := mgr.SyncSGEgressCidr(egressCidrRules); err != nil {
+			log.Error("sync sg_egress_cidr", "err", err)
 		}
 		for n := range nets {
 			if err := mgr.EnsureSGDrop(n); err != nil {
@@ -1513,6 +1528,32 @@ func compileEgressPorts(srcNet, dstNet uint32, group uint16, allowedDst uint64, 
 			continue
 		}
 		out = append(out, datapath.SGEgress{SrcNet: srcNet, DstNet: dstNet, Group: group, Proto: proto, Port: uint16(pp.Port), Allowed: allowedDst})
+	}
+	return out
+}
+
+// compileEgressCidrPorts expands a north-south egress rule into sg_egress_cidr
+// entries: (src net, proto, dst port, destination CIDR) admitting the source
+// group bitmap.
+func compileEgressCidrPorts(srcNet uint32, cidr *net.IPNet, allowedSrc uint64, ports []sdnv1alpha1.SecurityGroupPort) []datapath.SGEgressCidr {
+	var out []datapath.SGEgressCidr
+	if len(ports) == 0 {
+		for _, proto := range []uint8{unix.IPPROTO_TCP, unix.IPPROTO_UDP} {
+			out = append(out, datapath.SGEgressCidr{SrcNet: srcNet, Proto: proto, Port: 0, CIDR: cidr, AllowedGroups: allowedSrc})
+		}
+		return out
+	}
+	for _, pp := range ports {
+		var proto uint8
+		switch pp.Protocol {
+		case "TCP":
+			proto = unix.IPPROTO_TCP
+		case "UDP":
+			proto = unix.IPPROTO_UDP
+		default:
+			continue
+		}
+		out = append(out, datapath.SGEgressCidr{SrcNet: srcNet, Proto: proto, Port: uint16(pp.Port), CIDR: cidr, AllowedGroups: allowedSrc})
 	}
 	return out
 }

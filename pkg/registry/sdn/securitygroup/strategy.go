@@ -122,17 +122,25 @@ func validateSecurityGroup(sg *sdn.SecurityGroup) field.ErrorList {
 	}
 	for i, r := range sg.Spec.Egress {
 		p := specPath.Child("egress").Index(i).Child("to")
-		if r.To.Group == "" {
-			// v1 egress is group-only (east-west). to.cidr (external egress) is
-			// a later increment.
-			if r.To.CIDR != "" {
-				errs = append(errs, field.Forbidden(p.Child("cidr"), "egress cidr destinations are not yet supported; reference a group"))
-			} else {
-				errs = append(errs, field.Required(p.Child("group"), "an egress rule must name a destination group"))
+		hasGroup := r.To.Group != ""
+		hasCIDR := r.To.CIDR != ""
+		switch {
+		case hasGroup && hasCIDR:
+			errs = append(errs, field.Invalid(p, r.To, "set exactly one of group or cidr"))
+		case !hasGroup && !hasCIDR:
+			errs = append(errs, field.Required(p, "an egress rule must name a destination group or cidr"))
+		case hasCIDR:
+			if _, _, err := net.ParseCIDR(r.To.CIDR); err != nil {
+				errs = append(errs, field.Invalid(p.Child("cidr"), r.To.CIDR, "not a valid CIDR"))
 			}
 		}
-		if r.To.VPC != nil && (r.To.VPC.Namespace == "" || r.To.VPC.Name == "") {
-			errs = append(errs, field.Invalid(p.Child("vpc"), r.To.VPC, "peer vpc ref needs both namespace and name"))
+		if r.To.VPC != nil {
+			if r.To.VPC.Namespace == "" || r.To.VPC.Name == "" {
+				errs = append(errs, field.Invalid(p.Child("vpc"), r.To.VPC, "peer vpc ref needs both namespace and name"))
+			}
+			if !hasGroup {
+				errs = append(errs, field.Required(p.Child("group"), "a peer-VPC egress reference must name a group"))
+			}
 		}
 	}
 	return errs

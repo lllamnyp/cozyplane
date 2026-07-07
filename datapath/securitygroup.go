@@ -118,6 +118,50 @@ func (m *Manager) SyncSGCidr(entries []SGCidr) error {
 	return syncMap(m.objs.SgCidr, want)
 }
 
+// SGEgressCidr is one compiled north-south egress rule: source group members in
+// SrcNet may egress to a destination CIDR on (proto, port). AllowedGroups is the
+// bitmap of source groups (in SrcNet's id space) admitted there.
+type SGEgressCidr struct {
+	SrcNet        uint32
+	Proto         uint8
+	Port          uint16 // host order; stored network order
+	CIDR          *net.IPNet
+	AllowedGroups uint64
+}
+
+// SyncSGEgressCidr makes the sg_egress_cidr LPM map exactly `entries` (full-state
+// diff), the egress twin of SyncSGCidr keyed by source net + destination CIDR.
+func (m *Manager) SyncSGEgressCidr(entries []SGEgressCidr) error {
+	want := map[overlaySgEgressCidrKey]uint64{}
+	for _, e := range entries {
+		if e.CIDR == nil {
+			continue
+		}
+		ones, _ := e.CIDR.Mask.Size()
+		ip := e.CIDR.IP
+		var destPrefix uint32
+		if v4 := ip.To4(); v4 != nil {
+			ip = v4
+			destPrefix = 96 + uint32(ones)
+		} else {
+			destPrefix = uint32(ones)
+		}
+		a, err := addr128(ip)
+		if err != nil {
+			return fmt.Errorf("sg_egress_cidr dest %q: %w", e.CIDR, err)
+		}
+		key := overlaySgEgressCidrKey{
+			Prefixlen: 64 + destPrefix,
+			SrcNet:    e.SrcNet,
+			Port:      htons(e.Port),
+			Proto:     uint16(e.Proto),
+			Dest:      a,
+		}
+		want[key] |= e.AllowedGroups
+	}
+	return syncMap(m.objs.SgEgressCidr, want)
+}
+
 // SyncSGRules makes sg_rules exactly `rules` (full-state diff).
 func (m *Manager) SyncSGRules(rules []SGRule) error {
 	want := map[overlaySgRuleKey]uint64{}
