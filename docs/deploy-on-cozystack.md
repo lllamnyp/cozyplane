@@ -28,6 +28,14 @@ it removes the Cilium standalone-IPAM coexistence hazard
 
 **Not yet covered** (works on stock Cilium, must be planned around here):
 
+- **Admission webhooks across nodes** — the hostNetwork kube-apiserver can't reach
+  a webhook **pod on another node** (cozyplane doesn't deliver node-originated
+  traffic to a remote pod). This gates the full platform: cert-manager and every
+  operator with a webhook (kubevirt, cluster-api, kamaji, linstor…) only converge
+  by luck of pod placement. The open datapath item and its measurements are in
+  [bringup-field-notes.md](bringup-field-notes.md) (#5). **Until it's fixed, expect
+  the CNI + kpr + DNS + pod-origin ClusterIP layer to work but the operator layer
+  above cert-manager to stall.**
 - **host-firewall** and **default-network `NetworkPolicy`** — Cilium provided
   these; not replaced yet.
 - **External NodePort** and **VM-guest ClusterIP** — a KubeVirt guest bypasses
@@ -35,6 +43,11 @@ it removes the Cilium standalone-IPAM coexistence hazard
   (per-packet fallback), designed but not implemented — see
   [kube-proxy-replacement.md](kube-proxy-replacement.md). **In-cluster ClusterIP
   and DNS for pods work today.**
+
+The full set of bring-up difficulties (cert-manager ordering, the KubePrism agent
+bootstrap, the orphaned Cilium/kube-ovn packages, the `sdn.cozystack.io` group
+collision, and the webhook gap above) is written up in
+[bringup-field-notes.md](bringup-field-notes.md).
 
 ## The bootstrap ordering, and why the etcd is memory-backed
 
