@@ -91,7 +91,7 @@ maps and one program.
 | `svc_vips` | hash | {net, VIP, proto, port} → backend set + flags | agent (ServiceVIPs) |
 | `vpc_counters` | PERCPU hash | net id → {tx,rx bytes/packets} | datapath (in-band) |
 | `sg_members` | hash | {net, VPC IP} → `u64` group bitmap | agent (Ports' `status.groups`) |
-| `sg_rules` | hash | {net, dst group, proto, port} → `u64` allowed-source bitmap | agent (SecurityGroups) |
+| `sg_rules` | hash | {dst net, src net, dst group, proto, port} → `u64` allowed-source bitmap | agent (SecurityGroups) |
 | `sg_drops` | PERCPU hash | net id → policy-drop count | datapath (in-band) |
 | `params` | array | `[0]`=Geneve ifindex, `[1]`=default VNI | agent |
 
@@ -116,9 +116,16 @@ if it is grouped, it unions the `sg_rules` allowed-source bitmaps for the
 destination's groups and admits only if that intersects the source's bitmap,
 else drops and bumps `sg_drops`. TCP is gated on new connections only (SYN,
 no ACK) so replies pass without a conntrack; UDP always. Gateway-forwarded
-(`GW_MARK`) ingress is exempt. A peered source is in a disjoint CIDR, so it
-misses `sg_members[{dst net, src}]` and is dropped once the destination is
-grouped (the AWS-shaped default-deny).
+(`GW_MARK`) ingress is exempt. The source's groups come from its *own* net
+(`sg_members[{srcnet, src}]`) and rules are keyed by `src_net` too, so a
+**peered** group can be admitted (`from: {group, vpc}`) while an unreferenced
+peer still hits the default-deny. Cross-peer identity is made authoritative by a
+**Geneve TLV**: `from_pod` stamps a grouped source's `{net, groups}` (from its
+veth, not the packet) into a Geneve option on encap; `from_overlay` — the only
+hook that sees tunnel metadata — reads it, runs `sg_admit` before delivery, and
+sets an `SG_OK` mark so `to_pod` skips the (spoofable) inference. So a
+mutually-peered tenant can't wear another peer's *net*. (docs/security-groups.md
+has the trust model and its intra-VPC RPF caveat.)
 
 The scoped maps use a `{prefixlen, scope_net, addr}` LPM key: the scope net
 occupies the leading 32 bits (always fully specified), so a lookup never

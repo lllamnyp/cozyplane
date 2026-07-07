@@ -755,6 +755,47 @@ check_fail "sgnone -> sgweb (ungrouped source, default-deny)" \
 check_fail "sgweb -> sgcli (client has no ingress, default-deny)" \
   bash -c "$K -n team-a exec sgweb -- wget -qO- -T3 http://$(vpcip sgcli)/ 2>/dev/null | grep -q ."
 
+echo "[security groups: peered-group reference (v2, Geneve TLV)]"
+# A labeled pod in the peered vpc-c, on the OTHER worker so its traffic to sgweb
+# ($W) crosses a node and exercises the TLV path (from_pod stamps, from_overlay
+# enforces). vpc-c is peered with vpc-a (a-to-c above).
+$K -n team-a apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: cpeer, namespace: team-a, labels: {role: cpeer}, annotations: {sdn.cozystack.io/vpc: vpc-c}}
+spec: {nodeName: $W2, containers: [{name: c, image: busybox:1.36, command: ["sh","-c","$SRV"]}]}
+EOF
+$K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: SecurityGroup
+metadata: {name: cpeer, namespace: team-a}
+spec: {vpcRef: {name: vpc-c}, podSelector: {matchLabels: {role: cpeer}}}
+EOF
+$K -n team-a wait --for=condition=Ready pod/cpeer --timeout=60s >/dev/null 2>&1
+# Before a peer rule: peered traffic to grouped sgweb is default-denied.
+check_fail "cpeer(vpc-c) -> sgweb before peer rule (cross-peer default-deny)" \
+  bash -c "$K -n team-a exec cpeer -- wget -qO- -T3 http://$SGWEB/ 2>/dev/null | grep -q ."
+# web now also admits vpc-c's cpeer group (peer reference).
+$K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: SecurityGroup
+metadata: {name: web, namespace: team-a}
+spec:
+  vpcRef: {name: vpc-a}
+  podSelector: {matchLabels: {role: web}}
+  ingress:
+  - from: {group: client}
+    ports: [{protocol: TCP, port: 80}]
+  - from: {group: cpeer, vpc: {namespace: team-a, name: vpc-c}}
+    ports: [{protocol: TCP, port: 80}]
+EOF
+for i in $(seq 1 20); do
+  g=$($K get ports -o jsonpath="{range .items[*]}{.spec.podName}{'='}{.status.groups}{'\n'}{end}" | awk -F= '$1=="cpeer"{print $2}')
+  [ -n "$g" ] && [ "$g" != "[]" ] && break; sleep 1
+done
+check "cpeer(vpc-c) -> sgweb:80 admitted by peer rule (cross-node, TLV authoritative)" "sgweb" httpid team-a cpeer "$SGWEB"
+check "same-VPC sgcli -> sgweb:80 still admitted alongside the peer rule" "sgweb" httpid team-a sgcli "$SGWEB"
+
 echo "[revocation]"
 $K -n team-a delete vpcbinding vpc-a >/dev/null
 sleep 6

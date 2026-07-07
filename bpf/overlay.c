@@ -150,7 +150,23 @@ struct cozy_mac {
 // inside the 24-bit Geneve VNI (so the receiving node can re-mark after decap).
 // Tenants cannot forge either.
 #define GW_MARK        0x100000  // bit 20: clear of kube-proxy (0x4000/0x8000) and Cilium magic
+#define SG_OK          0x200000  // bit 21: from_overlay already enforced security groups (TLV)
 #define TUN_F_GATEWAY  (1 << 23) // top bit of the Geneve VNI; real VNIs are < 2^23
+
+// Security-group identity TLV (docs/security-groups.md, v2 stage B). The source
+// node stamps the source pod's authoritative {net, group bitmap} into a Geneve
+// option on cross-node encap, so a destination trusts the source's identity
+// across a VPC-peering trust boundary instead of inferring it from a spoofable
+// source IP. Read in from_overlay (the only place tunnel metadata is visible).
+#define SG_OPT_CLASS 0xC0FE // cozyplane private Geneve option class
+#define SG_OPT_TYPE  1
+struct sg_geneve_opt {
+	__be16 opt_class;
+	__u8 type;
+	__u8 length;   // in 4-byte units of opt_data: 12 bytes -> 3
+	__u32 src_net; // host order (both ends are cozyplane)
+	__u64 srcmap;
+} __attribute__((packed));
 
 // Shared Geneve MAC: the encap path rewrites the inner Ethernet destination to
 // it so a decapped default-network frame is PACKET_HOST on arrival and the
@@ -958,7 +974,7 @@ static __always_inline int deliver_local(struct __sk_buff *skb, struct endpoint 
 // encap sets the Geneve tunnel key and redirects to the Geneve device. tunnel_id
 // is the destination network so the receiver can demux by VNI; the gateway flag
 // rides the top VNI bit for the receiver's anti-spoof re-mark.
-static __always_inline int encap(struct __sk_buff *skb, __u32 dstnet, __u32 node_ip, __u32 gw)
+static __always_inline int encap_sg(struct __sk_buff *skb, __u32 dstnet, __u32 node_ip, __u32 gw, __u32 srcnet, __u64 srcmap)
 {
 	__u32 geneve = cfg(CFG_GENEVE_IFINDEX);
 	if (!geneve)
@@ -973,7 +989,26 @@ static __always_inline int encap(struct __sk_buff *skb, __u32 dstnet, __u32 node
 	tkey.remote_ipv4 = node_ip;
 	if (bpf_skb_set_tunnel_key(skb, &tkey, sizeof(tkey), BPF_F_ZERO_CSUM_TX) < 0)
 		return TC_ACT_SHOT;
+	// Stamp the source pod's authoritative group identity (stage B), but only
+	// for a grouped source — the common ungrouped case pays nothing.
+	if (srcmap) {
+		struct sg_geneve_opt opt = {
+			.opt_class = bpf_htons(SG_OPT_CLASS),
+			.type = SG_OPT_TYPE,
+			.length = 3,
+			.src_net = srcnet,
+			.srcmap = srcmap,
+		};
+		bpf_skb_set_tunnel_opt(skb, (void *)&opt, sizeof(opt));
+	}
 	return bpf_redirect(geneve, 0);
+}
+
+// encap without a security-group TLV (gateway, default-network, migration
+// re-encap — no tenant source identity to vouch for).
+static __always_inline int encap(struct __sk_buff *skb, __u32 dstnet, __u32 node_ip, __u32 gw)
+{
+	return encap_sg(skb, dstnet, node_ip, gw, 0, 0);
 }
 
 // ---- eBPF bridge NAT (north-south, no netfilter) -------------------------
@@ -2878,10 +2913,21 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 		}
 	}
 
-	// Remote destination in the same network (or a peer): encapsulate.
+	// Remote destination in the same network (or a peer): encapsulate. Stamp
+	// the source pod's authoritative group identity (stage B) so the receiver
+	// trusts it across a peering. srcnet/p.src are the source node's own view
+	// (from the veth's `ports` entry), not the (spoofable) claimed source.
 	__u32 *node_ip = remote_of(dstnet, p.dst);
-	if (node_ip)
-		return encap(skb, dstnet, *node_ip, is_gw);
+	if (node_ip) {
+		__u64 srcmap = 0;
+		if (srcnet && !is_gw) {
+			struct local_key sk = { .net = srcnet, .ip = p.src };
+			__u64 *sm = bpf_map_lookup_elem(&sg_members, &sk);
+			if (sm)
+				srcmap = *sm;
+		}
+		return encap_sg(skb, dstnet, *node_ip, is_gw, srcnet, srcmap);
+	}
 
 	// Same-node north-south: a default-network packet to a local VPC pod's
 	// fabric IP. Redirect into the pod's veth (to_pod does the DNAT), bypassing
@@ -2991,11 +3037,14 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 	// Security-group ingress (destination-side, #7). Only genuine intra-VPC /
 	// peered pod-to-pod traffic is gated: gateway-forwarded ingress (GW_MARK —
 	// internet/DNS replies) is north-south and stateful-reply territory, left
-	// alone in v1. A peered source is in a disjoint CIDR (peering requires it),
-	// so its members entry lives under another net and misses the lookup here —
-	// srcmap 0 — so a peered source is dropped once the destination is grouped
-	// (AWS-shaped default-deny until a v2 peer-group rule admits it).
-	if (dstnet && skb->mark != GW_MARK) {
+	// alone. A same-VPC peered source's groups come from its own net
+	// (sg_members[{srcnet, src}]); a peer with no admitting rule still misses and
+	// is dropped once the destination is grouped (AWS-shaped default-deny).
+	//
+	// SG_OK means from_overlay already enforced this cross-node packet
+	// authoritatively from the source's Geneve TLV (stage B) — skip the
+	// (spoofable) inference here rather than re-check it.
+	if (dstnet && !(skb->mark & (GW_MARK | SG_OK))) {
 		__u16 dport;
 		__u32 l4off = p.is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
 		if (sg_l4(skb, p.proto, l4off, &dport)) {
@@ -3070,8 +3119,36 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 	// The lookup is 128-bit, so a v6 VPC pod is delivered exactly like a v4 one.
 	struct endpoint *ep = local_of(vni, p.dst);
 	if (ep) {
-		if (gw)
+		if (gw) {
 			skb->mark = GW_MARK;
+		} else {
+			// Authoritative security-group enforcement (stage B): a grouped
+			// source stamped its {net, groups} in a Geneve option. Enforce it
+			// here — the only place the tunnel metadata is readable — and mark
+			// it done so to_pod won't re-check via (spoofable) inference. An
+			// ungrouped source carries no option and falls through to to_pod's
+			// same-node/inference path.
+			struct sg_geneve_opt opt;
+			if (bpf_skb_get_tunnel_opt(skb, (void *)&opt, sizeof(opt)) >= (int)sizeof(opt) &&
+			    opt.opt_class == bpf_htons(SG_OPT_CLASS) && opt.type == SG_OPT_TYPE) {
+				__u16 dport;
+				__u32 l4off = p.is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
+				if (sg_l4(skb, p.proto, l4off, &dport)) {
+					struct sg_query q = {
+						.dst = { .net = vni, .ip = p.dst },
+						.src_net = opt.src_net,
+						.srcmap = opt.srcmap,
+						.dport = dport,
+						.proto = p.proto,
+					};
+					if (!sg_admit(&q)) {
+						count_sg_drop(vni);
+						return TC_ACT_SHOT;
+					}
+				}
+				skb->mark |= SG_OK;
+			}
+		}
 		return deliver_local(skb, ep);
 	}
 

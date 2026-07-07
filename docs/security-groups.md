@@ -186,11 +186,12 @@ allow-all. `cozyplane_sg_drops_total` incremented per drop.
 4. **AuthZ** — owner-namespace-implies-policy-authority; no `policy` verb.
 5. **Naming** — `SecurityGroup` (AWS familiarity).
 
-## v2: peered-group references + the Geneve identity TLV (design)
+## v2: peered-group references + the Geneve identity TLV (built + dev4-validated)
 
 **Goal:** a group in one VPC can admit a group in a *peered* VPC —
 `from: {group: web, vpc: {namespace: team-b, name: vpc-b}}` — enforced
-correctly and safely across the tenant trust boundary.
+correctly and safely across the tenant trust boundary. Both stages are built and
+validated on dev4 (2026-07-06).
 
 ### Why v1 can't do this, and why the TLV
 
@@ -225,9 +226,9 @@ The agent compiles a peer rule by resolving the peer VPC's VNI (VPC lister) and
 the peer group's id (it already lists SecurityGroups cluster-wide).
 
 API: `SecurityGroupPeer` gains `VPC *VPCRef` (namespace+name). When set, `group`
-names a group in that peer VPC. Validation requires the referenced VPC to be a
-declared peer (a `VPCPeering` half exists) — else the rule can never match and
-is a silent footgun.
+names a group in that peer VPC. The apiserver validates the ref has both a
+namespace and name and pairs with a group; verifying the VPC is actually a
+declared peer is a later controller-condition check.
 
 ### Stage A — destination-side inference (functional, non-adversarial)
 
@@ -262,20 +263,47 @@ inner packet. So enforcement splits by path:
   no-TLV fall-through). Same-node has no over-the-wire spoofing surface, so
   inference is safe there.
 
-This keeps `sg_admit` a single shared subprogram. The risk is the `from_pod`
-stack/complexity budget (already tight — see `count_dir`): stamping adds one map
-lookup and a `bpf_skb_set_tunnel_opt` with a ~16-byte opt buffer. Load-verified
-on the 6.12 kernel; if it overflows, the fallback is to gate stamping behind the
-grouped-source check (already planned) and, worst case, a dedicated encap
-variant.
+This keeps `sg_admit` a single shared subprogram. The `from_pod` stamping (one
+`sg_members` lookup + a `bpf_skb_set_tunnel_opt` with a 16-byte opt) **loaded
+clean on the 6.12 kernel** — the stack budget held even though `from_pod` is the
+tightest hook.
 
-**Trust result:** a peer's group identity crossing into another VPC is what the
-source node vouched for, not what the packet claimed — c can no longer wear b's
-groups. Intra-VPC and same-node keep inference (same trust domain).
+**Trust result and its limit.** The TLV's **`src_net` is authoritative**: it
+comes from the source pod's veth (`ports` map) on the source node, not from the
+packet. So a mutually-peered tenant c cannot wear b's *net* — a rule keyed
+`src_net = b` never matches c's traffic (its TLV says c). That closes the
+cross-tenant impersonation the peering trust boundary is about. The source
+*group bitmap* is still looked up by the packet's source IP on the source node,
+so a pod could impersonate a **co-VPC** peer's group by spoofing that peer's IP
+— but that is within one tenant's own VPC (the tenant can already label any of
+its pods into the group), so it crosses no trust boundary. Closing it needs
+`from_pod` source-IP RPF (validate `src` against the veth's Port IP), which also
+hardens v1 intra-VPC — a noted follow-up, not done here.
+
+Same-node and no-TLV traffic keep inference (`to_pod`); same-node has no
+over-the-wire spoofing surface.
+
+**Not yet:** the apiserver validation only checks a peer ref names a group with
+a namespace+name; it does **not** yet verify a `VPCPeering` exists (an
+unpeered ref simply never matches — a footgun, a cheap controller-condition
+follow-up). A `migrate_fwd` re-encap during VM migration does not re-stamp the
+TLV, so a migrated grouped VM's cross-node traffic falls back to inference for
+the brief migration window.
+
+### Validated on dev4 (2026-07-06)
+
+vpc-a peered vpc-b (disjoint CIDRs, VNIs 101/102). vpc-a's `web` admits vpc-b's
+`bclient`. Stage A (inference, same-node) and stage B (TLV, cross-node) both
+correct: a cross-node vpc-b `bclient` pod reaches `web:80` (its TLV admitted in
+`from_overlay`); a cross-node vpc-b pod in a *different* group (`bother`, id 2 —
+colliding with vpc-a `web`'s own id 2) is dropped (the `src_net` key keeps the
+id spaces distinct); an ungrouped vpc-b pod is dropped; same-VPC rules keep
+working alongside.
 
 ## v2 backlog (remaining)
 
 Egress rules; north-south `from.cidr` (world pseudo-group is reserved; needs
 floating-path enforcement, then an LPM map for specific ranges); FQDN sources;
 label-change-follows membership; ICMP rules; a real conntrack to replace the TCP
-SYN-gate.
+SYN-gate; `from_pod` source-IP RPF (authoritative source group + general
+anti-spoof); peer-existence validation for peer refs.
