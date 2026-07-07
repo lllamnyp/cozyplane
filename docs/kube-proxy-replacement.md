@@ -181,13 +181,21 @@ Cilium's map ABI is not.
    `KPR_BPFFS_ROOT`) cover kind's `/sys/fs/cgroup` cgroup2 root — a flag-cell is
    the eventual home.
 
-   **Next:** package it (image + DaemonSet with the cgroup2/bpffs mounts), fold
-   the manual kind steps into `test/` as increment 2's `kubeProxyMode: none`
-   e2e, and exercise the UDP/DNS path (`sendmsg`/`recvmsg` + the reverse
-   translation) alongside TCP.
-2. **kube-proxy-less kind e2e** — kind supports `kubeProxyMode: none`; prove
-   ClusterIP (pods + hostns) and in-cluster NodePort; document the VM/external
-   gaps as expected failures.
+2. **kube-proxy-less kind e2e — DONE (`test/kpr-e2e.sh`).** Packaged as an
+   image (`kpr/Dockerfile`) + DaemonSet (`deploy/kpr-daemonset.yaml`:
+   hostNetwork, privileged, host bpffs + cgroup2 mounts, an init container that
+   mounts bpffs on nodes that lack it — e.g. kind), and validated on a
+   `kubeProxyMode: none` cluster where **there is no service proxy to fall back
+   on**, so a working ClusterIP *is* socket-LB. From a pod: TCP and UDP
+   ClusterIP both resolve and load-balance across backends, and cluster DNS
+   resolves (`kubernetes.default → 10.96.0.1`) — the UDP path exercises
+   `sendmsg` + the reverse `recvmsg` translation (the resolver accepts the
+   reply, so the round trip is whole). Bootstrap wrinkle handled: with no
+   kube-proxy the `kubernetes.default` ClusterIP is unserved until kpr runs, so
+   kpr points at the real apiserver endpoint (`--k8s-api-server-urls`) rather
+   than the in-cluster ClusterIP. RBAC is cluster-admin in the prototype
+   manifest (a scoped role is a follow-up). In-cluster NodePort and the
+   VM/external gaps move to increment 3.
 3. **Per-packet fallback** — external NodePort + VM-guest ClusterIP in
    `from_uplink`/`from_pod`, fed from the StateDB tables. Needs its own design
    pass on the ct-table interaction (the masquerade tables are close but

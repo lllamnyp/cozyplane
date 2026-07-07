@@ -1,0 +1,74 @@
+# cozyplane-kpr: kube-proxy replacement (socket-LB) as its own DaemonSet,
+# separate from cozyplane-agent (docs/kube-proxy-replacement.md). Prototype
+# manifest for the kind e2e — do NOT apply on a cluster running full Cilium
+# (both claim the cgroup root and the /sys/fs/bpf pin namespace).
+#
+# RBAC is cluster-admin here to keep the prototype e2e free of whack-a-mole; a
+# scoped role (services/endpointslices/nodes read + cilium.io) is a follow-up.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cozyplane-kpr
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cozyplane-kpr
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: cozyplane-kpr
+    namespace: kube-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cozyplane-kpr
+  namespace: kube-system
+  labels: {app: cozyplane-kpr}
+spec:
+  selector:
+    matchLabels: {app: cozyplane-kpr}
+  template:
+    metadata:
+      labels: {app: cozyplane-kpr}
+    spec:
+      serviceAccountName: cozyplane-kpr
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        - operator: Exists
+      initContainers:
+        # Ensure bpffs is mounted on the host at /sys/fs/bpf so the LB map pins
+        # are a real bpffs and survive the process. Bidirectional propagation
+        # pushes the mount to the node. (Nodes without a pre-mounted bpffs — e.g.
+        # kind — need this; Cilium's own DaemonSet does the equivalent.)
+        - name: mount-bpffs
+          image: busybox:1.36
+          command: ["sh", "-c", "mount | grep -q 'bpf on /sys/fs/bpf ' || mount -t bpf bpf /sys/fs/bpf"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - {name: bpffs, mountPath: /sys/fs/bpf, mountPropagation: Bidirectional}
+      containers:
+        - name: kpr
+          image: cozyplane-kpr:dev
+          imagePullPolicy: IfNotPresent
+          # In-cluster config (serviceaccount) — no --k8s-kubeconfig-path.
+          env:
+            - {name: KPR_CGROUP_ROOT, value: /host/cgroup2}
+            - {name: KPR_BPFFS_ROOT, value: /sys/fs/bpf}
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - {name: bpffs, mountPath: /sys/fs/bpf, mountPropagation: Bidirectional}
+            - {name: cgroup2, mountPath: /host/cgroup2}
+      volumes:
+        - name: bpffs
+          hostPath: {path: /sys/fs/bpf, type: DirectoryOrCreate}
+        - name: cgroup2
+          hostPath: {path: /sys/fs/cgroup, type: Directory}
