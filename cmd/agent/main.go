@@ -293,10 +293,21 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		}
 	}
 	if masqMode == "bpf" && clusterCIDR != "" {
+		// SNAT to the default-route source, not the InternalIP: the masqueraded
+		// packet egresses that link and must carry an address valid for it (they
+		// differ on a multi-NIC node, and a spoof-guarding underlay drops a
+		// mismatch). On a single-NIC node this equals the InternalIP.
+		masqIP, err := datapath.DefaultRouteSrcIP()
+		if err != nil {
+			return fmt.Errorf("determine masquerade source address: %w", err)
+		}
+		if err := mgr.SetMasqIP(masqIP); err != nil {
+			return fmt.Errorf("program masquerade IP: %w", err)
+		}
 		if err := mgr.SyncMasqSources(splitCIDRs(clusterCIDR)); err != nil {
 			return fmt.Errorf("program masquerade sources: %w", err)
 		}
-		log.Info("bpf cluster-egress masquerade enabled", "sources", clusterCIDR, "nodeIP", state.NodeIP, "nodeIPv6", nodeV6)
+		log.Info("bpf cluster-egress masquerade enabled", "sources", clusterCIDR, "masqIP", masqIP.String(), "nodeIP", state.NodeIP, "nodeIPv6", nodeV6)
 	}
 
 	// VPC DNS steering (docs/services-in-vpc.md): publish the cluster DNS
@@ -332,6 +343,11 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	go datapath.RunRAResponder(ctx, mtu, rdnss, log)
 
 	log.Info("published node state", "nodeIP", state.NodeIP, "podCIDR", podCIDR, "mtu", mtu)
+
+	// Advertise the address host-originated traffic sources from, so peers can
+	// encapsulate their pods' replies to this node over the overlay (node_remotes)
+	// instead of emitting a pod-sourced frame the underlay may drop.
+	advertiseNodeAddrs(ctx, client, nodeName, log)
 
 	if err := watchNodes(ctx, client, mgr, nodeName, log); err != nil {
 		return err
@@ -369,8 +385,49 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	return nil
 }
 
+// nodeAddrsAnnotation carries the addresses host-originated traffic on a node
+// sources from, beyond the InternalIP already in the node status — comma
+// separated. Peers map each to the node's Geneve endpoint (node_remotes) so a
+// pod's reply to that address is encapsulated instead of leaving pod-sourced.
+const nodeAddrsAnnotation = "cozyplane.io/node-addresses"
+
+// advertiseNodeAddrs publishes this node's default-route source address in the
+// node annotation, so peers can encapsulate their pods' replies to this node.
+// The InternalIP is already discoverable from the node status, so only the
+// default-route source (which differs from it on a multi-NIC node) is published.
+// Best-effort: on failure peers fall back to the InternalIP alone.
+func advertiseNodeAddrs(ctx context.Context, client kubernetes.Interface, nodeName string, log *slog.Logger) {
+	src, err := datapath.DefaultRouteSrcIP()
+	if err != nil {
+		log.Warn("determine default-route source; pod->node overlay may be incomplete on multi-NIC nodes", "err", err)
+		return
+	}
+	patch := []byte(fmt.Sprintf(`{"metadata":{"annotations":{%q:%q}}}`, nodeAddrsAnnotation, src.String()))
+	if _, err := client.CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
+		log.Warn("advertise node address", "err", err)
+		return
+	}
+	log.Info("advertised node address", "addr", src.String())
+}
+
+// nodeAddresses returns the set of a node's own addresses to encapsulate replies
+// to: its InternalIP(s) plus any advertised in the annotation.
+func nodeAddresses(node *corev1.Node) []net.IP {
+	var out []net.IP
+	if ip := net.ParseIP(internalIP(node)); ip != nil {
+		out = append(out, ip)
+	}
+	for _, s := range strings.Split(node.Annotations[nodeAddrsAnnotation], ",") {
+		if ip := net.ParseIP(strings.TrimSpace(s)); ip != nil {
+			out = append(out, ip)
+		}
+	}
+	return out
+}
+
 // watchNodes starts a Node informer that mirrors every other node's pod CIDR
-// into the remotes map. It blocks until the cache is synced.
+// into the remotes map, and every other node's addresses into node_remotes. It
+// blocks until the cache is synced.
 func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.Manager, selfName string, log *slog.Logger) error {
 	factory := informers.NewSharedInformerFactory(client, 0)
 	nodeInformer := factory.Core().V1().Nodes().Informer()
@@ -396,6 +453,14 @@ func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.
 			}
 			log.Info("remote set", "node", node.Name, "podCIDR", cidr, "nodeIP", ip)
 		}
+		// Map the node's own addresses to its Geneve endpoint, so a pod's reply to
+		// this node is encapsulated over the overlay (never emitted pod-sourced).
+		geneveIP := net.ParseIP(ip)
+		for _, addr := range nodeAddresses(node) {
+			if err := mgr.SetNodeRemote(addr, geneveIP); err != nil {
+				log.Error("set node remote", "node", node.Name, "addr", addr, "err", err)
+			}
+		}
 	}
 
 	_, err := nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -409,6 +474,11 @@ func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.
 			for _, cidr := range nodePodCIDRs(node) {
 				if err := mgr.DelRemote(0, cidr); err != nil {
 					log.Error("del remote", "node", node.Name, "cidr", cidr, "err", err)
+				}
+			}
+			for _, addr := range nodeAddresses(node) {
+				if err := mgr.DelNodeRemote(addr); err != nil {
+					log.Error("del node remote", "node", node.Name, "addr", addr, "err", err)
 				}
 			}
 		},

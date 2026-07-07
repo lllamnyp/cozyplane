@@ -83,6 +83,26 @@ func (m *Manager) SetNodeIP(ip net.IP) error {
 	return nil
 }
 
+// SetMasqIP publishes the cluster-egress masquerade SNAT source — the
+// default-route link's own address, so a masqueraded pod packet is valid for the
+// interface it egresses (which is not the InternalIP on a multi-NIC node, where
+// a spoof-guarding underlay would otherwise drop it). Stored network-order/native
+// like SetNodeIP. A nil IP clears it, disabling the bpf masquerade.
+func (m *Manager) SetMasqIP(ip net.IP) error {
+	var v uint32
+	if ip != nil {
+		ip4 := ip.To4()
+		if ip4 == nil {
+			return fmt.Errorf("masquerade IP %q is not IPv4", ip)
+		}
+		v = binary.NativeEndian.Uint32(ip4)
+	}
+	if err := m.objs.Params.Put(cfgMasqIP, v); err != nil {
+		return fmt.Errorf("set masquerade IP: %w", err)
+	}
+	return nil
+}
+
 // SetNodeIP6 publishes the node's v6 address for the v6 bpf masquerade (nil
 // clears it, disabling the v6 masq hooks — e.g. on a v4-only node).
 func (m *Manager) SetNodeIP6(ip net.IP) error {

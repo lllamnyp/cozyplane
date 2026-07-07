@@ -259,6 +259,25 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } remotes SEC(".maps");
 
+// node_remotes: a node address (any NIC) -> that node's Geneve underlay IP (host
+// order, same encoding as `remotes`). A default-network pod's reply to — or
+// dial of — a node address is encapsulated to that node over the overlay, so the
+// underlay only ever carries node source IPs. Without it the reply falls to the
+// kernel and hits the wire with a *pod* source, which a spoof-guarding fabric
+// (e.g. OCI) drops — silently black-holing every cross-node node<->pod flow
+// (hostNetwork apiserver -> webhook pod is the one that bites first). Exact /128
+// keys (node addresses are underlay handles, not tenant-scoped CIDRs). Populated
+// by the agent from each node's InternalIP plus its advertised default-route
+// source address.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct addr128);
+	__type(value, __u32);
+	__uint(max_entries, 1024);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} node_remotes SEC(".maps");
+
 // networks: (scope net, CIDR) -> destination net id. A VPC's own CIDR is stored
 // at its own scope; a peering adds each side's CIDR under the other's scope.
 // Absent => 0 (the default network).
@@ -453,6 +472,13 @@ struct {
 #define CFG_UPLINK_IFINDEX 2
 #define CFG_NODE_IP        3 // v4, network order in the low 32 bits
 #define CFG_RESOLVER_PORT  4 // host order; 0 disables VPC DNS steering
+#define CFG_MASQ_IP        5 // v4 cluster-egress SNAT source (network order).
+                             // The default-route link's own address, so the
+                             // masqueraded packet is valid for the interface it
+                             // leaves by — which need not be the node's InternalIP
+                             // (Geneve/DNS handle, CFG_NODE_IP) on a multi-NIC
+                             // node. A spoof-guarding underlay (OCI) drops a
+                             // packet whose source is not its egress VNIC's IP.
 
 // bpf-masquerade port range for cluster-egress SNAT (#10): disjoint from the
 // host ephemeral range (32768+) so a reverse lookup can never capture the
@@ -1044,6 +1070,13 @@ static __always_inline __u32 *remote_of(__u32 scope, struct addr128 addr)
 {
 	struct lpm_key key = { .prefixlen = LPM_FULL, .scope_net = scope, .addr = addr };
 	return bpf_map_lookup_elem(&remotes, &key);
+}
+
+// node_remote_of returns the Geneve underlay IP of the node that owns `addr`
+// (any of its interface addresses), or NULL if `addr` is not a known node.
+static __always_inline __u32 *node_remote_of(struct addr128 addr)
+{
+	return bpf_map_lookup_elem(&node_remotes, &addr);
 }
 
 static __always_inline struct endpoint *local_of(__u32 net, struct addr128 ip)
@@ -2169,7 +2202,7 @@ static __always_inline int masq_snat(struct __sk_buff *skb, struct pkt *p)
 {
 	if (!is_masq_src(p->src) || is_internal(p->dst))
 		return MASQ_MISS;
-	__u32 node_ip = cfg(CFG_NODE_IP);
+	__u32 node_ip = cfg(CFG_MASQ_IP);
 	if (!node_ip)
 		return MASQ_MISS;
 
@@ -2242,7 +2275,7 @@ static __always_inline int masq_snat(struct __sk_buff *skb, struct pkt *p)
 // with the same embedded-header rewrite as the bridge.
 static __always_inline int masq_reverse(struct __sk_buff *skb, struct pkt *p)
 {
-	__u32 node_ip = cfg(CFG_NODE_IP);
+	__u32 node_ip = cfg(CFG_MASQ_IP);
 	if (!node_ip || v4_of_128(&p->dst) != node_ip)
 		return MASQ_MISS;
 
@@ -3154,6 +3187,20 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 				srcmap = *sm;
 		}
 		return encap_sg(skb, dstnet, *node_ip, is_gw, srcnet, srcmap);
+	}
+
+	// A default-network pod addressing a *node* (its reply to a hostNetwork
+	// client, or a dial to a node service): encapsulate it to that node over the
+	// overlay so the underlay only ever carries node source IPs. The kernel path
+	// below would emit it with the pod's source, which a spoof-guarding fabric
+	// (OCI) drops — black-holing every cross-node node<->pod flow. Gated to the
+	// pod-veth attachment: at the uplink egress this hook also sees the Geneve
+	// *outer* (node->node) frames, and encapsulating those would loop forever.
+	// Default network only (srcnet==0): a VPC pod reaching the host is isolated.
+	if (!srcnet && ifindex != cfg(CFG_UPLINK_IFINDEX)) {
+		__u32 *nnode = node_remote_of(p.dst);
+		if (nnode)
+			return encap(skb, 0, *nnode, 0);
 	}
 
 	// Same-node north-south: a default-network packet to a local VPC pod's

@@ -226,6 +226,7 @@ const (
 	overlayMapMigrateFwd            = "migrate_fwd"
 	overlayMapNetworks              = "networks"
 	overlayMapNodeIp6               = "node_ip6"
+	overlayMapNodeRemotes           = "node_remotes"
 	overlayMapParams                = "params"
 	overlayMapPeers                 = "peers"
 	overlayMapPorts                 = "ports"
@@ -314,6 +315,7 @@ type overlayMapSpecs struct {
 	MigrateFwd     *ebpf.MapSpec `ebpf:"migrate_fwd"`
 	Networks       *ebpf.MapSpec `ebpf:"networks"`
 	NodeIp6        *ebpf.MapSpec `ebpf:"node_ip6"`
+	NodeRemotes    *ebpf.MapSpec `ebpf:"node_remotes"`
 	Params         *ebpf.MapSpec `ebpf:"params"`
 	Peers          *ebpf.MapSpec `ebpf:"peers"`
 	Ports          *ebpf.MapSpec `ebpf:"ports"`
@@ -372,6 +374,7 @@ type overlayMaps struct {
 	MigrateFwd     *ebpf.Map `ebpf:"migrate_fwd"`
 	Networks       *ebpf.Map `ebpf:"networks"`
 	NodeIp6        *ebpf.Map `ebpf:"node_ip6"`
+	NodeRemotes    *ebpf.Map `ebpf:"node_remotes"`
 	Params         *ebpf.Map `ebpf:"params"`
 	Peers          *ebpf.Map `ebpf:"peers"`
 	Ports          *ebpf.Map `ebpf:"ports"`
@@ -406,6 +409,7 @@ func (m *overlayMaps) Close() error {
 		m.MigrateFwd,
 		m.Networks,
 		m.NodeIp6,
+		m.NodeRemotes,
 		m.Params,
 		m.Peers,
 		m.Ports,

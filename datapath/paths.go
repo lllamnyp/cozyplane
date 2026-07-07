@@ -47,12 +47,17 @@ const (
 	cfgGeneveIfindex = uint32(0)
 	cfgVNI           = uint32(1)
 	cfgUplinkIfindex = uint32(2)
-	// cfgNodeIP is the node's v4 address (raw network-order bytes, native
-	// read) for the bpf cluster-egress masquerade; 0 disables it.
+	// cfgNodeIP is the node's v4 InternalIP (raw network-order bytes, native
+	// read): the Geneve/DNS-steer node handle. Distinct from cfgMasqIP below.
 	cfgNodeIP = uint32(3)
 	// cfgResolverPort is the node-local split-horizon resolver's port (host
 	// order); 0 disables VPC DNS steering. Set alongside SetClusterDNS.
 	cfgResolverPort = uint32(4)
+	// cfgMasqIP is the cluster-egress masquerade SNAT source — the default-route
+	// link's own address, so a masqueraded packet is valid for the interface it
+	// leaves by (which is not the InternalIP on a multi-NIC node). 0 disables the
+	// bpf masquerade.
+	cfgMasqIP = uint32(5)
 )
 
 // ResolverPort is the port the split-horizon resolver binds on the node

@@ -14,10 +14,11 @@ metadata:
   labels:
     {{- include "cozyplane.labels" . | nindent 4 }}
 rules:
-  # The agent learns remote pod CIDRs from Node objects.
+  # The agent learns remote pod CIDRs + addresses from Node objects, and patches
+  # its own Node to advertise the address host traffic sources from (node_remotes).
   - apiGroups: [""]
     resources: ["nodes"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "patch"]
   # The plugin (using this SA) reads pod annotations to resolve VPC membership,
   # and the agent reads pods to distinguish revocation from ordinary teardown.
   - apiGroups: [""]

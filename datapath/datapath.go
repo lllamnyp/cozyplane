@@ -211,6 +211,34 @@ func defaultRouteLink() (int, string, error) {
 	return 0, "", fmt.Errorf("no default route found")
 }
 
+// DefaultRouteSrcIP returns the IPv4 address host-originated traffic to off-link
+// destinations sources from — the primary global-scope address of the
+// default-route link. A remote pod's reply to this node is addressed to it, so
+// the agent advertises it and peers map it to this node's Geneve endpoint (see
+// node_remotes / SetNodeRemote). On a single-NIC node this equals the InternalIP;
+// on a multi-NIC node (e.g. dev4's OCI split of management vs cluster NIC) it may
+// differ, which is exactly why it must be advertised rather than inferred.
+func DefaultRouteSrcIP() (net.IP, error) {
+	idx, _, err := defaultRouteLink()
+	if err != nil {
+		return nil, err
+	}
+	link, err := netlink.LinkByIndex(idx)
+	if err != nil {
+		return nil, err
+	}
+	addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+	if err != nil {
+		return nil, fmt.Errorf("list addrs on default-route link: %w", err)
+	}
+	for _, a := range addrs {
+		if a.IP.IsGlobalUnicast() && a.Scope == int(netlink.SCOPE_UNIVERSE) {
+			return a.IP, nil
+		}
+	}
+	return nil, fmt.Errorf("no global IPv4 on default-route link")
+}
+
 // SetRemote installs (or replaces) a route to a remote endpoint within a
 // network scope: a node pod CIDR (scope 0, the default network) or a VPC pod
 // /32 (scope = VNI). Overlapping VPCs never collide because the scope is part
@@ -226,6 +254,36 @@ func (m *Manager) SetRemote(scope uint32, cidr string, nodeIP net.IP) error {
 	}
 	// remote_ipv4 is consumed by bpf_skb_set_tunnel_key in host byte order.
 	return m.objs.Remotes.Put(key, binary.BigEndian.Uint32(ip4))
+}
+
+// SetNodeRemote maps a node address (any of its interface IPs) to that node's
+// Geneve underlay IP, so a default-network pod's traffic to that address is
+// encapsulated over the overlay rather than leaving on the wire with a pod
+// source (which a spoof-guarding underlay, e.g. OCI, drops). geneveIP is the
+// node's overlay endpoint — its InternalIP, the same address SetRemote uses for
+// that node's pod CIDR.
+func (m *Manager) SetNodeRemote(addr, geneveIP net.IP) error {
+	key, err := addr128(addr)
+	if err != nil {
+		return err
+	}
+	ip4 := geneveIP.To4()
+	if ip4 == nil {
+		return fmt.Errorf("node geneve IP %q is not IPv4", geneveIP)
+	}
+	return m.objs.NodeRemotes.Put(key, binary.BigEndian.Uint32(ip4))
+}
+
+// DelNodeRemote removes a node address from the node_remotes map.
+func (m *Manager) DelNodeRemote(addr net.IP) error {
+	key, err := addr128(addr)
+	if err != nil {
+		return err
+	}
+	if err := m.objs.NodeRemotes.Delete(key); err != nil && !isNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 // SetNetwork maps a CIDR, as seen from a scope network, to a destination net
