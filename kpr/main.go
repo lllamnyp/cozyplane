@@ -22,8 +22,10 @@
 package main
 
 import (
+	"context"
 	_ "embed"
 	"os"
+	"path/filepath"
 
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/statedb"
@@ -104,7 +106,21 @@ func main() {
 
 	h.RegisterFlags(pflag.CommandLine)
 	pflag.Parse()
-	if err := h.Run(defaultLogger()); err != nil {
+
+	logger := defaultLogger()
+	// KPR increment 3, Half A (docs/kube-proxy-replacement.md): feed net-0
+	// ClusterIPs into the agent's pinned svc_vips map, for clients socket-LB
+	// can't rewrite at connect() — a bridge-bound KubeVirt guest. Independent of
+	// the LB hive (which drives socket-LB via Cilium's own maps); dies with the
+	// process on shutdown.
+	pinDir := filepath.Join(defaultSocketLBConfig().BPFFSRoot, "cozyplane")
+	go func() {
+		if err := runServiceVIPs(context.Background(), pinDir, logger); err != nil {
+			logger.Error("svc_vips reconciler exited", "err", err)
+		}
+	}()
+
+	if err := h.Run(logger); err != nil {
 		os.Exit(1)
 	}
 }
