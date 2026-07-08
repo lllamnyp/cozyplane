@@ -1775,6 +1775,15 @@ static __always_inline int deliver_net0(struct __sk_buff *skb, struct addr128 ds
 	__u32 *node_ip = remote_of(0, dst);
 	if (node_ip)
 		return encap(skb, 0, *node_ip, 0);
+	// A *remote node* client (hostNetwork — e.g. an apiserver probing a VPC
+	// pod's fabric IP): encapsulate the reply to that node, for the same reason
+	// as from_pod's node_remotes leg — the kernel path would emit it with the
+	// pod's fabric source, which a spoof-guarding underlay (OCI) drops. The
+	// node's own addresses are never in the map (watchNodes skips self), so
+	// same-node replies still go up the local stack.
+	__u32 *nnode = node_remote_of(dst);
+	if (nnode)
+		return encap(skb, 0, *nnode, 0);
 	return TC_ACT_OK;
 }
 
