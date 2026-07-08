@@ -174,12 +174,19 @@ port, `:22` included), but the portforward dialer doesn't know to use it.
 (`virtctl console`/VNC use the *other* dialer — virt-api → virt-handler →
 virt-launcher unix socket, no IP networking — and work fine for VPC VMs.)
 
-Workarounds, all verified: `virtctl console`; ssh via an in-VPC jump pod
+Operator conveniences, all verified: `virtctl console`; ssh via an in-VPC jump pod
 (`ssh -o ProxyCommand="kubectl -n <ns> exec -i <jump> -- nc %h %p" user@<vpc-ip>`);
-ssh to the **fabric IP** from any default-network pod or node. A real fix is
-KubeVirt-side and small: teach `getTargetInterfaceIP` (`dialers.go`) to prefer
-the launcher pod's IP (or gate it on an annotation) — the fabric bridge then
-delivers to the guest.
+ssh to the **fabric IP** from any default-network pod or node.
+
+**Decision: not pursued as a cozyplane concern.** A KubeVirt fix is not small:
+the VMI API surfaces no launcher-pod IP (`VirtualMachineInstanceStatus` has no
+`podIP` field), so the dialer change is gated on first adding one and having
+virt-controller populate it — an upstream API change (being explored separately).
+More to the point, `virtctl ssh` reachability is a platform internal, not a
+tenant contract: the supported way for a user to SSH into a VPC VM is the same as
+any cloud — **expose it (floating/public IP) or be inside the network (VPN /
+in-VPC client)** and SSH directly. The jump-pod/fabric paths above are operator
+tooling, not the product surface.
 
 ## What works today
 
