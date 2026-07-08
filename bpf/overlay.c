@@ -2876,8 +2876,10 @@ static __always_inline int svc_forward(struct __sk_buff *skb, struct pkt *p, __u
 // vip:vport. A hit is sanctioned (the forward direction was admitted).
 static __always_inline int svc_return(struct __sk_buff *skb, struct pkt *p, __u32 dstnet)
 {
-	if (!dstnet)
-		return SVC_MISS;
+	// net 0 included: a default-network ClusterIP (kpr-fed, KPR increment 3)
+	// reply must un-DNAT backend->vip too. A non-service reply simply misses the
+	// svc_rev lookup below and returns SVC_MISS, so this is safe for all net-0
+	// traffic — just one extra hash lookup on the reply path.
 	if (p->proto != IPPROTO_TCP && p->proto != IPPROTO_UDP)
 		return SVC_MISS;
 	if (!p->is_v6) {
@@ -3240,11 +3242,17 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 		return encap(skb, srcnet, g->node_ip, 0);
 	}
 
-	// ServiceVIP: an admitted packet (same net or peered) whose destination is
-	// a VIP of the destination net is DNAT'd to a backend VPC IP here — the
-	// rewrite updates p.dst, so the delivery below simply carries on toward
-	// the backend. A miss leaves the packet untouched.
-	if (srcnet && !is_gw)
+	// ServiceVIP DNAT. VPC ServiceVIPs (net != 0) for VPC pods; and — once
+	// kube-proxy is gone (KPR increment 3) — default-network (net 0) ClusterIPs
+	// too, fed by cozyplane-kpr. The rewrite updates p.dst, so delivery below
+	// carries on toward the backend; a miss leaves the packet untouched. Only
+	// clients whose connect() socket-LB never rewrote (a bridge-bound VM guest,
+	// a raw socket) still carry a VIP destination here — a socket-LB'd pod
+	// already carries dst = backend, so the svc_vips lookup misses. Gateways
+	// never DNAT (is_gw); skipped at the uplink-egress attachment (ifindex ==
+	// uplink) — host ClusterIP is socket-LB'd, and the outgoing Geneve/egress
+	// path should not pay a per-packet lookup.
+	if (!is_gw && ifindex != cfg(CFG_UPLINK_IFINDEX))
 		svc_forward(skb, &p, srcnet, dstnet);
 
 	// Same-node destination: redirect through the pod's veth egress (-> to_pod)

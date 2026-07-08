@@ -89,6 +89,12 @@ func (m *Manager) SyncServiceVIPs(entries []SvcEntry) error {
 	var stale []overlaySvcKey
 	it := m.objs.SvcVips.Iterate()
 	for it.Next(&key, &val) {
+		// net 0 (default-network ClusterIPs + NodePorts) is owned by
+		// cozyplane-kpr, not the agent's ServiceVIP (net != 0) reconciler —
+		// one map, ownership partitioned by net. Never prune kpr's keys.
+		if key.Net == 0 {
+			continue
+		}
 		if _, ok := want[key]; !ok {
 			stale = append(stale, key)
 		}
