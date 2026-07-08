@@ -197,3 +197,30 @@ addition to the CNI, cozyplane-kpr socket-LB (ClusterIP + DNS from pods), the
 east-west overlay, and same-node host→pod. (Stock components that embed
 `CiliumNetworkPolicy`/`CiliumClusterwideNetworkPolicy` also need those CRDs present
 — shipped inert in the variant, since cozyplane enforces no NetworkPolicy yet.)
+
+## 7. Floating IPs on a multi-NIC node — the uplink follows the FIB (FIXED)
+
+Two more instances of "the wrong link", found wiring a FloatingIP to the smoke
+VM: **(a)** all floating machinery — the `from_uplink` attach, the ARP/NDP
+responder MAC, the GARP announcement, the egress redirect — bound to the
+*default-route* link, while the floating range lives on the eth1 VLAN, exactly
+as the FIB says (`10.4.100.0/24 dev eth1`). `EnsureFloatingUplink` now derives
+the owning link from a route lookup per floating address and programs
+`CFG_FLOAT_IFINDEX` / `float_uplink_mac` / `CFG_FLOAT_NH` (the fabric's virtual
+router = first host of the covering subnet) / `float_net` (the subnet). Egress
+picks the neighbour by subnet: ON-subnet destinations resolve directly — OCI's
+virtual router answers ARP but will NOT hairpin intra-subnet traffic — while
+off-subnet ones go via the router (the FIB would offer the *default* gateway,
+wrong for this link). Single-NIC: the lookup lands on the default uplink, no-op.
+**(b)** `SetInternal` never pruned the pinned `internal` LPM map, so a CIDR
+removed from `--internal-cidrs` kept classifying destinations as
+cluster-internal and dropped floating replies into the closed-island path
+(diagnosed via `kfree_skb` reason `TC_INGRESS` + `bpftool map dump`). Now
+diff-synced like the masquerade sources.
+
+Exposure recipe (OCI): a reserved public IP cannot attach to a VLAN address —
+use a **public Network Load Balancer** (free) in the VCN subnet with the
+floating IP as an IP backend (`is-preserve-source=false` for symmetric return);
+the VCN virtual router ARPs on the VLAN and cozyplane answers/GARPs on
+migration. The VLAN NSG must admit the traffic; the NLB needs an NSG allowing
+its listener from outside and egress to the VLAN.
