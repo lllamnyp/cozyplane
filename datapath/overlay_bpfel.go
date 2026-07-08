@@ -76,6 +76,12 @@ type overlayEndpoint struct {
 	Pad     [2]uint8
 }
 
+type overlayFloatNet struct {
+	_    structs.HostLayout
+	Base uint32
+	Mask uint32
+}
+
 type overlayGwEntry struct {
 	_      structs.HostLayout
 	GwIp   overlayAddr128
@@ -217,6 +223,8 @@ const (
 	overlayMapDnsCt                 = "dns_ct"
 	overlayMapDnsIps                = "dns_ips"
 	overlayMapFabricOf              = "fabric_of"
+	overlayMapFloatNet              = "float_net"
+	overlayMapFloatUplinkMac        = "float_uplink_mac"
 	overlayMapFloating              = "floating"
 	overlayMapFloatingEgress        = "floating_egress"
 	overlayMapGateways              = "gateways"
@@ -306,6 +314,8 @@ type overlayMapSpecs struct {
 	DnsCt          *ebpf.MapSpec `ebpf:"dns_ct"`
 	DnsIps         *ebpf.MapSpec `ebpf:"dns_ips"`
 	FabricOf       *ebpf.MapSpec `ebpf:"fabric_of"`
+	FloatNet       *ebpf.MapSpec `ebpf:"float_net"`
+	FloatUplinkMac *ebpf.MapSpec `ebpf:"float_uplink_mac"`
 	Floating       *ebpf.MapSpec `ebpf:"floating"`
 	FloatingEgress *ebpf.MapSpec `ebpf:"floating_egress"`
 	Gateways       *ebpf.MapSpec `ebpf:"gateways"`
@@ -365,6 +375,8 @@ type overlayMaps struct {
 	DnsCt          *ebpf.Map `ebpf:"dns_ct"`
 	DnsIps         *ebpf.Map `ebpf:"dns_ips"`
 	FabricOf       *ebpf.Map `ebpf:"fabric_of"`
+	FloatNet       *ebpf.Map `ebpf:"float_net"`
+	FloatUplinkMac *ebpf.Map `ebpf:"float_uplink_mac"`
 	Floating       *ebpf.Map `ebpf:"floating"`
 	FloatingEgress *ebpf.Map `ebpf:"floating_egress"`
 	Gateways       *ebpf.Map `ebpf:"gateways"`
@@ -400,6 +412,8 @@ func (m *overlayMaps) Close() error {
 		m.DnsCt,
 		m.DnsIps,
 		m.FabricOf,
+		m.FloatNet,
+		m.FloatUplinkMac,
 		m.Floating,
 		m.FloatingEgress,
 		m.Gateways,

@@ -31,6 +31,7 @@
 #define ETH_P_ARP  0x0806
 #define ARPOP_REQUEST 1
 #define ARPOP_REPLY   2
+#define AF_INET 2 // for bpf_redir_neigh.nh_family (vmlinux.h carries no macros)
 #define TC_ACT_OK 0
 #define TC_ACT_SHOT 2
 #define LINK_LOCAL_GW 0xA9FE0101 // 169.254.1.1 (host order)
@@ -479,6 +480,18 @@ struct {
                              // (Geneve/DNS handle, CFG_NODE_IP) on a multi-NIC
                              // node. A spoof-guarding underlay (OCI) drops a
                              // packet whose source is not its egress VNIC's IP.
+#define CFG_FLOAT_IFINDEX  6 // the floating uplink: the link carrying the
+                             // floating-IP range when it differs from the
+                             // default-route uplink (an OCI L2 VLAN). 0 = same
+                             // link as CFG_UPLINK_IFINDEX (single-NIC default).
+                             // Floating egress redirects here; the ARP/NDP
+                             // responders answer with float_uplink_mac on it.
+#define CFG_FLOAT_NH       7 // v4 next-hop (network order) for floating egress
+                             // out the floating uplink — the L2 fabric's virtual
+                             // router. Needed because the kernel FIB routes
+                             // off-subnet destinations via the *default* uplink,
+                             // whose neighbour would be wrong for this link.
+                             // 0 = resolve via the FIB (single-NIC default).
 
 // bpf-masquerade port range for cluster-egress SNAT (#10): disjoint from the
 // host ephemeral range (32768+) so a reverse lookup can never capture the
@@ -508,6 +521,39 @@ struct {
 	__uint(max_entries, 1);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } uplink_mac SEC(".maps");
+
+// float_uplink_mac: the *floating* uplink's MAC, when floating traffic rides a
+// different link than the default route (CFG_FLOAT_IFINDEX set) — e.g. an OCI
+// L2 VLAN carrying the floating range, while the default route (and the
+// cluster-egress masquerade) stays on the native, spoof-guarded NIC. The ARP/NDP
+// responders answer with this MAC for requests arriving on that link. A separate
+// one-cell map (not uplink_mac[1]) so the pinned uplink_mac keeps its shape
+// across upgrades.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, struct cozy_mac);
+	__uint(max_entries, 1);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} float_uplink_mac SEC(".maps");
+
+// float_net: the floating uplink's v4 subnet (base and mask, network order).
+// Floating egress needs it to pick the right neighbour: an ON-subnet
+// destination is resolved directly (the FIB's on-link route does that with a
+// plain redirect), while an OFF-subnet one must go via CFG_FLOAT_NH — the L2
+// fabric's virtual router, which forwards out of the VLAN but does NOT hairpin
+// intra-subnet traffic back in (OCI drops it).
+struct float_net {
+	__be32 base;
+	__be32 mask;
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, struct float_net);
+	__uint(max_entries, 1);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} float_net SEC(".maps");
 
 // node_ip6 holds the node's v6 address for the v6 bpf masquerade (one entry;
 // params is a u32 array and cannot carry it). Zero disables v6 masquerade.
@@ -1051,6 +1097,18 @@ static __always_inline __u32 cfg(__u32 idx)
 {
 	__u32 *v = bpf_map_lookup_elem(&params, &idx);
 	return v ? *v : 0;
+}
+
+// responder_mac returns the MAC the floating ARP/NDP responders answer with on
+// the interface the request arrived on: the floating uplink's own MAC when the
+// request came in there, the default uplink's otherwise.
+static __always_inline struct cozy_mac *responder_mac(struct __sk_buff *skb)
+{
+	__u32 zero = 0;
+	__u32 fidx = cfg(CFG_FLOAT_IFINDEX);
+	if (fidx && skb->ifindex == fidx)
+		return bpf_map_lookup_elem(&float_uplink_mac, &zero);
+	return bpf_map_lookup_elem(&uplink_mac, &zero);
 }
 
 // A fully-specified scoped LPM lookup: 32 scope bits + 128 address bits.
@@ -2173,7 +2231,12 @@ static __always_inline int floating_egress_snat(struct __sk_buff *skb, struct ip
 		return FLOAT_MISS;
 	if (is_internal(dst128))
 		return FLOAT_MISS; // internal: let the gateway proxy DNS / deny the rest
-	__u32 uplink = cfg(CFG_UPLINK_IFINDEX);
+	// Floating egress leaves by the floating uplink (the link that carries the
+	// public range) — only there is the public source a valid address for the
+	// wire. Falls back to the default uplink when they are the same link.
+	__u32 uplink = cfg(CFG_FLOAT_IFINDEX);
+	if (!uplink)
+		uplink = cfg(CFG_UPLINK_IFINDEX);
 	if (!uplink)
 		return FLOAT_MISS;
 	__u32 pub = v4_of_128(public_ip), osrc = ip->saddr; // copied: stores invalidate ip
@@ -2192,6 +2255,23 @@ static __always_inline int floating_egress_snat(struct __sk_buff *skb, struct ip
 		}
 	}
 	nat_addr(skb, proto, IP_SADDR_OFF, osrc, pub);
+	// Pick the neighbour for the redirect. ON the floating subnet the
+	// destination is its own neighbour (the FIB's on-link route resolves it);
+	// OFF it the agent-supplied virtual router is — the FIB would route via
+	// the *default* link's gateway, the wrong neighbour for this uplink, and
+	// the virtual router won't hairpin intra-subnet traffic back in.
+	__u32 nh = cfg(CFG_FLOAT_NH);
+	if (nh) {
+		__u32 zero = 0;
+		struct float_net *fn = bpf_map_lookup_elem(&float_net, &zero);
+		__be32 dip = 0;
+		bpf_skb_load_bytes(skb, IP_DADDR_OFF, &dip, 4);
+		if (fn && fn->mask && (dip & fn->mask) == fn->base)
+			return bpf_redirect_neigh(uplink, NULL, 0, 0); // on-subnet: dst is the neighbour
+		struct bpf_redir_neigh rn = { .nh_family = AF_INET };
+		rn.ipv4_nh = nh;
+		return bpf_redirect_neigh(uplink, &rn, sizeof(rn), 0);
+	}
 	return bpf_redirect_neigh(uplink, NULL, 0, 0);
 }
 
@@ -2415,7 +2495,12 @@ static __always_inline int floating_egress_snat6(struct __sk_buff *skb, struct p
 		return FLOAT_MISS;
 	if (is_internal(p->dst))
 		return FLOAT_MISS;
-	__u32 uplink = cfg(CFG_UPLINK_IFINDEX);
+	// Same floating-uplink selection as the v4 path. No explicit v6 next-hop
+	// yet (CFG_FLOAT_NH is a v4 cell): on a distinct floating uplink, v6
+	// off-subnet egress still resolves via the FIB — revisit with v6 floating.
+	__u32 uplink = cfg(CFG_FLOAT_IFINDEX);
+	if (!uplink)
+		uplink = cfg(CFG_UPLINK_IFINDEX);
 	if (!uplink)
 		return FLOAT_MISS;
 	struct addr128 pub = *public_ip; // copied: stores below invalidate map values too
@@ -2467,8 +2552,7 @@ static __always_inline int floating_ndp(struct __sk_buff *skb)
 		return FLOAT_MISS;
 	if (!local_of(fe->net, fe->vpc_ip))
 		return FLOAT_MISS;
-	__u32 zidx = 0;
-	struct cozy_mac *node = bpf_map_lookup_elem(&uplink_mac, &zidx);
+	struct cozy_mac *node = responder_mac(skb);
 	if (!node)
 		return FLOAT_MISS;
 
@@ -3524,8 +3608,7 @@ static __always_inline int floating_arp(struct __sk_buff *skb)
 	if (!local_of(fe->net, fe->vpc_ip))
 		return FLOAT_MISS; // not our pod (shouldn't be programmed here otherwise)
 
-	__u32 zero = 0;
-	struct cozy_mac *node = bpf_map_lookup_elem(&uplink_mac, &zero);
+	struct cozy_mac *node = responder_mac(skb);
 	if (!node)
 		return FLOAT_MISS;
 

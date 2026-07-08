@@ -38,6 +38,10 @@ type Manager struct {
 	geneveIfindex int
 	uplinkIfindex int
 	uplinkMAC     net.HardwareAddr
+	// The floating uplink, when floating addresses live on a different link
+	// than the default route (EnsureFloatingUplink); zero = same as uplink.
+	floatIfindex int
+	floatMAC     net.HardwareAddr
 	recreatedPins []string
 }
 

@@ -33,14 +33,20 @@ import (
 // peer holding a warm cache to re-ask. Best-effort by nature: a lost
 // announcement only means waiting out the peer's cache.
 func (m *Manager) AnnounceAddress(ip net.IP) error {
-	if m.uplinkIfindex == 0 || len(m.uplinkMAC) != 6 {
+	// Announce on the link that owns the address: the floating uplink when it
+	// differs from the default route (EnsureFloatingUplink), else the uplink.
+	ifindex, mac := m.uplinkIfindex, m.uplinkMAC
+	if m.floatIfindex != 0 {
+		ifindex, mac = m.floatIfindex, m.floatMAC
+	}
+	if ifindex == 0 || len(mac) != 6 {
 		return fmt.Errorf("uplink not attached")
 	}
 	var frame []byte
 	if v4 := ip.To4(); v4 != nil {
-		frame = garpFrame(m.uplinkMAC, v4)
+		frame = garpFrame(mac, v4)
 	} else if v6 := ip.To16(); v6 != nil {
-		frame = unsolicitedNAFrame(m.uplinkMAC, v6)
+		frame = unsolicitedNAFrame(mac, v6)
 	} else {
 		return fmt.Errorf("invalid address %q", ip)
 	}
@@ -50,7 +56,7 @@ func (m *Manager) AnnounceAddress(ip net.IP) error {
 		return fmt.Errorf("packet socket: %w", err)
 	}
 	defer unix.Close(fd)
-	addr := &unix.SockaddrLinklayer{Ifindex: m.uplinkIfindex, Halen: 6}
+	addr := &unix.SockaddrLinklayer{Ifindex: ifindex, Halen: 6}
 	copy(addr.Addr[:], frame[0:6]) // the frame's destination
 	if err := unix.Sendto(fd, frame, 0, addr); err != nil {
 		return fmt.Errorf("send announcement: %w", err)

@@ -189,11 +189,11 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		return fmt.Errorf("attach uplink ingress: %w", err)
 	}
 	// Cluster-internal CIDRs a floating pod's public-IP egress must not reach
-	// (it bypasses the gateway that would otherwise deny them).
-	if internal := splitCIDRs(internalCIDRs); len(internal) > 0 {
-		if err := mgr.SetInternal(internal); err != nil {
-			return fmt.Errorf("program internal CIDRs: %w", err)
-		}
+	// (it bypasses the gateway that would otherwise deny them). Called even
+	// with an empty list: SetInternal diffs against the pinned map, and a CIDR
+	// dropped from the flag must be pruned, not left behind.
+	if err := mgr.SetInternal(splitCIDRs(internalCIDRs)); err != nil {
+		return fmt.Errorf("program internal CIDRs: %w", err)
 	}
 	log.Info("datapath loaded", "vni", vni, "geneve", datapath.GeneveDevice, "uplink", uplink)
 
@@ -1032,6 +1032,12 @@ func watchFloatingIPs(ctx context.Context, factory sdninformers.SharedInformerFa
 			return
 		}
 		for pub, v := range desired {
+			// The FIB decides which link serves this address: on a multi-NIC
+			// node the floating range may live on a non-default link (an OCI
+			// VLAN), where from_uplink must attach, answer ARP, and egress.
+			if err := mgr.EnsureFloatingUplink(pub); err != nil {
+				log.Warn("ensure floating uplink", "public", pub, "err", err)
+			}
 			// Put unconditionally: an existing entry may be stale (target moved).
 			// Programming the map both delivers and advertises (from_uplink
 			// answers ARP for it); there is no separate host-side advertise step.
