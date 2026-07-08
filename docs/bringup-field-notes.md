@@ -156,6 +156,23 @@ for the egress VNIC and OCI dropped it. Fix: a separate `CFG_MASQ_IP` = the
 default-route source address, distinct from `CFG_NODE_IP` (still the InternalIP,
 which the Geneve endpoint and DNS-steer handle need). Single-NIC: the two coincide.
 
+## 6. `virtctl ssh` / `port-forward` to a VPC VM (KNOWN GAP, by design)
+
+`virtctl ssh` fails with `dialing VM: dial tcp <vpc-ip>:22: ... timed out` for a
+VM inside a VPC. The tunnel terminates at **virt-handler** (a default-network
+pod on the VM's node), which then dials the VMI's guest IP — the **VPC IP** —
+from *outside* the VPC. cozyplane drops that, and must: membership is the
+boundary, and with overlapping CIDRs a bare "dial 10.88.0.2 from the node" isn't
+even well-defined. Security groups are unrelated (they only restrict intra-VPC).
+The K8s-contract door is the **fabric IP** (`status.podIP` — the bridge DNATs any
+port, `:22` included), but KubeVirt doesn't know to dial it.
+
+Workarounds, all verified: `virtctl console` (unix socket, no networking); ssh via
+an in-VPC jump pod (`ssh -o ProxyCommand="kubectl -n <ns> exec -i <jump> -- nc %h
+%p" user@<vpc-ip>`); ssh to the **fabric IP** from any default-network pod or
+node. A real fix would teach the virt-handler dial to use the fabric IP —
+KubeVirt-side, not cozyplane-side.
+
 ## What works today
 
 **Everything, end to end.** With the two datapath fixes above the full Cozystack
