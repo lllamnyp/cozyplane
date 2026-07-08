@@ -159,19 +159,27 @@ which the Geneve endpoint and DNS-steer handle need). Single-NIC: the two coinci
 ## 6. `virtctl ssh` / `port-forward` to a VPC VM (KNOWN GAP, by design)
 
 `virtctl ssh` fails with `dialing VM: dial tcp <vpc-ip>:22: ... timed out` for a
-VM inside a VPC. The tunnel terminates at **virt-handler** (a default-network
-pod on the VM's node), which then dials the VMI's guest IP — the **VPC IP** —
-from *outside* the VPC. cozyplane drops that, and must: membership is the
-boundary, and with overlapping CIDRs a bare "dial 10.88.0.2 from the node" isn't
-even well-defined. Security groups are unrelated (they only restrict intra-VPC).
-The K8s-contract door is the **fabric IP** (`status.podIP` — the bridge DNATs any
-port, `:22` included), but KubeVirt doesn't know to dial it.
+VM inside a VPC. Mechanics (kubevirt `pkg/virt-api/rest/`): `virtctl ssh` wraps
+the local `ssh` with `ProxyCommand=virtctl port-forward --stdio`, which opens a
+websocket to the apiserver's `.../virtualmachineinstances/<vm>/portforward/22`
+subresource; the aggregated **virt-api** pod terminates it and does a plain
+`net.Dial("tcp", vmi.Status.Interfaces[0].IP + ":22")` (`dialers.go` `netDial`)
+**from its own pod netns** — an ordinary default-network pod on an arbitrary
+node. That target is the guest IP = the **VPC IP**, which from the default
+network doesn't exist at all: VPC CIDRs live at their VNI's scope (they may
+overlap between tenants), so the packet matches nothing and falls to the default
+route — hang, then timeout. Security groups are unrelated (intra-VPC only). The
+K8s-contract door is the **fabric IP** (`status.podIP` — the bridge DNATs any
+port, `:22` included), but the portforward dialer doesn't know to use it.
+(`virtctl console`/VNC use the *other* dialer — virt-api → virt-handler →
+virt-launcher unix socket, no IP networking — and work fine for VPC VMs.)
 
-Workarounds, all verified: `virtctl console` (unix socket, no networking); ssh via
-an in-VPC jump pod (`ssh -o ProxyCommand="kubectl -n <ns> exec -i <jump> -- nc %h
-%p" user@<vpc-ip>`); ssh to the **fabric IP** from any default-network pod or
-node. A real fix would teach the virt-handler dial to use the fabric IP —
-KubeVirt-side, not cozyplane-side.
+Workarounds, all verified: `virtctl console`; ssh via an in-VPC jump pod
+(`ssh -o ProxyCommand="kubectl -n <ns> exec -i <jump> -- nc %h %p" user@<vpc-ip>`);
+ssh to the **fabric IP** from any default-network pod or node. A real fix is
+KubeVirt-side and small: teach `getTargetInterfaceIP` (`dialers.go`) to prefer
+the launcher pod's IP (or gate it on an annotation) — the fabric bridge then
+delivers to the guest.
 
 ## What works today
 
