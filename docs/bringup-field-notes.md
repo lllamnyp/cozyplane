@@ -135,6 +135,17 @@ from `eth0` (10.4.0.x), *not* the InternalIP (10.4.100.x / the Geneve+floating-I
 NIC), so the reply is addressed to `eth0` and cozyplane must know that address
 belongs to a node. On a single-NIC node the two coincide and it is a no-op.
 
+### 5a. Bridged replies to a remote node — the third instance (FIXED, same root)
+
+Found by the dev4 VPC smoke test after 5 and 5b were fixed: a hostNetwork client
+on another node couldn't reach a **VPC pod's fabric IP** (the kubelet-probe /
+north-south bridge path) — forward fine, reply dropped. `deliver_net0`, which all
+six bridge/DNS reverse paths use to send the un-NAT'd reply back to the client,
+handled local pods and remote *pod-CIDR* clients but let a remote *node* client
+fall to the kernel — pod-sourced frame on the wire again. Fix: the same
+`node_remotes` leg in `deliver_net0`. Same-node clients (kubelet itself) are
+unaffected — a node's own addresses are never in the map.
+
 ### 5b. Pod internet egress — masquerade from the wrong NIC (FIXED, same root)
 
 Same OCI anti-spoofing, exposed once webhooks worked: the node reached the internet
