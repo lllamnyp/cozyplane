@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -14,6 +15,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -21,6 +23,7 @@ import (
 	discoverylisters "k8s.io/client-go/listers/discovery/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 )
 
 // This is KPR increment 3, Half A (docs/kube-proxy-replacement.md): socket-LB
@@ -38,6 +41,14 @@ import (
 // DNAT path, no double-write. It watches Services/EndpointSlices directly rather
 // than reading Cilium's StateDB tables — a self-contained boundary with no
 // coupling to Cilium's internal LB schema.
+//
+// The reconcile is event-scoped: a workqueue keyed by service (an EndpointSlice
+// event enqueues its owning service), each item recomputed alone, and an
+// in-memory owned-keys index diffed against the previous state so a steady-state
+// event costs O(that service's endpoints) — never a full-cluster rebuild or a
+// full-map scan. The single full pass happens once at startup, to seed the index
+// and sweep net-0 keys a previous kpr incarnation left behind (the pinned map
+// outlives the process; a service deleted while kpr was down generates no event).
 
 // svc_vips key/value, replicating the pinned map's layout from bpf/overlay.c
 // (the commit-the-struct-shape contract, as with the socket-LB map adoption).
@@ -61,6 +72,8 @@ type svcBackend struct {
 	Pad  uint16
 }
 
+// svcVal holds only fixed-size arrays, so it is comparable — the diff below
+// relies on == to skip rewriting unchanged entries.
 type svcVal struct {
 	N     uint32
 	Flags uint32
@@ -94,6 +107,20 @@ func protoNum(p corev1.Protocol) (uint8, bool) {
 	default:
 		return 0, false // SCTP and the rest are out of scope
 	}
+}
+
+type vipReconciler struct {
+	vips      *ebpf.Map
+	svcLister corelisters.ServiceLister
+	epsLister discoverylisters.EndpointSliceLister
+	queue     workqueue.TypedRateLimitingInterface[string]
+	logger    *slog.Logger
+
+	// owned indexes the net-0 keys this process wrote, per service ("ns/name" →
+	// key → last-written value). It is what makes pruning scan-free: a service's
+	// reconcile diffs desired against owned[svc] and never iterates the map.
+	// Touched only by seed() and then the single worker goroutine — no lock.
+	owned map[string]map[svcKey]svcVal
 }
 
 // runServiceVIPs reconciles Services + EndpointSlices into the pinned svc_vips
@@ -131,126 +158,289 @@ func runServiceVIPs(ctx context.Context, pinDir string, logger *slog.Logger) err
 	svcInformer := factory.Core().V1().Services()
 	epsInformer := factory.Discovery().V1().EndpointSlices()
 
-	var pending bool
-	resync := func() {
-		if err := reconcileServiceVIPs(vips, svcInformer.Lister(), epsInformer.Lister()); err != nil {
-			logger.Error("reconcile svc_vips", "err", err)
-			pending = true
-			return
-		}
-		pending = false
+	r := &vipReconciler{
+		vips:      vips,
+		svcLister: svcInformer.Lister(),
+		epsLister: epsInformer.Lister(),
+		queue: workqueue.NewTypedRateLimitingQueue(
+			workqueue.DefaultTypedControllerRateLimiter[string]()),
+		logger: logger,
+		owned:  map[string]map[svcKey]svcVal{},
 	}
-	onAny := cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(any) { resync() },
-		UpdateFunc: func(_, _ any) { resync() },
-		DeleteFunc: func(any) { resync() },
-	}
-	_, _ = svcInformer.Informer().AddEventHandler(onAny)
-	_, _ = epsInformer.Informer().AddEventHandler(onAny)
+
+	_, _ = svcInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    r.enqueueService,
+		UpdateFunc: func(_, obj any) { r.enqueueService(obj) },
+		DeleteFunc: r.enqueueService,
+	})
+	_, _ = epsInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    r.enqueueSliceOwner,
+		UpdateFunc: func(_, obj any) { r.enqueueSliceOwner(obj) },
+		DeleteFunc: r.enqueueSliceOwner,
+	})
 
 	factory.Start(ctx.Done())
 	if !cache.WaitForCacheSync(ctx.Done(), svcInformer.Informer().HasSynced, epsInformer.Informer().HasSynced) {
 		return fmt.Errorf("informer cache failed to sync")
 	}
-	resync()
-	logger.Info("net-0 ClusterIP svc_vips reconciler running", "pin", pin)
 
-	// A retry tick catches a transient map-write failure without waiting for the
-	// next Service/EndpointSlice event.
-	tick := time.NewTicker(30 * time.Second)
-	defer tick.Stop()
+	// One-time full pass before the worker starts: seed the owned index and
+	// sweep leftovers. Events that raced in during it sit in the queue and are
+	// simply re-reconciled (idempotent).
+	if err := r.seed(); err != nil {
+		return fmt.Errorf("seed svc_vips: %w", err)
+	}
+	logger.Info("net-0 ClusterIP svc_vips reconciler running", "pin", pin, "services", len(r.owned))
+
+	go func() {
+		<-ctx.Done()
+		r.queue.ShutDown()
+	}()
+	r.runWorker()
+	return nil
+}
+
+// enqueueService queues a Service object (or its deletion tombstone) by key.
+func (r *vipReconciler) enqueueService(obj any) {
+	if tomb, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = tomb.Obj
+	}
+	key, err := cache.MetaNamespaceKeyFunc(obj)
+	if err != nil {
+		return
+	}
+	r.queue.Add(key)
+}
+
+// enqueueSliceOwner queues the Service that owns an EndpointSlice event.
+func (r *vipReconciler) enqueueSliceOwner(obj any) {
+	if tomb, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = tomb.Obj
+	}
+	es, ok := obj.(*discoveryv1.EndpointSlice)
+	if !ok {
+		return
+	}
+	svc := es.Labels[discoveryv1.LabelServiceName]
+	if svc == "" {
+		return
+	}
+	r.queue.Add(es.Namespace + "/" + svc)
+}
+
+// runWorker drains the queue until shutdown. A single worker: map writes are
+// cheap, and one writer keeps the owned index lock-free.
+func (r *vipReconciler) runWorker() {
 	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-tick.C:
-			if pending {
-				resync()
-			}
+		key, shutdown := r.queue.Get()
+		if shutdown {
+			return
 		}
+		err := r.reconcileService(key)
+		r.queue.Done(key)
+		if err != nil {
+			r.logger.Error("reconcile service", "service", key, "err", err)
+			r.queue.AddRateLimited(key)
+			continue
+		}
+		r.queue.Forget(key)
 	}
 }
 
-// reconcileServiceVIPs makes the net-0 entries of svc_vips exactly the current
-// Service/EndpointSlice state (full-state diff, pruning stale net-0 keys).
-func reconcileServiceVIPs(vips *ebpf.Map, svcLister corelisters.ServiceLister, epsLister discoverylisters.EndpointSliceLister) error {
-	services, err := svcLister.List(labels.Everything())
+// reconcileService recomputes one service's desired net-0 entries and applies
+// the delta against what this process last wrote for it.
+func (r *vipReconciler) reconcileService(key string) error {
+	ns, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		return err
 	}
-	slices, err := epsLister.List(labels.Everything())
+	svc, err := r.svcLister.Services(ns).Get(name)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	desired, err := r.computeService(svc)
 	if err != nil {
 		return err
+	}
+	return r.apply(key, desired)
+}
+
+// apply writes desired-minus-owned and deletes owned-minus-desired, then
+// records desired as owned. Unchanged entries (value-equal) are not rewritten.
+func (r *vipReconciler) apply(key string, desired map[svcKey]svcVal) error {
+	prev := r.owned[key]
+	for k, v := range desired {
+		if pv, ok := prev[k]; ok && pv == v {
+			continue
+		}
+		if err := r.vips.Put(&k, &v); err != nil {
+			return fmt.Errorf("put svc_vips %v: %w", k, err)
+		}
+	}
+	for k := range prev {
+		if _, ok := desired[k]; ok {
+			continue
+		}
+		if err := r.vips.Delete(&k); err != nil && !isMapKeyNotExist(err) {
+			return fmt.Errorf("delete svc_vips %v: %w", k, err)
+		}
+	}
+	if len(desired) == 0 {
+		delete(r.owned, key)
+	} else {
+		r.owned[key] = desired
+	}
+	return nil
+}
+
+func isMapKeyNotExist(err error) bool {
+	return errors.Is(err, ebpf.ErrKeyNotExist)
+}
+
+// computeService builds the desired net-0 svc_vips entries for one service.
+// A nil svc (deleted), ExternalName, headless, or backend-less service yields
+// an empty set — apply() then prunes whatever was owned.
+//
+// Single pass over the service's EndpointSlices: ready endpoints are bucketed
+// by {address family, port name}, then each (servicePort × clusterIP) picks its
+// bucket — no per-port re-walk of the endpoints.
+func (r *vipReconciler) computeService(svc *corev1.Service) (map[svcKey]svcVal, error) {
+	if svc == nil || svc.Spec.Type == corev1.ServiceTypeExternalName {
+		return nil, nil
+	}
+	clusterIPs := svc.Spec.ClusterIPs
+	if len(clusterIPs) == 0 && svc.Spec.ClusterIP != "" {
+		clusterIPs = []string{svc.Spec.ClusterIP}
 	}
 
-	// Index EndpointSlices by their owning Service (namespace/name).
-	byService := map[string][]*discoveryv1.EndpointSlice{}
+	sel := labels.SelectorFromSet(labels.Set{discoveryv1.LabelServiceName: svc.Name})
+	slices, err := r.epsLister.EndpointSlices(svc.Namespace).List(sel)
+	if err != nil {
+		return nil, err
+	}
+
+	type bucketKey struct {
+		v4       bool
+		portName string
+	}
+	buckets := map[bucketKey][]svcBackend{}
 	for _, es := range slices {
-		svc := es.Labels[discoveryv1.LabelServiceName]
-		if svc == "" {
-			continue
+		var v4 bool
+		switch es.AddressType {
+		case discoveryv1.AddressTypeIPv4:
+			v4 = true
+		case discoveryv1.AddressTypeIPv6:
+			v4 = false
+		default:
+			continue // FQDN slices carry no addresses we can NAT to
 		}
-		key := es.Namespace + "/" + svc
-		byService[key] = append(byService[key], es)
+		for _, ep := range es.Ports {
+			if ep.Port == nil {
+				continue
+			}
+			pname := ""
+			if ep.Name != nil {
+				pname = *ep.Name
+			}
+			bk := bucketKey{v4: v4, portName: pname}
+			if len(buckets[bk]) >= svcMaxBackends {
+				continue
+			}
+			tport := htons(uint16(*ep.Port))
+			for _, e := range es.Endpoints {
+				if e.Conditions.Ready != nil && !*e.Conditions.Ready {
+					continue
+				}
+				for _, addrStr := range e.Addresses {
+					ip := net.ParseIP(addrStr)
+					if ip == nil {
+						continue
+					}
+					a, ok := addr128(ip)
+					if !ok {
+						continue
+					}
+					buckets[bk] = append(buckets[bk], svcBackend{IP: a, Port: tport})
+					if len(buckets[bk]) >= svcMaxBackends {
+						break
+					}
+				}
+				if len(buckets[bk]) >= svcMaxBackends {
+					break
+				}
+			}
+		}
 	}
 
-	want := map[svcKey]svcVal{}
-	for _, s := range services {
-		if s.Spec.Type == corev1.ServiceTypeExternalName {
+	affinity := svc.Spec.SessionAffinity == corev1.ServiceAffinityClientIP
+	desired := map[svcKey]svcVal{}
+	for _, sp := range svc.Spec.Ports {
+		proto, ok := protoNum(sp.Protocol)
+		if !ok {
 			continue
 		}
-		clusterIPs := s.Spec.ClusterIPs
-		if len(clusterIPs) == 0 && s.Spec.ClusterIP != "" {
-			clusterIPs = []string{s.Spec.ClusterIP}
-		}
-		affinity := s.Spec.SessionAffinity == corev1.ServiceAffinityClientIP
-		ess := byService[s.Namespace+"/"+s.Name]
-
-		for _, sp := range s.Spec.Ports {
-			proto, ok := protoNum(sp.Protocol)
+		for _, cipStr := range clusterIPs {
+			cip := net.ParseIP(cipStr)
+			if cip == nil || cipStr == corev1.ClusterIPNone {
+				continue
+			}
+			vip, ok := addr128(cip)
 			if !ok {
 				continue
 			}
-			for _, cipStr := range clusterIPs {
-				cip := net.ParseIP(cipStr)
-				if cip == nil || cipStr == corev1.ClusterIPNone {
-					continue
-				}
-				vip, ok := addr128(cip)
-				if !ok {
-					continue
-				}
-				be := collectBackends(ess, sp, cip)
-				if len(be) == 0 {
-					continue // no ready endpoints: leave it unresolved (svc_forward SVC_MISS)
-				}
-				key := svcKey{Net: 0, Vip: vip, Proto: proto, Port: htons(uint16(sp.Port))}
-				var val svcVal
-				val.N = uint32(len(be))
-				copy(val.Be[:], be)
-				if affinity {
-					val.Flags = svcFAffinity
-				}
-				want[key] = val
+			be := buckets[bucketKey{v4: cip.To4() != nil, portName: sp.Name}]
+			if len(be) == 0 {
+				continue // no ready endpoints: leave it unresolved (svc_forward SVC_MISS)
 			}
+			k := svcKey{Net: 0, Vip: vip, Proto: proto, Port: htons(uint16(sp.Port))}
+			var v svcVal
+			v.N = uint32(len(be))
+			copy(v.Be[:], be)
+			if affinity {
+				v.Flags = svcFAffinity
+			}
+			desired[k] = v
+		}
+	}
+	return desired, nil
+}
+
+// seed runs once at startup, before the worker: computes every service, applies
+// it (seeding the owned index), then sweeps net-0 keys in the pinned map that no
+// current service owns — leftovers of a previous kpr incarnation (the map
+// outlives the process, and a service deleted while kpr was down produces no
+// event to prune it by).
+func (r *vipReconciler) seed() error {
+	services, err := r.svcLister.List(labels.Everything())
+	if err != nil {
+		return err
+	}
+	for _, s := range services {
+		key := s.Namespace + "/" + s.Name
+		desired, err := r.computeService(s)
+		if err != nil {
+			return err
+		}
+		if err := r.apply(key, desired); err != nil {
+			return err
 		}
 	}
 
-	// Write desired, then prune stale net-0 keys. Only net 0 is ours.
-	for k, v := range want {
-		if err := vips.Put(&k, &v); err != nil {
-			return fmt.Errorf("put svc_vips %v: %w", k, err)
+	live := map[svcKey]bool{}
+	for _, keys := range r.owned {
+		for k := range keys {
+			live[k] = true
 		}
 	}
 	var key svcKey
 	var val svcVal
 	var stale []svcKey
-	it := vips.Iterate()
+	it := r.vips.Iterate()
 	for it.Next(&key, &val) {
 		if key.Net != 0 {
 			continue // VPC ServiceVIPs — the agent's territory
 		}
-		if _, ok := want[key]; !ok {
+		if !live[key] {
 			stale = append(stale, key)
 		}
 	}
@@ -258,57 +448,12 @@ func reconcileServiceVIPs(vips *ebpf.Map, svcLister corelisters.ServiceLister, e
 		return fmt.Errorf("iterate svc_vips: %w", err)
 	}
 	for _, k := range stale {
-		if err := vips.Delete(&k); err != nil {
-			return fmt.Errorf("delete svc_vips %v: %w", k, err)
+		if err := r.vips.Delete(&k); err != nil && !isMapKeyNotExist(err) {
+			return fmt.Errorf("sweep svc_vips %v: %w", k, err)
 		}
+	}
+	if len(stale) > 0 {
+		r.logger.Info("swept stale net-0 svc_vips entries", "count", len(stale))
 	}
 	return nil
-}
-
-// collectBackends resolves the ready backend {IP, targetPort} pairs for one
-// service port and ClusterIP family, from the service's EndpointSlices.
-func collectBackends(ess []*discoveryv1.EndpointSlice, sp corev1.ServicePort, cip net.IP) []svcBackend {
-	wantV4 := cip.To4() != nil
-	var out []svcBackend
-	for _, es := range ess {
-		if (es.AddressType == discoveryv1.AddressTypeIPv4) != wantV4 {
-			continue // match the ClusterIP's family
-		}
-		// The endpoint port for this service port (matched by name; a single
-		// unnamed port has an empty name on both sides).
-		var tport int32 = -1
-		for _, ep := range es.Ports {
-			name := ""
-			if ep.Name != nil {
-				name = *ep.Name
-			}
-			if name == sp.Name && ep.Port != nil {
-				tport = *ep.Port
-				break
-			}
-		}
-		if tport < 0 {
-			continue
-		}
-		for _, e := range es.Endpoints {
-			if e.Conditions.Ready != nil && !*e.Conditions.Ready {
-				continue
-			}
-			for _, addrStr := range e.Addresses {
-				ip := net.ParseIP(addrStr)
-				if ip == nil {
-					continue
-				}
-				a, ok := addr128(ip)
-				if !ok {
-					continue
-				}
-				out = append(out, svcBackend{IP: a, Port: htons(uint16(tport))})
-				if len(out) >= svcMaxBackends {
-					return out
-				}
-			}
-		}
-	}
-	return out
 }
