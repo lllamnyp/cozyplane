@@ -96,6 +96,7 @@ Sequenced **after** Services-in-a-VPC ([services-in-vpc.md](services-in-vpc.md),
 ## 7. Deployment robustness
 
 - [x] Cozystack chart integration (aggregated-apiserver mode, operator etcd, RBAC/CRDs)
+- [x] Chart split: `chart/cozyplane` (CNI; serves the group as **bootstrap CRDs**, no cert-manager) + `chart/cozyplane-apiserver` (apiserver + etcd + certs; in Cozystack a separate component that `dependsOn` cert-manager, whose APIService atomically takes over the group from the CRDs) — closes field-note #1's deferred fix; [control-plane.md](control-plane.md) §0
 - [x] Image digest-pinning in the chart
 - [x] Agent recreates incompatible pinned eBPF maps on load and rebuilds pod state from veth alias records — a map-ABI upgrade is a rolling DaemonSet update, no node reboots (e2e-covered) — [#7](../../issues/7)
 - [x] Gateway `.1` Port reuse after an unclean death: the controller GCs live Ports whose claimant pod is gone (VM persistent Ports exempt), so the replacement's ADD retry claims the freed `.1` (e2e-covered)

@@ -2,16 +2,16 @@
        PVC-backed, TLS end to end (the cozyportal shape). Requires the aenix
        etcd-operator (Cozystack ships it) and cert-manager. The self-signed
        root issuer comes from templates/apiserver.yaml. */ -}}
-{{- if and .Values.apiserver.enabled .Values.apiserver.etcd.operator.enabled }}
+{{- if .Values.etcd.operator.enabled }}
 {{- $ns := .Release.Namespace -}}
-{{- $replicas := int .Values.apiserver.etcd.operator.replicas -}}
+{{- $replicas := int .Values.etcd.operator.replicas -}}
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
   name: cozyplane-etcd-peer-ca
   namespace: {{ $ns }}
   labels:
-    {{- include "cozyplane.labels" . | nindent 4 }}
+    {{- include "cozyplane-apiserver.labels" . | nindent 4 }}
 spec:
   isCA: true
   usages: ["signing", "key encipherment", "cert sign"]
@@ -32,7 +32,7 @@ metadata:
   name: cozyplane-etcd-ca
   namespace: {{ $ns }}
   labels:
-    {{- include "cozyplane.labels" . | nindent 4 }}
+    {{- include "cozyplane-apiserver.labels" . | nindent 4 }}
 spec:
   isCA: true
   usages: ["signing", "key encipherment", "cert sign"]
@@ -53,7 +53,7 @@ metadata:
   name: cozyplane-etcd-peer-issuer
   namespace: {{ $ns }}
   labels:
-    {{- include "cozyplane.labels" . | nindent 4 }}
+    {{- include "cozyplane-apiserver.labels" . | nindent 4 }}
 spec:
   ca:
     secretName: cozyplane-etcd-peer-ca-tls
@@ -64,7 +64,7 @@ metadata:
   name: cozyplane-etcd-issuer
   namespace: {{ $ns }}
   labels:
-    {{- include "cozyplane.labels" . | nindent 4 }}
+    {{- include "cozyplane-apiserver.labels" . | nindent 4 }}
 spec:
   ca:
     secretName: cozyplane-etcd-ca-tls
@@ -75,7 +75,7 @@ metadata:
   name: cozyplane-etcd-server
   namespace: {{ $ns }}
   labels:
-    {{- include "cozyplane.labels" . | nindent 4 }}
+    {{- include "cozyplane-apiserver.labels" . | nindent 4 }}
 spec:
   commonName: cozyplane-etcd-server
   secretName: cozyplane-etcd-server-tls
@@ -106,7 +106,7 @@ metadata:
   name: cozyplane-etcd-peer
   namespace: {{ $ns }}
   labels:
-    {{- include "cozyplane.labels" . | nindent 4 }}
+    {{- include "cozyplane-apiserver.labels" . | nindent 4 }}
 spec:
   commonName: cozyplane-etcd-peer
   secretName: cozyplane-etcd-peer-tls
@@ -139,7 +139,7 @@ metadata:
   name: cozyplane-etcd-client
   namespace: {{ $ns }}
   labels:
-    {{- include "cozyplane.labels" . | nindent 4 }}
+    {{- include "cozyplane-apiserver.labels" . | nindent 4 }}
 spec:
   commonName: root
   secretName: cozyplane-etcd-client-tls
@@ -159,7 +159,7 @@ metadata:
   name: cozyplane-etcd
   namespace: {{ $ns }}
   labels:
-    {{- include "cozyplane.labels" . | nindent 4 }}
+    {{- include "cozyplane-apiserver.labels" . | nindent 4 }}
 spec:
   options:
     auto-compaction-mode: "periodic"
@@ -174,8 +174,8 @@ spec:
       spec:
         resources:
           requests:
-            storage: {{ .Values.apiserver.etcd.operator.size }}
-        {{- with .Values.apiserver.etcd.operator.storageClass }}
+            storage: {{ .Values.etcd.operator.size }}
+        {{- with .Values.etcd.operator.storageClass }}
         storageClassName: {{ . }}
         {{- end }}
   security:

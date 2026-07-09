@@ -20,12 +20,18 @@ want cert-manager `Certificate`/`Issuer` objects. Bundling the apiserver into th
 first (CNI) Helm release makes the release depend on a CRD that does not exist
 yet.
 
-**Fix.** Split the concern at deploy time: the CNI slot installs **cert-manager-free**
-(`apiserver.enabled: false` in the Talos values). The default network, Services,
-and DNS all work without the aggregated apiserver; VPC tenancy (`sdn.cozystack.io`)
-is deferred. The proper fix (tracked, not yet done) is to split the chart so the
-apiserver+etcd is a *separate* component that `dependsOn` cert-manager, restoring
-tenancy without wedging the CNI. See [roadmap.md](roadmap.md).
+**Fix (interim).** Split the concern at deploy time: the CNI slot installed
+**cert-manager-free** (`apiserver.enabled: false` in the Talos values), tenancy
+served as CRDs.
+
+**Fix (proper, done).** The chart is split: `chart/cozyplane` (the CNI) serves
+the group as **CRDs from the moment it lands** — the bootstrap surface — and
+`chart/cozyplane-apiserver` (apiserver + etcd + certs) is a separate component
+that `dependsOn` cert-manager. When it installs, its explicit APIService
+atomically takes over the group's serving from the CRDs (they stay, shadowed).
+Fresh clusters migrate nothing (the CRD store is empty at takeover); clusters
+with live CRD objects export → install → re-apply. See
+[control-plane.md](control-plane.md) §0.
 
 ## 2. The agent can't reach the apiserver with no kube-proxy (solved)
 

@@ -1,8 +1,30 @@
 # cozyplane — control plane & implementation
 
 How the operator comes alive. Companion to `design.md` (architecture). Group:
-`sdn.cozystack.io`, version `v1alpha1`, served by the **Cozystack aggregated API
-server**, not CRDs.
+`sdn.cozystack.io`, version `v1alpha1`, served by the **cozyplane aggregated API
+server** — with a CRD serving of the same group as the **bootstrap surface**.
+
+## 0. Two serving modes, one group — and the takeover
+
+The group has two servers, packaged as two charts, because of a deploy-time
+truth: **the CNI must install before cert-manager, and the aggregated apiserver
+needs cert-manager** (serving cert, etcd PKI).
+
+- **CRD mode** (`chart/cozyplane`, `crds.enabled`, the default): the group is
+  served by CRDs from the moment the CNI lands. No cert-manager, no etcd.
+  Tenancy works immediately; validation is CEL-grade, no subresources.
+- **Aggregated mode** (`chart/cozyplane-apiserver`): the real apiserver with its
+  dedicated etcd. In Cozystack it is a separate component that `dependsOn`
+  cert-manager. Installing it creates the explicit APIService for
+  `v1alpha1.sdn.cozystack.io`, which **atomically takes over** the group's
+  serving from the CRDs' implicit APIService — the CRDs stay installed, shadowed
+  and inert, and every request from that moment hits the aggregated server.
+
+The takeover is storage-disjoint: objects in the CRD store (kube etcd) are not
+visible through the aggregated server (its own etcd). On a fresh cluster that is
+a non-event — the CRD store is empty when the apiserver lands (tenants come
+later). On a cluster with live CRD-stored objects, export → install → re-apply
+(see the cozyplane-apiserver chart README).
 
 ## 1. Why the aggregated apiserver changes the design
 

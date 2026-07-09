@@ -28,21 +28,14 @@ it removes the Cilium standalone-IPAM coexistence hazard
 
 **Not yet covered** (works on stock Cilium, must be planned around here):
 
-- **Admission webhooks across nodes** — the hostNetwork kube-apiserver can't reach
-  a webhook **pod on another node** (cozyplane doesn't deliver node-originated
-  traffic to a remote pod). This gates the full platform: cert-manager and every
-  operator with a webhook (kubevirt, cluster-api, kamaji, linstor…) only converge
-  by luck of pod placement. The open datapath item and its measurements are in
-  [bringup-field-notes.md](bringup-field-notes.md) (#5). **Until it's fixed, expect
-  the CNI + kpr + DNS + pod-origin ClusterIP layer to work but the operator layer
-  above cert-manager to stall.**
 - **host-firewall** and **default-network `NetworkPolicy`** — Cilium provided
   these; not replaced yet.
-- **External NodePort** and **VM-guest ClusterIP** — a KubeVirt guest bypasses
-  the host socket, so socket-LB can't serve it. Needs cozyplane-kpr increment 3
-  (per-packet fallback), designed but not implemented — see
-  [kube-proxy-replacement.md](kube-proxy-replacement.md). **In-cluster ClusterIP
-  and DNS for pods work today.**
+- **External NodePort** — needs cozyplane-kpr increment 3 Half B
+  ([lllamnyp/cozyplane#13](https://github.com/lllamnyp/cozyplane/issues/13)):
+  `externalTrafficPolicy`, client masquerade. In-cluster ClusterIP + DNS
+  (socket-LB) and **VM-guest ClusterIP** (the net-0 per-packet DNAT, increment 3
+  Half A) work today; earlier blockers — cross-node admission webhooks
+  (field note #5) and the floating-IP uplink (field note #7) — are fixed.
 
 The full set of bring-up difficulties (cert-manager ordering, the KubePrism agent
 bootstrap, the orphaned Cilium/kube-ovn packages, the `sdn.cozystack.io` group
@@ -52,15 +45,29 @@ collision, and the webhook gap above) is written up in
 ## The bootstrap ordering, and why the etcd is memory-backed
 
 Fresh clusters have a dependency knot: the CNI must come up first (nothing
-networks without it), but cozyplane's **aggregated apiserver** needs etcd, and
-persistent etcd needs storage (Linstor), and Linstor needs the CNI. To break it,
-cozyplane's etcd is **memory-backed** (`etcd-operator.cozystack.io/v1alpha2`,
-`storage.medium: Memory`) — it needs no storage layer, so:
+networks without it), but cozyplane's **aggregated apiserver** needs
+cert-manager (its serving cert and etcd PKI) and etcd, and persistent etcd
+needs storage (Linstor), and Linstor needs the CNI. Two mechanisms break it:
 
-1. **cozyplane CNI** installs first (default-network pods network without the
-   apiserver).
-2. **cozyplane apiserver + memory etcd** come up (no PVC → no wait on storage).
-3. **Linstor** installs (as usual).
+- **The chart split + CRD bootstrap.** The CNI chart serves `sdn.cozystack.io`
+  as **CRDs** from the moment it lands (no cert-manager), so tenancy never
+  waits. The aggregated apiserver is a **separate component**
+  (`cozystack.cozyplane-apiserver`, chart `cozyplane-apiserver`) that
+  `dependsOn` cert-manager and etcd-operator; when it installs, its explicit
+  `APIService` **atomically takes over** the group's serving from the CRDs
+  (they stay installed, shadowed). On a fresh cluster the CRD store is empty at
+  takeover — tenants come later — so nothing migrates.
+- **Memory-backed etcd.** The apiserver's etcd is
+  `etcd-operator.cozystack.io/v1alpha2` with `storage.medium: Memory` — no PVC,
+  no wait on storage.
+
+So the order is:
+
+1. **cozyplane CNI** installs first (default network + CRD-served tenancy).
+2. **cert-manager** and the operator layer converge (webhooks work — field
+   note #5 is fixed).
+3. **cozyplane-apiserver + memory etcd** install and take over the group.
+4. **Linstor** installs (as usual).
 
 There is a second bootstrap cycle to break: the hostNetwork **agent** needs the
 kube-apiserver, but with no kube-proxy the `kubernetes.default` ClusterIP
@@ -136,8 +143,9 @@ spec:
 ```
 
 Apply it and watch as in the tutorial's step 2.3. Expect this order to settle:
-cozyplane agent Ready → cozyplane-kpr Ready (socket-LB attached) → cozyplane
-apiserver Ready (memory etcd) → the rest of the system bundle.
+cozyplane agent Ready → cozyplane-kpr Ready (socket-LB attached) → cert-manager
+→ cozyplane-apiserver Ready (memory etcd; the APIService takes over the group
+from the bootstrap CRDs) → the rest of the system bundle.
 
 ### 3. Storage / networking / finalize
 

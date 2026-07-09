@@ -80,42 +80,12 @@ controller:
 exportPolicy:
   enabled: true
 
-# Serve the sdn.cozystack.io API group from a real aggregated API server (backed
-# by a dedicated etcd) instead of CRDs. This is the design target — it enables
-# custom validation and subresources (e.g. the /ports observability subresource)
-# beyond CRD ergonomics. Requires cert-manager (for the serving certificate) and
-# a cluster that permits APIService aggregation. When false, the group is served
-# as CRDs (the lightweight path — no etcd/cert-manager needed).
-apiserver:
-  enabled: false
-  replicas: 1
-  resources:
-    requests:
-      cpu: 50m
-      memory: 128Mi
-    limits:
-      memory: 256Mi
-  etcd:
-    # Operator-managed etcd (aenix etcd-operator; Cozystack ships it):
-    # replicated, PVC-backed, TLS end to end. The production path — without it
-    # the built-in single-pod etcd below is used, and with its default
-    # emptyDir storage a single pod reschedule erases every sdn.cozystack.io
-    # object in the cluster.
-    operator:
-      enabled: false
-      replicas: 3
-      size: 4Gi
-      # StorageClass for the members' PVCs ("" = cluster default).
-      storageClass: ""
-    # Built-in single-pod etcd (dev/evaluation only).
-    image: registry.k8s.io/etcd:3.5.16-0
-    # Storage for the built-in etcd. The default is ephemeral (emptyDir); use a
-    # persistentVolumeClaim volume source to survive a pod restart.
-    storage:
-      emptyDir: {}
-    resources:
-      requests:
-        cpu: 50m
-        memory: 128Mi
-      limits:
-        memory: 256Mi
+# The CRD serving of sdn.cozystack.io — the bootstrap surface: tenancy works
+# from the moment the CNI lands, with no cert-manager in sight. The aggregated
+# API server (custom validation, subresources — the design target) is the
+# SEPARATE chart/cozyplane-apiserver, which installs later (it needs
+# cert-manager) and atomically takes over the group's serving from these CRDs
+# via its explicit APIService; the CRDs stay installed, shadowed and inert.
+# Disable only to keep the group entirely unserved until that chart installs.
+crds:
+  enabled: true
