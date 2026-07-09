@@ -267,7 +267,7 @@ done
 check_ok "cli -> internet ping (bpf masq, ICMP echo)" $K exec cli -- ping -c2 -W3 1.1.1.1
 check_ok "cli -> internet TCP connect (bpf masq)" \
   bash -c "$K exec cli -- sh -c 'nc -w3 1.1.1.1 80 </dev/null'"
-MKNET=$(docker network inspect kind -f '{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null)
+MKNET=$(docker network inspect kind -f '{{range .IPAM.Config}}{{.Subnet}}{{"\n"}}{{end}}' 2>/dev/null | grep -v : | head -1)
 MKGW="$(echo "${MKNET:-172.18.0.0/16}" | cut -d. -f1-2).0.1"
 check "cli traceroute hop2 = docker gw $MKGW (masq ICMP-error un-SNAT)" "ok" \
   bash -c "$K exec cli -- traceroute -q1 -w3 -m2 1.1.1.1 2>/dev/null | grep -q \"($MKGW)\" && echo ok"
@@ -529,6 +529,41 @@ check "affinity: 12 fresh flows from affcli pin to ONE backend" "1" \
   bash -c "for i in \$(seq 1 12); do $K -n team-a exec affcli -- wget -qO- -T4 http://vipsvc.team-a.svc.cluster.local/ 2>/dev/null; done | sort -u | grep -cE '^dns[12]\$'"
 $K patch service vipsvc -n team-a --type=merge -p '{"spec":{"sessionAffinity":"None"}}' >/dev/null
 
+echo "[net-0 ClusterIP DNAT (kube-proxy-replacement.md, increment 3 Half A)]"
+# svc_forward/svc_return un-gated for net 0 serve default-network ClusterIPs
+# per-packet — the path a bridge-bound VM guest takes (its traffic never makes
+# a host socket syscall, so socket-LB can't rewrite it; this harness attaches
+# no socket-LB at all, so a plain wget models it exactly). Isolation from the
+# kube-proxy that runs here: the VIP under test is OUTSIDE the service CIDR and
+# fed straight into the pinned svc_vips map at net 0 (as cozyplane-kpr does in
+# production) — kube-proxy knows nothing of it and no route delivers it, so a
+# response can only be the eBPF DNAT, in both directions.
+idpod default n0web "$W"      # default-network backend (no vpc annotation)
+$K wait --for=condition=Ready pod/n0web --timeout=120s >/dev/null
+N0IP=$($K get pod n0web -o jsonpath='{.status.podIP}')
+FAKEVIP=10.97.99.1            # outside the 10.96.0.0/16 service subnet
+
+# A static bpftool (the CI/debug-recipe build) writes the map on the CLIENT's
+# node — from_pod looks up svc_vips where the client runs (cli is on $W2).
+BPFTOOL=/tmp/cozyplane-e2e-bpftool
+if [ ! -x "$BPFTOOL" ]; then
+  curl -sL https://github.com/libbpf/bpftool/releases/download/v7.5.0/bpftool-v7.5.0-amd64.tar.gz | tar xz -C /tmp bpftool && mv /tmp/bpftool "$BPFTOOL" && chmod +x "$BPFTOOL"
+fi
+docker cp "$BPFTOOL" "$W2:/bpftool" >/dev/null
+nat64hex() { local a b c d; IFS=. read -r a b c d <<<"$1"; printf '00 64 ff 9b 00 00 00 00 00 00 00 00 %02x %02x %02x %02x' "$a" "$b" "$c" "$d"; }
+# svc_key {net=0, vip, TCP, port 80 network-order}; svc_val {n=1, flags=0,
+# be[0]={backend ip, port 80}, 15 zero backends} — layouts from bpf/overlay.c.
+KEYHEX="00 00 00 00 $(nat64hex "$FAKEVIP") 06 00 00 50"
+VALHEX="01 00 00 00 00 00 00 00 $(nat64hex "$N0IP") 00 50 00 00 $(printf '00 %.0s' $(seq 1 300))"
+docker exec "$W2" /bpftool map update pinned /sys/fs/bpf/cozyplane/svc_vips key hex $KEYHEX value hex $VALHEX any
+
+check "net-0 client -> fake ClusterIP $FAKEVIP (svc_forward DNAT + svc_return un-DNAT; kube-proxy blind to it)" "n0web" \
+  bash -c "$K exec cli -- wget -qO- -T4 http://$FAKEVIP/ 2>/dev/null"
+docker exec "$W2" /bpftool map delete pinned /sys/fs/bpf/cozyplane/svc_vips key hex $KEYHEX
+check_fail "the fake VIP goes dark once its net-0 svc_vips entry is removed (it WAS the eBPF path)" \
+  bash -c "$K exec cli -- timeout 3 wget -qO- http://$FAKEVIP/ >/dev/null 2>&1"
+$K delete pod n0web --wait=false >/dev/null 2>&1
+
 echo "[per-VPC traffic counters (#2): the datapath meters east-west by VPC]"
 # The agent serves per-VPC byte/packet counters on each node's :9411 (the
 # DaemonSet is hostNetwork). Generate sustained intra-VPC traffic a1->a2 and
@@ -632,7 +667,7 @@ echo "[floating IP: external ingress, source-preserving]"
 # to_pod floating DNAT -> pod, the source-preserving reply, and ARP advertisement
 # from a1's node. The public IP is drawn from the kind subnet's high /24 (kind's
 # DHCP allocates low), so the client resolves it by ARP on the shared bridge.
-KNET=$(docker network inspect kind -f '{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null)
+KNET=$(docker network inspect kind -f '{{range .IPAM.Config}}{{.Subnet}}{{"\n"}}{{end}}' 2>/dev/null | grep -v : | head -1)
 KPFX=$(echo "${KNET:-172.18.0.0/16}" | cut -d. -f1-2)
 FIP="${KPFX}.240.10"
 A1IP=$(vpcip a1)
@@ -824,10 +859,13 @@ echo "[security groups: peered-group reference (v2, Geneve TLV)]"
 # A labeled pod in the peered vpc-c, on the OTHER worker so its traffic to sgweb
 # ($W) crosses a node and exercises the TLV path (from_pod stamps, from_overlay
 # enforces). vpc-c is peered with vpc-a (a-to-c above).
+# NOTE: the pod is sgpeer, NOT cpeer — a pod named cpeer already exists (the
+# ServiceVIP section's, with an immutable hostname), and applying a different
+# spec over it is rejected, leaving a pod without this section's role label.
 $K -n team-a apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Pod
-metadata: {name: cpeer, namespace: team-a, labels: {role: cpeer}, annotations: {sdn.cozystack.io/vpc: vpc-c}}
+metadata: {name: sgpeer, namespace: team-a, labels: {role: cpeer}, annotations: {sdn.cozystack.io/vpc: vpc-c}}
 spec: {nodeName: $W2, containers: [{name: c, image: busybox:1.36, command: ["sh","-c","$SRV"]}]}
 EOF
 $K apply -f - >/dev/null <<EOF
@@ -840,10 +878,10 @@ spec:
   # Peer egress: cpeer (vpc-c) must be allowed to reach web in the peered vpc-a.
   egress: [{to: {group: web, vpc: {namespace: team-a, name: vpc-a}}, ports: [{protocol: TCP, port: 80}]}]
 EOF
-$K -n team-a wait --for=condition=Ready pod/cpeer --timeout=60s >/dev/null 2>&1
+$K -n team-a wait --for=condition=Ready pod/sgpeer --timeout=60s >/dev/null 2>&1
 # Before a peer rule: peered traffic to grouped sgweb is default-denied.
-check_fail "cpeer(vpc-c) -> sgweb before peer rule (cross-peer default-deny)" \
-  bash -c "$K -n team-a exec cpeer -- wget -qO- -T3 http://$SGWEB/ 2>/dev/null | grep -q ."
+check_fail "sgpeer(vpc-c) -> sgweb before peer rule (cross-peer default-deny)" \
+  bash -c "$K -n team-a exec sgpeer -- wget -qO- -T3 http://$SGWEB/ 2>/dev/null | grep -q ."
 # web now also admits vpc-c's cpeer group (peer reference).
 $K apply -f - >/dev/null <<EOF
 apiVersion: sdn.cozystack.io/v1alpha1
@@ -859,10 +897,10 @@ spec:
     ports: [{protocol: TCP, port: 80}]
 EOF
 for i in $(seq 1 20); do
-  g=$($K get ports -o jsonpath="{range .items[*]}{.spec.podName}{'='}{.status.groups}{'\n'}{end}" | awk -F= '$1=="cpeer"{print $2}')
+  g=$($K get ports -o jsonpath="{range .items[*]}{.spec.podName}{'='}{.status.groups}{'\n'}{end}" | awk -F= '$1=="sgpeer"{print $2}')
   [ -n "$g" ] && [ "$g" != "[]" ] && break; sleep 1
 done
-check "cpeer(vpc-c) -> sgweb:80 admitted by peer rule (cross-node, TLV authoritative)" "sgweb" httpid team-a cpeer "$SGWEB"
+check "sgpeer(vpc-c) -> sgweb:80 admitted by peer rule (cross-node, TLV authoritative)" "sgweb" httpid team-a sgpeer "$SGWEB"
 check "same-VPC sgcli -> sgweb:80 still admitted alongside the peer rule" "sgweb" httpid team-a sgcli "$SGWEB"
 
 echo "[security groups: north-south from.cidr (v2)]"
