@@ -28,9 +28,16 @@ store is not visible through the aggregated server:
 kubectl get vpcs,ports,vpcbindings,vpcpeerings,securitygroups,floatingips,servicevips,externalpools -A -o yaml > sdn-backup.yaml
 helm install cozyplane-apiserver ./chart/cozyplane-apiserver -n cozyplane-system
 kubectl apply -f sdn-backup.yaml
+kubectl -n <cozyplane-namespace> rollout restart deploy/cozyplane-controller ds/cozyplane-agent
 ```
 
 (Strip `resourceVersion`/`uid`/`status` on re-apply, or use `kubectl create`.)
+
+The final restart is load-bearing: watch streams opened against the CRD serving
+survive the takeover (the kube-apiserver closes idle watches only after 30–60
+minutes), so without it the controller and agents keep watching the shadowed
+CRD store. Restart **after** the import so agent startup pruning sees a
+populated store and no-ops instead of tearing down live datapath state.
 
 ## Requirements
 

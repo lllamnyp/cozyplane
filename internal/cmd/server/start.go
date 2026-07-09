@@ -66,6 +66,14 @@ type CozyplaneServerOptions struct {
 	AlternateDNS []string
 
 	ServeSDN bool
+
+	// EnsureAPIServiceService ("namespace/name", empty = off) makes the server
+	// register/take over the group's APIService at startup, pointed at that
+	// Service. EnsureAPIServiceCAInjection ("namespace/certificate") adds the
+	// cert-manager cainjector annotation. See EnsureAPIService for why this is
+	// done here and not in a chart manifest.
+	EnsureAPIServiceService     string
+	EnsureAPIServiceCAInjection string
 }
 
 // NewCozyplaneServerOptions returns a new CozyplaneServerOptions.
@@ -130,6 +138,10 @@ func NewCommandStartCozyplaneServer(ctx context.Context, defaults *CozyplaneServ
 	logsapi.AddFlags(o.Logging, flags)
 
 	flags.BoolVar(&o.ServeSDN, "serve-sdn", o.ServeSDN, "Serve the sdn.cozystack.io API group from this server.")
+	flags.StringVar(&o.EnsureAPIServiceService, "ensure-apiservice-service", o.EnsureAPIServiceService,
+		"namespace/name of this server's Service; when set, register (or take over from CRD autoregistration) the group's APIService pointing at it.")
+	flags.StringVar(&o.EnsureAPIServiceCAInjection, "ensure-apiservice-ca-injection", o.EnsureAPIServiceCAInjection,
+		"namespace/certificate for the cert-manager.io/inject-ca-from annotation on the ensured APIService.")
 
 	// Register the default kube component if not already present in the global registry.
 	_, _ = defaults.ComponentGlobalsRegistry.ComponentGlobalsOrRegister(basecompatibility.DefaultKubeComponent,
@@ -220,6 +232,17 @@ func (o CozyplaneServerOptions) RunCozyplaneServer(ctx context.Context) error {
 
 		return nil
 	})
+
+	if o.EnsureAPIServiceService != "" {
+		svcNS, svcName, err := splitServiceRef(o.EnsureAPIServiceService)
+		if err != nil {
+			return fmt.Errorf("--ensure-apiservice-service: %w", err)
+		}
+		clientConfig := config.GenericConfig.ClientConfig
+		server.GenericAPIServer.AddPostStartHookOrDie("ensure-apiservice", func(hookCtx genericapiserver.PostStartHookContext) error {
+			return EnsureAPIService(hookCtx, clientConfig, svcNS, svcName, o.EnsureAPIServiceCAInjection)
+		})
+	}
 
 	return server.GenericAPIServer.PrepareRun().RunWithContext(ctx)
 }

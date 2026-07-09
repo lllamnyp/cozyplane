@@ -26,6 +26,23 @@ a non-event — the CRD store is empty when the apiserver lands (tenants come
 later). On a cluster with live CRD-stored objects, export → install → re-apply
 (see the cozyplane-apiserver chart README).
 
+Two mechanics of the takeover, both learned the empirical way:
+
+- **The APIService cannot be a chart manifest.** The kube-apiserver
+  auto-registers an APIService for every served CRD group, so in the takeover
+  scenario the object always pre-exists — and Helm refuses to adopt an object
+  it does not own. The aggregated server therefore registers (or takes over)
+  its own APIService at startup (`--ensure-apiservice-service`), stripping the
+  `kube-aggregator.kubernetes.io/automanaged` label so the CRD autoregistration
+  controller stops reconciling it back to local serving.
+- **Established watches do not follow the takeover.** A client that opened its
+  watch streams against the CRD serving keeps them — the kube-apiserver closes
+  idle watch connections only after 30–60 minutes — so it watches the shadowed
+  store and never sees aggregated-store objects. After the takeover (and after
+  the import, on a migrating cluster), **restart the cozyplane controller and
+  agents**; import-first ordering matters, so agent startup pruning sees a
+  populated store and no-ops instead of tearing down live datapath state.
+
 ## 1. Why the aggregated apiserver changes the design
 
 We own the REST handlers and the backing store, so we are not bound by CRD
