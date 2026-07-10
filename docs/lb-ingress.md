@@ -61,10 +61,16 @@ controller — increment 1 decides; leaning kpr, which already owns Services):
   honoured when free and in-range; assignment is sticky.
 - **Report**: set `status.loadBalancer.ingress[0].ip`. That is the entire
   tenant-visible API.
-- **Policy gate**: `externalTrafficPolicy: Cluster` is *not supported* in
-  v1 — the controller emits a clear event and does not allocate/announce
-  (supporting it means cross-node fan-out behind a client masquerade — the
-  deferred NodePort-shaped machinery; revisit together).
+- **Policy gate**: `externalTrafficPolicy: Cluster` is *deferred* in v1 —
+  the controller emits a clear event and does not allocate/announce. To be
+  precise about why (it does **not** need NodePort): Cluster mode is DNAT to
+  any ready backend cluster-wide plus a **client SNAT at the point of
+  ingress**, so the reply returns through the ingress node — the eBPF
+  masquerade ct at the uplink is the natural home for that SNAT, and by
+  definition the mode gives up source preservation. Deferred purely as a v1
+  scope cut. (Known later alternative that avoids even the SNAT: DSR —
+  carry `{client, lbIP}` in Geneve metadata so the backend's node replies
+  directly from the LB IP.)
 
 ### Announcement: deterministic, no new election machinery
 
@@ -143,22 +149,81 @@ per-node filter, not a datapath mode). Programmed on every candidate node
 
 ## Open questions
 
-- **Where the controller lives**: kpr (owns Services/EndpointSlices already;
-  but it's a DaemonSet — allocation wants a single writer, so either a
-  leader-elected sliver in kpr or the allocation half in cozyplane-controller
-  with kpr consuming status). Leaning: allocation in cozyplane-controller
-  (single writer exists), announcement/programming in kpr (per-node by
-  nature).
-- **`spec.loadBalancerIP` vs annotation**: the field is deprecated upstream
-  but universally used; MetalLB moved to `metallb.io/loadBalancerIPs`.
-  Support the field, add our annotation twin, or both?
-- **Shared IPs** (two Services, one LB IP, disjoint ports — MetalLB's
-  `allow-shared-ip`): out of v1; the union allocator makes it a pure
-  follow-up.
+### Q1 — where the controller lives
+
+Two jobs with different natures: **allocation** (one writer, cluster-wide,
+must serialize against the FloatingIP allocator over the same pools) and
+**programming/announcement** (per-node by construction).
+
+- **Option A (leaning): split by nature.** Allocation in
+  `cozyplane-controller` — it *already is* the single allocator over
+  `ExternalPool` (FloatingIPs), so the union free-set stays serialized
+  in-process in one place; adding a second allocator over the same keyspace
+  in kpr would recreate exactly the two-uncoordinated-authorities disease
+  the Port/ServiceVIP layer-2 work just closed. The allocation result is
+  written to `status.loadBalancer.ingress`, which *is* the hand-off: each
+  node's kpr consumes Service status + EndpointSlices and programs/announces
+  its own node. No new API, no lease, crash-safe (recompute-idempotent, no
+  claim object needed — a half-written allocation is re-derived from status
+  on the next reconcile).
+- **Option B: everything in kpr**, with a leader-elected allocation sliver.
+  One component owns Services end to end, but it costs a leader lease, and
+  the allocator either duplicates the pool view (two writers over one
+  keyspace) or kpr must also absorb FloatingIP allocation — a much bigger
+  move.
+
+Decision rides on one principle: **one keyspace, one allocator.** A follow-on
+detail for either option: `ExternalPool.status.allocated/available` today
+counts only FloatingIPs; it starts counting LB IPs too.
+
+### Q2 — how a user requests a specific address
+
+`spec.loadBalancerIP` is deprecated upstream (since 1.24) because it cannot
+express dual-stack (one field, one address) — but it is still present,
+universally understood, and what most charts set. MetalLB's answer is the
+`metallb.io/loadBalancerIPs` annotation (comma-separated, one per family),
+with the field still honoured.
+
+- **Option A: field only.** Simplest; dead end for dual-stack requests.
+- **Option B: our annotation only** (`sdn.cozystack.io/loadBalancerIPs`,
+  comma-separated, one address per family). Clean and dual-stack-capable,
+  but silently ignores the field users actually set today.
+- **Option C (leaning): both, annotation wins.** The field is honoured as a
+  single-family request; the annotation is the dual-stack-capable form; if
+  both are set and disagree, event + annotation wins. This is MetalLB's
+  shape, so migrating a manifest is a key rename.
+
+Explicitly *not* proposed: parsing `metallb.io/*` keys for drop-in
+compatibility — migration is a sed, and honouring another project's
+annotations is a trap when semantics drift. Related v1 scoping: dual-stack
+Services (`ipFamilyPolicy: PreferDualStack/RequireDualStack`) get one LB IP
+per family only once increment 3 lands; until then single-family, family
+picked by the Service's first `ipFamilies` entry.
+
+### Q3 — shared LB IPs (many Services, one address)
+
+MetalLB's `allow-shared-ip`: Services carrying the same sharing key may
+co-hold one address when their port sets are disjoint. Real uses: scarce
+public v4, and TCP+UDP on one address across two Services (the classic
+DNS-53 split before mixed-protocol Services).
+
+The datapath is already indifferent — `svc_vips` keys on
+`{ip, proto, port}`, so two Services on one IP with disjoint ports are just
+more rows. What sharing actually costs is **control-plane rules**: the
+sharing key + disjointness validation, equal `externalTrafficPolicy` across
+holders, and — the subtle one — a **common announcer**: under `etp: Local`
+all holders must have a ready local backend on the *same* node (the
+announcer must be a candidate for every holder), which constrains scheduling
+the way MetalLB's same-node requirement does.
+
+Leaning: out of v1 (an explicit `spec.loadBalancerIP` collision is an event,
+not a share), added later as a pure control-plane increment — unless
+Cozystack deployments are v4-starved enough to want it in increment 1.
 
 ## Non-goals
 
-- `externalTrafficPolicy: Cluster` (needs the client masquerade + cross-node
-  fan-out — pairs with external NodePort, both deferred).
+- `externalTrafficPolicy: Cluster` — a v1 scope cut, not a dependency: it
+  needs only an ingress-point client SNAT (see the policy gate above), or
+  DSR later to avoid even that.
 - BGP/ECMP advertisement (tracked with the floating-IP L2→BGP tail).
 - Anything tenant-facing beyond the standard Service object.
