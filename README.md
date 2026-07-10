@@ -113,3 +113,16 @@ docker build -t ghcr.io/lllamnyp/cozyplane:dev .   # eBPF object is committed + 
 To change the datapath, edit `bpf/overlay.c` and regenerate the committed object
 (needs clang + bpftool); see [CLAUDE.md](CLAUDE.md). Then see the
 [user guide](docs/user-guide.md) to run it on kind.
+
+## License
+
+Apache-2.0 (see [LICENSE](LICENSE)), with two carve-outs dictated by the kernel:
+
+- `bpf/` is **GPL-2.0** (`SPDX-License-Identifier` in the sources): the
+  datapath uses eBPF helpers the kernel exposes only to GPL-compatible
+  programs. The compiled object is committed and embedded into the
+  Apache-licensed Go binaries, the same arrangement Cilium uses.
+- `kpr/bpf_sock.o` is compiled unmodified from
+  [Cilium](https://github.com/cilium/cilium)'s `bpf/bpf_sock.c` (dual
+  GPL-2.0/BSD-2-Clause; kernel license string "Dual BSD/GPL") — see
+  `kpr/build-bpf.sh` for provenance and the pinned tag.
