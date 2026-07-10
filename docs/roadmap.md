@@ -45,10 +45,10 @@ they're discovered rather than leaving them only in issues.
 
 - [x] VPC peering: symmetric halves, native cross-VPC datapath, status controller
 - [x] Per-VPC egress NAT gateway (gateway-attach, per-VPC gateway pod)
-- [x] Floating IPs: eBPF bridge extension (no gateway pod), true public IP both directions
+- [x] Floating IPs: eBPF bridge extension (no gateway pod), true public IP both directions — closes [#5](../../issues/5) (which proposed gateway-anchored iptables NAT; shipped eBPF-native instead)
 - [x] Floating-IP advertisement in eBPF (`from_uplink` ARP responder) + readiness gated on a live target Port
 - [x] Gate `VPCPeering` creation on a `peer` virtual verb on the local VPC — strategy-enforced in aggregated mode (which also closed the `export` gap there: admission never sees aggregated resources), VAP twin for CRD mode — [#1](../../issues/1)
-- [ ] Floating IPs: 1:1 public-address NAT anchored on the per-VPC gateway (internet-gateway equivalent) — [#5](../../issues/5)
+- [ ] Floating-IP advertisement beyond L2: BGP speaker / multi-node HA (today the address is L2-announced from the target pod's node only, GARP/NA on move)
 - [ ] Site-to-site VPN: authorized-forwarder role + per-VPC route table — [#6](../../issues/6)
 - [ ] Network policy / security groups within a VPC — **v1 + peered-group refs + north-south (world) done** ([security-groups.md](security-groups.md)): east-west group-to-group ingress, destination-side eBPF (`sg_members`/`sg_rules`, TCP SYN-gate, per-VPC id allocation, membership from stamped pod labels); **peered-VPC group refs** (`from: {group, vpc}`) authoritative via a Geneve identity TLV; **north-south `from: {cidr}`** (AWS-strict default-deny, kubelet exempt by NS_MARK path; all-addresses via SG_WORLD, specific ranges via an `sg_cidr` LPM); **east-west egress** (`egress: {to: {group, vpc}}`, symmetric default-deny, `sg_egress` mirror enforced beside ingress in to_pod + the TLV path); **north-south/external egress** (`egress: {to: {cidr}}`, source-side default-deny at `from_pod`'s gateway path via a loop-free `ns_egress_ok` + `sg_egress_cidr` LPM — plus the off-VPC-transit fix so the pod→gateway hop isn't re-gated as east-west, which had silently broken all grouped-pod TCP/UDP north-south egress) — all dev-cluster-validated. Outstanding (v2): floating-pod egress gating, FQDN, label-change-follows membership, `from_pod` source-IP RPF, [#11](../../issues/11)
 - [ ] Per-VPC metadata endpoint + guest autoconfiguration — **design draft: [vm-provisioning.md](vm-provisioning.md)** (awaiting review; also closes #8)
@@ -120,7 +120,7 @@ Sequenced **after** Services-in-a-VPC ([services-in-vpc.md](services-in-vpc.md),
 | [#2](../../issues/2) | Per-VPC traffic counters in the datapath hooks | Datapath / metering |
 | [#3](../../issues/3) | ICMP to a VPC pod's fabric IP is dropped (north-south ping / PMTU) | Datapath |
 | [#4](../../issues/4) | Release digest non-determinism (closed: reproducible) | Packaging |
-| [#5](../../issues/5) | Floating IPs: 1:1 public-address NAT on the per-VPC gateway | Floating IPs |
+| [#5](../../issues/5) | Floating IPs: 1:1 public-address NAT on the per-VPC gateway (closed: shipped eBPF-native, no gateway pod) | Floating IPs |
 | [#6](../../issues/6) | Site-to-site VPN: authorized-forwarder + per-VPC route table | Connectivity |
 | [#7](../../issues/7) | Agent: recreate incompatible pinned eBPF maps on load | Deployment |
 | [#8](../../issues/8) | IPv6 guests don't autoconfigure (no RA / DHCPv6) | IPv6 |
