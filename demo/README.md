@@ -1,6 +1,6 @@
 # cozyplane live demo
 
-Five acts, one script per act, run in order. Every script acts on **the
+Seven acts, one script per act, run in order. Every script acts on **the
 cluster kubectl currently points at** (`KUBECONFIG` + current-context) and
 prints presenter notes: what exists, the exact commands for *you* to type
 (highlighted in yellow), and the one-liner takeaways to say out loud.
@@ -13,6 +13,7 @@ prints presenter notes: what exists, the exact commands for *you* to type
 | 4 | `04-migrate.sh` | Live migration under the open SSH session — node changes, VPC IP + MAC don't, the session survives. |
 | 5 | `05-nginx.sh` | nginx in the VPC: kubelet's HTTP readiness probe reaches it on the **fabric** IP (dual-address bridge), peers curl it on the **VPC** IP. |
 | 6 | `06-egress.sh` | The door to the outside world: DNS already resolves but connections die; one `natGateway` flag on the VPC and `wget example.com` works. Pauses for Enter before opening the door. |
+| 7 | `07-dns.sh` | Split-horizon DNS: the same annotation attaches a Service — the VPC resolves it to a **tenant VIP** (never the ClusterIP), headless names answer VPC IPs, the cluster's own names (`kubernetes.default`) are NXDOMAIN, internet names forward upstream, and peered blue resolves red's services. Detects the cluster domain automatically. |
 | — | `99-teardown.sh` | Deletes everything the demo created. |
 
 ## Prerequisites

@@ -10,6 +10,7 @@ kind: Pod
 metadata:
   name: web
   namespace: $RED_NS
+  labels: {app: web}
   annotations: {sdn.cozystack.io/vpc: $RED_VPC}
 spec:
   containers:
