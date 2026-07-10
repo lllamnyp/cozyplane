@@ -1,7 +1,7 @@
 # Container image (shared with the cozyplane chart — the apiserver binary lives
 # in the same image). Digest-pinned (no floating tag); update on each published
 # build.
-image: ghcr.io/lllamnyp/cozyplane@sha256:3d6fece3355f4f0accf47c4ab02d9b75919f002db4dee444a08f157d888c2a7b
+image: ghcr.io/lllamnyp/cozyplane@sha256:e4d636688272d5f952fbc09dacb4bfa8a08ff68d4baf2266dd58a56653702c94
 imagePullPolicy: IfNotPresent
 imagePullSecrets: []
 
