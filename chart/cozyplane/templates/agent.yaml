@@ -53,6 +53,12 @@ rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["floatingips"]
     verbs: ["get", "list", "watch"]
+  # ExternalPools: the agent ensures the datapath serves every pool's link on
+  # every node — LB/NodePort frontends arrive wherever the provider attracts
+  # them, and a DSR reply must leave by that link (docs/lb-ingress.md).
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["externalpools"]
+    verbs: ["get", "list", "watch"]
   # ServiceVIPs: the agent programs the svc_vips datapath map from them, the
   # resolver answers attached ClusterIP services with the VIP, and the CNI
   # plugin counts them as used addresses when claiming a Port IP.
