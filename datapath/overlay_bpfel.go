@@ -89,6 +89,16 @@ type overlayGwEntry struct {
 	Pad    uint32
 }
 
+type overlayLbScratch struct {
+	_       structs.HostLayout
+	Fk      overlaySvcFwdKey
+	Rk      overlaySvcRevKey
+	Fv      overlaySvcFwdVal
+	Rv      overlaySvcRevVal
+	Sk      overlaySvcKey
+	Backend overlayAddr128
+}
+
 type overlayLocalKey struct {
 	_   structs.HostLayout
 	Net uint32
@@ -190,7 +200,7 @@ type overlaySvcRevVal struct {
 	_     structs.HostLayout
 	Vip   overlayAddr128
 	Vport uint16
-	Pad   uint16
+	Lb    uint16
 }
 
 type overlaySvcVal struct {
@@ -229,6 +239,7 @@ const (
 	overlayMapFloatingEgress        = "floating_egress"
 	overlayMapGateways              = "gateways"
 	overlayMapInternal              = "internal"
+	overlayMapLbScratch             = "lb_scratch"
 	overlayMapLocals                = "locals"
 	overlayMapMasqSrcs              = "masq_srcs"
 	overlayMapMigrateFwd            = "migrate_fwd"
@@ -320,6 +331,7 @@ type overlayMapSpecs struct {
 	FloatingEgress *ebpf.MapSpec `ebpf:"floating_egress"`
 	Gateways       *ebpf.MapSpec `ebpf:"gateways"`
 	Internal       *ebpf.MapSpec `ebpf:"internal"`
+	LbScratch      *ebpf.MapSpec `ebpf:"lb_scratch"`
 	Locals         *ebpf.MapSpec `ebpf:"locals"`
 	MasqSrcs       *ebpf.MapSpec `ebpf:"masq_srcs"`
 	MigrateFwd     *ebpf.MapSpec `ebpf:"migrate_fwd"`
@@ -381,6 +393,7 @@ type overlayMaps struct {
 	FloatingEgress *ebpf.Map `ebpf:"floating_egress"`
 	Gateways       *ebpf.Map `ebpf:"gateways"`
 	Internal       *ebpf.Map `ebpf:"internal"`
+	LbScratch      *ebpf.Map `ebpf:"lb_scratch"`
 	Locals         *ebpf.Map `ebpf:"locals"`
 	MasqSrcs       *ebpf.Map `ebpf:"masq_srcs"`
 	MigrateFwd     *ebpf.Map `ebpf:"migrate_fwd"`
@@ -418,6 +431,7 @@ func (m *overlayMaps) Close() error {
 		m.FloatingEgress,
 		m.Gateways,
 		m.Internal,
+		m.LbScratch,
 		m.Locals,
 		m.MasqSrcs,
 		m.MigrateFwd,

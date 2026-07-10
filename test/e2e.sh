@@ -961,6 +961,79 @@ websg "10.255.255.0/24"; sleep 4
 check_fail "cli -> sgweb.fabric with from:{cidr:unrelated/24} (specific CIDR denies)" \
   bash -c "$K exec cli -- wget -qO- -T3 http://$SGWEBFAB/ 2>/dev/null | grep -q ."
 
+
+echo "[LoadBalancer ingress: delivery for a status LB IP (lb-ingress.md)]"
+# cozyplane consumes status.loadBalancer.ingress as written — here patched by
+# hand, simulating ANY provider (CCM, MetalLB, a human with a console) — and
+# delivers per externalTrafficPolicy: Local at from_uplink, client source
+# preserved end to end. The backend echoes the peer address it saw, so source
+# preservation is a body assertion. kpr feeds the per-node local-backend rows;
+# deployed late in the suite so its socket-LB can't perturb earlier checks.
+if [ -z "${KPR_IMAGE:-}" ]; then
+  echo "== building cozyplane-kpr =="
+  (cd "$ROOT" && CGO_ENABLED=0 go -C kpr build -o cozyplane-kpr . \
+    && docker build -q -t cozyplane-kpr:dev -f kpr/Dockerfile kpr >/dev/null) \
+    || fail "cozyplane-kpr image build"
+  KPR_IMAGE=cozyplane-kpr:dev
+fi
+kind load docker-image "$KPR_IMAGE" --name "$CLUSTER" >/dev/null 2>&1
+sed "s#image: cozyplane-kpr:dev#image: ${KPR_IMAGE}#" "$ROOT/deploy/kpr-daemonset.yaml" | $K apply -f - >/dev/null
+$K -n kube-system rollout status ds/cozyplane-kpr --timeout=180s >/dev/null 2>&1 || fail "cozyplane-kpr rollout"
+
+# TEST-NET-2: deliberately NOT on the kind L2 — nothing ARPs for it; the
+# client routes it via a node, exactly what a provider's attraction does.
+LBIP="198.51.100.7"
+$K apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: lbweb, namespace: default, labels: {app: lbweb}}
+spec:
+  nodeName: $W
+  containers:
+    - name: s
+      image: nicolaka/netshoot
+      command:
+        - sh
+        - -c
+        - socat TCP-LISTEN:8080,fork,reuseaddr SYSTEM:'echo HTTP/1.0 200 OK; echo; echo saw \$SOCAT_PEERADDR'
+---
+apiVersion: v1
+kind: Service
+metadata: {name: lbweb, namespace: default}
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector: {app: lbweb}
+  ports: [{port: 80, targetPort: 8080}]
+EOF
+$K -n default wait --for=condition=Ready pod/lbweb --timeout=120s >/dev/null 2>&1
+$K -n default patch svc lbweb --subresource=status --type=merge \
+  -p "{\"status\":{\"loadBalancer\":{\"ingress\":[{\"ip\":\"$LBIP\"}]}}}" >/dev/null
+
+# v4 InternalIP only: dual-stack kind reports both families and a mixed
+# next-hop list breaks `ip route add`.
+WIP=$($K get node "$W" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' | tr ' ' '\n' | grep -v : | head -1)
+W2IP=$($K get node "$W2" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' | tr ' ' '\n' | grep -v : | head -1)
+docker run -d --rm --name lbcli --cap-add NET_ADMIN --network kind nicolaka/netshoot sleep 600 >/dev/null 2>&1
+LBCLIP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' lbcli 2>/dev/null)
+docker exec lbcli ip route add "$LBIP/32" via "$WIP" >/dev/null 2>&1
+got=""
+for _ in $(seq 1 12); do
+  got=$(docker exec lbcli curl -s -m3 "http://$LBIP/" 2>/dev/null | tr -d '\r')
+  echo "$got" | grep -q "saw" && break
+  sleep 2
+done
+if [ "$got" = "saw $LBCLIP" ]; then
+  pass "external client -> LB IP $LBIP served by the local backend, source preserved (backend saw $LBCLIP)"
+else
+  fail "external client -> LB IP $LBIP source-preserving delivery (got '$got', client $LBCLIP)"
+fi
+# etp: Local's contract — a node without local ready backends must NOT serve.
+docker exec lbcli ip route replace "$LBIP/32" via "$W2IP" >/dev/null 2>&1
+check_fail "LB IP via the backend-less node does not serve (etp: Local)" \
+  docker exec lbcli curl -s -m3 "http://$LBIP/"
+docker rm -f lbcli >/dev/null 2>&1
+
 echo "[revocation]"
 $K -n team-a delete vpcbinding vpc-a >/dev/null
 sleep 6

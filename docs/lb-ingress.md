@@ -1,7 +1,8 @@
-# LoadBalancer ingress — delivery for LB IPs, eBPF-native (design draft)
+# LoadBalancer ingress — delivery for LB IPs, eBPF-native
 
-**Status: DESIGN DRAFT (awaiting review).** Nothing here is built. Tracks
-[#13](../../issues/13).
+**Status: increment 1 IMPLEMENTED** (v4, default-net backends; v6 + VPC-pod
+backends are increment 2, `loadBalancerSourceRanges` is a fast-follow). Tracks
+[#13](../../issues/13). As-built notes are inline below.
 
 ## Scope: delivery, not provisioning
 
@@ -113,6 +114,27 @@ in Geneve metadata so the backend's node replies directly from the LB IP.)
    steer packets for the LB IP at a node, assert delivery, stickiness, and
    the **client source seen by the backend**; assert a backend-less node
    does NOT serve.
+
+   **Implemented** — kpr's reconciler derives LB rows beside the ClusterIP
+   rows (one pass over the EndpointSlices buckets cluster-wide and node-local
+   sets in parallel; `NODE_NAME` downward API scopes the node); the datapath
+   forward is `lb_ingress` at `from_uplink`'s tail and the reply is
+   `lb_return` inlined in `from_pod`, exiting by the floating uplink.
+   e2e-covered (kind, both assertions above), and validated on the real
+   cluster **as the full composition**: MetalLB allocated + L2-advertised the
+   address, cozyplane delivered — with one environment caveat: OCI's VLAN
+   emulation routes cross-subnet clients through its external-access NAT, so
+   the backend there sees OCI's NAT address; source preservation end to end
+   is asserted on a real L2 by the e2e. Verifier war stories, for the next
+   datapath increment: inlining the svc machinery into `from_uplink` blew the
+   1M-insn verification budget (fixed: noinline BPF-to-BPF subprogram);
+   building the conntrack keys on the stack blew the 512-byte combined
+   call-stack limit — `from_pod` is 496 bytes by itself and can host no
+   callee (fixed: per-CPU scratch map for `lb_ingress`, `lb_return` stays
+   inline); and clang folded a memset-then-overwrite sequence on the per-CPU
+   scratch into dropping the overwrites, shipping conntrack keys with zeroed
+   fields (fixed: explicit per-field stores, no memset, and compiler barriers
+   before each map call that reads the scratch).
 2. **VPC-pod backends + v6** — bridge masquerade suppression for pinned LB
    flows, SG gating verified; overlapping-CIDR two-tenant exposure in e2e.
 

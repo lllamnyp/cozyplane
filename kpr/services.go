@@ -115,6 +115,9 @@ type vipReconciler struct {
 	epsLister discoverylisters.EndpointSliceLister
 	queue     workqueue.TypedRateLimitingInterface[string]
 	logger    *slog.Logger
+	// nodeName scopes the LB-ingress rows to this node's ready backends
+	// (etp: Local as a per-node filter). Empty disables LB rows.
+	nodeName string
 
 	// owned indexes the net-0 keys this process wrote, per service ("ns/name" →
 	// key → last-written value). It is what makes pruning scan-free: a service's
@@ -126,7 +129,8 @@ type vipReconciler struct {
 // runServiceVIPs reconciles Services + EndpointSlices into the pinned svc_vips
 // map at net 0 until ctx is done. Runs alongside the LB hive; the two never
 // write the same keys (this owns net 0, socket-LB uses Cilium's own maps).
-func runServiceVIPs(ctx context.Context, pinDir string, logger *slog.Logger) error {
+// nodeName (the node this kpr instance runs on) scopes LB-ingress rows.
+func runServiceVIPs(ctx context.Context, pinDir, nodeName string, logger *slog.Logger) error {
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
 		return fmt.Errorf("in-cluster config: %w", err)
@@ -164,8 +168,9 @@ func runServiceVIPs(ctx context.Context, pinDir string, logger *slog.Logger) err
 		epsLister: epsInformer.Lister(),
 		queue: workqueue.NewTypedRateLimitingQueue(
 			workqueue.DefaultTypedControllerRateLimiter[string]()),
-		logger: logger,
-		owned:  map[string]map[svcKey]svcVal{},
+		logger:   logger,
+		nodeName: nodeName,
+		owned:    map[string]map[svcKey]svcVal{},
 	}
 
 	_, _ = svcInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -300,30 +305,40 @@ func isMapKeyNotExist(err error) bool {
 // computeService builds the desired net-0 svc_vips entries for one service.
 // A nil svc (deleted), ExternalName, headless, or backend-less service yields
 // an empty set — apply() then prunes whatever was owned.
-//
-// Single pass over the service's EndpointSlices: ready endpoints are bucketed
-// by {address family, port name}, then each (servicePort × clusterIP) picks its
-// bucket — no per-port re-walk of the endpoints.
 func (r *vipReconciler) computeService(svc *corev1.Service) (map[svcKey]svcVal, error) {
 	if svc == nil || svc.Spec.Type == corev1.ServiceTypeExternalName {
 		return nil, nil
 	}
-	clusterIPs := svc.Spec.ClusterIPs
-	if len(clusterIPs) == 0 && svc.Spec.ClusterIP != "" {
-		clusterIPs = []string{svc.Spec.ClusterIP}
-	}
-
 	sel := labels.SelectorFromSet(labels.Set{discoveryv1.LabelServiceName: svc.Name})
 	slices, err := r.epsLister.EndpointSlices(svc.Namespace).List(sel)
 	if err != nil {
 		return nil, err
 	}
+	return computeRows(svc, slices, r.nodeName), nil
+}
 
-	type bucketKey struct {
-		v4       bool
-		portName string
-	}
+type bucketKey struct {
+	v4       bool
+	portName string
+}
+
+// computeRows derives the map rows from a Service and its EndpointSlices:
+// ClusterIP rows (cluster-wide ready backends — the per-packet fallback for
+// clients socket-LB can't rewrite) and, for a LoadBalancer Service, LB-ingress
+// rows keyed by the Service's status ingress IPs whose backend set is THIS
+// node's ready endpoints only (docs/lb-ingress.md).
+//
+// Single pass over the EndpointSlices: ready endpoints are bucketed by
+// {address family, port name}, cluster-wide and node-local in parallel, then
+// each (servicePort × address) picks its bucket — no per-port re-walk.
+func computeRows(svc *corev1.Service, slices []*discoveryv1.EndpointSlice, nodeName string) map[svcKey]svcVal {
 	buckets := map[bucketKey][]svcBackend{}
+	local := map[bucketKey][]svcBackend{}
+	add := func(m map[bucketKey][]svcBackend, bk bucketKey, be svcBackend) {
+		if len(m[bk]) < svcMaxBackends {
+			m[bk] = append(m[bk], be)
+		}
+	}
 	for _, es := range slices {
 		var v4 bool
 		switch es.AddressType {
@@ -343,14 +358,12 @@ func (r *vipReconciler) computeService(svc *corev1.Service) (map[svcKey]svcVal, 
 				pname = *ep.Name
 			}
 			bk := bucketKey{v4: v4, portName: pname}
-			if len(buckets[bk]) >= svcMaxBackends {
-				continue
-			}
 			tport := htons(uint16(*ep.Port))
 			for _, e := range es.Endpoints {
 				if e.Conditions.Ready != nil && !*e.Conditions.Ready {
 					continue
 				}
+				isLocal := nodeName != "" && e.NodeName != nil && *e.NodeName == nodeName
 				for _, addrStr := range e.Addresses {
 					ip := net.ParseIP(addrStr)
 					if ip == nil {
@@ -360,19 +373,30 @@ func (r *vipReconciler) computeService(svc *corev1.Service) (map[svcKey]svcVal, 
 					if !ok {
 						continue
 					}
-					buckets[bk] = append(buckets[bk], svcBackend{IP: a, Port: tport})
-					if len(buckets[bk]) >= svcMaxBackends {
-						break
+					add(buckets, bk, svcBackend{IP: a, Port: tport})
+					if isLocal {
+						add(local, bk, svcBackend{IP: a, Port: tport})
 					}
-				}
-				if len(buckets[bk]) >= svcMaxBackends {
-					break
 				}
 			}
 		}
 	}
 
 	affinity := svc.Spec.SessionAffinity == corev1.ServiceAffinityClientIP
+	mkVal := func(be []svcBackend) svcVal {
+		var v svcVal
+		v.N = uint32(len(be))
+		copy(v.Be[:], be)
+		if affinity {
+			v.Flags = svcFAffinity
+		}
+		return v
+	}
+
+	clusterIPs := svc.Spec.ClusterIPs
+	if len(clusterIPs) == 0 && svc.Spec.ClusterIP != "" {
+		clusterIPs = []string{svc.Spec.ClusterIP}
+	}
 	desired := map[svcKey]svcVal{}
 	for _, sp := range svc.Spec.Ports {
 		proto, ok := protoNum(sp.Protocol)
@@ -392,17 +416,45 @@ func (r *vipReconciler) computeService(svc *corev1.Service) (map[svcKey]svcVal, 
 			if len(be) == 0 {
 				continue // no ready endpoints: leave it unresolved (svc_forward SVC_MISS)
 			}
-			k := svcKey{Net: 0, Vip: vip, Proto: proto, Port: htons(uint16(sp.Port))}
-			var v svcVal
-			v.N = uint32(len(be))
-			copy(v.Be[:], be)
-			if affinity {
-				v.Flags = svcFAffinity
-			}
-			desired[k] = v
+			desired[svcKey{Net: 0, Vip: vip, Proto: proto, Port: htons(uint16(sp.Port))}] = mkVal(be)
 		}
 	}
-	return desired, nil
+
+	// LoadBalancer ingress rows (docs/lb-ingress.md): traffic for a status
+	// ingress IP that reaches THIS node is DNAT'd at from_uplink to node-local
+	// ready backends — externalTrafficPolicy: Local as a per-node table filter,
+	// the client source preserved by the datapath. Only Local is served
+	// (Cluster needs an ingress-point client SNAT — deferred); ipMode Proxy
+	// means the LB terminates and proxies — no interception. Whoever wrote the
+	// status (a CCM, MetalLB, a human) is the provider; cozyplane only reads.
+	if svc.Spec.Type == corev1.ServiceTypeLoadBalancer &&
+		svc.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyLocal {
+		for _, ing := range svc.Status.LoadBalancer.Ingress {
+			if ing.IP == "" || (ing.IPMode != nil && *ing.IPMode == corev1.LoadBalancerIPModeProxy) {
+				continue
+			}
+			lbIP := net.ParseIP(ing.IP)
+			if lbIP == nil || lbIP.To4() == nil {
+				continue // v6 LB delivery is increment 2; no inert rows
+			}
+			lb128, ok := addr128(lbIP)
+			if !ok {
+				continue
+			}
+			for _, sp := range svc.Spec.Ports {
+				proto, ok := protoNum(sp.Protocol)
+				if !ok {
+					continue
+				}
+				be := local[bucketKey{v4: true, portName: sp.Name}]
+				if len(be) == 0 {
+					continue // no local ready backend: no row — Local's contract
+				}
+				desired[svcKey{Net: 0, Vip: lb128, Proto: proto, Port: htons(uint16(sp.Port))}] = mkVal(be)
+			}
+		}
+	}
+	return desired
 }
 
 // seed runs once at startup, before the worker: computes every service, applies

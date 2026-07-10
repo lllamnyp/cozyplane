@@ -114,8 +114,15 @@ func main() {
 	// the LB hive (which drives socket-LB via Cilium's own maps); dies with the
 	// process on shutdown.
 	pinDir := filepath.Join(defaultSocketLBConfig().BPFFSRoot, "cozyplane")
+	// NODE_NAME (downward API) scopes LoadBalancer-ingress rows to this node's
+	// ready backends (docs/lb-ingress.md). Without it only ClusterIP rows are
+	// fed — LB delivery silently off, so say so.
+	nodeName := os.Getenv("NODE_NAME")
+	if nodeName == "" {
+		logger.Warn("NODE_NAME unset: LoadBalancer-ingress rows disabled")
+	}
 	go func() {
-		if err := runServiceVIPs(context.Background(), pinDir, logger); err != nil {
+		if err := runServiceVIPs(context.Background(), pinDir, nodeName, logger); err != nil {
 			logger.Error("svc_vips reconciler exited", "err", err)
 		}
 	}()
