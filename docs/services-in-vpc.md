@@ -195,6 +195,21 @@ which socket-based approaches structurally cannot offer inside a VPC.
   NodePort), unifying both worlds on one datapath primitive. This also settles
   that draft's review Q2: the feed is tables → our maps; Cilium's map ABI
   could never express net-scoped VPC-IP backends.
+- **Public exposure needs nothing from this design** (review resolution
+  2026-07-10). A VPC pod's fabric IP is `status.podIP`, so it is an ordinary
+  Service endpoint: `type: LoadBalancer` / NodePort traffic arrives at the
+  cluster, the standard service layer DNATs to the fabric IP, and the bridge
+  translates into the VPC — validated on a real cluster (external client →
+  provider NLB → VM in a VPC). No ServiceVIP, no VPC address, no cozyplane
+  API is involved; SecurityGroups still gate at the bridge DNAT point. A
+  "floating service" (a cozyplane-native public address fronting a
+  ServiceVIP) was drafted and **rejected** as reimplementing
+  `type: LoadBalancer`: the ServiceVIP exists for *east-west* traffic inside
+  the tenant (VM guests can't socket-LB; cluster ClusterIPs must not leak
+  into VPCs), not as an ingress primitive. Known trade of the standard path:
+  the backend sees the bridge's masqueraded client, not the caller's address
+  (use PROXY protocol / L7 headers if the tenant needs it); a per-pod
+  `FloatingIP` remains the source-preserving option for single workloads.
 
 ## The etcd walkthrough (acceptance case)
 
