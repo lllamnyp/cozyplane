@@ -608,7 +608,7 @@ struct {
 // Deliberately NOT inlined and stack-free. Two verifier constraints shaped it:
 // inlining at the top of the large from_pod program pushed path exploration
 // past the 1M-instruction complexity budget (rejected on a 6.12 kernel, though
-// the CI's 6.8 verifier accepted it — so it only showed on dev4); and as a
+// the CI's 6.8 verifier accepted it — so it only showed on the dev cluster); and as a
 // BPF-to-BPF subprogram, any stack local of its own overflowed the 512-byte
 // combined-call-stack limit (from_pod's frame is already near it). So the
 // entry is NEVER created here — the agent pre-creates a zeroed vpc_counters
@@ -2833,7 +2833,7 @@ static __always_inline int svc_forward(struct __sk_buff *skb, struct pkt *p, __u
 		// depends on the hash's LOW bits, and the kernel hands out ephemeral
 		// source ports of one parity in a burst (Talos: all-even) — starving
 		// the low bits so every flow from a client collapsed onto one backend
-		// (found live on dev4). The high 32 bits of the 64-bit product carry
+		// (found live on the dev cluster). The high 32 bits of the 64-bit product carry
 		// the full avalanche, so this is uniform for any n and any port stride.
 		__u32 idx = (__u32)(((__u64)svc_hash(p, hport, dport) * n) >> 32);
 		// Bound the index with an AND the compiler cannot elide (a plain

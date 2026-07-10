@@ -166,7 +166,7 @@ func (m *Manager) DelFloating(publicIP string) error {
 // pinned map like SyncMasqSources: the map outlives the agent, so a CIDR
 // removed from --internal-cidrs must be PRUNED — a stale entry silently
 // reclassifies destinations as internal and drops floating replies to them
-// (bit us on dev4: a leftover node-net entry FLOAT_MISSed every reply to a
+// (bit us on the dev cluster: a leftover node-net entry FLOAT_MISSed every reply to a
 // VLAN client into the closed-island drop).
 func (m *Manager) SetInternal(cidrs []string) error {
 	want := map[overlayLpmKey]bool{}

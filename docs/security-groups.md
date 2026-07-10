@@ -1,6 +1,6 @@
 # Security groups — intra-VPC policy
 
-**Status: v1 implemented and dev4-validated (2026-07-06).** East-west
+**Status: v1 implemented and dev-cluster-validated (2026-07-06).** East-west
 (intra-VPC, group-to-group) ingress enforcement is built and validated on a real
 cluster. This is the first increment of `design.md` §7 ("Network identity &
 security groups"). The remaining §7 surface (egress, peered-group references,
@@ -167,7 +167,7 @@ identities must cross a trust boundary (peered VPCs, v2).
   owner's namespace and its `vpcRef` is same-namespace (like VPCPeering), so
   owning the namespace *is* owning the VPC's policy. No new virtual verb.
 
-## Validated on dev4 (2026-07-06)
+## Validated on the dev cluster (2026-07-06)
 
 Two groups in `vpc-a` (`client`, `web`; `web` admits `client` on TCP 80). With
 labeled pods `sgcli` (role=client), `sgweb` (role=web), `sgnone` (unlabeled):
@@ -186,12 +186,12 @@ allow-all. `cozyplane_sg_drops_total` incremented per drop.
 4. **AuthZ** — owner-namespace-implies-policy-authority; no `policy` verb.
 5. **Naming** — `SecurityGroup` (AWS familiarity).
 
-## v2: peered-group references + the Geneve identity TLV (built + dev4-validated)
+## v2: peered-group references + the Geneve identity TLV (built + dev-cluster-validated)
 
 **Goal:** a group in one VPC can admit a group in a *peered* VPC —
 `from: {group: web, vpc: {namespace: team-b, name: vpc-b}}` — enforced
 correctly and safely across the tenant trust boundary. Both stages are built and
-validated on dev4 (2026-07-06).
+validated on the dev cluster (2026-07-06).
 
 ### Why v1 can't do this, and why the TLV
 
@@ -290,7 +290,7 @@ follow-up). A `migrate_fwd` re-encap during VM migration does not re-stamp the
 TLV, so a migrated grouped VM's cross-node traffic falls back to inference for
 the brief migration window.
 
-### Validated on dev4 (2026-07-06)
+### Validated on the dev cluster (2026-07-06)
 
 vpc-a peered vpc-b (disjoint CIDRs, VNIs 101/102). vpc-a's `web` admits vpc-b's
 `bclient`. Stage A (inference, same-node) and stage B (TLV, cross-node) both
@@ -300,7 +300,7 @@ colliding with vpc-a `web`'s own id 2) is dropped (the `src_net` key keeps the
 id spaces distinct); an ungrouped vpc-b pod is dropped; same-VPC rules keep
 working alongside.
 
-## v2: north-south `from.cidr` (built + dev4-validated)
+## v2: north-south `from.cidr` (built + dev-cluster-validated)
 
 **Goal:** a security group can admit *north-south* callers by source CIDR —
 `from: {cidr: 0.0.0.0/0, ports: [{protocol: TCP, port: 443}]}` — so a grouped
@@ -318,7 +318,7 @@ probes, the split-horizon DNS resolver's replies, and node-originated traffic
 must never be subject to tenant SG policy.
 
 The exemption is by **path, not source IP**. A first cut that exempted "source ==
-the node IP" was tried on dev4 and **broke** — a grouped pod with a TCP readiness
+the node IP" was tried on the dev cluster and **broke** — a grouped pod with a TCP readiness
 probe went NotReady, because kubelet's probe to a pod's fabric IP does not carry
 the node's own address as source (the `/32` route to the veth has no host IP to
 borrow). What *is* reliable: kubelet reaches `bridge_forward` via the **kernel
@@ -355,7 +355,7 @@ non-floating traffic — those paths return earlier).
 
 ### Stages
 
-- **Stage 1 — world + kubelet exemption (built, dev4-validated).**
+- **Stage 1 — world + kubelet exemption (built, dev-cluster-validated).**
   `from: {cidr: 0.0.0.0/0}` / `::/0` via the reserved `SG_WORLD` pseudo-group
   (scaffolding from v1); enforcement in `bridge_forward`/`floating_forward`
   (+ v6) with the `NS_MARK` path exemption. The apiserver un-rejects the
@@ -363,7 +363,7 @@ non-floating traffic — those paths return earlier).
   a grouped pod with a TCP readiness probe stays Ready (kubelet exempt); a
   default-network pod is dropped reaching it (N-S default-deny); adding
   `from: {cidr: 0.0.0.0/0}` reopens it; an ungrouped pod is unaffected.
-- **Stage 2 — specific ranges (built, dev4-validated).** An `sg_cidr` LPM map
+- **Stage 2 — specific ranges (built, dev-cluster-validated).** An `sg_cidr` LPM map
   keyed by `{net, proto, port, client prefix}` → the bitmap of destination
   groups that admit that CIDR; the datapath ANDs it with the pod's own groups.
   A v4 range is stored in the NAT64 form (`/N` → `/(96+N)` in the 128-bit client
@@ -381,7 +381,7 @@ non-floating traffic — those paths return earlier).
   (unioned in the value bitmap), and a pod in a single group (the common case)
   are exact; a true union would need a per-group LPM or a prefix-walk.
 
-## v2: egress rules (built + dev4-validated)
+## v2: egress rules (built + dev-cluster-validated)
 
 **Goal:** a group controls where its members may *send*, the mirror of ingress —
 `egress: [{to: {group: db}, ports: [{protocol: TCP, port: 5432}]}]`.
@@ -444,7 +444,7 @@ compiles each egress rule into `sg_egress` by resolving the destination group's
 id and VNI (same lister walk as a peered ingress ref). Membership and id
 allocation are unchanged.
 
-**Validated on dev4 (2026-07-06).** A grouped `client` pod with no egress rule
+**Validated on the dev cluster (2026-07-06).** A grouped `client` pod with no egress rule
 can't reach `web` even though `web`'s ingress admits `client` (egress
 default-deny); adding `client` `egress: {to: web, TCP 80}` opens `:80` (both
 directions now allow) while `:81` stays closed; both same-node (inference) and
@@ -458,7 +458,7 @@ their flows to keep working (a `client` group that reaches `web` needs
 `egress: {to: web}`). This is the deliberate consequence of symmetric
 default-deny.
 
-## v2: north-south / external egress (`to: {cidr}`) (built + dev4-validated)
+## v2: north-south / external egress (`to: {cidr}`) (built + dev-cluster-validated)
 
 **Goal:** a group controls where its members may reach *off-VPC* — the internet
 and cluster, via the VPC's NAT gateway — by destination CIDR:
@@ -498,7 +498,7 @@ The `from_pod` source is `p.src` (the pod's claimed address); a co-VPC pod could
 spoof a same-VPC IP to borrow its egress groups — the same intra-VPC RPF gap
 noted for ingress, closed by the same future `from_pod` RPF.
 
-**Validated on dev4 (2026-07-07).** A grouped `client` pod's off-VPC egress to a
+**Validated on the dev cluster (2026-07-07).** A grouped `client` pod's off-VPC egress to a
 node IP (`10.4.100.13:6443`, reached through the vpc-a NAT gateway) is
 default-denied with no egress rule; `egress: {to: {cidr: 0.0.0.0/0}, TCP 6443}`
 opens it, as do a covering `10.4.100.0/24` and an exact `10.4.100.13/32`, while an

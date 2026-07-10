@@ -131,7 +131,7 @@ this responder and the split-horizon DNS resolver are **one per-node process**
 ## Increments
 
 1. **v6 RA responder (Part 1C)** — smallest, highest-value, pure datapath, kind
-   + dev4 testable (a Fedora cloud-init containerDisk that does SLAAC). Closes #8.
+   + dev-cluster testable (a Fedora cloud-init containerDisk that does SLAAC). Closes #8.
 2. **Metadata responder (Part 2)** — the per-node service + DNAT steering.
 3. **Wire cloud-init** — user-data/network-data from the KubeVirt Secret.
 

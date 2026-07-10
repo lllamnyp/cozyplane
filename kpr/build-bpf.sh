@@ -30,6 +30,7 @@ echo "building bpf_sock.o from ${SRC} (${CILIUM_TAG})…"
 	-DENABLE_IPV4 -DENABLE_IPV6 \
 	-DENABLE_SOCKET_LB_TCP -DENABLE_SOCKET_LB_UDP \
 	-g -O2 --target=bpf -std=gnu99 -nostdinc -mcpu=v3 \
+	-ffile-prefix-map="$(pwd)=cilium-${CILIUM_TAG}" \
 	-c bpf/bpf_sock.c -o "$OUT" )
 
 echo "wrote ${OUT} ($(stat -c%s "$OUT") bytes)"

@@ -122,7 +122,7 @@ the webhook (pod IP `…2.8` / ClusterIP `…1.180`) on the node that hosts it:
 forward (node→pod) wasn't encapsulated. In fact a capture on the *webhook's* node
 showed the forward SYN arriving decapsulated, the pod **SYN-ACKing**, and the
 reply leaving `eth0` as `pod-IP → node-IP` — **un-encapsulated, with a pod source
-on the bare underlay.** dev4 is OCI, whose fabric drops any frame whose source is
+on the bare underlay.** The dev cluster is OCI, whose fabric drops any frame whose source is
 not its VNIC's assigned address (anti-spoofing). So node→pod worked (encapsulated,
 node-source outer); **pod→node — the reply — did not** (`from_pod` fell to
 `TC_ACT_OK`, the kernel routed it out `eth0` pod-sourced, OCI dropped it). Result:
@@ -136,14 +136,14 @@ default-network pod's traffic to a node — but **only on the pod-veth path**, s
 at the uplink egress the same hook sees the Geneve *outer* frames and encapsulating
 those would loop. The agent learns node addresses from Node InternalIPs plus a
 `cozyplane.io/node-addresses` annotation each agent publishes (its default-route
-source), which is what covers the **multi-NIC** case: on dev4 the host sources
+source), which is what covers the **multi-NIC** case: on the dev cluster the host sources
 from `eth0` (10.4.0.x), *not* the InternalIP (10.4.100.x / the Geneve+floating-IP
 NIC), so the reply is addressed to `eth0` and cozyplane must know that address
 belongs to a node. On a single-NIC node the two coincide and it is a no-op.
 
 ### 5a. Bridged replies to a remote node — the third instance (FIXED, same root)
 
-Found by the dev4 VPC smoke test after 5 and 5b were fixed: a hostNetwork client
+Found by the dev-cluster VPC smoke test after 5 and 5b were fixed: a hostNetwork client
 on another node couldn't reach a **VPC pod's fabric IP** (the kubelet-probe /
 north-south bridge path) — forward fine, reply dropped. `deliver_net0`, which all
 six bridge/DNS reverse paths use to send the un-NAT'd reply back to the client,

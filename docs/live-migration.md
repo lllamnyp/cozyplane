@@ -74,7 +74,7 @@ KubeVirt flips to the target at cutover — mirroring how Kube-OVN reads
 VMI as unstructured (no `kubevirt.io/api` dependency) and watches it only when
 the CRD is served; without KubeVirt it degrades to the launcher pod's
 `kubevirt.io/nodeName` label. The launcher-pod list is still consulted for the
-target's **fabric IP** and for GC. Validated on dev4 with a real `VMIM`
+target's **fabric IP** and for GC. Validated on the dev cluster with a real `VMIM`
 migration (IP+MAC preserved, cross-VPC 0% loss). Kube-OVN goes one step
 further — it delegates the *instant* of cutover to the guest's RARP via OVN's
 `activation-strategy=rarp`, so the control-plane only opens a dual-bound
@@ -160,7 +160,7 @@ before the Port is really removed.
   authz value didn't justify the API surface; the effort went into the
   Kube-OVN cutover model instead.
 
-## Test (dev4, real KubeVirt)
+## Test (dev cluster, real KubeVirt)
 
 A bridge-bound cirros VM (annotation set) attached to a VPC: capture its VPC IP +
 MAC, `virtctl migrate`, and assert **the VPC IP and MAC are identical** on the

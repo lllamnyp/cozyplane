@@ -86,8 +86,8 @@ change is — resolve that first, in writing.
 ## Testing
 
 - e2e: `test/e2e.sh` on kind (`test/kind.yaml`, dual-stack). Real-cluster behaviour
-  (KubeVirt migration, IPv6) is validated on the dev cluster — see the session
-  memory for cluster specifics.
+  (KubeVirt migration, IPv6) is validated on a real cluster (Talos, multi-NIC
+  OCI nodes, KubeVirt) before a feature is called done.
 - Don't write tests that grep source, chart templates, or rendered manifests as
   "drift guards" — assert real behaviour (unit logic or e2e), not text.
 

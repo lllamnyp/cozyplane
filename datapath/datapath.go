@@ -220,7 +220,7 @@ func defaultRouteLink() (int, string, error) {
 // default-route link. A remote pod's reply to this node is addressed to it, so
 // the agent advertises it and peers map it to this node's Geneve endpoint (see
 // node_remotes / SetNodeRemote). On a single-NIC node this equals the InternalIP;
-// on a multi-NIC node (e.g. dev4's OCI split of management vs cluster NIC) it may
+// on a multi-NIC node (e.g. the dev cluster's OCI split of management vs cluster NIC) it may
 // differ, which is exactly why it must be advertised rather than inferred.
 func DefaultRouteSrcIP() (net.IP, error) {
 	idx, _, err := defaultRouteLink()

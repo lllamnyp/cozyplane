@@ -102,7 +102,7 @@ from `to_pod`** (rx for the destination net, tx for the source net), the one
 placement-independent delivery hook, so east-west is metered once. It is a
 `noinline` BPF-to-BPF subprogram that only looks up and increments (never
 allocates): inlining it blew `from_pod` past the verifier's 1M-instruction
-budget on a 6.12 kernel (6.8 accepted it — caught only on dev4), and any callee
+budget on a 6.12 kernel (6.8 accepted it — caught only on the dev cluster), and any callee
 stack of its own overflowed the 512-byte combined-frame limit against
 `from_pod`'s already-large frame. The **agent seeds** a zeroed PERCPU entry per
 VPC net (`EnsureVPCCounter`, alongside `SetNetwork`); the datapath can't create
@@ -394,7 +394,7 @@ Both halves are **stateless** (no ct entry, no port allocation):
 
 **Socket-LB coexistence (`dns_ct`).** Under a socket-LB kube-proxy replacement
 — and Cilium KPR *forces* socket LB on (`NewKPRConfig` overrides
-`bpf-lb-sock: false`; validated live on dev4) — the ClusterIP is translated to
+`bpf-lb-sock: false`; validated live on the dev cluster) — the ClusterIP is translated to
 a backend pod address at `connect()` time, so the wire packet `from_pod` sees
 carries the backend, not `dns_ips`. The steer therefore also matches any
 **cluster-internal** `:53` destination (`is_internal`; a tenant's DNS to an
@@ -975,9 +975,9 @@ hack/                       codegen scripts; Makefile drives generate/build
 - **Datapath / CNI** (`bpf/`, `datapath/`, `cmd/{cni,agent}`,
   `internal/controller`) is the working prototype.
 - **Aggregated API server** (`pkg/apiserver`, `pkg/registry`, `internal/cmd`,
-  `internal/setup`, `cmd/apiserver`) is scaffolding adapted from
-  `aenix-org/cozyportal`, currently unused at runtime (CRDs serve the API). It
-  builds and runs; wiring `Port` storage and deploying it is a later step.
+  `internal/setup`, `cmd/apiserver`) is the design-target serving path: the CNI
+  chart ships the group as bootstrap CRDs, and the separate cozyplane-apiserver
+  chart takes serving over via its APIService (control-plane.md).
 
 ## 6. Build & codegen
 

@@ -14,7 +14,7 @@ resources:
     memory: 256Mi
 
 etcd:
-  # Operator-managed etcd (aenix etcd-operator; Cozystack ships it):
+  # Operator-managed etcd (the aenix-io etcd-operator; Cozystack ships it):
   # replicated, PVC-backed, TLS end to end. The production path — without it
   # the built-in single-pod etcd below is used, and with its default
   # emptyDir storage a single pod reschedule erases every sdn.cozystack.io

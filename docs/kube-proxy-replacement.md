@@ -132,7 +132,7 @@ Cilium's map ABI is not.
   per-packet fallback lands.
 - **Proven interaction, from the DNS-steering work:** Cilium KPR *forces*
   socket LB on (`NewKPRConfig` overrides `bpf-lb-sock: false` — observed live
-  on dev4: `cil_sock4_connect` attached at the cgroup root despite the
+  on the dev cluster: `cil_sock4_connect` attached at the cgroup root despite the
   ConfigMap). Any cozyplane feature that matches on a ClusterIP at the tc
   hooks must expect the connect()-time translation instead — the split-horizon
   DNS steer handles it with a small LRU (`dns_ct`) recording the original wire
@@ -248,7 +248,7 @@ Cilium's map ABI is not.
    `from_pod` DNAT reaches a backend. NodePort is driven from the host against
    `nodeIP:nodePort`. Both fold into `test/e2e.sh` (the cozyplane-CNI harness),
    not `kpr-e2e.sh` (which has no `from_pod`).
-4. **Retire kube-proxy on dev4** — at which point `firewall.go` detects no
+4. **Retire kube-proxy on the dev cluster** — at which point `firewall.go` detects no
    `KUBE-FORWARD` and installs nothing: #10 reaches its true end state.
 
 ## Open questions (review)

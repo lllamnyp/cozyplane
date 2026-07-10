@@ -42,7 +42,7 @@ populated store and no-ops instead of tearing down live datapath state.
 ## Requirements
 
 - cert-manager (serving certificate, etcd PKI).
-- For the production etcd: the aenix etcd-operator (`etcd.operator.enabled`),
+- For the production etcd: the aenix-io etcd-operator (`etcd.operator.enabled`),
   replicated and PVC-backed. The default is a built-in single-pod etcd with
   emptyDir storage — dev/evaluation only; a pod reschedule erases every
   `sdn.cozystack.io` object.

@@ -204,11 +204,11 @@ etcd pods (or VM-hosted members) in `vpc-a`, Services annotated into the VPC:
    resolver (shared with metadata), DNS interception in `from_pod`, headless
    answers as VPC IPs, non-cluster names forwarded upstream. Already unblocks
    etcd *peer* traffic and all name-based intra-VPC addressing. kind-testable.
-   **Implemented and validated on dev4 (2026-07-06)** — `dns_steer`/`dns_return`
+   **Implemented and validated on the dev cluster (2026-07-06)** — `dns_steer`/`dns_return`
    in the datapath (the pod's fabric IP is the rewritten source and the
    per-Port identity handle), `cmd/responder` as an unprivileged second
    container in the agent DaemonSet, e2e-covered on kind (kube-proxy) and
-   validated on dev4 (Talos + Cilium KPR): headless answers as VPC IPs with
+   validated on the dev cluster (Talos + Cilium KPR): headless answers as VPC IPs with
    same-node and cross-node delivery, per-hostname records, UDP + TCP, upstream
    forwarding via the node resolvers, authoritative NXDOMAIN across tenants,
    and the running VM untouched by the upgrade. As-built details: internals.md
