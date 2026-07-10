@@ -1023,6 +1023,10 @@ struct svc_backend {
 // no per-client timeout table, so a backend-set change may rebalance ~1/n of
 // clients (which is also true of any consistent-hash LB).
 #define SVC_F_AFFINITY 1
+// SVC_F_SRC_RANGES: the Service declares loadBalancerSourceRanges — admit the
+// client only on an lb_src LPM hit (checked at the DNAT point in lb_ingress,
+// before any flow state exists). LB rows only.
+#define SVC_F_SRC_RANGES 2
 
 struct svc_val {
 	__u32 n;
@@ -1041,6 +1045,25 @@ struct {
 // svc_fwd pins an established flow to its backend (a rebalance must not move
 // mid-flow TCP), keyed by the client's view of the connection. Scoped to the
 // CLIENT's net: the entry is written and read only on the client's node.
+// lb_src admits LoadBalancer clients by loadBalancerSourceRanges: LPM on the
+// client address with the frontend (LB IP) fully specified ahead of it — the
+// composite-LPM shape of sg_cidr. Addresses are the 16-byte NAT64 form, so a
+// v4 /24 range is prefixlen 128 + 96 + 24. kpr feeds it beside the LB rows.
+struct lb_src_key {
+	__u32 prefixlen; // 128 (LB IP) + client prefix bits
+	struct addr128 vip;
+	struct addr128 client;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__type(key, struct lb_src_key);
+	__type(value, __u8);
+	__uint(max_entries, 16384);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} lb_src SEC(".maps");
+
 struct svc_fwd_key {
 	__u32 net; // the client's net
 	__u8 proto;
@@ -2956,26 +2979,33 @@ static __always_inline int svc_hairpin_reverse(struct __sk_buff *skb, struct pkt
 	return deliver_local(skb, l);
 }
 
-// lb_return: the reply half of LoadBalancer ingress (docs/lb-ingress.md), at
-// the BACKEND's from_pod — the client is external, so the reply cannot ride a
-// client-node to_pod the way ClusterIP/ServiceVIP replies do. A svc_rev hit
-// whose entry from_uplink wrote (rv->lb) restores backend:tport -> lbIP:port
-// with the client untouched (source preservation end to end) and exits by the
-// public uplink, mirroring floating_egress_snat's exit: on the floating subnet
+// lb_return: the reply half of LoadBalancer/NodePort ingress
+// (docs/lb-ingress.md), at the BACKEND's from_pod — the client is external,
+// so the reply cannot ride a client-node to_pod the way ClusterIP/ServiceVIP
+// replies do. A svc_rev hit whose entry from_uplink wrote (rv->lb) restores
+// backend:tport -> lbIP:port with the client untouched (source preservation
+// end to end) and exits by the public uplink, mirroring the floating exits:
+// v4 picks the neighbour like floating_egress_snat (on the floating subnet
 // the destination is its own neighbour, off it the agent-supplied virtual
-// router is. Non-LB traffic misses (one LRU lookup) or hits with lb==0
-// (a same-node ClusterIP flow) and is left to the normal path.
+// router); v6 resolves via the FIB like floating_egress_snat6. Works for
+// net-0 and VPC-pod backends alike — the pinned reply identity is whatever
+// address the pod answers from. Non-LB traffic misses (one LRU lookup) or
+// hits with lb==0 (a same-node ClusterIP flow) and is left to the normal
+// path.
 #define LB_MISS -1
 
 static __always_inline int lb_return(struct __sk_buff *skb, struct pkt *p)
 {
 	if (p->proto != IPPROTO_TCP && p->proto != IPPROTO_UDP)
 		return LB_MISS;
-	struct iphdr *ip;
-	if (parse_ipv4(skb, &ip) < 0 || ip->ihl != 5)
-		return LB_MISS;
+	if (!p->is_v6) {
+		struct iphdr *ip;
+		if (parse_ipv4(skb, &ip) < 0 || ip->ihl != 5)
+			return LB_MISS;
+	}
 	__u16 sport, dport;
-	if (l4_ports(skb, &sport, &dport) < 0)
+	if (p->is_v6 ? l4_ports6(skb, &sport, &dport) < 0
+		     : l4_ports(skb, &sport, &dport) < 0)
 		return LB_MISS;
 
 	struct svc_rev_key rk = { .net = 0, .proto = p->proto, .cport = dport,
@@ -2984,15 +3014,24 @@ static __always_inline int lb_return(struct __sk_buff *skb, struct pkt *p)
 	if (!rv || !rv->lb)
 		return LB_MISS;
 
-	nat_addr(skb, p->proto, IP_SADDR_OFF, v4_of_128(&p->src), v4_of_128(&rv->vip));
-	if (sport != rv->vport)
-		nat_port(skb, p->proto, L4_SPORT_OFF, sport, rv->vport);
-
 	__u32 uplink = cfg(CFG_FLOAT_IFINDEX);
 	if (!uplink)
 		uplink = cfg(CFG_UPLINK_IFINDEX);
 	if (!uplink)
 		return TC_ACT_OK;
+
+	if (p->is_v6) {
+		struct addr128 vip = rv->vip;
+		nat_addr6(skb, p->proto, IP6_SADDR_OFF, &p->src, &vip);
+		if (sport != rv->vport)
+			nat_port6(skb, p->proto, L4_SPORT_OFF6, sport, rv->vport);
+		return bpf_redirect_neigh(uplink, NULL, 0, 0);
+	}
+
+	nat_addr(skb, p->proto, IP_SADDR_OFF, v4_of_128(&p->src), v4_of_128(&rv->vip));
+	if (sport != rv->vport)
+		nat_port(skb, p->proto, L4_SPORT_OFF, sport, rv->vport);
+
 	__u32 nh = cfg(CFG_FLOAT_NH);
 	if (nh) {
 		__u32 zero = 0;
@@ -3008,9 +3047,9 @@ static __always_inline int lb_return(struct __sk_buff *skb, struct pkt *p)
 	return bpf_redirect_neigh(uplink, NULL, 0, 0);
 }
 
-// Per-CPU scratch for lb_ingress: the svc_fwd/svc_rev keys and values are
-// ~130 bytes of struct building that must not live on the stack — from_uplink
-// (352 bytes) + an lb_ingress that builds them locally exceeded the verifier's
+// Per-CPU scratch for lb_ingress: the svc/ct keys and values are ~200 bytes
+// of struct building that must not live on the stack — from_uplink (352
+// bytes) + an lb_ingress that builds them locally exceeded the verifier's
 // 512-byte combined call-stack limit (found live: 640).
 struct lb_scratch {
 	struct svc_fwd_key fk;
@@ -3018,7 +3057,9 @@ struct lb_scratch {
 	struct svc_fwd_val fv;
 	struct svc_rev_val rv;
 	struct svc_key sk;
-	struct addr128 backend;
+	struct addr128 backend; // the row backend (a pod/fabric address)
+	struct addr128 dst;     // the delivered identity (VPC IP when bridged)
+	struct lb_src_key lk;
 };
 
 struct {
@@ -3028,32 +3069,58 @@ struct {
 	__uint(max_entries, 1);
 } lb_scratch SEC(".maps");
 
+// lb_prog holds the LB-ingress program for the tail call out of from_uplink.
+// A tail-callee gets a FRESH 512-byte stack and its own 1M-insn verification
+// budget — the structural end of the combined-stack fights (from_pod is 496
+// bytes, from_uplink 352; any BPF-to-BPF callee of theirs re-fights the
+// limit). The agent re-populates slot 0 on every load; an unpopulated slot
+// makes the tail call fall through to TC_ACT_OK (LB delivery off, nothing
+// else affected).
+struct {
+	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32);
+} lb_prog SEC(".maps");
+
 // lb_ingress: the inbound half at from_uplink (docs/lb-ingress.md) — dst may
-// be a Service LB IP the provider attracted here. kpr filled svc_vips at net 0
-// with THIS node's ready backends only (externalTrafficPolicy: Local as a
-// per-node table filter): select a local backend, pin the flow (lb=1 -> the
-// reply exits via lb_return at the backend's from_pod), DNAT with the client
-// source preserved, deliver locally. A mis-attracted node has no row: the
-// probe misses and the packet falls to the kernel, which owns no such address
-// — Local's contract (do not serve).
+// be a Service LB IP or this node's own address on a NodePort. kpr filled
+// svc_vips at net 0 with THIS node's ready backends only (etp: Local as a
+// per-node table filter): admit by loadBalancerSourceRanges when the row is
+// flagged, select a local backend (lockstep with svc_forward — avalanched
+// multiply-shift), pin the flow (lb=1 -> the reply exits via lb_return at
+// the backend's from_pod), DNAT with the client source preserved, deliver
+// locally. A VPC-pod backend is a second, bridge-shaped hop: the row carries
+// the pod's FABRIC address, `bridges` maps it to {net, VPC IP}, the DNAT
+// goes straight to the VPC IP (no client masquerade — source preservation is
+// the point and the reply exits this same node), and SecurityGroups gate
+// unconditionally, as on every deliberate external surface (the floating
+// rule). A mis-attracted node has no row: the probe misses and the packet
+// falls to the kernel — Local's contract (do not serve).
 //
-// noinline (BPF-to-BPF): inlined into from_uplink this blew the 1M-insn
-// verification budget (path product with the hooks' other branches). A lean
-// LB-specific body rather than a svc_forward reuse, so the frame stays small
-// (scratch above) — the backend selection must stay in LOCKSTEP with
-// svc_forward's (avalanched multiply-shift; see the comments there).
-static __attribute__((noinline)) int lb_ingress(struct __sk_buff *skb)
+// Reached by TAIL CALL from from_uplink's tail (lb_prog): inlined there it
+// blew the 1M-insn verification budget, and as a BPF-to-BPF callee its frame
+// had to fit in 512 minus from_uplink's 352 bytes — the SG gate alone broke
+// that. A tail-callee is its own program: fresh stack, own budget. The
+// per-CPU scratch (above) still carries the key building; the clang
+// store-elision hazard it guards against is position-independent.
+SEC("tc")
+int cozyplane_lb_ingress(struct __sk_buff *skb)
 {
-	struct iphdr *ip;
-	if (parse_ipv4(skb, &ip) < 0 || ip->ihl != 5)
+	struct pkt p;
+	if (parse_ip(skb, &p) < 0)
 		return TC_ACT_OK;
-	__u8 proto = ip->protocol;
-	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
+	if (p.proto != IPPROTO_TCP && p.proto != IPPROTO_UDP)
 		return TC_ACT_OK;
+	if (!p.is_v6) {
+		struct iphdr *ip;
+		if (parse_ipv4(skb, &ip) < 0 || ip->ihl != 5)
+			return TC_ACT_OK;
+	}
 	__u16 sport, dport;
-	if (l4_ports(skb, &sport, &dport) < 0)
+	if (p.is_v6 ? l4_ports6(skb, &sport, &dport) < 0
+		    : l4_ports(skb, &sport, &dport) < 0)
 		return TC_ACT_OK;
-	__u32 saddr = ip->saddr, daddr = ip->daddr;
 
 	__u32 zero = 0;
 	struct lb_scratch *s = bpf_map_lookup_elem(&lb_scratch, &zero);
@@ -3065,23 +3132,32 @@ static __attribute__((noinline)) int lb_ingress(struct __sk_buff *skb)
 	// zeroed), and the barriers before each map call keep the stores from
 	// being elided or sunk past the reader.
 	s->fk.net = 0;
-	s->fk.proto = proto;
+	s->fk.proto = p.proto;
 	s->fk.pad = 0;
 	s->fk.cport = sport;
-	v4_to_128(&s->fk.client, saddr);
-	v4_to_128(&s->fk.vip, daddr);
+	s->fk.client = p.src;
+	s->fk.vip = p.dst;
 	s->fk.vport = dport;
 	s->fk.pad2 = 0;
 
 	s->sk.net = 0;
-	s->sk.proto = proto;
+	s->sk.proto = p.proto;
 	s->sk.pad = 0;
 	s->sk.port = dport;
-	v4_to_128(&s->sk.vip, daddr);
+	s->sk.vip = p.dst;
 	asm volatile("" ::: "memory");
 	struct svc_val *sv = bpf_map_lookup_elem(&svc_vips, &s->sk);
 	if (!sv || !sv->n)
 		return TC_ACT_OK;
+
+	if (sv->flags & SVC_F_SRC_RANGES) {
+		s->lk.prefixlen = 256; // full vip + full client: longest possible match
+		s->lk.vip = p.dst;
+		s->lk.client = p.src;
+		asm volatile("" ::: "memory");
+		if (!bpf_map_lookup_elem(&lb_src, &s->lk))
+			return TC_ACT_SHOT; // declared ranges, no match: firewall drop
+	}
 
 	__u16 tport;
 	asm volatile("" ::: "memory");
@@ -3096,37 +3172,63 @@ static __attribute__((noinline)) int lb_ingress(struct __sk_buff *skb)
 		// Lockstep with svc_forward: ClientIP affinity drops the source
 		// port; Knuth multiplicative hash + fold, multiply-shift reduce.
 		__u16 hport = (sv->flags & SVC_F_AFFINITY) ? 0 : sport;
-		__u32 h = saddr ^ (daddr << 1) ^ hport ^ ((__u32)dport << 16) ^ proto;
-		h *= 2654435761u;
-		h ^= h >> 16;
+		__u32 h = svc_hash(&p, hport, dport);
 		__u32 idx = (__u32)(((__u64)h * n) >> 32);
 		asm volatile("%0 &= %1" : "+r"(idx) : "i"(SVC_MAX_BACKENDS - 1));
 		s->backend = sv->be[idx].ip;
 		tport = sv->be[idx].port;
-		s->fv.backend = s->backend;
+	}
+
+	// A VPC-pod backend: the row's address is the pod's fabric handle; the
+	// tenant identity is one bridges hop away. The DNAT target and the pinned
+	// reply identity are the VPC IP.
+	struct bridge_ep *be = bridge_of(s->backend);
+	struct endpoint *l;
+	if (be) {
+		s->dst = be->vpc_ip;
+		if (!ns_sg_admit(be->net, be->vpc_ip, s->fk.client, p.proto, tport)) {
+			count_sg_drop(be->net);
+			return TC_ACT_SHOT;
+		}
+		l = local_of(be->net, be->vpc_ip);
+	} else {
+		s->dst = s->backend;
+		l = NULL;
+	}
+
+	if (!pin) {
+		s->fv.backend = s->backend; // the ROW backend: re-bridged per packet
 		s->fv.tport = tport;
 		s->fv.hairpin = 0; // client is external, never a backend
 		asm volatile("" ::: "memory");
 		bpf_map_update_elem(&svc_fwd, &s->fk, &s->fv, BPF_ANY);
 		s->rk.net = 0;
-		s->rk.proto = proto;
+		s->rk.proto = p.proto;
 		s->rk.pad = 0;
 		s->rk.cport = sport;
-		s->rk.backend = s->backend;
-		v4_to_128(&s->rk.client, saddr);
+		s->rk.backend = s->dst; // the DELIVERED identity: what the reply carries
+		s->rk.client = p.src;
 		s->rk.tport = tport;
 		s->rk.pad2 = 0;
-		v4_to_128(&s->rv.vip, daddr);
+		s->rv.vip = p.dst;
 		s->rv.vport = dport;
 		s->rv.lb = 1;
 		asm volatile("" ::: "memory");
 		bpf_map_update_elem(&svc_rev, &s->rk, &s->rv, BPF_ANY);
 	}
 
-	nat_addr(skb, proto, IP_DADDR_OFF, daddr, v4_of_128(&s->backend));
-	if (dport != tport)
-		nat_port(skb, proto, L4_DPORT_OFF, dport, tport);
-	return deliver_net0(skb, s->backend);
+	if (p.is_v6) {
+		nat_addr6(skb, p.proto, IP6_DADDR_OFF, &p.dst, &s->dst);
+		if (dport != tport)
+			nat_port6(skb, p.proto, L4_DPORT_OFF6, dport, tport);
+	} else {
+		nat_addr(skb, p.proto, IP_DADDR_OFF, v4_of_128(&p.dst), v4_of_128(&s->dst));
+		if (dport != tport)
+			nat_port(skb, p.proto, L4_DPORT_OFF, dport, tport);
+	}
+	if (be)
+		return l ? deliver_local(skb, l) : TC_ACT_OK;
+	return deliver_net0(skb, s->dst);
 }
 
 // ---- VPC DNS steering (split-horizon resolver) ----------------------------
@@ -3354,6 +3456,19 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 			return d;
 	}
 
+	// LoadBalancer/NodePort reply (docs/lb-ingress.md): a backend — net-0 pod
+	// or VPC pod — answering the external client whose flow from_uplink
+	// DNAT'd. Checked before the floating/gateway/masquerade paths would
+	// claim the reply (the client must see the LB IP: a floating backend's
+	// own EIP SNAT or the node masquerade would rewrite it wrong). Pod-veth
+	// attachment only, external destinations only (!dstnet); costs one LRU
+	// miss on other off-net egress.
+	if (!is_gw && !dstnet && ifindex != cfg(CFG_UPLINK_IFINDEX)) {
+		int lr = lb_return(skb, &p);
+		if (lr != LB_MISS)
+			return lr;
+	}
+
 	// The north-south bridge and floating IPs are v4-only today (v6 fabric IPs
 	// and an NDP responder are later phases), so a v6 packet skips straight to
 	// the family-agnostic overlay delivery below.
@@ -3428,17 +3543,6 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	// path should not pay a per-packet lookup.
 	if (!is_gw && ifindex != cfg(CFG_UPLINK_IFINDEX))
 		svc_forward(skb, &p, srcnet, dstnet);
-
-	// LoadBalancer reply (docs/lb-ingress.md): a net-0 backend answering the
-	// external client whose flow from_uplink DNAT'd. Must intercept before
-	// the kernel path would carry the reply to the uplink-egress masquerade
-	// (the client has to see the LB IP, not the node's). Pod-veth attachment
-	// only; costs one LRU miss for ordinary net-0 egress.
-	if (!srcnet && !p.is_v6 && ifindex != cfg(CFG_UPLINK_IFINDEX)) {
-		int lr = lb_return(skb, &p);
-		if (lr != LB_MISS)
-			return lr;
-	}
 
 	// Same-node destination: redirect through the pod's veth egress (-> to_pod)
 	// — VPC nets only. Default-network (net 0) traffic is delivered by the
@@ -3592,6 +3696,26 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 	// off-VPC (the internet, cluster DNS) so srcnet is 0, but it carries the
 	// in-kernel gateway mark that tenants cannot forge.
 	if (!nets_allowed(srcnet, dstnet)) {
+		// A second exception: an LB/NodePort flow into a VPC-pod backend
+		// (docs/lb-ingress.md) — external source, tenant destination, pinned
+		// by from_uplink's lb_ingress in svc_rev (net-0-keyed; this node by
+		// construction). SecurityGroups were enforced at the DNAT point, so a
+		// hit is fully sanctioned, like the bridge/floating paths (return
+		// delivered — the SG block below gates east-west, not this). Only
+		// isolation-failing packets pay the lookup.
+		if (srcnet == 0 && dstnet != 0 &&
+		    (p.proto == IPPROTO_TCP || p.proto == IPPROTO_UDP)) {
+			__u16 sp2, dp2;
+			if ((p.is_v6 ? l4_ports6(skb, &sp2, &dp2)
+				     : l4_ports(skb, &sp2, &dp2)) == 0) {
+				struct svc_rev_key lrk = { .net = 0, .proto = p.proto,
+							   .cport = sp2, .backend = p.dst,
+							   .client = p.src, .tport = dp2 };
+				struct svc_rev_val *lrv = bpf_map_lookup_elem(&svc_rev, &lrk);
+				if (lrv && lrv->lb)
+					return TC_ACT_OK;
+			}
+		}
 		if (!(srcnet == 0 && dstnet != 0 && skb->mark == GW_MARK))
 			return TC_ACT_SHOT;
 	}
@@ -3878,7 +4002,10 @@ int cozyplane_from_uplink(struct __sk_buff *skb)
 		return deliver_local(skb, l);
 	}
 
-	// LoadBalancer ingress (docs/lb-ingress.md): dst may be a Service LB IP
-	// the provider attracted here — one hash miss for everything else.
-	return lb_ingress(skb);
+	// LoadBalancer/NodePort ingress (docs/lb-ingress.md): dst may be a
+	// Service LB IP or this node's address on a NodePort — a tail call into
+	// its own program (fresh stack + budget; see lb_prog). Falls through to
+	// TC_ACT_OK when the agent hasn't populated the slot.
+	bpf_tail_call(skb, &lb_prog, 0);
+	return TC_ACT_OK;
 }

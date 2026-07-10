@@ -1,8 +1,9 @@
 # LoadBalancer ingress — delivery for LB IPs, eBPF-native
 
-**Status: increment 1 IMPLEMENTED** (v4, default-net backends; v6 + VPC-pod
-backends are increment 2, `loadBalancerSourceRanges` is a fast-follow). Tracks
-[#13](../../issues/13). As-built notes are inline below.
+**Status: IMPLEMENTED** — increments 1 and 2 (both families, net-0 and
+VPC-pod backends), `loadBalancerSourceRanges`, and external NodePort
+(`externalTrafficPolicy: Local`). `Cluster` mode remains deferred by design.
+Tracks [#13](../../issues/13). As-built notes are inline below.
 
 ## Scope: delivery, not provisioning
 
@@ -122,10 +123,11 @@ in Geneve metadata so the backend's node replies directly from the LB IP.)
    `lb_return` inlined in `from_pod`, exiting by the floating uplink.
    e2e-covered (kind, both assertions above), and validated on the real
    cluster **as the full composition**: MetalLB allocated + L2-advertised the
-   address, cozyplane delivered — with one environment caveat: OCI's VLAN
-   emulation routes cross-subnet clients through its external-access NAT, so
-   the backend there sees OCI's NAT address; source preservation end to end
-   is asserted on a real L2 by the e2e. Verifier war stories, for the next
+   address, cozyplane delivered. (A validation footnote: an *in-cluster*
+   host-netns test client is socket-LB'd at connect() — the wire never
+   carries the LB IP, so the backend sees the client node's own address.
+   The genuinely-external wire path, source preservation included, is what
+   the kind e2e asserts with an off-cluster client.) Verifier war stories, for the next
    datapath increment: inlining the svc machinery into `from_uplink` blew the
    1M-insn verification budget (fixed: noinline BPF-to-BPF subprogram);
    building the conntrack keys on the stack blew the 512-byte combined
@@ -138,16 +140,65 @@ in Geneve metadata so the backend's node replies directly from the LB IP.)
 2. **VPC-pod backends + v6** — bridge masquerade suppression for pinned LB
    flows, SG gating verified; overlapping-CIDR two-tenant exposure in e2e.
 
-## Open questions
+   **Implemented** — `lb_ingress` went family-agnostic and became a **tail
+   call** out of `from_uplink` (`lb_prog`, slot repopulated on every agent
+   load): its own program, fresh 512-byte stack, own 1M-insn budget — the
+   structural end of the combined-stack fights (`from_pod` is 496 bytes and
+   `to_pod` 432; neither can host a BPF-to-BPF callee, and the SG gate alone
+   overflowed the callee budget behind `from_uplink`). A VPC-pod backend is
+   one `bridges` hop inside `lb_ingress`: the row carries the pod's fabric
+   address, the DNAT goes straight to the VPC IP (never the bridge's client
+   masquerade — the reply exits this same node), SecurityGroups gate
+   unconditionally at the DNAT point (`ns_sg_admit`, the floating rule), the
+   `to_pod` isolation check admits the flow by its `svc_rev` pin (a lookup
+   paid only by packets that would otherwise drop), and the pinned reply
+   identity is the VPC IP so `lb_return` catches the tenant pod's answer
+   before the floating/gateway paths could rewrite it. `lb_return` handles
+   both families; the v6 exit resolves via the FIB like the floating v6 half.
+   e2e: v6 LB IP end-to-end with the client's v6 source asserted, and an LB
+   IP fronting a VPC pod with the real external caller seen inside the
+   tenant. Dev-cluster validation rode NodePort (the only wire path an
+   in-cluster client exercises — see the socket-LB note above): node-to-node
+   traffic served with no kube-proxy on the cluster, source preserved,
+   through the VPC bridge hop. `loadBalancerSourceRanges` (lb_src LPM, flag-gated, drop before
+   any flow state) and NodePort (node addresses as frontends; the kube-proxy
+   KUBE-NODEPORTS counter stays flat while cozyplane serves, proving who
+   answered) landed in the same increment, per the sections above.
 
-- **`loadBalancerSourceRanges`**: part of the Service dataplane contract
-  (kube-proxy enforces it). An LPM check at the DNAT point is cheap —
-  increment 1 or a fast-follow?
-- **In-cluster clients dialling the LB IP**: kube-proxy short-circuits LB
-  IPs from inside the cluster; Cilium's LB tables can carry ingress IPs as
-  socket-LB frontends. Verify whether the imported lbcell already feeds
-  them (likely) — if so this works today and needs only an e2e assertion;
-  if not, decide whether in-cluster LB-IP dials matter.
+### `loadBalancerSourceRanges`
+
+Part of the Service dataplane contract (kube-proxy enforces it as a firewall
+on the LB IP). Enforced at the DNAT point: a `SVC_F_SRC_RANGES` flag on the
+LB row sends the client through an `lb_src` LPM keyed `{prefixlen, lbIP,
+client}` — the same composite-LPM shape as `sg_cidr` (the frontend address
+fully specified ahead of the client prefix; a v4 range is its NAT64 form, so
+a `/24` is prefixlen 128+96+24). Flag set with no match → drop, before any
+flow state is created. LB rows only, matching upstream semantics (NodePort
+traffic is not range-filtered by kube-proxy either).
+
+### External NodePort — the same rows, node addresses as frontends
+
+NodePort needs nothing the LB path doesn't already have: kpr writes the same
+net-0 rows keyed by **this node's addresses** (InternalIP/ExternalIP, both
+families) × `spec.ports[].nodePort`, for `type: NodePort` and `LoadBalancer`
+Services under `externalTrafficPolicy: Local` — node-local ready backends,
+client source preserved, same `lb_ingress`/`lb_return` datapath, zero new
+maps or hooks. A node without local backends has no row (`Local`'s drop
+contract). `Cluster` mode stays deferred with the LB case. The masquerade
+port range (16384–29999, #10) is disjoint from the NodePort range by
+construction, so `masq_reverse` (checked first) never shadows a NodePort row.
+`healthCheckNodePort` is not served — it is kube-proxy's healthz; providers
+that health-check (MetalLB, CCMs) derive readiness from the API as MetalLB
+already does.
+
+## Resolved questions
+
+- **In-cluster clients dialling the LB IP** — confirmed live on the dev
+  cluster: the imported lbcell feeds LB ingress IPs as socket-LB frontends,
+  so an in-cluster client's connect() is rewritten straight to a backend
+  (kube-proxy's short-circuit, at the socket layer). Consequence: in-cluster
+  clients bypass the per-packet path — `loadBalancerSourceRanges` and the
+  `Local`-only gate apply to *wire* traffic, exactly as with Cilium KPR.
 - **Health-check integration for cloud LBs**: the upstream mechanism for
   "does this node have local backends" is `healthCheckNodePort` — which is
   a NodePort. Out of scope here (the provider owns attraction), but worth a
@@ -162,5 +213,4 @@ in Geneve metadata so the backend's node replies directly from the LB IP.)
   status. (`ExternalPool` remains FloatingIP-only.)
 - `externalTrafficPolicy: Cluster` — v1 scope cut (ingress-point client
   SNAT, or DSR later), not a NodePort dependency.
-- External NodePort — separate, low priority (#13).
 - Anything tenant-facing beyond the standard Service object.

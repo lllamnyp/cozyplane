@@ -97,6 +97,14 @@ func (m *Manager) Load(vni uint32) error {
 		return fmt.Errorf("set vni: %w", err)
 	}
 
+	// Populate the LB tail-call slot (docs/lb-ingress.md): from_uplink tail
+	// calls into cozyplane_lb_ingress — its own program, fresh stack, own
+	// verification budget. Re-done on every load; until then the tail call
+	// falls through and LB delivery is simply off.
+	if err := m.objs.LbProg.Put(uint32(0), uint32(m.objs.CozyplaneLbIngress.FD())); err != nil {
+		return fmt.Errorf("populate lb tail-call slot: %w", err)
+	}
+
 	return nil
 }
 

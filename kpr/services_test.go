@@ -55,7 +55,7 @@ func TestLBRows(t *testing.T) {
 	slices := slice("node-a", "node-b")
 
 	// node-a: one local backend -> one LB row with only 10.244.0.10.
-	rows := computeRows(svc, slices, "node-a")
+	rows, _ := computeRows(svc, slices, "node-a", nil)
 	lbKey := keyFor(lbIP, 80)
 	v, ok := rows[lbKey]
 	if !ok {
@@ -75,32 +75,79 @@ func TestLBRows(t *testing.T) {
 	}
 
 	// A node with no local backend gets no LB row (Local's contract).
-	rows = computeRows(svc, slices, "node-c")
+	rows, _ = computeRows(svc, slices, "node-c", nil)
 	if _, ok := rows[lbKey]; ok {
 		t.Fatal("node-c has an LB row despite no local backend")
 	}
 
 	// etp: Cluster is deferred — no LB rows anywhere.
-	rows = computeRows(lbSvc(corev1.ServiceExternalTrafficPolicyCluster,
-		corev1.LoadBalancerIngress{IP: lbIP}), slices, "node-a")
+	rows, _ = computeRows(lbSvc(corev1.ServiceExternalTrafficPolicyCluster,
+		corev1.LoadBalancerIngress{IP: lbIP}), slices, "node-a", nil)
 	if _, ok := rows[lbKey]; ok {
 		t.Fatal("etp: Cluster produced an LB row")
 	}
 
 	// ipMode: Proxy means the LB proxies — no interception.
 	proxy := corev1.LoadBalancerIPModeProxy
-	rows = computeRows(lbSvc(corev1.ServiceExternalTrafficPolicyLocal,
-		corev1.LoadBalancerIngress{IP: lbIP, IPMode: &proxy}), slices, "node-a")
+	rows, _ = computeRows(lbSvc(corev1.ServiceExternalTrafficPolicyLocal,
+		corev1.LoadBalancerIngress{IP: lbIP, IPMode: &proxy}), slices, "node-a", nil)
 	if _, ok := rows[lbKey]; ok {
 		t.Fatal("ipMode Proxy produced an LB row")
 	}
 
 	// Empty nodeName (env unset) disables LB rows but keeps ClusterIP rows.
-	rows = computeRows(svc, slices, "")
+	rows, _ = computeRows(svc, slices, "", nil)
 	if _, ok := rows[lbKey]; ok {
 		t.Fatal("empty nodeName produced an LB row")
 	}
 	if _, ok := rows[keyFor("10.96.0.50", 80)]; !ok {
 		t.Fatal("empty nodeName dropped the ClusterIP row")
+	}
+}
+
+func TestNodePortAndSourceRangeRows(t *testing.T) {
+	lbIP := "198.51.100.7"
+	svc := lbSvc(corev1.ServiceExternalTrafficPolicyLocal, corev1.LoadBalancerIngress{IP: lbIP})
+	svc.Spec.Ports[0].NodePort = 30080
+	svc.Spec.LoadBalancerSourceRanges = []string{"192.0.2.0/24", "bogus"}
+	slices := slice("node-a", "node-b")
+	nodeAddrs := []net.IP{net.ParseIP("10.0.0.5"), net.ParseIP("fd00::5")}
+
+	rows, srcs := computeRows(svc, slices, "node-a", nodeAddrs)
+
+	// NodePort row keyed by the node's v4 address x nodePort, local backends.
+	npKey := keyFor("10.0.0.5", 30080)
+	if v, ok := rows[npKey]; !ok || v.N != 1 {
+		t.Fatalf("NodePort row = %+v ok=%v, want 1 local backend", rows[npKey], ok)
+	}
+	// The v6 node address has no v6 backends in the fixture: no row.
+	if _, ok := rows[keyFor("fd00::5", 30080)]; ok {
+		t.Fatal("v6 NodePort row despite no v6 backends")
+	}
+	// The LB row carries the src-ranges flag; the NodePort row does not.
+	lbKey := keyFor(lbIP, 80)
+	if rows[lbKey].Flags&svcFSrcRanges == 0 {
+		t.Fatal("LB row missing SVC_F_SRC_RANGES")
+	}
+	if rows[npKey].Flags&svcFSrcRanges != 0 {
+		t.Fatal("NodePort row wrongly range-flagged")
+	}
+	// One LPM entry: the valid /24 in NAT64 form (prefixlen 128+96+24);
+	// the bogus range is ignored.
+	if len(srcs) != 1 {
+		t.Fatalf("lb_src entries = %d, want 1: %v", len(srcs), srcs)
+	}
+	want, _ := addr128(net.ParseIP("192.0.2.0"))
+	lb128, _ := addr128(net.ParseIP(lbIP))
+	if _, ok := srcs[lbSrcKey{Prefixlen: 128 + 96 + 24, Vip: lb128, Client: want}]; !ok {
+		t.Fatalf("missing expected lb_src key: %v", srcs)
+	}
+
+	// No ingress IP written (etp Cluster) -> no rows AND no LPM entries.
+	cl := lbSvc(corev1.ServiceExternalTrafficPolicyCluster, corev1.LoadBalancerIngress{IP: lbIP})
+	cl.Spec.LoadBalancerSourceRanges = []string{"192.0.2.0/24"}
+	_, srcs = computeRows(cl, slices, "node-a", nodeAddrs)
+	if len(srcs) != 0 {
+		t.Fatalf("etp Cluster produced lb_src entries: %v", srcs)
 	}
 }

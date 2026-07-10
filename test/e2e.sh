@@ -1032,6 +1032,128 @@ fi
 docker exec lbcli ip route replace "$LBIP/32" via "$W2IP" >/dev/null 2>&1
 check_fail "LB IP via the backend-less node does not serve (etp: Local)" \
   docker exec lbcli curl -s -m3 "http://$LBIP/"
+docker exec lbcli ip route replace "$LBIP/32" via "$WIP" >/dev/null 2>&1
+
+# loadBalancerSourceRanges: a firewall on the LB IP, enforced at the DNAT
+# point (lb_src LPM). Admit the client's /32 -> works; an unrelated range ->
+# dropped before any flow state; cleared -> works again.
+$K -n default patch svc lbweb --type=merge -p "{\"spec\":{\"loadBalancerSourceRanges\":[\"$LBCLIP/32\"]}}" >/dev/null
+sleep 3
+got=$(docker exec lbcli curl -s -m3 "http://$LBIP/" 2>/dev/null | tr -d '\r')
+[ "$got" = "saw $LBCLIP" ] && pass "sourceRanges admits the declared client /32" \
+  || fail "sourceRanges admits the declared client /32 (got '$got')"
+$K -n default patch svc lbweb --type=merge -p '{"spec":{"loadBalancerSourceRanges":["192.0.2.0/24"]}}' >/dev/null
+sleep 3
+check_fail "sourceRanges drops an undeclared client" \
+  docker exec lbcli curl -s -m3 "http://$LBIP/"
+$K -n default patch svc lbweb --type=json -p '[{"op":"remove","path":"/spec/loadBalancerSourceRanges"}]' >/dev/null
+sleep 3
+
+# External NodePort: the same rows keyed by the node's own address. The
+# kube-proxy NODEPORTS counter must stay flat — tc runs before netfilter, so
+# a served curl that leaves it unmoved was served by cozyplane.
+NP=$($K -n default get svc lbweb -o jsonpath='{.spec.ports[0].nodePort}')
+npcount() { docker exec "$W" iptables -t nat -L KUBE-NODEPORTS -v -x 2>/dev/null | awk 'NR>2{n+=$1}END{print n+0}'; }
+np0=$(npcount)
+got=$(docker exec lbcli curl -s -m3 "http://$WIP:$NP/" 2>/dev/null | tr -d '\r')
+[ "$got" = "saw $LBCLIP" ] && pass "external NodePort $WIP:$NP served, source preserved" \
+  || fail "external NodePort $WIP:$NP served, source preserved (got '$got')"
+np1=$(npcount)
+[ "$np0" = "$np1" ] && pass "kube-proxy KUBE-NODEPORTS counter flat: cozyplane served it" \
+  || fail "kube-proxy KUBE-NODEPORTS counter moved ($np0 -> $np1): kube-proxy served it"
+check_fail "NodePort on the backend-less node does not serve (etp: Local)" \
+  docker exec lbcli curl -s -m3 "http://$W2IP:$NP/"
+
+# v6 LB IP: same composition through the v6 halves (lb_ingress is
+# family-agnostic; the reply resolves via the FIB like the floating v6 exit).
+WIP6=$($K get node "$W" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' | tr ' ' '\n' | grep : | head -1)
+LBIP6="2001:db8:42::7"
+$K apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: lbweb6, namespace: default, labels: {app: lbweb6}}
+spec:
+  nodeName: $W
+  containers:
+    - name: s
+      image: nicolaka/netshoot
+      command:
+        - sh
+        - -c
+        - socat TCP6-LISTEN:8080,fork,reuseaddr SYSTEM:'echo HTTP/1.0 200 OK; echo; echo saw \$SOCAT_PEERADDR'
+---
+apiVersion: v1
+kind: Service
+metadata: {name: lbweb6, namespace: default}
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  ipFamilies: [IPv6]
+  selector: {app: lbweb6}
+  ports: [{port: 80, targetPort: 8080}]
+EOF
+$K -n default wait --for=condition=Ready pod/lbweb6 --timeout=120s >/dev/null 2>&1
+$K -n default patch svc lbweb6 --subresource=status --type=merge \
+  -p "{\"status\":{\"loadBalancer\":{\"ingress\":[{\"ip\":\"$LBIP6\"}]}}}" >/dev/null
+LBCLIP6=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}' lbcli 2>/dev/null)
+docker exec lbcli ip -6 route add "$LBIP6/128" via "$WIP6" >/dev/null 2>&1
+got=""
+for _ in $(seq 1 10); do
+  got=$(docker exec lbcli curl -gs -m3 "http://[$LBIP6]/" 2>/dev/null | tr -d '\r')
+  echo "$got" | grep -q "saw" && break
+  sleep 2
+done
+# socat reports the v6 peer bracketed and fully expanded; normalize both
+# sides to the canonical form before comparing.
+gotip=$(echo "$got" | sed -n 's/^saw \[\(.*\)\]$/\1/p')
+gotnorm=$(python3 -c "import ipaddress,sys; print(ipaddress.ip_address(sys.argv[1]))" "$gotip" 2>/dev/null)
+wantnorm=$(python3 -c "import ipaddress,sys; print(ipaddress.ip_address(sys.argv[1]))" "$LBCLIP6" 2>/dev/null)
+[ -n "$gotnorm" ] && [ "$gotnorm" = "$wantnorm" ] && pass "v6 LB IP $LBIP6 served, source preserved (backend saw $gotnorm)" \
+  || fail "v6 LB IP $LBIP6 source-preserving delivery (got '$got', client $LBCLIP6)"
+
+# A VPC-pod backend: the row carries the pod's fabric address; lb_ingress
+# takes the bridges hop and DNATs straight to the VPC IP with NO client
+# masquerade — the tenant pod sees the real external caller.
+LBIP2="198.51.100.8"
+$K apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lbvpc
+  namespace: team-a
+  labels: {app: lbvpc}
+  annotations: {sdn.cozystack.io/vpc: vpc-a}
+spec:
+  nodeName: $W
+  containers:
+    - name: s
+      image: nicolaka/netshoot
+      command:
+        - sh
+        - -c
+        - socat TCP-LISTEN:8080,fork,reuseaddr SYSTEM:'echo HTTP/1.0 200 OK; echo; echo saw \$SOCAT_PEERADDR'
+---
+apiVersion: v1
+kind: Service
+metadata: {name: lbvpc, namespace: team-a}
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector: {app: lbvpc}
+  ports: [{port: 80, targetPort: 8080}]
+EOF
+$K -n team-a wait --for=condition=Ready pod/lbvpc --timeout=120s >/dev/null 2>&1
+$K -n team-a patch svc lbvpc --subresource=status --type=merge \
+  -p "{\"status\":{\"loadBalancer\":{\"ingress\":[{\"ip\":\"$LBIP2\"}]}}}" >/dev/null
+docker exec lbcli ip route add "$LBIP2/32" via "$WIP" >/dev/null 2>&1
+got=""
+for _ in $(seq 1 10); do
+  got=$(docker exec lbcli curl -s -m3 "http://$LBIP2/" 2>/dev/null | tr -d '\r')
+  echo "$got" | grep -q "saw" && break
+  sleep 2
+done
+[ "$got" = "saw $LBCLIP" ] && pass "VPC-pod backend behind LB IP $LBIP2: delivered into the VPC, source preserved" \
+  || fail "VPC-pod backend behind LB IP $LBIP2 (got '$got', client $LBCLIP)"
 docker rm -f lbcli >/dev/null 2>&1
 
 echo "[revocation]"

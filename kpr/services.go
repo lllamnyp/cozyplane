@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -16,6 +17,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -57,6 +59,17 @@ import (
 
 const svcMaxBackends = 16
 const svcFAffinity uint32 = 1
+const svcFSrcRanges uint32 = 2
+
+// lbSrcKey replicates bpf/overlay.c's lb_src LPM key: loadBalancerSourceRanges
+// admission, the frontend fully specified ahead of the client prefix.
+// Prefixlen = 128 (LB IP) + client prefix bits; v4 addresses are the NAT64
+// form, so a v4 /24 contributes 96+24 client bits.
+type lbSrcKey struct {
+	Prefixlen uint32
+	Vip       [16]byte
+	Client    [16]byte
+}
 
 type svcKey struct {
 	Net   uint32
@@ -124,6 +137,16 @@ type vipReconciler struct {
 	// reconcile diffs desired against owned[svc] and never iterates the map.
 	// Touched only by seed() and then the single worker goroutine — no lock.
 	owned map[string]map[svcKey]svcVal
+
+	// lbsrc is the pinned lb_src LPM (loadBalancerSourceRanges), ownedSrc its
+	// per-service index — the same diff discipline as owned/vips.
+	lbsrc    *ebpf.Map
+	ownedSrc map[string]map[lbSrcKey]uint8
+
+	// nodeAddrs are THIS node's InternalIP/ExternalIP addresses (both
+	// families), the frontends for NodePort rows. Fetched once at startup —
+	// node addresses effectively never change; a kpr restart re-reads them.
+	nodeAddrs []net.IP
 }
 
 // runServiceVIPs reconciles Services + EndpointSlices into the pinned svc_vips
@@ -158,6 +181,41 @@ func runServiceVIPs(ctx context.Context, pinDir, nodeName string, logger *slog.L
 	}
 	defer vips.Close()
 
+	// The lb_src LPM (loadBalancerSourceRanges) is pinned by the same agent
+	// load; by the time svc_vips exists this does too.
+	var lbsrc *ebpf.Map
+	for {
+		lbsrc, err = ebpf.LoadPinnedMap(filepath.Join(pinDir, "lb_src"), nil)
+		if err == nil {
+			break
+		}
+		logger.Info("waiting for agent lb_src pin", "err", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+	}
+	defer lbsrc.Close()
+
+	// This node's addresses are the NodePort frontends. Fetched once —
+	// node addresses effectively never change; a restart re-reads.
+	var nodeAddrs []net.IP
+	if nodeName != "" {
+		node, err := clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("get own node %s: %w", nodeName, err)
+		}
+		for _, a := range node.Status.Addresses {
+			if a.Type != corev1.NodeInternalIP && a.Type != corev1.NodeExternalIP {
+				continue
+			}
+			if ip := net.ParseIP(a.Address); ip != nil {
+				nodeAddrs = append(nodeAddrs, ip)
+			}
+		}
+	}
+
 	factory := informers.NewSharedInformerFactory(clientset, 0)
 	svcInformer := factory.Core().V1().Services()
 	epsInformer := factory.Discovery().V1().EndpointSlices()
@@ -168,9 +226,12 @@ func runServiceVIPs(ctx context.Context, pinDir, nodeName string, logger *slog.L
 		epsLister: epsInformer.Lister(),
 		queue: workqueue.NewTypedRateLimitingQueue(
 			workqueue.DefaultTypedControllerRateLimiter[string]()),
-		logger:   logger,
-		nodeName: nodeName,
-		owned:    map[string]map[svcKey]svcVal{},
+		logger:    logger,
+		nodeName:  nodeName,
+		owned:     map[string]map[svcKey]svcVal{},
+		lbsrc:     lbsrc,
+		ownedSrc:  map[string]map[lbSrcKey]uint8{},
+		nodeAddrs: nodeAddrs,
 	}
 
 	_, _ = svcInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -263,16 +324,17 @@ func (r *vipReconciler) reconcileService(key string) error {
 	if err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
-	desired, err := r.computeService(svc)
+	desired, desiredSrc, err := r.computeService(svc)
 	if err != nil {
 		return err
 	}
-	return r.apply(key, desired)
+	return r.apply(key, desired, desiredSrc)
 }
 
 // apply writes desired-minus-owned and deletes owned-minus-desired, then
-// records desired as owned. Unchanged entries (value-equal) are not rewritten.
-func (r *vipReconciler) apply(key string, desired map[svcKey]svcVal) error {
+// records desired as owned — for the svc_vips rows and the lb_src LPM alike.
+// Unchanged entries (value-equal) are not rewritten.
+func (r *vipReconciler) apply(key string, desired map[svcKey]svcVal, desiredSrc map[lbSrcKey]uint8) error {
 	prev := r.owned[key]
 	for k, v := range desired {
 		if pv, ok := prev[k]; ok && pv == v {
@@ -295,6 +357,29 @@ func (r *vipReconciler) apply(key string, desired map[svcKey]svcVal) error {
 	} else {
 		r.owned[key] = desired
 	}
+
+	prevSrc := r.ownedSrc[key]
+	for k, v := range desiredSrc {
+		if pv, ok := prevSrc[k]; ok && pv == v {
+			continue
+		}
+		if err := r.lbsrc.Put(&k, &v); err != nil {
+			return fmt.Errorf("put lb_src %v: %w", k, err)
+		}
+	}
+	for k := range prevSrc {
+		if _, ok := desiredSrc[k]; ok {
+			continue
+		}
+		if err := r.lbsrc.Delete(&k); err != nil && !isMapKeyNotExist(err) {
+			return fmt.Errorf("delete lb_src %v: %w", k, err)
+		}
+	}
+	if len(desiredSrc) == 0 {
+		delete(r.ownedSrc, key)
+	} else {
+		r.ownedSrc[key] = desiredSrc
+	}
 	return nil
 }
 
@@ -305,16 +390,17 @@ func isMapKeyNotExist(err error) bool {
 // computeService builds the desired net-0 svc_vips entries for one service.
 // A nil svc (deleted), ExternalName, headless, or backend-less service yields
 // an empty set — apply() then prunes whatever was owned.
-func (r *vipReconciler) computeService(svc *corev1.Service) (map[svcKey]svcVal, error) {
+func (r *vipReconciler) computeService(svc *corev1.Service) (map[svcKey]svcVal, map[lbSrcKey]uint8, error) {
 	if svc == nil || svc.Spec.Type == corev1.ServiceTypeExternalName {
-		return nil, nil
+		return nil, nil, nil
 	}
 	sel := labels.SelectorFromSet(labels.Set{discoveryv1.LabelServiceName: svc.Name})
 	slices, err := r.epsLister.EndpointSlices(svc.Namespace).List(sel)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return computeRows(svc, slices, r.nodeName), nil
+	rows, srcs := computeRows(svc, slices, r.nodeName, r.nodeAddrs)
+	return rows, srcs, nil
 }
 
 type bucketKey struct {
@@ -331,7 +417,7 @@ type bucketKey struct {
 // Single pass over the EndpointSlices: ready endpoints are bucketed by
 // {address family, port name}, cluster-wide and node-local in parallel, then
 // each (servicePort × address) picks its bucket — no per-port re-walk.
-func computeRows(svc *corev1.Service, slices []*discoveryv1.EndpointSlice, nodeName string) map[svcKey]svcVal {
+func computeRows(svc *corev1.Service, slices []*discoveryv1.EndpointSlice, nodeName string, nodeAddrs []net.IP) (map[svcKey]svcVal, map[lbSrcKey]uint8) {
 	buckets := map[bucketKey][]svcBackend{}
 	local := map[bucketKey][]svcBackend{}
 	add := func(m map[bucketKey][]svcBackend, bk bucketKey, be svcBackend) {
@@ -427,34 +513,98 @@ func computeRows(svc *corev1.Service, slices []*discoveryv1.EndpointSlice, nodeN
 	// (Cluster needs an ingress-point client SNAT — deferred); ipMode Proxy
 	// means the LB terminates and proxies — no interception. Whoever wrote the
 	// status (a CCM, MetalLB, a human) is the provider; cozyplane only reads.
-	if svc.Spec.Type == corev1.ServiceTypeLoadBalancer &&
-		svc.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyLocal {
+	desiredSrc := map[lbSrcKey]uint8{}
+	local2 := svc.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyLocal
+	if svc.Spec.Type == corev1.ServiceTypeLoadBalancer && local2 {
+		// loadBalancerSourceRanges: parsed once; applied to every VIP-mode
+		// ingress IP as lb_src LPM entries + the flag on the rows. LB rows
+		// only, matching upstream (NodePort traffic is not range-filtered).
+		type srcRange struct {
+			a    [16]byte
+			bits uint32
+		}
+		var ranges []srcRange
+		for _, cidr := range svc.Spec.LoadBalancerSourceRanges {
+			_, ipn, err := net.ParseCIDR(strings.TrimSpace(cidr))
+			if err != nil {
+				continue // invalid ranges are ignored, like kube-proxy
+			}
+			a, ok := addr128(ipn.IP)
+			if !ok {
+				continue
+			}
+			ones, _ := ipn.Mask.Size()
+			bits := uint32(ones)
+			if ipn.IP.To4() != nil {
+				bits += 96 // NAT64 form: the v4 bits sit behind the /96 prefix
+			}
+			ranges = append(ranges, srcRange{a: a, bits: bits})
+		}
+		var flags uint32
+		if len(svc.Spec.LoadBalancerSourceRanges) > 0 {
+			flags = svcFSrcRanges
+		}
 		for _, ing := range svc.Status.LoadBalancer.Ingress {
 			if ing.IP == "" || (ing.IPMode != nil && *ing.IPMode == corev1.LoadBalancerIPModeProxy) {
 				continue
 			}
 			lbIP := net.ParseIP(ing.IP)
-			if lbIP == nil || lbIP.To4() == nil {
-				continue // v6 LB delivery is increment 2; no inert rows
+			if lbIP == nil {
+				continue
 			}
 			lb128, ok := addr128(lbIP)
 			if !ok {
 				continue
 			}
+			wrote := false
 			for _, sp := range svc.Spec.Ports {
 				proto, ok := protoNum(sp.Protocol)
 				if !ok {
 					continue
 				}
-				be := local[bucketKey{v4: true, portName: sp.Name}]
+				be := local[bucketKey{v4: lbIP.To4() != nil, portName: sp.Name}]
 				if len(be) == 0 {
 					continue // no local ready backend: no row — Local's contract
 				}
-				desired[svcKey{Net: 0, Vip: lb128, Proto: proto, Port: htons(uint16(sp.Port))}] = mkVal(be)
+				v := mkVal(be)
+				v.Flags |= flags
+				desired[svcKey{Net: 0, Vip: lb128, Proto: proto, Port: htons(uint16(sp.Port))}] = v
+				wrote = true
+			}
+			if wrote {
+				for _, sr := range ranges {
+					desiredSrc[lbSrcKey{Prefixlen: 128 + sr.bits, Vip: lb128, Client: sr.a}] = 1
+				}
 			}
 		}
 	}
-	return desired
+
+	// External NodePort (docs/lb-ingress.md): the same rows with this node's
+	// own addresses as the frontends — type NodePort and LoadBalancer alike,
+	// Local only, no range filter, same datapath.
+	if local2 && (svc.Spec.Type == corev1.ServiceTypeNodePort || svc.Spec.Type == corev1.ServiceTypeLoadBalancer) {
+		for _, sp := range svc.Spec.Ports {
+			if sp.NodePort == 0 {
+				continue
+			}
+			proto, ok := protoNum(sp.Protocol)
+			if !ok {
+				continue
+			}
+			for _, na := range nodeAddrs {
+				na128, ok := addr128(na)
+				if !ok {
+					continue
+				}
+				be := local[bucketKey{v4: na.To4() != nil, portName: sp.Name}]
+				if len(be) == 0 {
+					continue
+				}
+				desired[svcKey{Net: 0, Vip: na128, Proto: proto, Port: htons(uint16(sp.NodePort))}] = mkVal(be)
+			}
+		}
+	}
+	return desired, desiredSrc
 }
 
 // seed runs once at startup, before the worker: computes every service, applies
@@ -469,11 +619,11 @@ func (r *vipReconciler) seed() error {
 	}
 	for _, s := range services {
 		key := s.Namespace + "/" + s.Name
-		desired, err := r.computeService(s)
+		desired, desiredSrc, err := r.computeService(s)
 		if err != nil {
 			return err
 		}
-		if err := r.apply(key, desired); err != nil {
+		if err := r.apply(key, desired, desiredSrc); err != nil {
 			return err
 		}
 	}
@@ -506,6 +656,34 @@ func (r *vipReconciler) seed() error {
 	}
 	if len(stale) > 0 {
 		r.logger.Info("swept stale net-0 svc_vips entries", "count", len(stale))
+	}
+
+	// The same leftover sweep for the lb_src LPM (it is exclusively ours).
+	liveSrc := map[lbSrcKey]bool{}
+	for _, keys := range r.ownedSrc {
+		for k := range keys {
+			liveSrc[k] = true
+		}
+	}
+	var skey lbSrcKey
+	var sval uint8
+	var staleSrc []lbSrcKey
+	sit := r.lbsrc.Iterate()
+	for sit.Next(&skey, &sval) {
+		if !liveSrc[skey] {
+			staleSrc = append(staleSrc, skey)
+		}
+	}
+	if err := sit.Err(); err != nil {
+		return fmt.Errorf("iterate lb_src: %w", err)
+	}
+	for _, k := range staleSrc {
+		if err := r.lbsrc.Delete(&k); err != nil && !isMapKeyNotExist(err) {
+			return fmt.Errorf("sweep lb_src %v: %w", k, err)
+		}
+	}
+	if len(staleSrc) > 0 {
+		r.logger.Info("swept stale lb_src entries", "count", len(staleSrc))
 	}
 	return nil
 }
