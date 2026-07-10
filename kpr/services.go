@@ -514,8 +514,18 @@ func computeRows(svc *corev1.Service, slices []*discoveryv1.EndpointSlice, nodeN
 	// means the LB terminates and proxies — no interception. Whoever wrote the
 	// status (a CCM, MetalLB, a human) is the provider; cozyplane only reads.
 	desiredSrc := map[lbSrcKey]uint8{}
-	local2 := svc.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyLocal
-	if svc.Spec.Type == corev1.ServiceTypeLoadBalancer && local2 {
+	// etp picks the backend set: Local rows carry this node's ready backends
+	// only; Cluster rows carry the cluster-wide set (remote backends ride
+	// DSR — docs/lb-ingress.md). That is the entire difference between the
+	// modes here.
+	etpLocal := svc.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyLocal
+	pick := func(bk bucketKey) []svcBackend {
+		if etpLocal {
+			return local[bk]
+		}
+		return buckets[bk]
+	}
+	if svc.Spec.Type == corev1.ServiceTypeLoadBalancer {
 		// loadBalancerSourceRanges: parsed once; applied to every VIP-mode
 		// ingress IP as lb_src LPM entries + the flag on the rows. LB rows
 		// only, matching upstream (NodePort traffic is not range-filtered).
@@ -562,9 +572,9 @@ func computeRows(svc *corev1.Service, slices []*discoveryv1.EndpointSlice, nodeN
 				if !ok {
 					continue
 				}
-				be := local[bucketKey{v4: lbIP.To4() != nil, portName: sp.Name}]
+				be := pick(bucketKey{v4: lbIP.To4() != nil, portName: sp.Name})
 				if len(be) == 0 {
-					continue // no local ready backend: no row — Local's contract
+					continue // Local: no local ready backend -> no row (the contract); Cluster: no backends at all
 				}
 				v := mkVal(be)
 				v.Flags |= flags
@@ -581,8 +591,9 @@ func computeRows(svc *corev1.Service, slices []*discoveryv1.EndpointSlice, nodeN
 
 	// External NodePort (docs/lb-ingress.md): the same rows with this node's
 	// own addresses as the frontends — type NodePort and LoadBalancer alike,
-	// Local only, no range filter, same datapath.
-	if local2 && (svc.Spec.Type == corev1.ServiceTypeNodePort || svc.Spec.Type == corev1.ServiceTypeLoadBalancer) {
+	// both traffic policies (Cluster is NodePort's upstream default), no
+	// range filter, same datapath.
+	if svc.Spec.Type == corev1.ServiceTypeNodePort || svc.Spec.Type == corev1.ServiceTypeLoadBalancer {
 		for _, sp := range svc.Spec.Ports {
 			if sp.NodePort == 0 {
 				continue
@@ -596,7 +607,7 @@ func computeRows(svc *corev1.Service, slices []*discoveryv1.EndpointSlice, nodeN
 				if !ok {
 					continue
 				}
-				be := local[bucketKey{v4: na.To4() != nil, portName: sp.Name}]
+				be := pick(bucketKey{v4: na.To4() != nil, portName: sp.Name})
 				if len(be) == 0 {
 					continue
 				}

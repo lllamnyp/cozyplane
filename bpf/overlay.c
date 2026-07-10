@@ -171,6 +171,7 @@ struct sg_geneve_opt {
 	__u64 srcmap;
 } __attribute__((packed));
 
+
 // Shared Geneve MAC: the encap path rewrites the inner Ethernet destination to
 // it so a decapped default-network frame is PACKET_HOST on arrival and the
 // kernel forwards it to the local pod. VPC frames are redirected by
@@ -1022,6 +1023,21 @@ struct svc_backend {
 // backend set is stable. Statelessly consistent — unlike kube-proxy there is
 // no per-client timeout table, so a backend-set change may rebalance ~1/n of
 // clients (which is also true of any consistent-hash LB).
+// The LB DSR option (docs/lb-ingress.md, etp: Cluster): the ingress node
+// DNAT'd an LB/NodePort flow to a REMOTE backend and encapsulated it; this
+// option carries the frontend identity {lbIP, port} so the backend's node can
+// pin svc_rev (lb=1) and the reply leaves THAT node already answering as the
+// LB IP — DSR, the client source preserved end to end.
+#define LB_OPT_TYPE 2
+struct lb_geneve_opt {
+	__be16 opt_class; // SG_OPT_CLASS: one private class, types discriminate
+	__u8 type;
+	__u8 length; // 4-byte units of opt_data: 20 bytes -> 5
+	struct addr128 vip;
+	__be16 vport;
+	__u16 pad;
+} __attribute__((packed));
+
 #define SVC_F_AFFINITY 1
 // SVC_F_SRC_RANGES: the Service declares loadBalancerSourceRanges — admit the
 // client only on an lb_src LPM hit (checked at the DNAT point in lb_ingress,
@@ -2299,6 +2315,35 @@ static __always_inline int floating_egress_snat(struct __sk_buff *skb, struct ip
 	return bpf_redirect_neigh(uplink, NULL, 0, 0);
 }
 
+// encap_lb: encapsulate an LB/NodePort flow to a remote backend's node at
+// net 0, stamping the DSR option (the frontend identity the reply assumes).
+// Mirrors encap/encap_sg; vip/vport point into the caller's scratch.
+static __always_inline int encap_lb(struct __sk_buff *skb, __u32 node_ip,
+				    const struct addr128 *vip, __u16 vport)
+{
+	__u32 geneve = cfg(CFG_GENEVE_IFINDEX);
+	if (!geneve)
+		return TC_ACT_SHOT;
+	__u8 dmac[6] = OVERLAY_DMAC;
+	if (bpf_skb_store_bytes(skb, 0, dmac, sizeof(dmac), 0) < 0)
+		return TC_ACT_SHOT;
+	struct bpf_tunnel_key tkey = {};
+	tkey.tunnel_id = cfg(CFG_VNI);
+	tkey.remote_ipv4 = node_ip;
+	if (bpf_skb_set_tunnel_key(skb, &tkey, sizeof(tkey), BPF_F_ZERO_CSUM_TX) < 0)
+		return TC_ACT_SHOT;
+	struct lb_geneve_opt opt = {
+		.opt_class = bpf_htons(SG_OPT_CLASS),
+		.type = LB_OPT_TYPE,
+		.length = 5,
+		.vip = *vip,
+		.vport = vport,
+	};
+	if (bpf_skb_set_tunnel_opt(skb, (void *)&opt, sizeof(opt)) < 0)
+		return TC_ACT_SHOT;
+	return bpf_redirect(geneve, 0);
+}
+
 #define MASQ_MISS -1
 
 // masq_snat is the cluster-egress bpf masquerade (#10), run in from_pod at the
@@ -3078,7 +3123,7 @@ struct {
 // else affected).
 struct {
 	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-	__uint(max_entries, 1);
+	__uint(max_entries, 2); // 0: lb_ingress (from_uplink), 1: lb_dsr (from_overlay)
 	__type(key, __u32);
 	__type(value, __u32);
 } lb_prog SEC(".maps");
@@ -3180,10 +3225,16 @@ int cozyplane_lb_ingress(struct __sk_buff *skb)
 	}
 
 	// A VPC-pod backend: the row's address is the pod's fabric handle; the
-	// tenant identity is one bridges hop away. The DNAT target and the pinned
-	// reply identity are the VPC IP.
+	// tenant identity is one bridges hop away (bridges is node-local, so this
+	// resolves only when the backend lives HERE — a remote VPC backend takes
+	// the DSR path below and is bridged on its own node). The DNAT target and
+	// the pinned reply identity are the VPC IP.
 	struct bridge_ep *be = bridge_of(s->backend);
 	struct endpoint *l;
+	// `remote` is a SCALAR on purpose: spelling this as `!be && !l` lets
+	// clang fuse the two null tests into a pointer OR (`r1 |= r0`), which
+	// the verifier prohibits ("bitwise operator |= on pointer").
+	int remote = 0;
 	if (be) {
 		s->dst = be->vpc_ip;
 		if (!ns_sg_admit(be->net, be->vpc_ip, s->fk.client, p.proto, tport)) {
@@ -3193,15 +3244,44 @@ int cozyplane_lb_ingress(struct __sk_buff *skb)
 		l = local_of(be->net, be->vpc_ip);
 	} else {
 		s->dst = s->backend;
-		l = NULL;
+		l = local_of(0, s->backend);
+		remote = (l == NULL);
 	}
 
 	if (!pin) {
-		s->fv.backend = s->backend; // the ROW backend: re-bridged per packet
+		// The flow pin lives at the ingress node either way — stickiness for
+		// every later packet of the flow, local or DSR'd.
+		s->fv.backend = s->backend; // the ROW backend: re-resolved per packet
 		s->fv.tport = tport;
 		s->fv.hairpin = 0; // client is external, never a backend
 		asm volatile("" ::: "memory");
 		bpf_map_update_elem(&svc_fwd, &s->fk, &s->fv, BPF_ANY);
+	}
+
+	// Remote backend (etp: Cluster rows carry the cluster-wide set): DNAT to
+	// the backend, keep the client source, and DSR-encapsulate to its node —
+	// remotes at net 0 maps pod addresses to nodes. The reply identity is
+	// pinned THERE (lb_dsr, from the Geneve option), because the reply exits
+	// that node's uplink. No svc_rev pin here: the reply never passes us.
+	if (remote) {
+		__u32 *node_ip = remote_of(0, s->backend);
+		if (!node_ip)
+			return TC_ACT_SHOT; // a row backend with no home is misprogrammed
+		s->rv.vip = p.dst; // scratch: carries {vip, vport} into encap_lb
+		s->rv.vport = dport;
+		if (p.is_v6) {
+			nat_addr6(skb, p.proto, IP6_DADDR_OFF, &p.dst, &s->dst);
+			if (dport != tport)
+				nat_port6(skb, p.proto, L4_DPORT_OFF6, dport, tport);
+		} else {
+			nat_addr(skb, p.proto, IP_DADDR_OFF, v4_of_128(&p.dst), v4_of_128(&s->dst));
+			if (dport != tport)
+				nat_port(skb, p.proto, L4_DPORT_OFF, dport, tport);
+		}
+		return encap_lb(skb, *node_ip, &s->rv.vip, s->rv.vport);
+	}
+
+	if (!pin) {
 		s->rk.net = 0;
 		s->rk.proto = p.proto;
 		s->rk.pad = 0;
@@ -3228,7 +3308,80 @@ int cozyplane_lb_ingress(struct __sk_buff *skb)
 	}
 	if (be)
 		return l ? deliver_local(skb, l) : TC_ACT_OK;
-	return deliver_net0(skb, s->dst);
+	return l ? deliver_local(skb, l) : deliver_net0(skb, s->dst);
+}
+
+// cozyplane_lb_dsr: the receiving half of etp: Cluster (docs/lb-ingress.md),
+// tail-called from from_overlay when a net-0 decap carries the LB option.
+// The ingress node already DNAT'd to the backend and preserved the client;
+// this node — where the backend lives and where the reply will exit — pins
+// the frontend identity from the option (svc_rev, lb=1, lookup-first so
+// steady-state packets don't rewrite the LRU), takes the bridges hop for a
+// VPC-pod backend (SG-gated here, where the pod is local), and delivers.
+SEC("tc")
+int cozyplane_lb_dsr(struct __sk_buff *skb)
+{
+	struct lb_geneve_opt lopt;
+	if (bpf_skb_get_tunnel_opt(skb, (void *)&lopt, sizeof(lopt)) < (int)sizeof(lopt) ||
+	    lopt.opt_class != bpf_htons(SG_OPT_CLASS) || lopt.type != LB_OPT_TYPE)
+		return TC_ACT_SHOT; // tail-called on a match; anything else is malformed
+	struct pkt p;
+	if (parse_ip(skb, &p) < 0)
+		return TC_ACT_SHOT;
+	if (p.proto != IPPROTO_TCP && p.proto != IPPROTO_UDP)
+		return TC_ACT_SHOT;
+	__u16 sport, dport;
+	if (p.is_v6 ? l4_ports6(skb, &sport, &dport) < 0
+		    : l4_ports(skb, &sport, &dport) < 0)
+		return TC_ACT_SHOT;
+
+	__u32 zero = 0;
+	struct lb_scratch *s = bpf_map_lookup_elem(&lb_scratch, &zero);
+	if (!s)
+		return TC_ACT_SHOT;
+
+	struct bridge_ep *be = bridge_of(p.dst);
+	struct endpoint *l;
+	if (be) {
+		s->dst = be->vpc_ip;
+		if (!ns_sg_admit(be->net, be->vpc_ip, p.src, p.proto, dport)) {
+			count_sg_drop(be->net);
+			return TC_ACT_SHOT;
+		}
+		l = local_of(be->net, be->vpc_ip);
+	} else {
+		s->dst = p.dst;
+		l = local_of(0, p.dst);
+	}
+
+	// Pin the reply identity (explicit stores + barriers: the clang
+	// store-elision hazard on per-CPU values, see lb_ingress).
+	s->rk.net = 0;
+	s->rk.proto = p.proto;
+	s->rk.pad = 0;
+	s->rk.cport = sport;
+	s->rk.backend = s->dst;
+	s->rk.client = p.src;
+	s->rk.tport = dport;
+	s->rk.pad2 = 0;
+	asm volatile("" ::: "memory");
+	if (!bpf_map_lookup_elem(&svc_rev, &s->rk)) {
+		s->rv.vip = lopt.vip;
+		s->rv.vport = lopt.vport;
+		s->rv.lb = 1;
+		asm volatile("" ::: "memory");
+		bpf_map_update_elem(&svc_rev, &s->rk, &s->rv, BPF_ANY);
+	}
+
+	if (be) {
+		// The second, bridge-shaped DNAT: fabric -> VPC IP.
+		if (p.is_v6) {
+			nat_addr6(skb, p.proto, IP6_DADDR_OFF, &p.dst, &s->dst);
+		} else {
+			nat_addr(skb, p.proto, IP_DADDR_OFF, v4_of_128(&p.dst), v4_of_128(&s->dst));
+		}
+	}
+	return l ? deliver_local(skb, l) : TC_ACT_OK;
 }
 
 // ---- VPC DNS steering (split-horizon resolver) ----------------------------
@@ -3810,6 +3963,18 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 	__u32 gw = tk.tunnel_id & TUN_F_GATEWAY;
 	__u32 vni = (__u32)tk.tunnel_id & ~TUN_F_GATEWAY;
 	if (vni == cfg(CFG_VNI)) {
+		// etp: Cluster DSR (docs/lb-ingress.md): the ingress node DNAT'd an
+		// LB/NodePort flow to a backend on THIS node and stamped the frontend
+		// identity. Checked before the bridge below — a bridged fabric dst
+		// with the option must take the DSR pin, not the masquerading bridge.
+		// One get_tunnel_opt on net-0 decaps only; east-west VPC traffic
+		// never pays it.
+		struct lb_geneve_opt lopt;
+		if (bpf_skb_get_tunnel_opt(skb, (void *)&lopt, sizeof(lopt)) >= (int)sizeof(lopt) &&
+		    lopt.opt_class == bpf_htons(SG_OPT_CLASS) && lopt.type == LB_OPT_TYPE) {
+			bpf_tail_call(skb, &lb_prog, 1);
+			return TC_ACT_SHOT; // slot unpopulated: no correct delivery exists
+		}
 		// Default network. A cross-node north-south packet to a local VPC pod's
 		// fabric IP (either family; the bridges map is 128-bit) is delivered to
 		// its veth here (to_pod does the DNAT), bypassing the kernel FORWARD

@@ -1,8 +1,8 @@
 # LoadBalancer ingress — delivery for LB IPs, eBPF-native
 
 **Status: IMPLEMENTED** — increments 1 and 2 (both families, net-0 and
-VPC-pod backends), `loadBalancerSourceRanges`, and external NodePort
-(`externalTrafficPolicy: Local`). `Cluster` mode remains deferred by design.
+VPC-pod backends), `loadBalancerSourceRanges`, external NodePort, and
+`externalTrafficPolicy: Cluster` via DSR, source preserved in every mode.
 Tracks [#13](../../issues/13). As-built notes are inline below.
 
 ## Scope: delivery, not provisioning
@@ -97,14 +97,67 @@ Each node's kpr derives its rows from objects as written:
   entry; SecurityGroups gate unconditionally at the DNAT point.
 - **v6**: same composition; both families in scope (increment 2).
 
-### `externalTrafficPolicy: Cluster` — deferred, and what it actually needs
+### `externalTrafficPolicy: Cluster` — DSR, still source-preserving
 
-Not NodePort: `Cluster` mode is DNAT to any ready backend cluster-wide plus
-a **client SNAT at the point of ingress** so the reply returns through the
-ingress node — the eBPF masquerade ct at the uplink is the natural home, and
-the mode gives up source preservation by definition. Deferred as a v1 scope
-cut. (Later alternative avoiding even the SNAT: DSR — carry `{client, lbIP}`
-in Geneve metadata so the backend's node replies directly from the LB IP.)
+`Cluster` mode is DNAT to any ready backend cluster-wide. The textbook
+implementation adds a client SNAT at the ingress node so the reply returns
+through it — kube-proxy's shape, which forfeits the client source and needs
+a flow conntrack plus a port range carved against the egress masquerade.
+cozyplane does **DSR** instead (Cilium's Geneve-DSR shape), keeping source
+preservation even in `Cluster` mode:
+
+- **kpr** writes `Cluster` rows with the **cluster-wide** ready backend set
+  (`Local` keeps the node-local set — that stays the only difference between
+  the modes in the tables). NodePort's upstream *default* is `Cluster`, so
+  default NodePort services are now served too.
+- **`lb_ingress`** selects as usual (sourceRanges and the `svc_fwd` flow pin
+  at the ingress node are unchanged, so stickiness holds). A backend that
+  resolves locally takes the existing path. A remote one is DNAT'd (client
+  source untouched) and encapsulated to its node — `remotes` at net 0
+  already maps pod addresses to nodes — with a Geneve option carrying
+  `{lbIP, port}`, the identity the reply must assume.
+- **`from_overlay`** (net-0 branch), on seeing the LB option, tail calls
+  `cozyplane_lb_dsr` (`lb_prog` slot 1): resolve the inner destination — a
+  `bridges` hit is a VPC-pod backend (SG-gated here, where the pod is local;
+  DNAT fabric → VPC IP) — pin `svc_rev` with the option's identity (`lb=1`,
+  lookup-first so steady-state packets don't rewrite the LRU), and deliver
+  locally.
+- **The reply exits the backend's own node**: `lb_return` finds the pin and
+  answers *as the LB IP* out the local uplink — unchanged code; pinning the
+  identity where the backend lives is the whole trick.
+
+**As built.** kpr's `pick` between the node-local and cluster-wide bucket is
+the entire control-plane delta. `encap_lb` stamps the option (class shared
+with the SG TLV, types discriminate); `from_overlay`'s net-0 branch pays one
+`get_tunnel_opt` per decap and tail calls `cozyplane_lb_dsr` (slot 1) on a
+match — VPC east-west never pays it. Two things found live: **(a)** spelling
+the remote test `!be && !l` lets clang fuse two pointer null-tests into a
+pointer OR (`r1 |= r0`), which the verifier prohibits — a scalar
+`remote = (l == NULL)` inside one branch is the fix; **(b)** the frontend's
+link was only configured where a local FloatingIP existed, so a
+MetalLB-announced LB IP black-holed on backend-less nodes — the agent now
+ensures the attach (and the DSR reply's exit config) for **every
+`ExternalPool`'s link on every node**, poll-driven and idempotent, with
+`externalpools` read RBAC added. Consequence for operators: the LB range's
+link must carry a cozyplane `ExternalPool` (or be the default-route link).
+Validated on the dev cluster as a fully asymmetric triangle — client on one
+node, MetalLB announcing from a second (backend-less) node, backend on a
+third: raw SYNs (an in-cluster client's socket-LB bypass) came back as
+SYN-ACKs sourced from the LB IP, emitted by the backend's own node across
+the OCI VLAN. e2e: the backend-less-node `Cluster` delivery with the client
+source asserted, and the default-policy (Cluster) NodePort served from a
+backend-less node.
+
+Three DSR caveats. Two are standard: every node's uplink must be allowed to
+source the LB IP on the wire (the floating-IP anti-spoof class — true
+wherever MetalLB-L2 works), and strictly symmetric middleboxes between
+client and cluster won't like the asymmetric return. The third is sharper
+and NodePort-specific: a cross-node `Cluster` NodePort reply assumes the
+*ingress node's own address* as its source, emitted from the backend's node
+— per-VNIC anti-spoofing (OCI) drops exactly that, and it is the reason
+kube-proxy SNATs this path. On such underlays, cross-node NodePort under
+`Cluster` is provider-dependent; LB IPs (shared addresses, like floating
+IPs) are unaffected.
 
 ## Increments
 
@@ -211,6 +264,4 @@ already does.
   (ARP/NDP announcement, BGP, cloud LB config) — the LB implementation's
   job: CCM, MetalLB, appliance, or operator. cozyplane never writes Service
   status. (`ExternalPool` remains FloatingIP-only.)
-- `externalTrafficPolicy: Cluster` — v1 scope cut (ingress-point client
-  SNAT, or DSR later), not a NodePort dependency.
 - Anything tenant-facing beyond the standard Service object.

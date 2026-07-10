@@ -275,6 +275,7 @@ const (
 	overlayProgCozyplaneFromOverlay = "cozyplane_from_overlay"
 	overlayProgCozyplaneFromPod     = "cozyplane_from_pod"
 	overlayProgCozyplaneFromUplink  = "cozyplane_from_uplink"
+	overlayProgCozyplaneLbDsr       = "cozyplane_lb_dsr"
 	overlayProgCozyplaneLbIngress   = "cozyplane_lb_ingress"
 	overlayProgCozyplaneToPod       = "cozyplane_to_pod"
 )
@@ -324,6 +325,7 @@ type overlayProgramSpecs struct {
 	CozyplaneFromOverlay *ebpf.ProgramSpec `ebpf:"cozyplane_from_overlay"`
 	CozyplaneFromPod     *ebpf.ProgramSpec `ebpf:"cozyplane_from_pod"`
 	CozyplaneFromUplink  *ebpf.ProgramSpec `ebpf:"cozyplane_from_uplink"`
+	CozyplaneLbDsr       *ebpf.ProgramSpec `ebpf:"cozyplane_lb_dsr"`
 	CozyplaneLbIngress   *ebpf.ProgramSpec `ebpf:"cozyplane_lb_ingress"`
 	CozyplaneToPod       *ebpf.ProgramSpec `ebpf:"cozyplane_to_pod"`
 }
@@ -488,6 +490,7 @@ type overlayPrograms struct {
 	CozyplaneFromOverlay *ebpf.Program `ebpf:"cozyplane_from_overlay"`
 	CozyplaneFromPod     *ebpf.Program `ebpf:"cozyplane_from_pod"`
 	CozyplaneFromUplink  *ebpf.Program `ebpf:"cozyplane_from_uplink"`
+	CozyplaneLbDsr       *ebpf.Program `ebpf:"cozyplane_lb_dsr"`
 	CozyplaneLbIngress   *ebpf.Program `ebpf:"cozyplane_lb_ingress"`
 	CozyplaneToPod       *ebpf.Program `ebpf:"cozyplane_to_pod"`
 }
@@ -497,6 +500,7 @@ func (p *overlayPrograms) Close() error {
 		p.CozyplaneFromOverlay,
 		p.CozyplaneFromPod,
 		p.CozyplaneFromUplink,
+		p.CozyplaneLbDsr,
 		p.CozyplaneLbIngress,
 		p.CozyplaneToPod,
 	)

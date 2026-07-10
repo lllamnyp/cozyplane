@@ -1154,6 +1154,52 @@ for _ in $(seq 1 10); do
 done
 [ "$got" = "saw $LBCLIP" ] && pass "VPC-pod backend behind LB IP $LBIP2: delivered into the VPC, source preserved" \
   || fail "VPC-pod backend behind LB IP $LBIP2 (got '$got', client $LBCLIP)"
+
+# etp: Cluster — DSR. The backend lives only on $W; the client enters via
+# $W2, which Local provably refuses (checked above). The ingress node DNATs
+# with the client source untouched and DSR-encapsulates to $W with the
+# frontend identity in a Geneve option; the reply exits $W's own uplink
+# already answering as the LB IP. The backend must still see the REAL client.
+LBIP3="198.51.100.9"
+$K apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: lbclu, namespace: default, labels: {app: lbclu}}
+spec:
+  nodeName: $W
+  containers:
+    - name: s
+      image: nicolaka/netshoot
+      command:
+        - sh
+        - -c
+        - socat TCP-LISTEN:8080,fork,reuseaddr SYSTEM:'echo HTTP/1.0 200 OK; echo; echo saw \$SOCAT_PEERADDR'
+---
+apiVersion: v1
+kind: Service
+metadata: {name: lbclu, namespace: default}
+spec:
+  type: LoadBalancer
+  selector: {app: lbclu}
+  ports: [{port: 80, targetPort: 8080}]
+EOF
+$K -n default wait --for=condition=Ready pod/lbclu --timeout=120s >/dev/null 2>&1
+$K -n default patch svc lbclu --subresource=status --type=merge \
+  -p "{\"status\":{\"loadBalancer\":{\"ingress\":[{\"ip\":\"$LBIP3\"}]}}}" >/dev/null
+docker exec lbcli ip route add "$LBIP3/32" via "$W2IP" >/dev/null 2>&1
+got=""
+for _ in $(seq 1 10); do
+  got=$(docker exec lbcli curl -s -m3 "http://$LBIP3/" 2>/dev/null | tr -d '\r')
+  echo "$got" | grep -q "saw" && break
+  sleep 2
+done
+[ "$got" = "saw $LBCLIP" ] && pass "etp Cluster via the backend-less node: DSR to the backend, source preserved" \
+  || fail "etp Cluster DSR delivery (got '$got', client $LBCLIP)"
+# NodePort under Cluster (the upstream default) serves from ANY node.
+NP3=$($K -n default get svc lbclu -o jsonpath='{.spec.ports[0].nodePort}')
+got=$(docker exec lbcli curl -s -m3 "http://$W2IP:$NP3/" 2>/dev/null | tr -d '\r')
+[ "$got" = "saw $LBCLIP" ] && pass "default-policy NodePort $W2IP:$NP3 (Cluster) served from the backend-less node" \
+  || fail "default-policy NodePort via backend-less node (got '$got', client $LBCLIP)"
 docker rm -f lbcli >/dev/null 2>&1
 
 echo "[revocation]"

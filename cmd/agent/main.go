@@ -366,6 +366,7 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		watchPeerings(ctx, factory, mgr, log)
 		watchGateways(ctx, factory, mgr, nodeName, log)
 		watchFloatingIPs(ctx, factory, mgr, nodeName, log)
+		go ensurePoolUplinks(ctx, sdnClient, mgr, log)
 		watchServiceVIPs(ctx, factory, mgr, log)
 		watchSecurityGroups(ctx, factory, mgr, log)
 		// Per-VPC traffic metrics (#2): serve the datapath counters, labeled by
@@ -996,6 +997,41 @@ func desiredGateways(ports []*sdnv1alpha1.Port, selfName string) map[uint32]gate
 		desired[vni] = gw
 	}
 	return desired
+}
+
+// ensurePoolUplinks keeps the datapath serving every ExternalPool's link on
+// EVERY node. LB/NodePort frontends (docs/lb-ingress.md) arrive wherever the
+// provider attracts them — the pool's L2 — including on nodes that host no
+// floating-IP target, and an etp: Cluster DSR reply must leave by that same
+// link (found live: a MetalLB-announced LB IP black-holed on a node whose
+// only VLAN attach trigger was a local FloatingIP). The floating machinery
+// configured the link per programmed address; pools make it unconditional.
+// Poll-based: pools are tiny, near-static, and EnsureFloatingUplink is
+// idempotent.
+func ensurePoolUplinks(ctx context.Context, client sdnclientset.Interface, mgr *datapath.Manager, log *slog.Logger) {
+	for {
+		pools, err := client.SdnV1alpha1().ExternalPools().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			log.Warn("list externalpools", "err", err)
+		} else {
+			for _, p := range pools.Items {
+				for _, cidr := range p.Spec.CIDRs {
+					ip, _, err := net.ParseCIDR(cidr)
+					if err != nil {
+						continue
+					}
+					if err := mgr.EnsureFloatingUplink(ip.String()); err != nil {
+						log.Warn("ensure pool uplink", "pool", p.Name, "cidr", cidr, "err", err)
+					}
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(30 * time.Second):
+		}
+	}
 }
 
 // watchFloatingIPs programs this node's floating IPs: for each FloatingIP whose

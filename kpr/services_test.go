@@ -80,11 +80,11 @@ func TestLBRows(t *testing.T) {
 		t.Fatal("node-c has an LB row despite no local backend")
 	}
 
-	// etp: Cluster is deferred — no LB rows anywhere.
+	// etp: Cluster carries the cluster-wide backend set (remote ones DSR).
 	rows, _ = computeRows(lbSvc(corev1.ServiceExternalTrafficPolicyCluster,
 		corev1.LoadBalancerIngress{IP: lbIP}), slices, "node-a", nil)
-	if _, ok := rows[lbKey]; ok {
-		t.Fatal("etp: Cluster produced an LB row")
+	if v, ok := rows[lbKey]; !ok || v.N != 2 {
+		t.Fatalf("etp Cluster LB row = %+v ok=%v, want the cluster-wide 2 backends", rows[lbKey], ok)
 	}
 
 	// ipMode: Proxy means the LB proxies — no interception.
@@ -143,11 +143,19 @@ func TestNodePortAndSourceRangeRows(t *testing.T) {
 		t.Fatalf("missing expected lb_src key: %v", srcs)
 	}
 
-	// No ingress IP written (etp Cluster) -> no rows AND no LPM entries.
+	// etp Cluster: rows carry the cluster-wide set, sourceRanges still apply,
+	// and NodePort rows exist too (Cluster is NodePort's upstream default).
 	cl := lbSvc(corev1.ServiceExternalTrafficPolicyCluster, corev1.LoadBalancerIngress{IP: lbIP})
+	cl.Spec.Ports[0].NodePort = 30080
 	cl.Spec.LoadBalancerSourceRanges = []string{"192.0.2.0/24"}
-	_, srcs = computeRows(cl, slices, "node-a", nodeAddrs)
-	if len(srcs) != 0 {
-		t.Fatalf("etp Cluster produced lb_src entries: %v", srcs)
+	rows, srcs = computeRows(cl, slices, "node-a", nodeAddrs)
+	if v, ok := rows[keyFor(lbIP, 80)]; !ok || v.N != 2 || v.Flags&svcFSrcRanges == 0 {
+		t.Fatalf("etp Cluster LB row = %+v ok=%v, want 2 backends + range flag", v, ok)
+	}
+	if v, ok := rows[keyFor("10.0.0.5", 30080)]; !ok || v.N != 2 {
+		t.Fatalf("etp Cluster NodePort row = %+v ok=%v, want 2 backends", v, ok)
+	}
+	if len(srcs) != 1 {
+		t.Fatalf("etp Cluster lb_src entries = %d, want 1: %v", len(srcs), srcs)
 	}
 }
