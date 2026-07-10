@@ -19,6 +19,8 @@ package port
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
 	"k8s.io/apimachinery/pkg/fields"
@@ -84,8 +86,30 @@ func (portStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Objec
 	newPort.Status = oldPort.Status
 }
 
+// Validate pins the name to the address claim: a Port must be named exactly
+// v<vni>.<escaped spec.ip> with spec.ip in canonical form, or the name-based
+// claim (and the registry's cross-kind twin check) could be spoofed by naming
+// one address and using another.
 func (portStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
-	return field.ErrorList{}
+	port := obj.(*sdn.Port)
+	var errs field.ErrorList
+
+	ip := net.ParseIP(port.Spec.IP)
+	if ip == nil || ip.String() != port.Spec.IP {
+		errs = append(errs, field.Invalid(field.NewPath("spec", "ip"), port.Spec.IP,
+			"must be an IP address in canonical form"))
+		return errs
+	}
+	vni, _, ok := sdn.ParseClaim(sdn.ClaimPrefixPort, port.Name)
+	if !ok {
+		errs = append(errs, field.Invalid(field.NewPath("metadata", "name"), port.Name,
+			"must have the form v<vni>.<escaped spec.ip>: the name is the address claim"))
+	} else if port.Name != sdn.PortName(vni, port.Spec.IP) {
+		errs = append(errs, field.Invalid(field.NewPath("metadata", "name"), port.Name,
+			fmt.Sprintf("must be %q (v<vni>.<escaped spec.ip>): the name is the address claim",
+				sdn.PortName(vni, port.Spec.IP))))
+	}
+	return errs
 }
 
 // WarningsOnCreate returns warnings for the creation of the given object.
@@ -104,8 +128,23 @@ func (portStrategy) AllowUnconditionalUpdate() bool {
 func (portStrategy) Canonicalize(obj runtime.Object) {
 }
 
+// ValidateUpdate keeps the claimed address immutable: the (immutable) name is
+// the claim on {VNI, spec.ip}, so neither the address nor the VPC it is
+// scoped to may drift after create. Everything else (node re-point at
+// migration cutover, labels) updates freely.
 func (portStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
-	return field.ErrorList{}
+	newPort := obj.(*sdn.Port)
+	oldPort := old.(*sdn.Port)
+	var errs field.ErrorList
+	if newPort.Spec.IP != oldPort.Spec.IP {
+		errs = append(errs, field.Forbidden(field.NewPath("spec", "ip"),
+			"immutable: the Port name is the claim on this address"))
+	}
+	if newPort.Spec.VPCRef != oldPort.Spec.VPCRef {
+		errs = append(errs, field.Forbidden(field.NewPath("spec", "vpcRef"),
+			"immutable: the claim is scoped to the VPC's VNI"))
+	}
+	return errs
 }
 
 // WarningsOnUpdate returns warnings for the given update.

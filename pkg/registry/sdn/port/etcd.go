@@ -18,9 +18,12 @@ package port
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
 	"github.com/lllamnyp/cozyplane/pkg/registry"
+	"github.com/lllamnyp/cozyplane/pkg/registry/sdn/claim"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/registry/generic"
@@ -31,9 +34,12 @@ import (
 // NewREST returns RESTStorage objects for Ports and their /status subresource.
 // The Port name encodes the VPC VNI and the IP, so creating a Port is an atomic
 // IP claim — etcd name uniqueness serializes concurrent allocators
-// (AlreadyExists on collision), no server-side allocator required. The /status
-// subresource carries controller-resolved SecurityGroup membership.
-func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter) (*registry.REST, *StatusREST, error) {
+// (AlreadyExists on collision), no server-side allocator required. twin is the
+// late-bound handle to the ServiceVIP store: a create is 409-rejected when the
+// same {VNI, IP} claim exists under the other kind (allocators treat the 409
+// like AlreadyExists — address taken, walk on). The /status subresource carries
+// controller-resolved SecurityGroup membership.
+func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter, twin *claim.Twin) (*registry.REST, *StatusREST, error) {
 	strategy := NewStrategy(scheme)
 
 	store := &genericregistry.Store{
@@ -46,6 +52,27 @@ func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter) (*reg
 		CreateStrategy: strategy,
 		UpdateStrategy: strategy,
 		DeleteStrategy: strategy,
+
+		// The cross-kind half of the claim (Validate already pinned the name
+		// to {VNI, spec.ip}): fail the create if a ServiceVIP holds the twin
+		// name. One live Get; runs after validation, before the etcd write.
+		BeginCreate: func(ctx context.Context, obj runtime.Object, _ *metav1.CreateOptions) (genericregistry.FinishFunc, error) {
+			port := obj.(*sdn.Port)
+			vni, _, ok := sdn.ParseClaim(sdn.ClaimPrefixPort, port.Name)
+			if !ok { // unreachable: Validate rejected it already
+				return claim.FinishNothing, nil
+			}
+			twinName := sdn.ServiceVIPName(vni, port.Spec.IP)
+			taken, err := twin.Exists(ctx, twinName)
+			if err != nil {
+				return nil, err
+			}
+			if taken {
+				return nil, apierrors.NewConflict(sdn.Resource("ports"), port.Name,
+					fmt.Errorf("VPC IP %s (VNI %d) is already held by ServiceVIP %s", port.Spec.IP, vni, twinName))
+			}
+			return claim.FinishNothing, nil
+		},
 
 		TableConvertor: rest.NewDefaultTableConvertor(sdn.Resource("ports")),
 	}

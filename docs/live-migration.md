@@ -38,9 +38,11 @@ A pod is a VM NIC pod when it carries the label **`vm.kubevirt.io/name`** (the V
 name); `kubevirt.io/created-by` is the VMI UID (stable across migration) and
 `kubevirt.io/nodeName` is the **active** location (the node the VM currently runs
 on — set on the target only *after* cutover). The stable key is
-`{vpcNamespace, vpc, vm.kubevirt.io/name}`; the Port is named
-`v<vni>-vm-<vmname>` (distinct from the ephemeral `v<vni>.<ip>` shape), so a
-lookup by VM identity needs no IP.
+`{vpcNamespace, vpc, vm.kubevirt.io/name}`; the Port keeps the ordinary
+`v<vni>.<ip>` claim name (the name is the *address* claim, uniform across all
+Ports and registry-enforced) and carries the VM identity as the
+`sdn.cozystack.io/vm-name` label, so a lookup by VM identity is a label
+selection and needs no IP.
 
 - **First pod** (VM start): no persistent Port exists → **create** it, allocating
   the VPC IP (as today) and **generating a stable locally-administered MAC**

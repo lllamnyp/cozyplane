@@ -21,6 +21,7 @@ import (
 	"github.com/lllamnyp/cozyplane/api/sdn/install"
 	sdnopenapi "github.com/lllamnyp/cozyplane/pkg/generated/sdn/openapi"
 	defaultregistry "github.com/lllamnyp/cozyplane/pkg/registry"
+	"github.com/lllamnyp/cozyplane/pkg/registry/sdn/claim"
 	externalpoolstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/externalpool"
 	floatingipstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/floatingip"
 	portstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/port"
@@ -74,14 +75,20 @@ func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOpt
 	if err != nil {
 		panic(err)
 	}
-	serviceVIPREST, serviceVIPStatusREST, err := servicevipstorage.NewREST(scheme, restOptionsGetter)
+	// Ports and ServiceVIPs cross-check each other's address claims at create
+	// (services-in-vpc.md, "VIP allocation" layer 2). The twin handles are
+	// late-bound: both stores must exist before either can look the other up.
+	portTwin, vipTwin := &claim.Twin{}, &claim.Twin{}
+	serviceVIPREST, serviceVIPStatusREST, err := servicevipstorage.NewREST(scheme, restOptionsGetter, vipTwin)
 	if err != nil {
 		panic(err)
 	}
-	portREST, portStatusREST, err := portstorage.NewREST(scheme, restOptionsGetter)
+	portREST, portStatusREST, err := portstorage.NewREST(scheme, restOptionsGetter, portTwin)
 	if err != nil {
 		panic(err)
 	}
+	portTwin.Exists = claim.StoreExists(serviceVIPREST.Store)
+	vipTwin.Exists = claim.StoreExists(portREST.Store)
 	securityGroupREST, securityGroupStatusREST, err := securitygroupstorage.NewREST(scheme, restOptionsGetter)
 	if err != nil {
 		panic(err)

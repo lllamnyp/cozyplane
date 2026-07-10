@@ -91,14 +91,24 @@ Two kinds now draw from one per-net IP keyspace, and a Port and a
    live-read (APIReader, per the VNI-duplicate lesson) **union of claims
    across both kinds**, serialized per VPC where the allocation happens
    in-process.
-2. **Fail closed at the API** *(deferred as-built)*: the registry strategies
-   have no cross-kind reader today, so this layer is not implemented. In its
-   place, **both allocators check the live union** (the controller's VIP walk
-   lists Ports + ServiceVIPs; the CNI's Port claim now also counts
-   ServiceVIPs as used) and they **walk from opposite ends** of the CIDR
-   (Ports bottom-up from `.2`, VIPs top-down from the last address), so a
-   collision requires a nearly-exhausted pool plus a lost race — which layer
-   3 then repairs.
+2. **Fail closed at the API** (aggregated mode): the Port and ServiceVIP
+   registries enforce the claim at write time. `Validate` pins the name *to*
+   the claim — a create must be named exactly `v<vni>.<escaped spec.ip>` /
+   `sv<vni>.<escaped spec.ip>` with `spec.ip` in canonical form, and
+   `spec.ip`/`spec.vpcRef` are immutable on update — and `BeginCreate` then
+   rejects the create with `409 Conflict` when the **twin name** (the same
+   `<vni>.<ip>` under the other kind's prefix) already exists, via one live
+   Get against the other kind's storage. Both allocators treat that 409
+   exactly like `AlreadyExists`: address taken, walk on. There is no
+   cross-kind transaction, so two *simultaneous* creates of the same address
+   can still both land — that residue, and CRD mode (which has no registry
+   strategies), is what layer 3 repairs.
+   In front of the API check, **both allocators check the live union** (the
+   controller's VIP walk lists Ports + ServiceVIPs; the CNI's Port claim also
+   counts ServiceVIPs as used) and they **walk from opposite ends** of the
+   CIDR (Ports bottom-up from `.2`, VIPs top-down from the last address), so
+   reaching the fail-closed check at all requires a nearly-exhausted pool
+   plus a lost race.
 3. **Deterministic repair backstop.** If a duplicate ever materializes (cache
    lag, CRD mode), **the Port always wins**: Port IPs are workload- and
    VM-pinned identity and immovable, while a VIP is movable *by construction*
@@ -241,12 +251,15 @@ etcd pods (or VM-hosted members) in `vpc-a`, Services annotated into the VPC:
    attached ClusterIP services with the VIP (A/AAAA and `_port._proto` SRV);
    the cluster ClusterIP never appears in a tenant.
 
-   **Cross-kind uniqueness, as hardened:** the registry-layer fail-closed
-   check (design layer 2) is still deferred, but the Port-always-wins repair
-   is now *prompt* — the ServiceVIP controller watches Ports and re-checks any
-   same-VPC VIP holding a new Port's IP immediately, rather than waiting for
-   the Service to change. Combined with opposite-end allocation (layer 1), a
-   collision is both improbable and repaired at watch latency.
+   **Cross-kind uniqueness, as hardened:** all three layers are in. The
+   registry-layer fail-closed check (design layer 2, above) landed after the
+   increment: in aggregated mode the name is validated to *be* the claim and
+   a create is 409-rejected when the twin name exists under the other kind.
+   The Port-always-wins repair is *prompt* — the ServiceVIP controller
+   watches Ports and re-checks any same-VPC VIP holding a new Port's IP
+   immediately, rather than waiting for the Service to change. Combined with
+   opposite-end allocation (layer 1), a collision now needs a simultaneous
+   cross-kind create race (or CRD mode), and is repaired at watch latency.
 3. **VM resolver config** — ties into vm-provisioning's RA/DHCP so guests
    learn the resolver without manual config.
    **Implemented** — the agent's userspace RA responder

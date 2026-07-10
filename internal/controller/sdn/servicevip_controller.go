@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/lllamnyp/cozyplane/api/sdn"
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
 )
 
@@ -256,9 +257,11 @@ func (r *ServiceVIPReconciler) ensureVIP(ctx context.Context, svc *corev1.Servic
 		},
 	}
 	if err := r.Create(ctx, svip); err != nil {
-		if apierrors.IsAlreadyExists(err) {
+		if apierrors.IsAlreadyExists(err) || apierrors.IsConflict(err) {
 			// The name encodes the (VNI, IP) claim: a concurrent allocator got
-			// there first. Requeue and walk again.
+			// there first — AlreadyExists for a sibling VIP, Conflict (409)
+			// from the aggregated registry's cross-kind check when a Port
+			// holds the address. Requeue and walk again.
 			return nil, nil
 		}
 		return nil, fmt.Errorf("create ServiceVIP: %w", err)
@@ -282,10 +285,11 @@ func vipPorts(svc *corev1.Service) []sdnv1alpha1.VIPPort {
 }
 
 // vipName mirrors the Port name convention (sv<vni>.<ip-with-dashes>): the
-// name is an atomic claim on the address among ServiceVIPs.
+// name is an atomic claim on the address among ServiceVIPs, registry-validated
+// to match spec.ip. Shared helper so the writers and the registry check can
+// never drift.
 func vipName(vni int32, ip string) string {
-	esc := strings.NewReplacer(".", "-", ":", "-").Replace(ip)
-	return fmt.Sprintf("sv%d.%s", vni, esc)
+	return sdn.ServiceVIPName(vni, ip)
 }
 
 // allocateVIP picks a free address from the top of the VPC's first CIDR

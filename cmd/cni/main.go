@@ -49,6 +49,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"github.com/lllamnyp/cozyplane/api/sdn"
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
 	"github.com/lllamnyp/cozyplane/datapath"
 	sdnclientset "github.com/lllamnyp/cozyplane/pkg/generated/sdn/clientset/versioned"
@@ -726,7 +727,10 @@ func attachPort(client sdnclientset.Interface, vpc *sdnv1alpha1.VPC, vpcNS strin
 			Spec: spec,
 		}
 		created, err := client.SdnV1alpha1().Ports().Create(context.TODO(), port, metav1.CreateOptions{})
-		if apierrors.IsAlreadyExists(err) {
+		// AlreadyExists: another Port claimed the name first. Conflict (409):
+		// the aggregated registry's cross-kind check — a ServiceVIP holds the
+		// same address. Either way the address is taken; walk on.
+		if apierrors.IsAlreadyExists(err) || apierrors.IsConflict(err) {
 			used[ipStr] = true
 			candidate = nextIP(candidate)
 			continue
@@ -748,14 +752,12 @@ func genMAC() net.HardwareAddr {
 	return net.HardwareAddr(b)
 }
 
-// portName builds the cluster-scoped Port name v<vni>.<ip-escaped>. Both the v4
-// dot and the v6 colon are invalid in a Kubernetes object name, so both are
-// escaped to '-' (e.g. 10.0.0.2 -> v5.10-0-0-2, fd00:10::2 -> v5.fd00-10--2).
-// Only the VNI is parsed back out (netFromPortName); the address is carried in
-// the Port spec, so the escaping need not be reversible, only unique per VNI.
+// portName builds the cluster-scoped Port name v<vni>.<ip-escaped> — the
+// address claim, registry-validated to match spec.ip. Shared helper so the
+// writer (here), the controller's ServiceVIP twin, and the registry check
+// can never drift.
 func portName(vni int32, ip string) string {
-	esc := strings.NewReplacer(".", "-", ":", "-").Replace(ip)
-	return fmt.Sprintf("v%d.%s", vni, esc)
+	return sdn.PortName(vni, ip)
 }
 
 // setupVeth creates the pod veth, configures the pod-side address and routes,
