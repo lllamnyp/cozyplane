@@ -88,6 +88,63 @@ func (m *Manager) SyncNPAllows(allows []NPAllow) error {
 	return syncMap(m.objs.NpAllow, want)
 }
 
+// NPCidr is one compiled ipBlock entry: for the isolated identity (the
+// destination of an ingress rule, the source of an egress one), an address
+// range that admits (Allow) or masks (an `except` — !Allow) traffic on
+// (proto, port). Port 0 = any. Longest-prefix-match makes an except win over
+// its enclosing allow; at an identical prefix an allow from any policy wins
+// (policies union).
+type NPCidr struct {
+	ID    uint64
+	Dir   uint8
+	Proto uint8
+	Port  uint16 // host order; stored network order
+	CIDR  *net.IPNet
+	Allow bool
+}
+
+// SyncNPCidrs makes the np_cidr LPM exactly `entries` (full-state diff). A v4
+// range lives in NAT64 form, so its /N becomes /(96+N) in the address space;
+// the key prefix is the 96 fixed bits (dir+proto+port+id) plus that.
+func (m *Manager) SyncNPCidrs(entries []NPCidr) error {
+	want := map[overlayNpCidrKey]uint8{}
+	for _, e := range entries {
+		if e.CIDR == nil {
+			continue
+		}
+		ones, _ := e.CIDR.Mask.Size()
+		ip := e.CIDR.IP
+		var bits uint32
+		if v4 := ip.To4(); v4 != nil {
+			ip = v4
+			bits = 96 + uint32(ones)
+		} else {
+			bits = uint32(ones)
+		}
+		a, err := addr128(ip)
+		if err != nil {
+			return fmt.Errorf("np_cidr range %q: %w", e.CIDR, err)
+		}
+		key := overlayNpCidrKey{
+			Prefixlen: 96 + bits,
+			Dir:       e.Dir,
+			Proto:     e.Proto,
+			Port:      htons(e.Port),
+			Id:        e.ID,
+			Addr:      a,
+		}
+		var v uint8
+		if e.Allow {
+			v = 1
+		}
+		if prev, ok := want[key]; ok && prev == 1 {
+			continue // an allow from any policy wins at an identical prefix
+		}
+		want[key] = v
+	}
+	return syncMap(m.objs.NpCidr, want)
+}
+
 // SetNPNode marks an address as node-origin (ingress-policy exempt);
 // DelNPNode unmarks it. Incremental, like SetNodeRemote.
 func (m *Manager) SetNPNode(ip net.IP) error {

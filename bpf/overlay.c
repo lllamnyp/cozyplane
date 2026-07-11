@@ -850,6 +850,30 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } np_ct SEC(".maps");
 
+// np_cidr: ipBlock rules, both directions (increment 2). LPM on the queried
+// address (the SOURCE for an ingress rule, the DESTINATION for egress) with
+// {dir, proto, port, identity} fully specified ahead of it — the composite-LPM
+// shape of sg_cidr. The value distinguishes allow (1) from deny (0): an
+// ipBlock `except` is a longer deny prefix, and longest-prefix-match makes it
+// win over the enclosing allow. Port 0 = any-port, probed second.
+struct np_cidr_key {
+	__u32 prefixlen; // 96 (dir+proto+port+id) + address prefix bits
+	__u8 dir;        // NP_DIR_*
+	__u8 proto;
+	__u16 port; // network order; 0 = any
+	__u64 id;   // the isolated pod's identity (dst for IN, src for EG)
+	struct addr128 addr;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__type(key, struct np_cidr_key);
+	__type(value, __u8);
+	__uint(max_entries, 65536);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} np_cidr SEC(".maps");
+
 // np_nodes: node addresses (all nodes, both families, agent-fed from Node
 // objects). Node-origin plumbing — kubelet probes, hostNetwork pods — bypasses
 // ingress policy, per invariant #7 and every implementation's convention.
@@ -898,6 +922,7 @@ struct np_scratch_val {
 	struct np_query q;
 	struct np_allow_key ak;
 	struct np_ct_key ck;
+	struct np_cidr_key cd;
 };
 
 struct {
@@ -907,12 +932,55 @@ struct {
 	__uint(max_entries, 1);
 } np_scratch SEC(".maps");
 
-// np_ingress decides a gated net-0 delivery (query pre-filled in scratch).
-// Returns 1 to admit. Noinline with a single map-value pointer arg: to_pod's
-// frame gains nothing, and this frame holds only spilled registers — the
-// sg_admit shape. Probe order: exact {dst,src} pair, its any-port row, the
-// ANY_POD rows (src must resolve as a pod), the ANY rows (external included),
-// then the UDP reply-pin.
+// np_cidr_check probes the ipBlock LPM for one direction (the queried address
+// pre-copied into s->cd.addr): exact port then any-port. Returns 1 on an
+// allow match; a deny match (an `except`) or no match returns 0 — the deny
+// only needs to mask the allow, and longest-prefix-match already did that.
+static __always_inline int np_cidr_check(struct np_scratch_val *s, __u8 dir, __u64 self)
+{
+	s->cd.prefixlen = 96 + 128;
+	s->cd.dir = dir;
+	s->cd.proto = s->q.proto;
+	s->cd.id = self;
+	s->cd.port = s->q.dport;
+	asm volatile("" ::: "memory");
+	__u8 *v = bpf_map_lookup_elem(&np_cidr, &s->cd);
+	if (v)
+		return *v;
+	s->cd.port = 0;
+	asm volatile("" ::: "memory");
+	v = bpf_map_lookup_elem(&np_cidr, &s->cd);
+	return v ? *v : 0;
+}
+
+// np_pin_check probes the UDP reply-pin: the destination asked first, so the
+// reply is sanctioned past BOTH directions — the pin lives on the
+// initiator's node, which is exactly where the reply is policy-checked.
+static __always_inline int np_pin_check(struct np_scratch_val *s)
+{
+	if (s->q.proto != IPPROTO_UDP)
+		return 0;
+	s->ck.pod = s->q.dst;
+	s->ck.peer = s->q.src;
+	s->ck.pport = s->q.dport;
+	s->ck.rport = s->q.sport;
+	s->ck.proto = IPPROTO_UDP;
+	s->ck.pad[0] = 0;
+	s->ck.pad[1] = 0;
+	s->ck.pad[2] = 0;
+	asm volatile("" ::: "memory");
+	return bpf_map_lookup_elem(&np_ct, &s->ck) != NULL;
+}
+
+// np_ingress / np_egress decide one direction each of a gated net-0 delivery
+// (query pre-filled in scratch); a flow is delivered only if both admit —
+// the sg_admit/sg_egress_admit composition on the NP maps. TWO lean sibling
+// callees instead of one fat one: to_pod sits at 432 bytes of frame, and the
+// combined-call-stack limit is per CHAIN — sibling frames don't stack, but a
+// single callee holding both directions' spilled state blew 512 on the 6.8
+// verifier (544) while a newer kernel accepted it. Straight-line unrolled
+// probes, every key in scratch, single map-value pointer arg (the sg_admit
+// shape). Each returns 1 to admit.
 static __attribute__((noinline)) int np_ingress(struct np_scratch_val *s)
 {
 	struct np_ident_val *di = bpf_map_lookup_elem(&np_ident, &s->q.dst);
@@ -959,21 +1027,60 @@ static __attribute__((noinline)) int np_ingress(struct np_scratch_val *s)
 	if (bpf_map_lookup_elem(&np_allow, &s->ak))
 		return 1;
 
-	if (s->q.proto == IPPROTO_UDP) {
-		// The reply half of a pinned outbound UDP flow: this pod asked first.
-		s->ck.pod = s->q.dst;
-		s->ck.peer = s->q.src;
-		s->ck.pport = s->q.dport;
-		s->ck.rport = s->q.sport;
-		s->ck.proto = IPPROTO_UDP;
-		s->ck.pad[0] = 0;
-		s->ck.pad[1] = 0;
-		s->ck.pad[2] = 0;
+	s->cd.addr = s->q.src;
+	if (np_cidr_check(s, NP_DIR_IN, di->id))
+		return 1;
+	return np_pin_check(s);
+}
+
+static __attribute__((noinline)) int np_egress(struct np_scratch_val *s)
+{
+	struct np_ident_val *si = bpf_map_lookup_elem(&np_ident, &s->q.src);
+	if (!si)
+		return 1;
+	if (!(si->flags & NP_EG_ISOLATED))
+		return 1;
+
+	struct np_ident_val *di = bpf_map_lookup_elem(&np_ident, &s->q.dst);
+
+	s->ak.src_id = si->id;
+	s->ak.dir = NP_DIR_EG;
+	s->ak.proto = s->q.proto;
+	s->ak.pad = 0;
+	if (di) {
+		s->ak.dst_id = di->id;
+		s->ak.port = s->q.dport;
 		asm volatile("" ::: "memory");
-		if (bpf_map_lookup_elem(&np_ct, &s->ck))
+		if (bpf_map_lookup_elem(&np_allow, &s->ak))
+			return 1;
+		s->ak.port = 0;
+		asm volatile("" ::: "memory");
+		if (bpf_map_lookup_elem(&np_allow, &s->ak))
+			return 1;
+		s->ak.dst_id = NP_SRC_ANY_POD;
+		s->ak.port = s->q.dport;
+		asm volatile("" ::: "memory");
+		if (bpf_map_lookup_elem(&np_allow, &s->ak))
+			return 1;
+		s->ak.port = 0;
+		asm volatile("" ::: "memory");
+		if (bpf_map_lookup_elem(&np_allow, &s->ak))
 			return 1;
 	}
-	return 0;
+	s->ak.dst_id = NP_SRC_ANY;
+	s->ak.port = s->q.dport;
+	asm volatile("" ::: "memory");
+	if (bpf_map_lookup_elem(&np_allow, &s->ak))
+		return 1;
+	s->ak.port = 0;
+	asm volatile("" ::: "memory");
+	if (bpf_map_lookup_elem(&np_allow, &s->ak))
+		return 1;
+
+	s->cd.addr = s->q.dst;
+	if (np_cidr_check(s, NP_DIR_EG, si->id))
+		return 1;
+	return np_pin_check(s);
 }
 
 // sg_query is the fully-initialized argument to sg_admit: a single PTR_TO_STACK
@@ -3835,21 +3942,45 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 			return lr;
 	}
 
-	// NetworkPolicy UDP reply-pin (docs/network-policy.md): an ingress-
-	// isolated net-0 pod's outbound UDP pins {pod, peer, ports} so the reply
-	// passes this pod's to_pod gate — upstream-stateful semantics, one LRU
-	// write on the pod's own node (the maps are per-node; the reply is
-	// checked here too). Inline: from_pod hosts no BPF-to-BPF callee; the
-	// key is built in per-CPU scratch, costing this frame nothing. Non-UDP
-	// and non-isolated sources pay one hash lookup at most.
-	if (!srcnet && !dstnet && p.proto == IPPROTO_UDP &&
-	    ifindex != cfg(CFG_UPLINK_IFINDEX)) {
+	// NetworkPolicy, the from_pod half (docs/network-policy.md). Two duties,
+	// both inline (from_pod hosts no BPF-to-BPF callee) with every key in
+	// per-CPU scratch:
+	//
+	// 1. The UDP reply-pin: an outbound UDP query pins {pod, peer, ports}
+	//    when this pod's ingress is isolated OR the responder's egress is —
+	//    the reply is policy-checked for BOTH directions at this node's
+	//    to_pod, and the pin sanctions both (upstream-stateful UDP, no
+	//    cross-node state).
+	// 2. The external-egress gate: pod-to-pod egress is enforced at the
+	//    destination's to_pod, but an identity-less destination (off-
+	//    cluster) has no to_pod anywhere — gate it here via the reserved-
+	//    ANY pair rows and the np_cidr LPM. Node-destined egress is exempt
+	//    (apiserver/kubelet plumbing — a documented deviation).
+	//
+	// Cost when idle: one hash lookup for TCP from a non-isolated pod, two
+	// for UDP.
+	if (!srcnet && !dstnet && ifindex != cfg(CFG_UPLINK_IFINDEX) &&
+	    (p.proto == IPPROTO_TCP || p.proto == IPPROTO_UDP)) {
 		struct np_ident_val *ni = bpf_map_lookup_elem(&np_ident, &p.src);
-		if (ni && (ni->flags & NP_ING_ISOLATED)) {
+		int eg = ni && (ni->flags & NP_EG_ISOLATED);
+		if (ni && (eg || p.proto == IPPROTO_UDP)) {
+			struct np_ident_val *di = bpf_map_lookup_elem(&np_ident, &p.dst);
+			int want_pin = 0, want_gate = 0;
+			if (p.proto == IPPROTO_UDP) {
+				want_pin = (ni->flags & NP_ING_ISOLATED) != 0;
+				if (di && (di->flags & NP_EG_ISOLATED))
+					want_pin = 1;
+			}
+			if (eg && !di) {
+				if (!bpf_map_lookup_elem(&np_nodes, &p.dst))
+					want_gate = 1;
+			}
 			__u32 zero = 0;
-			struct np_scratch_val *s = bpf_map_lookup_elem(&np_scratch, &zero);
+			struct np_scratch_val *s = NULL;
+			if (want_pin || want_gate)
+				s = bpf_map_lookup_elem(&np_scratch, &zero);
 			__u32 l4off = p.is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
-			if (s) {
+			if (s && want_pin) {
 				s->ck.pod = p.src;
 				s->ck.peer = p.dst;
 				bpf_skb_load_bytes(skb, l4off, &s->ck.pport, 2);
@@ -3861,6 +3992,66 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 				__u8 one = 1;
 				asm volatile("" ::: "memory");
 				bpf_map_update_elem(&np_ct, &s->ck, &one, BPF_ANY);
+			}
+			if (s && want_gate) {
+				// Gate new TCP connections and all UDP (sg_l4 semantics,
+				// hand-rolled through scratch to keep this frame flat).
+				int gate = 1;
+				bpf_skb_load_bytes(skb, l4off + 2, &s->q.dport, 2);
+				if (p.proto == IPPROTO_TCP) {
+					s->q.pad[0] = 0;
+					bpf_skb_load_bytes(skb, l4off + 13, &s->q.pad[0], 1);
+					gate = (s->q.pad[0] & 0x02) && !(s->q.pad[0] & 0x10);
+				}
+				if (gate) {
+					int ok = 0;
+					s->ak.dst_id = NP_SRC_ANY; // empty to: admits external
+					s->ak.src_id = ni->id;
+					s->ak.dir = NP_DIR_EG;
+					s->ak.proto = p.proto;
+					s->ak.pad = 0;
+					s->ak.port = s->q.dport;
+					asm volatile("" ::: "memory");
+					if (bpf_map_lookup_elem(&np_allow, &s->ak))
+						ok = 1;
+					if (!ok) {
+						s->ak.port = 0;
+						asm volatile("" ::: "memory");
+						if (bpf_map_lookup_elem(&np_allow, &s->ak))
+							ok = 1;
+					}
+					if (!ok) {
+						s->cd.prefixlen = 96 + 128;
+						s->cd.dir = NP_DIR_EG;
+						s->cd.proto = p.proto;
+						s->cd.port = s->q.dport;
+						s->cd.id = ni->id;
+						s->cd.addr = p.dst;
+						asm volatile("" ::: "memory");
+						__u8 *v = bpf_map_lookup_elem(&np_cidr, &s->cd);
+						if (v && *v)
+							ok = 1;
+						if (!ok) {
+							s->cd.port = 0;
+							asm volatile("" ::: "memory");
+							v = bpf_map_lookup_elem(&np_cidr, &s->cd);
+							if (v && *v)
+								ok = 1;
+						}
+					}
+					if (!ok) {
+						// Inline drop count, key via scratch: from_pod
+						// at 496 bytes affords neither count_np_drop's
+						// frame (496+48 = 544 blew the 512 combined-
+						// stack limit on 6.8) nor a new stack slot.
+						s->cd.prefixlen = NP_DIR_EG;
+						asm volatile("" ::: "memory");
+						__u64 *d = bpf_map_lookup_elem(&np_drops, &s->cd.prefixlen);
+						if (d)
+							(*d)++;
+						return TC_ACT_SHOT;
+					}
+				}
 			}
 		}
 	}
@@ -4199,6 +4390,10 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 			asm volatile("" ::: "memory");
 			if (!np_ingress(s)) {
 				count_np_drop(NP_DIR_IN);
+				return TC_ACT_SHOT;
+			}
+			if (!np_egress(s)) {
+				count_np_drop(NP_DIR_EG);
 				return TC_ACT_SHOT;
 			}
 		}

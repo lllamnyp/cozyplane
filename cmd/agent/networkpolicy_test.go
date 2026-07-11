@@ -261,18 +261,136 @@ func TestNPCompileSkipsAndWarnings(t *testing.T) {
 	if _, ok := identOf(c, "172.18.0.2"); ok {
 		t.Fatal("hostNetwork pod got an identity row")
 	}
-	var sawFiltered, sawIPBlock, sawNamed bool
+	var sawFiltered, sawNamed bool
 	for _, w := range c.warnings {
 		sawFiltered = sawFiltered || strings.Contains(w, "identity-filtered")
-		sawIPBlock = sawIPBlock || strings.Contains(w, "ipBlock")
 		sawNamed = sawNamed || strings.Contains(w, "named port")
 	}
-	if !sawFiltered || !sawIPBlock || !sawNamed {
+	if !sawFiltered || !sawNamed {
 		t.Fatalf("missing warnings: %v", c.warnings)
 	}
-	// The unserved peers/ports compiled to nothing — fail closed, no allows.
+	// The unserved port compiled the whole rule to nothing — fail closed:
+	// no allows, and no cidr entries for the ipBlock either.
+	if len(c.allows) != 0 || len(c.cidrs) != 0 {
+		t.Fatalf("unserved constructs leaked rows: %+v %+v", c.allows, c.cidrs)
+	}
+}
+
+func TestNPCompileIPBlock(t *testing.T) {
+	pods := []*corev1.Pod{
+		npPod("prod", "web-1", "10.244.0.10", map[string]string{"app": "web"}),
+	}
+	nss := []*corev1.Namespace{npNS("prod", nil)}
+	nps := []*networkingv1.NetworkPolicy{{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "from-range"},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{{
+				From: []networkingv1.NetworkPolicyPeer{{
+					IPBlock: &networkingv1.IPBlock{
+						CIDR:   "192.0.2.0/24",
+						Except: []string{"192.0.2.128/25"},
+					},
+				}},
+				Ports: []networkingv1.NetworkPolicyPort{{Port: ptrIntOrString(8080)}},
+			}},
+		},
+	}}
+	c := compileNetworkPolicies(pods, nss, nps)
+	w, _ := identOf(c, "10.244.0.10")
+	var allow, deny bool
+	for _, e := range c.cidrs {
+		if e.ID != w.ID || e.Dir != datapath.NPDirIn || e.Proto != 6 || e.Port != 8080 {
+			t.Fatalf("cidr entry mis-keyed: %+v", e)
+		}
+		if e.CIDR.String() == "192.0.2.0/24" && e.Allow {
+			allow = true
+		}
+		if e.CIDR.String() == "192.0.2.128/25" && !e.Allow {
+			deny = true
+		}
+	}
+	if !allow || !deny {
+		t.Fatalf("ipBlock not compiled to allow+except: %+v", c.cidrs)
+	}
+	// No identity pairs from a pure-ipBlock rule.
 	if len(c.allows) != 0 {
-		t.Fatalf("unserved constructs leaked allows: %+v", c.allows)
+		t.Fatalf("ipBlock leaked pair rows: %+v", c.allows)
+	}
+}
+
+func TestNPCompileEgress(t *testing.T) {
+	pods := []*corev1.Pod{
+		npPod("prod", "cli-1", "10.244.0.11", map[string]string{"role": "cli"}),
+		npPod("prod", "web-1", "10.244.0.10", map[string]string{"app": "web"}),
+	}
+	nss := []*corev1.Namespace{npNS("prod", nil)}
+	nps := []*networkingv1.NetworkPolicy{{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "cli-egress"},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"role": "cli"}},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
+			Egress: []networkingv1.NetworkPolicyEgressRule{
+				{
+					To:    []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}}},
+					Ports: []networkingv1.NetworkPolicyPort{{Port: ptrIntOrString(8080)}},
+				},
+				{
+					To: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: "198.51.100.0/24"}}},
+				},
+				{
+					// namespaceSelector {}: any pod destination.
+					To: []networkingv1.NetworkPolicyPeer{{NamespaceSelector: &metav1.LabelSelector{}}},
+					Ports: []networkingv1.NetworkPolicyPort{{
+						Protocol: new(corev1.ProtocolUDP), Port: ptrIntOrString(53),
+					}},
+				},
+			},
+		},
+	}}
+	c := compileNetworkPolicies(pods, nss, nps)
+	cli, _ := identOf(c, "10.244.0.11")
+	web, _ := identOf(c, "10.244.0.10")
+	if cli.Flags&datapath.NPEgIsolated == 0 {
+		t.Fatal("egress policy did not isolate the subject")
+	}
+	if cli.Flags&datapath.NPIngIsolated != 0 {
+		t.Fatal("egress-only policy wrongly ingress-isolated the subject")
+	}
+	if web.Flags != 0 {
+		t.Fatal("peer wrongly isolated")
+	}
+	// Pair row: subject in the SRC slot, peer in the DST slot, dir EG.
+	found := false
+	for _, a := range c.allows {
+		if a.Dir == datapath.NPDirEg && a.SrcID == cli.ID && a.DstID == web.ID && a.Proto == 6 && a.Port == 8080 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing egress pair row: %+v", c.allows)
+	}
+	// ANY_POD destination for the DNS rule.
+	found = false
+	for _, a := range c.allows {
+		if a.Dir == datapath.NPDirEg && a.SrcID == cli.ID && a.DstID == datapath.NPSrcAnyPod && a.Proto == 17 && a.Port == 53 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing ANY_POD egress DNS row: %+v", c.allows)
+	}
+	// The egress ipBlock is keyed by the SUBJECT identity, dir EG, and the
+	// rule's empty ports mean any-port rows for both protocols.
+	var v4any bool
+	for _, e := range c.cidrs {
+		if e.ID == cli.ID && e.Dir == datapath.NPDirEg && e.CIDR.String() == "198.51.100.0/24" && e.Allow && e.Port == 0 {
+			v4any = true
+		}
+	}
+	if !v4any {
+		t.Fatalf("missing egress cidr entry: %+v", c.cidrs)
 	}
 }
 

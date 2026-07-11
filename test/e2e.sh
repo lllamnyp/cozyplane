@@ -1248,7 +1248,9 @@ metadata: {name: npsame, namespace: nptest, labels: {role: allowed}}
 spec:
   nodeName: $W
   containers:
-    - {name: s, image: nicolaka/netshoot, command: [sleep, infinity]}
+    - name: s
+      image: nicolaka/netshoot
+      command: [python3, -m, http.server, "8080", --bind, "::"]
 EOF
 $K -n nptest wait --for=condition=Ready pod/npsrv pod/npcli pod/npsame --timeout=120s >/dev/null 2>&1
 NPSRV=$($K -n nptest get pod npsrv -o jsonpath='{.status.podIP}')
@@ -1338,6 +1340,150 @@ spec:
 EOF
 np_served nptest npcli "http://$NPSRV:8080/" && pass "empty-from rule reopens npsrv (NP_SRC_ANY union)" \
   || fail "empty-from rule did not admit the client"
+
+# --- increment 2: ipBlock + egress (network-policy.md) ---
+# External clients reach pods via the sanctioned paths only (LB/NodePort), so
+# the ipBlock tests ride a hand-provisioned LB IP (the thought-experiment
+# path): status patched by hand, client routed at a node, lb_ingress DNATs
+# with the source preserved — exactly what ipBlock evaluates.
+$K -n nptest delete networkpolicy npsrv-open >/dev/null
+NPLB="198.51.100.20"
+NPWIP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$W")
+$K apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Service
+metadata: {name: npsrv, namespace: nptest}
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector: {app: npsrv}
+  ports: [{port: 8080, targetPort: 8080}]
+EOF
+$K -n nptest patch svc npsrv --subresource=status --type=merge \
+  -p "{\"status\":{\"loadBalancer\":{\"ingress\":[{\"ip\":\"$NPLB\"}]}}}" >/dev/null
+docker run -d --rm --name npext --cap-add NET_ADMIN --network kind nicolaka/netshoot \
+  sh -c 'python3 -m http.server 8080 --bind :: >/dev/null 2>&1 & sleep 600' >/dev/null 2>&1
+NPEXTIP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' npext)
+docker exec npext ip route add "$NPLB/32" via "$NPWIP" >/dev/null 2>&1
+
+npext_refused() {
+  for _ in $(seq 1 10); do
+    docker exec npext curl -s -m3 "http://$NPLB:8080/" >/dev/null 2>&1 || return 0
+    sleep 2
+  done
+  return 1
+}
+npext_served() {
+  for _ in $(seq 1 10); do
+    docker exec npext curl -s -m3 "http://$NPLB:8080/" >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  return 1
+}
+
+npext_refused && pass "isolated backend refuses the external LB client (no ipBlock)" \
+  || fail "external client served without an ipBlock rule"
+$K apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: npsrv-ext, namespace: nptest}
+spec:
+  podSelector: {matchLabels: {app: npsrv}}
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{ipBlock: {cidr: $NPEXTIP/32}}]
+      ports: [{port: 8080}]
+EOF
+npext_served && pass "ipBlock admits the declared external client (through lb_ingress, source preserved)" \
+  || fail "ipBlock rule did not admit the external client"
+$K apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: npsrv-ext, namespace: nptest}
+spec:
+  podSelector: {matchLabels: {app: npsrv}}
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{ipBlock: {cidr: 172.18.0.0/16, except: [$NPEXTIP/32]}}]
+      ports: [{port: 8080}]
+EOF
+npext_refused && pass "ipBlock except masks the client (longer deny prefix wins)" \
+  || fail "ipBlock except did not mask the client"
+
+# Egress: pair rule, external default-deny, the canonical DNS rule, ipBlock.
+NPSAME=$($K -n nptest get pod npsame -o jsonpath='{.status.podIP}')
+np_served nptest npcli "http://$NPSAME:8080/" && pass "npcli reaches npsame before egress policy" \
+  || fail "npsame unreachable before egress policy"
+$K apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: cli-egress, namespace: nptest}
+spec:
+  podSelector: {matchLabels: {role: cli}}
+  policyTypes: [Egress]
+  egress:
+    - to: [{podSelector: {matchLabels: {role: allowed}}}]
+      ports: [{port: 8080}]
+EOF
+dnsdead=0
+for _ in $(seq 1 10); do
+  $K -n nptest exec npcli -- nslookup -timeout=2 kubernetes.default >/dev/null 2>&1 || { dnsdead=1; break; }
+  sleep 2
+done
+[ "$dnsdead" = "1" ] && pass "egress isolation gates UDP DNS (no rule yet)" \
+  || fail "egress-isolated pod still resolves DNS without a rule"
+np_served nptest npcli "http://$NPSAME:8080/" && pass "egress pair rule admits the declared destination" \
+  || fail "egress pair rule did not admit npsame"
+egout=0
+$K -n nptest exec npcli -- curl -s -m3 "http://$NPEXTIP:8080/" >/dev/null 2>&1 && egout=1
+[ "$egout" = "0" ] && pass "external egress default-deny (no cidr rule)" \
+  || fail "egress-isolated pod reached an external destination without a rule"
+$K apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: cli-egress, namespace: nptest}
+spec:
+  podSelector: {matchLabels: {role: cli}}
+  policyTypes: [Egress]
+  egress:
+    - to: [{podSelector: {matchLabels: {role: allowed}}}]
+      ports: [{port: 8080}]
+    - to: [{namespaceSelector: {}}]
+      ports: [{protocol: UDP, port: 53}]
+    - to: [{ipBlock: {cidr: $NPEXTIP/32}}]
+      ports: [{port: 8080}]
+EOF
+dnsok=0
+for _ in $(seq 1 10); do
+  $K -n nptest exec npcli -- nslookup -timeout=3 kubernetes.default >/dev/null 2>&1 && { dnsok=1; break; }
+  sleep 2
+done
+[ "$dnsok" = "1" ] && pass "egress DNS rule (ANY_POD destination, UDP 53) restores lookups" \
+  || fail "DNS still dead under the egress DNS rule"
+egok=0
+for _ in $(seq 1 10); do
+  $K -n nptest exec npcli -- curl -s -m3 "http://$NPEXTIP:8080/" >/dev/null 2>&1 && { egok=1; break; }
+  sleep 2
+done
+[ "$egok" = "1" ] && pass "egress ipBlock opens the external destination (from_pod gate)" \
+  || fail "egress ipBlock did not open the external destination"
+$K apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: cli-egress, namespace: nptest}
+spec:
+  podSelector: {matchLabels: {role: cli}}
+  policyTypes: [Egress]
+  egress: [{}]
+EOF
+egany=0
+for _ in $(seq 1 10); do
+  $K -n nptest exec npcli -- curl -s -m3 "http://$NPEXTIP:8080/" >/dev/null 2>&1 && { egany=1; break; }
+  sleep 2
+done
+[ "$egany" = "1" ] && pass "empty egress rule = allow-all destinations (reserved ANY)" \
+  || fail "empty egress rule did not allow the external destination"
+docker rm -f npext >/dev/null 2>&1
 
 $K delete ns nptest --wait=false >/dev/null 2>&1
 

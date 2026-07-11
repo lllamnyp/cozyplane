@@ -132,6 +132,7 @@ func npNodeAddresses(node *corev1.Node) []net.IP {
 type npCompiled struct {
 	idents   []datapath.NPIdent
 	allows   []datapath.NPAllow
+	cidrs    []datapath.NPCidr
 	warnings []string
 }
 
@@ -266,52 +267,44 @@ func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*
 			}
 		}
 
-		if !hasIngress {
-			continue
-		}
-		for _, rule := range np.Spec.Ingress {
-			ports := npCompilePorts(policy, rule.Ports, &c.warnings)
-
-			// Peers: an empty from admits everything, external included.
-			// (Compiled before the empty-ports bail so unserved-peer
-			// warnings still surface.)
-			var peerIDs []uint64
-			if len(rule.From) == 0 {
-				peerIDs = []uint64{datapath.NPSrcAny}
-			}
-			for _, from := range rule.From {
-				if from.IPBlock != nil {
-					c.warnings = append(c.warnings, fmt.Sprintf("%s: ipBlock not served yet (increment 2) — peer compiled closed", policy))
+		// resolvePeers compiles one rule's peer list into identity ids
+		// (reserved ANY_POD for namespaceSelector:{}) and ipBlocks.
+		resolvePeers := func(peers []networkingv1.NetworkPolicyPeer) ([]uint64, []*networkingv1.IPBlock) {
+			var ids []uint64
+			var blocks []*networkingv1.IPBlock
+			for _, peer := range peers {
+				if peer.IPBlock != nil {
+					blocks = append(blocks, peer.IPBlock)
 					continue
 				}
-				npSelectorWarnings(policy, from.PodSelector, &c.warnings)
-				npSelectorWarnings(policy, from.NamespaceSelector, &c.warnings)
+				npSelectorWarnings(policy, peer.PodSelector, &c.warnings)
+				npSelectorWarnings(policy, peer.NamespaceSelector, &c.warnings)
 
 				switch {
-				case from.NamespaceSelector == nil:
+				case peer.NamespaceSelector == nil:
 					// Same-namespace pod peers.
-					sel, err := metav1.LabelSelectorAsSelector(from.PodSelector)
+					sel, err := metav1.LabelSelectorAsSelector(peer.PodSelector)
 					if err != nil {
 						c.warnings = append(c.warnings, fmt.Sprintf("%s: bad peer podSelector: %v", policy, err))
 						continue
 					}
 					for id, info := range registry {
 						if info.ns == np.Namespace && sel.Matches(info.lbls) {
-							peerIDs = append(peerIDs, id)
+							ids = append(ids, id)
 						}
 					}
-				case from.PodSelector == nil && len(from.NamespaceSelector.MatchLabels) == 0 && len(from.NamespaceSelector.MatchExpressions) == 0:
-					// namespaceSelector: {} — any pod source, one reserved id.
-					peerIDs = append(peerIDs, datapath.NPSrcAnyPod)
+				case peer.PodSelector == nil && len(peer.NamespaceSelector.MatchLabels) == 0 && len(peer.NamespaceSelector.MatchExpressions) == 0:
+					// namespaceSelector: {} — any pod, one reserved id.
+					ids = append(ids, datapath.NPSrcAnyPod)
 				default:
-					nsSel, err := metav1.LabelSelectorAsSelector(from.NamespaceSelector)
+					nsSel, err := metav1.LabelSelectorAsSelector(peer.NamespaceSelector)
 					if err != nil {
 						c.warnings = append(c.warnings, fmt.Sprintf("%s: bad peer namespaceSelector: %v", policy, err))
 						continue
 					}
 					podSel := labels.Everything()
-					if from.PodSelector != nil {
-						podSel, err = metav1.LabelSelectorAsSelector(from.PodSelector)
+					if peer.PodSelector != nil {
+						podSel, err = metav1.LabelSelectorAsSelector(peer.PodSelector)
 						if err != nil {
 							c.warnings = append(c.warnings, fmt.Sprintf("%s: bad peer podSelector: %v", policy, err))
 							continue
@@ -323,26 +316,107 @@ func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*
 							continue
 						}
 						if podSel.Matches(info.lbls) {
-							peerIDs = append(peerIDs, id)
+							ids = append(ids, id)
 						}
 					}
 				}
 			}
+			return ids, blocks
+		}
 
-			if len(ports) == 0 {
-				continue
-			}
-			for _, dst := range subjects {
-				for _, src := range peerIDs {
-					for _, p := range ports {
-						allows[datapath.NPAllow{
-							DstID: dst,
-							SrcID: src,
-							Dir:   datapath.NPDirIn,
-							Proto: p.proto,
-							Port:  p.port,
-						}] = true
+		// compileBlocks turns one ipBlock into np_cidr entries for one
+		// isolated identity: the allow range plus a deny per except.
+		compileBlocks := func(blocks []*networkingv1.IPBlock, self uint64, dir uint8, ports []npPort) {
+			for _, b := range blocks {
+				_, cidr, err := net.ParseCIDR(strings.TrimSpace(b.CIDR))
+				if err != nil {
+					c.warnings = append(c.warnings, fmt.Sprintf("%s: bad ipBlock cidr %q: %v", policy, b.CIDR, err))
+					continue
+				}
+				for _, p := range ports {
+					c.cidrs = append(c.cidrs, datapath.NPCidr{
+						ID: self, Dir: dir, Proto: p.proto, Port: p.port,
+						CIDR: cidr, Allow: true,
+					})
+				}
+				for _, exs := range b.Except {
+					_, ex, err := net.ParseCIDR(strings.TrimSpace(exs))
+					if err != nil {
+						c.warnings = append(c.warnings, fmt.Sprintf("%s: bad ipBlock except %q: %v", policy, exs, err))
+						continue
 					}
+					for _, p := range ports {
+						c.cidrs = append(c.cidrs, datapath.NPCidr{
+							ID: self, Dir: dir, Proto: p.proto, Port: p.port,
+							CIDR: ex, Allow: false,
+						})
+					}
+				}
+			}
+		}
+
+		if hasIngress {
+			for _, rule := range np.Spec.Ingress {
+				ports := npCompilePorts(policy, rule.Ports, &c.warnings)
+
+				// An empty from admits everything, external included.
+				// (Peers compiled before the empty-ports bail so their
+				// warnings still surface.)
+				var peerIDs []uint64
+				var blocks []*networkingv1.IPBlock
+				if len(rule.From) == 0 {
+					peerIDs = []uint64{datapath.NPSrcAny}
+				} else {
+					peerIDs, blocks = resolvePeers(rule.From)
+				}
+				if len(ports) == 0 {
+					continue
+				}
+				for _, dst := range subjects {
+					for _, src := range peerIDs {
+						for _, p := range ports {
+							allows[datapath.NPAllow{
+								DstID: dst,
+								SrcID: src,
+								Dir:   datapath.NPDirIn,
+								Proto: p.proto,
+								Port:  p.port,
+							}] = true
+						}
+					}
+					compileBlocks(blocks, dst, datapath.NPDirIn, ports)
+				}
+			}
+		}
+
+		if hasEgress {
+			for _, rule := range np.Spec.Egress {
+				ports := npCompilePorts(policy, rule.Ports, &c.warnings)
+
+				// An empty to admits every destination, external included.
+				var peerIDs []uint64
+				var blocks []*networkingv1.IPBlock
+				if len(rule.To) == 0 {
+					peerIDs = []uint64{datapath.NPSrcAny}
+				} else {
+					peerIDs, blocks = resolvePeers(rule.To)
+				}
+				if len(ports) == 0 {
+					continue
+				}
+				for _, src := range subjects {
+					for _, dst := range peerIDs {
+						for _, p := range ports {
+							allows[datapath.NPAllow{
+								DstID: dst, // the peer side for egress
+								SrcID: src, // the isolated subject
+								Dir:   datapath.NPDirEg,
+								Proto: p.proto,
+								Port:  p.port,
+							}] = true
+						}
+					}
+					compileBlocks(blocks, src, datapath.NPDirEg, ports)
 				}
 			}
 		}
@@ -417,6 +491,10 @@ func watchNetworkPolicies(ctx context.Context, client kubernetes.Interface, mgr 
 		}
 		if err := mgr.SyncNPAllows(c.allows); err != nil {
 			log.Error("sync np_allow (a full map only over-drops — fail-closed)", "err", err)
+			npSyncErrors.Add(1)
+		}
+		if err := mgr.SyncNPCidrs(c.cidrs); err != nil {
+			log.Error("sync np_cidr (a full map only over-drops — fail-closed)", "err", err)
 			npSyncErrors.Add(1)
 		}
 	}

@@ -131,6 +131,16 @@ type overlayNpAllowKey struct {
 	Pad   uint32
 }
 
+type overlayNpCidrKey struct {
+	_         structs.HostLayout
+	Prefixlen uint32
+	Dir       uint8
+	Proto     uint8
+	Port      uint16
+	Id        uint64
+	Addr      overlayAddr128
+}
+
 type overlayNpCtKey struct {
 	_     structs.HostLayout
 	Pod   overlayAddr128
@@ -161,6 +171,7 @@ type overlayNpScratchVal struct {
 	}
 	Ak overlayNpAllowKey
 	Ck overlayNpCtKey
+	Cd overlayNpCidrKey
 }
 
 type overlayPeerKey struct {
@@ -300,6 +311,7 @@ const (
 	overlayMapNodeIp6               = "node_ip6"
 	overlayMapNodeRemotes           = "node_remotes"
 	overlayMapNpAllow               = "np_allow"
+	overlayMapNpCidr                = "np_cidr"
 	overlayMapNpCt                  = "np_ct"
 	overlayMapNpDrops               = "np_drops"
 	overlayMapNpIdent               = "np_ident"
@@ -404,6 +416,7 @@ type overlayMapSpecs struct {
 	NodeIp6        *ebpf.MapSpec `ebpf:"node_ip6"`
 	NodeRemotes    *ebpf.MapSpec `ebpf:"node_remotes"`
 	NpAllow        *ebpf.MapSpec `ebpf:"np_allow"`
+	NpCidr         *ebpf.MapSpec `ebpf:"np_cidr"`
 	NpCt           *ebpf.MapSpec `ebpf:"np_ct"`
 	NpDrops        *ebpf.MapSpec `ebpf:"np_drops"`
 	NpIdent        *ebpf.MapSpec `ebpf:"np_ident"`
@@ -474,6 +487,7 @@ type overlayMaps struct {
 	NodeIp6        *ebpf.Map `ebpf:"node_ip6"`
 	NodeRemotes    *ebpf.Map `ebpf:"node_remotes"`
 	NpAllow        *ebpf.Map `ebpf:"np_allow"`
+	NpCidr         *ebpf.Map `ebpf:"np_cidr"`
 	NpCt           *ebpf.Map `ebpf:"np_ct"`
 	NpDrops        *ebpf.Map `ebpf:"np_drops"`
 	NpIdent        *ebpf.Map `ebpf:"np_ident"`
@@ -520,6 +534,7 @@ func (m *overlayMaps) Close() error {
 		m.NodeIp6,
 		m.NodeRemotes,
 		m.NpAllow,
+		m.NpCidr,
 		m.NpCt,
 		m.NpDrops,
 		m.NpIdent,

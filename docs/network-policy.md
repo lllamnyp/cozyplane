@@ -1,8 +1,8 @@
 # NetworkPolicy on the default network (net 0)
 
-Status: **increment 1 built** (ingress, pod/namespace selector peers, label-
-follows, the UDP reply-pin, node exemption — e2e 128/128). Increments 2–3
-(ipBlock, egress, conformance) are design-final, not yet built.
+Status: **increments 1–2 built** (ingress + egress, selector and ipBlock
+peers with `except`, label-follows, the UDP reply-pin, node exemption —
+e2e 138/138). Increment 3 (conformance, endPort) remains.
 
 The production blocker Cilium's removal left open (roadmap §6): the default
 network has no `NetworkPolicy` enforcement. The decision (2026-07-11) is to
@@ -87,7 +87,7 @@ u32s.
 |-----|-----|-------|
 | `np_ident` | fabric IP (addr128) | `{u64 identity, u32 flags}` — flags: ING_ISOLATED, EG_ISOLATED |
 | `np_allow` | `{u64 dst_id, u64 src_id, u8 dir, u8 proto, u16 port}` | presence = allow (`port` 0 = any) |
-| `np_cidr` | LPM `{u64 id, u8 dir, prefix, addr128}` | allow / deny (ipBlock `except` = longer deny prefix) |
+| `np_cidr` | LPM `{prefixlen, u8 dir, u8 proto, u16 port, u64 id, addr128}` | allow / deny (ipBlock `except` = longer deny prefix; port 0 = any, probed second) |
 | `np_ct` | `{addr128 ×2, ports, proto}` LRU | UDP reply-pin (written at the admitted direction) |
 | `np_drops` | direction | drop counter (metrics, like `sg_drops`) |
 
@@ -120,10 +120,23 @@ separate policy unions, unlike SG's symmetric-pair admission).
 - **Egress, pod-to-pod: also `to_pod`** — enforced at the destination's
   delivery hook exactly as `sg_egress_admit` is (a flow is delivered only if
   both directions allow; placement-independent, and it spares `from_pod`'s
-  496-byte stack).
-- **Egress, cluster-external: `from_pod`'s masquerade/uplink path**, the
-  `ns_egress_ok` precedent — an `np_cidr` egress probe keyed by the source's
-  identity, same loop-free shape.
+  496-byte stack). This placement is also what makes stateful UDP work for
+  the egress direction *with per-node maps*: a reply is policy-checked —
+  both the reply's ingress into the initiator AND the responder's egress —
+  on the **initiator's node**, which is exactly where the initiator's
+  outbound query pinned `np_ct`. One pin sanctions both directions; no
+  cross-node state. The pin-write condition is therefore "initiator
+  ingress-isolated **or** responder egress-isolated" (the initiator's node
+  knows both: `np_ident` is cluster-wide on every node).
+- **Egress, cluster-external: `from_pod`, inline** (the destination has no
+  `to_pod` anywhere) — reserved-ANY `np_allow` probes plus the `np_cidr`
+  LPM, keys through the same per-CPU scratch (from_pod hosts no callee).
+  Two documented deviations/gaps here: **node-destined egress is exempt**
+  (apiserver/kubelet plumbing keeps working — invariant #7's spirit; some
+  implementations gate this, revisit with the host firewall), and a net-0
+  **VM guest's per-packet-DNAT'd ClusterIP egress is checked against the
+  VIP, not the backend** (socket-LB'd pods — the normal case — present the
+  post-translation backend address, matching upstream implementations).
 - **Statefulness**: TCP gated on new connections only (SYN-gate — SG's
   conntrack-free trick, upstream-compatible in practice). **UDP is the open
   problem**: upstream semantics are stateful (an egress-allowed DNS query's
@@ -170,8 +183,27 @@ separate policy unions, unlike SG's symmetric-pair admission).
    message. `NP_EG_ISOLATED` is fed truthfully but not yet enforced.
    Resync is a full recompute + diff-sync on any watched event (the SG
    shape); map writes happen only for actual deltas.
-2. **ipBlock + egress** — `np_cidr` (with `except`), EG_ISOLATED, the
-   `to_pod` egress pair and the `from_pod` external-egress LPM.
+2. **ipBlock + egress** — **BUILT.** `np_cidr` (allow/deny values; `except`
+   = a longer deny prefix, allow-wins at an identical prefix so policies
+   union), egress enforced at the destination's `to_pod` for pod-to-pod and
+   inline at `from_pod` for identity-less destinations, the widened pin
+   condition. e2e (138/138): ipBlock admit + except through the LB path
+   with the source preserved, egress pair/DNS/external-cidr/empty-`to`,
+   plus everything from increment 1.
+
+   *As built — a verifier war story with a moral.* The first cut put both
+   directions in one `np_check` callee and counted `from_pod`'s gate drops
+   via the `count_np_drop` subprogram. dev4's kernel loaded it; kind's 6.8
+   verifier refused: *"combined stack size of 2 calls is 544"* —
+   `from_pod`(496) plus even a trivial callee frame busts 512, and the
+   two-direction callee's spills did the same on `to_pod`(432). The moral:
+   **frames near the cliff get sibling callees, never nested ones, and hot
+   paths at 496 bytes get zero bpf-to-bpf calls** — `np_ingress` and
+   `np_egress` are two lean siblings (sibling frames don't stack), and
+   `from_pod` counts its drop inline with the map key routed through
+   scratch. Different kernels explore different verifier states: a load
+   that succeeds on one kernel proves nothing about the floor the project
+   supports — kind's 6.8 is the gate.
 3. **Conformance + scale** — run the upstream netpol conformance/cyclonus
    suite against kind; map sizing under identity churn; `endPort` ranges.
 
