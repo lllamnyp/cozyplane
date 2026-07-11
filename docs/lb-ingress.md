@@ -148,16 +148,31 @@ the OCI VLAN. e2e: the backend-less-node `Cluster` delivery with the client
 source asserted, and the default-policy (Cluster) NodePort served from a
 backend-less node.
 
-Three DSR caveats. Two are standard: every node's uplink must be allowed to
-source the LB IP on the wire (the floating-IP anti-spoof class — true
-wherever MetalLB-L2 works), and strictly symmetric middleboxes between
-client and cluster won't like the asymmetric return. The third is sharper
-and NodePort-specific: a cross-node `Cluster` NodePort reply assumes the
-*ingress node's own address* as its source, emitted from the backend's node
-— per-VNIC anti-spoofing (OCI) drops exactly that, and it is the reason
-kube-proxy SNATs this path. On such underlays, cross-node NodePort under
-`Cluster` is provider-dependent; LB IPs (shared addresses, like floating
-IPs) are unaffected.
+Three DSR caveats, best read as three grades of spoof permission the
+underlay must grant:
+
+1. **`Cluster` LB DSR needs *every* backend-hosting node allowed to source
+   the LB IP on the wire.** This is strictly stronger than what MetalLB-L2
+   itself proves: L2 announcement only requires the *announcer* to source
+   the IP, and under `Local` the announcer is also the replying node — so
+   `Local` works wherever MetalLB-L2 works, but `Cluster` does not follow.
+   A per-VNIC anti-spoof underlay (default OCI VNICs, AWS/GCP source/dest
+   checks) can grant the announcer and deny the fleet; the failure is a
+   silent black hole (DNAT and encap succeed, the fabric eats the reply).
+   The dev cluster works because the floating VLAN carries the exemption on
+   every node. On a strict fabric the degradation is `etp: Local`; the
+   deliberately-unbuilt escape hatch is kube-proxy's SNAT-at-ingress, which
+   would trade the client source for fabric-independence — an opt-in knob
+   if such a provider ever matters, never a default.
+2. Strictly symmetric middleboxes between client and cluster won't like the
+   asymmetric return.
+3. Sharper still, and NodePort-specific: a cross-node `Cluster` NodePort
+   reply assumes the *ingress node's own address* as its source, emitted
+   from the backend's node. A node address is not a shareable address — no
+   anti-spoof exemption class exists for it anywhere — and this is the
+   reason kube-proxy SNATs this path. Cross-node NodePort under `Cluster`
+   is the most provider-dependent piece; LB IPs at least have the
+   floating-IP exemption class to lean on.
 
 ## Increments
 
