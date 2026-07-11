@@ -1187,6 +1187,19 @@ $K -n default wait --for=condition=Ready pod/lbclu --timeout=120s >/dev/null 2>&
 $K -n default patch svc lbclu --subresource=status --type=merge \
   -p "{\"status\":{\"loadBalancer\":{\"ingress\":[{\"ip\":\"$LBIP3\"}]}}}" >/dev/null
 docker exec lbcli ip route add "$LBIP3/32" via "$W2IP" >/dev/null 2>&1
+# DSR is strictly opt-in and the DS ships CLUSTER_DSR=false: while gated
+# off, cozyplane writes no row on the backend-less node, so no
+# source-preserving delivery can happen. (This kind cluster still runs
+# kube-proxy, so the un-intercepted traffic falls through to its iptables
+# — served, but masqueraded. The preserved client source is DSR's
+# unforgeable signature; on a cozyplane-only cluster the node refuses.)
+sleep 5
+got=$(docker exec lbcli curl -s -m3 "http://$LBIP3/" 2>/dev/null | tr -d '\r')
+[ "$got" = "saw $LBCLIP" ] && fail "etp Cluster gated off, yet delivery preserved the source (DSR leaked past the gate)" \
+  || pass "etp Cluster gated off (CLUSTER_DSR=false): no source-preserving delivery (got '${got:-nothing}')"
+$K -n kube-system set env ds/cozyplane-kpr -c kpr CLUSTER_DSR=true >/dev/null
+$K -n kube-system rollout status ds/cozyplane-kpr --timeout=180s >/dev/null 2>&1 \
+  || fail "cozyplane-kpr rollout after CLUSTER_DSR=true"
 got=""
 for _ in $(seq 1 10); do
   got=$(docker exec lbcli curl -s -m3 "http://$LBIP3/" 2>/dev/null | tr -d '\r')

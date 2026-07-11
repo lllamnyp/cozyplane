@@ -66,6 +66,12 @@ spec:
             # (externalTrafficPolicy: Local — docs/lb-ingress.md).
             - name: NODE_NAME
               valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            # externalTrafficPolicy: Cluster via DSR is strictly opt-in: it
+            # needs EVERY node permitted to source the LB IPs on the wire,
+            # which cozyplane cannot verify and whose denial black-holes
+            # silently (docs/lb-ingress.md, DSR caveats). Off, Cluster rows
+            # degrade to node-local backends (Local delivery semantics).
+            - {name: CLUSTER_DSR, value: "false"}
           securityContext:
             privileged: true
           volumeMounts:

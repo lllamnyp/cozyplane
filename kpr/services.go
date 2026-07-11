@@ -131,6 +131,9 @@ type vipReconciler struct {
 	// nodeName scopes the LB-ingress rows to this node's ready backends
 	// (etp: Local as a per-node filter). Empty disables LB rows.
 	nodeName string
+	// clusterDSR opts in to serving etp: Cluster cluster-wide via DSR
+	// (docs/lb-ingress.md). Off, Cluster rows degrade to node-local backends.
+	clusterDSR bool
 
 	// owned indexes the net-0 keys this process wrote, per service ("ns/name" →
 	// key → last-written value). It is what makes pruning scan-free: a service's
@@ -152,8 +155,9 @@ type vipReconciler struct {
 // runServiceVIPs reconciles Services + EndpointSlices into the pinned svc_vips
 // map at net 0 until ctx is done. Runs alongside the LB hive; the two never
 // write the same keys (this owns net 0, socket-LB uses Cilium's own maps).
-// nodeName (the node this kpr instance runs on) scopes LB-ingress rows.
-func runServiceVIPs(ctx context.Context, pinDir, nodeName string, logger *slog.Logger) error {
+// nodeName (the node this kpr instance runs on) scopes LB-ingress rows;
+// clusterDSR is the strictly-opt-in etp: Cluster DSR gate.
+func runServiceVIPs(ctx context.Context, pinDir, nodeName string, clusterDSR bool, logger *slog.Logger) error {
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
 		return fmt.Errorf("in-cluster config: %w", err)
@@ -226,12 +230,13 @@ func runServiceVIPs(ctx context.Context, pinDir, nodeName string, logger *slog.L
 		epsLister: epsInformer.Lister(),
 		queue: workqueue.NewTypedRateLimitingQueue(
 			workqueue.DefaultTypedControllerRateLimiter[string]()),
-		logger:    logger,
-		nodeName:  nodeName,
-		owned:     map[string]map[svcKey]svcVal{},
-		lbsrc:     lbsrc,
-		ownedSrc:  map[string]map[lbSrcKey]uint8{},
-		nodeAddrs: nodeAddrs,
+		logger:     logger,
+		nodeName:   nodeName,
+		clusterDSR: clusterDSR,
+		owned:      map[string]map[svcKey]svcVal{},
+		lbsrc:      lbsrc,
+		ownedSrc:   map[string]map[lbSrcKey]uint8{},
+		nodeAddrs:  nodeAddrs,
 	}
 
 	_, _ = svcInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -399,7 +404,7 @@ func (r *vipReconciler) computeService(svc *corev1.Service) (map[svcKey]svcVal, 
 	if err != nil {
 		return nil, nil, err
 	}
-	rows, srcs := computeRows(svc, slices, r.nodeName, r.nodeAddrs)
+	rows, srcs := computeRows(svc, slices, r.nodeName, r.nodeAddrs, r.clusterDSR)
 	return rows, srcs, nil
 }
 
@@ -417,7 +422,7 @@ type bucketKey struct {
 // Single pass over the EndpointSlices: ready endpoints are bucketed by
 // {address family, port name}, cluster-wide and node-local in parallel, then
 // each (servicePort × address) picks its bucket — no per-port re-walk.
-func computeRows(svc *corev1.Service, slices []*discoveryv1.EndpointSlice, nodeName string, nodeAddrs []net.IP) (map[svcKey]svcVal, map[lbSrcKey]uint8) {
+func computeRows(svc *corev1.Service, slices []*discoveryv1.EndpointSlice, nodeName string, nodeAddrs []net.IP, clusterDSR bool) (map[svcKey]svcVal, map[lbSrcKey]uint8) {
 	buckets := map[bucketKey][]svcBackend{}
 	local := map[bucketKey][]svcBackend{}
 	add := func(m map[bucketKey][]svcBackend, bk bucketKey, be svcBackend) {
@@ -517,10 +522,13 @@ func computeRows(svc *corev1.Service, slices []*discoveryv1.EndpointSlice, nodeN
 	// etp picks the backend set: Local rows carry this node's ready backends
 	// only; Cluster rows carry the cluster-wide set (remote backends ride
 	// DSR — docs/lb-ingress.md). That is the entire difference between the
-	// modes here.
+	// modes here. Cluster's cluster-wide set is strictly opt-in (clusterDSR):
+	// DSR needs every node permitted to source the LB IPs on the wire, and a
+	// denying underlay black-holes silently — ungated, Cluster degrades to
+	// node-local delivery (Local semantics under Cluster's API contract).
 	etpLocal := svc.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyLocal
 	pick := func(bk bucketKey) []svcBackend {
-		if etpLocal {
+		if etpLocal || !clusterDSR {
 			return local[bk]
 		}
 		return buckets[bk]

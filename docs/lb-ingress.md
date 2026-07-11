@@ -126,6 +126,17 @@ preservation even in `Cluster` mode:
   answers *as the LB IP* out the local uplink — unchanged code; pinning the
   identity where the backend lives is the whole trick.
 
+**Strictly opt-in.** DSR's fleet-wide spoof requirement (caveat 1 below) is
+an underlay property cozyplane cannot detect, and denial fails as a silent
+black hole — so `Cluster` DSR ships default-off, gated by `CLUSTER_DSR=true`
+on cozyplane-kpr. Ungated, `Cluster` rows carry the node-local backend set:
+`Local` delivery semantics under `Cluster`'s API contract — a node serves
+the backends it hosts (source preserved), a backend-less node refuses,
+nothing black-holes. (On a cluster still running kube-proxy, un-intercepted
+LB traffic simply falls through to its iptables — served cluster-wide,
+masqueraded: kube-proxy's own `Cluster` semantics.) Enable it only where every node may source the LB
+range on the wire (e.g. the dev cluster's floating VLAN).
+
 **As built.** kpr's `pick` between the node-local and cluster-wide bucket is
 the entire control-plane delta. `encap_lb` stamps the option (class shared
 with the SG TLV, types discriminate); `from_overlay`'s net-0 branch pays one

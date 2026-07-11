@@ -55,7 +55,7 @@ func TestLBRows(t *testing.T) {
 	slices := slice("node-a", "node-b")
 
 	// node-a: one local backend -> one LB row with only 10.244.0.10.
-	rows, _ := computeRows(svc, slices, "node-a", nil)
+	rows, _ := computeRows(svc, slices, "node-a", nil, false)
 	lbKey := keyFor(lbIP, 80)
 	v, ok := rows[lbKey]
 	if !ok {
@@ -75,28 +75,41 @@ func TestLBRows(t *testing.T) {
 	}
 
 	// A node with no local backend gets no LB row (Local's contract).
-	rows, _ = computeRows(svc, slices, "node-c", nil)
+	rows, _ = computeRows(svc, slices, "node-c", nil, false)
 	if _, ok := rows[lbKey]; ok {
 		t.Fatal("node-c has an LB row despite no local backend")
 	}
 
-	// etp: Cluster carries the cluster-wide backend set (remote ones DSR).
-	rows, _ = computeRows(lbSvc(corev1.ServiceExternalTrafficPolicyCluster,
-		corev1.LoadBalancerIngress{IP: lbIP}), slices, "node-a", nil)
+	// etp: Cluster with the DSR opt-in carries the cluster-wide backend set
+	// (remote ones DSR).
+	cluster := lbSvc(corev1.ServiceExternalTrafficPolicyCluster,
+		corev1.LoadBalancerIngress{IP: lbIP})
+	rows, _ = computeRows(cluster, slices, "node-a", nil, true)
 	if v, ok := rows[lbKey]; !ok || v.N != 2 {
 		t.Fatalf("etp Cluster LB row = %+v ok=%v, want the cluster-wide 2 backends", rows[lbKey], ok)
+	}
+
+	// Without the opt-in, Cluster degrades to node-local delivery: the local
+	// backend on node-a, no row at all on backend-less node-c.
+	rows, _ = computeRows(cluster, slices, "node-a", nil, false)
+	if v, ok := rows[lbKey]; !ok || v.N != 1 || v.Be[0].IP != want {
+		t.Fatalf("gated-off Cluster LB row = %+v ok=%v, want the 1 local backend", rows[lbKey], ok)
+	}
+	rows, _ = computeRows(cluster, slices, "node-c", nil, false)
+	if _, ok := rows[lbKey]; ok {
+		t.Fatal("gated-off Cluster produced an LB row on a backend-less node")
 	}
 
 	// ipMode: Proxy means the LB proxies — no interception.
 	proxy := corev1.LoadBalancerIPModeProxy
 	rows, _ = computeRows(lbSvc(corev1.ServiceExternalTrafficPolicyLocal,
-		corev1.LoadBalancerIngress{IP: lbIP, IPMode: &proxy}), slices, "node-a", nil)
+		corev1.LoadBalancerIngress{IP: lbIP, IPMode: &proxy}), slices, "node-a", nil, false)
 	if _, ok := rows[lbKey]; ok {
 		t.Fatal("ipMode Proxy produced an LB row")
 	}
 
 	// Empty nodeName (env unset) disables LB rows but keeps ClusterIP rows.
-	rows, _ = computeRows(svc, slices, "", nil)
+	rows, _ = computeRows(svc, slices, "", nil, false)
 	if _, ok := rows[lbKey]; ok {
 		t.Fatal("empty nodeName produced an LB row")
 	}
@@ -113,7 +126,7 @@ func TestNodePortAndSourceRangeRows(t *testing.T) {
 	slices := slice("node-a", "node-b")
 	nodeAddrs := []net.IP{net.ParseIP("10.0.0.5"), net.ParseIP("fd00::5")}
 
-	rows, srcs := computeRows(svc, slices, "node-a", nodeAddrs)
+	rows, srcs := computeRows(svc, slices, "node-a", nodeAddrs, false)
 
 	// NodePort row keyed by the node's v4 address x nodePort, local backends.
 	npKey := keyFor("10.0.0.5", 30080)
@@ -143,12 +156,13 @@ func TestNodePortAndSourceRangeRows(t *testing.T) {
 		t.Fatalf("missing expected lb_src key: %v", srcs)
 	}
 
-	// etp Cluster: rows carry the cluster-wide set, sourceRanges still apply,
-	// and NodePort rows exist too (Cluster is NodePort's upstream default).
+	// etp Cluster (DSR opted in): rows carry the cluster-wide set, sourceRanges
+	// still apply, and NodePort rows exist too (Cluster is NodePort's upstream
+	// default).
 	cl := lbSvc(corev1.ServiceExternalTrafficPolicyCluster, corev1.LoadBalancerIngress{IP: lbIP})
 	cl.Spec.Ports[0].NodePort = 30080
 	cl.Spec.LoadBalancerSourceRanges = []string{"192.0.2.0/24"}
-	rows, srcs = computeRows(cl, slices, "node-a", nodeAddrs)
+	rows, srcs = computeRows(cl, slices, "node-a", nodeAddrs, true)
 	if v, ok := rows[keyFor(lbIP, 80)]; !ok || v.N != 2 || v.Flags&svcFSrcRanges == 0 {
 		t.Fatalf("etp Cluster LB row = %+v ok=%v, want 2 backends + range flag", v, ok)
 	}
@@ -157,5 +171,14 @@ func TestNodePortAndSourceRangeRows(t *testing.T) {
 	}
 	if len(srcs) != 1 {
 		t.Fatalf("etp Cluster lb_src entries = %d, want 1: %v", len(srcs), srcs)
+	}
+
+	// Gated off, the same service's rows degrade to the node-local backend.
+	rows, _ = computeRows(cl, slices, "node-a", nodeAddrs, false)
+	if v, ok := rows[keyFor(lbIP, 80)]; !ok || v.N != 1 {
+		t.Fatalf("gated-off Cluster LB row = %+v ok=%v, want 1 local backend", v, ok)
+	}
+	if v, ok := rows[keyFor("10.0.0.5", 30080)]; !ok || v.N != 1 {
+		t.Fatalf("gated-off Cluster NodePort row = %+v ok=%v, want 1 local backend", v, ok)
 	}
 }

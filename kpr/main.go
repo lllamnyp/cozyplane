@@ -26,6 +26,7 @@ import (
 	_ "embed"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/statedb"
@@ -121,8 +122,16 @@ func main() {
 	if nodeName == "" {
 		logger.Warn("NODE_NAME unset: LoadBalancer-ingress rows disabled")
 	}
+	// externalTrafficPolicy: Cluster via DSR is strictly opt-in — it needs
+	// every node permitted to source the LB IPs on the wire, an underlay
+	// property that fails as a silent black hole when denied (docs/lb-ingress.md,
+	// DSR caveats). Ungated, Cluster rows degrade to node-local backends.
+	clusterDSR, _ := strconv.ParseBool(os.Getenv("CLUSTER_DSR"))
+	if !clusterDSR {
+		logger.Info("CLUSTER_DSR off: externalTrafficPolicy Cluster degrades to node-local delivery")
+	}
 	go func() {
-		if err := runServiceVIPs(context.Background(), pinDir, nodeName, logger); err != nil {
+		if err := runServiceVIPs(context.Background(), pinDir, nodeName, clusterDSR, logger); err != nil {
 			logger.Error("svc_vips reconciler exited", "err", err)
 		}
 	}()
