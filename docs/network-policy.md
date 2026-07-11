@@ -1,6 +1,8 @@
 # NetworkPolicy on the default network (net 0)
 
-Status: **design draft — awaiting review**. Nothing here is built.
+Status: **increment 1 built** (ingress, pod/namespace selector peers, label-
+follows, the UDP reply-pin, node exemption — e2e 128/128). Increments 2–3
+(ipBlock, egress, conformance) are design-final, not yet built.
 
 The production blocker Cilium's removal left open (roadmap §6): the default
 network has no `NetworkPolicy` enforcement. The decision (2026-07-11) is to
@@ -146,11 +148,28 @@ separate policy unions, unlike SG's symmetric-pair admission).
 
 ## Increments
 
-1. **Ingress, pod selectors** — PodIdentity claims + allocator, agent
-   compiler (Pods/Namespaces/NetworkPolicies watches, label-follows from day
-   one), `np_ident`/`np_allow`, `to_pod` net-0 ingress gate, TCP SYN-gate +
-   the UDP reply-pin, node exemption. e2e: isolation on/off, cross-node,
-   label churn, probes still pass, DNS still works for an isolated pod.
+1. **Ingress, pod selectors** — **BUILT.** Agent compiler
+   (Pods/Namespaces/NetworkPolicies watches, label-follows from day one),
+   `np_ident`/`np_allow`, `to_pod` net-0 ingress gate, TCP SYN-gate + the
+   UDP reply-pin, node exemption. e2e (128/128): isolation on/off, same- and
+   cross-node, v6, label churn both directions, probes still pass, DNS still
+   works for an isolated pod, empty-`from` union.
+
+   *As built.* The `to_pod` gate is a noinline `np_ingress(scratch)` — one
+   map-value pointer arg, every key built in a per-CPU `np_scratch` (to_pod
+   sits at 432 bytes of frame; the SG scratch/barrier lessons apply
+   verbatim). The `from_pod` pin write is inline through the same scratch
+   (from_pod = 496 bytes, hosts no callee); it costs non-isolated UDP one
+   hash lookup and nothing else. Probe order: exact pair → its any-port row
+   → ANY_POD rows (src must resolve as a pod) → ANY rows → the UDP pin.
+   `np_nodes` is fed from **all** nodes *including self* (kubelet probes
+   source from the local node) — all InternalIP/ExternalIP status addresses
+   plus the agent-advertised default-route source (`nodeAddrsAnnotation`,
+   the multi-NIC case). Unserved constructs (ipBlock, named ports, endPort,
+   SCTP) compile to nothing — fail closed — and warn once per distinct
+   message. `NP_EG_ISOLATED` is fed truthfully but not yet enforced.
+   Resync is a full recompute + diff-sync on any watched event (the SG
+   shape); map writes happen only for actual deltas.
 2. **ipBlock + egress** — `np_cidr` (with `except`), EG_ISOLATED, the
    `to_pod` egress pair and the `from_pod` external-egress LPM.
 3. **Conformance + scale** — run the upstream netpol conformance/cyclonus

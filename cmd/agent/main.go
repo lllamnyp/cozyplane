@@ -353,6 +353,13 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		return err
 	}
 
+	// Default-net NetworkPolicy (docs/network-policy.md): compile upstream
+	// NetworkPolicies into the pinned NP maps. Fatal on failure like
+	// watchNodes — policy must be fed or the node must not serve.
+	if err := watchNetworkPolicies(ctx, client, mgr, log); err != nil {
+		return err
+	}
+
 	// VPC watching is best-effort: the default network must work even before the
 	// sdn.cozystack.io API exists, so we don't block readiness on it. One shared
 	// factory backs all sdn informers; it is started only after every handler is
@@ -486,6 +493,40 @@ func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.
 	})
 	if err != nil {
 		return fmt.Errorf("add node handler: %w", err)
+	}
+
+	// np_nodes (docs/network-policy.md): every node's addresses — INCLUDING
+	// this node's, unlike the remotes above — are ingress-policy exempt
+	// (kubelet probes, hostNetwork pods). Same-node probes source from the
+	// local node's own addresses, hence no self-skip.
+	npApply := func(obj any) {
+		node, ok := obj.(*corev1.Node)
+		if !ok {
+			return
+		}
+		for _, addr := range npNodeAddresses(node) {
+			if err := mgr.SetNPNode(addr); err != nil {
+				log.Error("set np node", "node", node.Name, "addr", addr, "err", err)
+			}
+		}
+	}
+	_, err = nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    npApply,
+		UpdateFunc: func(_, newObj any) { npApply(newObj) },
+		DeleteFunc: func(obj any) {
+			node, ok := obj.(*corev1.Node)
+			if !ok {
+				return
+			}
+			for _, addr := range npNodeAddresses(node) {
+				if err := mgr.DelNPNode(addr); err != nil {
+					log.Error("del np node", "node", node.Name, "addr", addr, "err", err)
+				}
+			}
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("add np node handler: %w", err)
 	}
 
 	factory.Start(ctx.Done())
@@ -1826,6 +1867,19 @@ func serveMetrics(ctx context.Context, mgr *datapath.Manager, vpcs sdnv1alpha1in
 					net, id[0], id[1], nodeName, d)
 			}
 		}
+
+		// Default-net NetworkPolicy drops + compiler sync failures
+		// (docs/network-policy.md — a failed np_allow sync only over-drops,
+		// but it must be visible).
+		if drops, err := mgr.NPDrops(); err == nil {
+			fmt.Fprintf(&b, "# HELP cozyplane_np_drops_total Packets dropped by default-net NetworkPolicy (this node).\n# TYPE cozyplane_np_drops_total counter\n")
+			dirs := map[uint8]string{datapath.NPDirIn: "ingress", datapath.NPDirEg: "egress"}
+			for dir, d := range drops {
+				fmt.Fprintf(&b, "cozyplane_np_drops_total{direction=\"%s\",node=\"%s\"} %d\n", dirs[dir], nodeName, d)
+			}
+		}
+		fmt.Fprintf(&b, "# HELP cozyplane_np_sync_errors_total NetworkPolicy compiler sync failures (this node).\n# TYPE cozyplane_np_sync_errors_total counter\n")
+		fmt.Fprintf(&b, "cozyplane_np_sync_errors_total{node=\"%s\"} %d\n", nodeName, npSyncErrors.Load())
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		_, _ = w.Write([]byte(b.String()))
 	})

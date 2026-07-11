@@ -197,9 +197,9 @@ func (m *Manager) SyncSGEgress(rules []SGEgress) error {
 }
 
 // syncMap makes a hash map exactly `want` (prune stale, put desired).
-func syncMap[K comparable](mp *ebpf.Map, want map[K]uint64) error {
+func syncMap[K, V comparable](mp *ebpf.Map, want map[K]V) error {
 	var key K
-	var val uint64
+	var val V
 	var stale []K
 	it := mp.Iterate()
 	for it.Next(&key, &val) {

@@ -14,10 +14,20 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
-  # The plugin (using this SA) reads pod annotations to resolve VPC membership.
+  # The plugin (using this SA) reads pod annotations to resolve VPC membership;
+  # the agent's NetworkPolicy compiler watches pods for identities/membership
+  # (docs/network-policy.md).
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get"]
+    verbs: ["get", "list", "watch"]
+  # Namespace labels resolve namespaceSelector peers; NetworkPolicies are the
+  # net-0 policy source (docs/network-policy.md).
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch"]
   # Tenant network ids from VPC objects (namespaced; read across all namespaces).
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcs"]

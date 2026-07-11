@@ -1215,6 +1215,132 @@ got=$(docker exec lbcli curl -s -m3 "http://$W2IP:$NP3/" 2>/dev/null | tr -d '\r
   || fail "default-policy NodePort via backend-less node (got '$got', client $LBCLIP)"
 docker rm -f lbcli >/dev/null 2>&1
 
+# --- Default-net NetworkPolicy (docs/network-policy.md, increment 1) ---
+# Upstream networking.k8s.io/v1 policies compiled to identity-pair rules,
+# enforced destination-side in to_pod at net 0. Server on $W with a readiness
+# probe (the node-exemption canary); a same-node allowed peer, a cross-node
+# client whose label flips prove label-follows both ways.
+echo "[NetworkPolicy: default-net (network-policy.md)]"
+$K create ns nptest >/dev/null
+$K apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: npsrv, namespace: nptest, labels: {app: npsrv}}
+spec:
+  nodeName: $W
+  containers:
+    - name: s
+      image: nicolaka/netshoot
+      command: [python3, -m, http.server, "8080", --bind, "::"]
+      readinessProbe: {tcpSocket: {port: 8080}, periodSeconds: 2}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: npcli, namespace: nptest, labels: {role: cli}}
+spec:
+  nodeName: $W2
+  containers:
+    - {name: s, image: nicolaka/netshoot, command: [sleep, infinity]}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: npsame, namespace: nptest, labels: {role: allowed}}
+spec:
+  nodeName: $W
+  containers:
+    - {name: s, image: nicolaka/netshoot, command: [sleep, infinity]}
+EOF
+$K -n nptest wait --for=condition=Ready pod/npsrv pod/npcli pod/npsame --timeout=120s >/dev/null 2>&1
+NPSRV=$($K -n nptest get pod npsrv -o jsonpath='{.status.podIP}')
+NPSRV6=$($K -n nptest get pod npsrv -o jsonpath='{.status.podIPs[*].ip}' | tr ' ' '\n' | grep : | head -1)
+
+np_served() { # ns pod url — poll until the request serves
+  for _ in $(seq 1 10); do
+    $K -n "$1" exec "$2" -- curl -gs -m3 "$3" >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  return 1
+}
+np_refused() { # ns pod url — poll until the request stops serving
+  for _ in $(seq 1 10); do
+    $K -n "$1" exec "$2" -- curl -gs -m3 "$3" >/dev/null 2>&1 || return 0
+    sleep 2
+  done
+  return 1
+}
+
+np_served nptest npcli "http://$NPSRV:8080/" && pass "npsrv serves npcli before any policy" \
+  || fail "npsrv unreachable before any policy"
+
+$K apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: npsrv-ingress, namespace: nptest}
+spec:
+  podSelector: {matchLabels: {app: npsrv}}
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {role: allowed}}}]
+      ports: [{port: 8080}]
+EOF
+np_refused nptest npcli "http://$NPSRV:8080/" && pass "isolated npsrv refuses the unlabeled client" \
+  || fail "npsrv still serves npcli under the role=allowed-only policy"
+np_served nptest npsame "http://$NPSRV:8080/" && pass "same-node allowed peer served" \
+  || fail "same-node allowed peer refused"
+[ -n "$NPSRV6" ] && { np_refused nptest npcli "http://[$NPSRV6]:8080/" \
+  && pass "v6 delivery gated by the same policy" || fail "v6 leaked past the policy"; }
+
+# Label-follows, both directions: relabel the client into the allowed set and
+# back out — upstream semantics SG v1 deliberately lacked.
+$K -n nptest label pod npcli role=allowed --overwrite >/dev/null
+np_served nptest npcli "http://$NPSRV:8080/" && pass "relabeled client admitted (label-follows)" \
+  || fail "relabel to role=allowed did not open the path"
+$K -n nptest label pod npcli role=cli --overwrite >/dev/null
+np_refused nptest npcli "http://$NPSRV:8080/" && pass "relabel back re-isolates (label-follows both ways)" \
+  || fail "relabel back to role=cli did not close the path"
+
+# Kubelet probes are node-origin plumbing and bypass policy: the isolated
+# server must still be Ready (its probe has been firing throughout).
+sleep 4
+ready=$($K -n nptest get pod npsrv -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+[ "$ready" = "True" ] && pass "isolated npsrv stays Ready (kubelet probe exempt)" \
+  || fail "kubelet probe blocked by policy (Ready=$ready)"
+
+# An ingress-isolated pod's UDP DNS still works: the query's egress pins
+# np_ct on the pod's node, the reply enters on the pin (upstream-stateful
+# UDP without a policy conntrack).
+$K apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: npcli-lockdown, namespace: nptest}
+spec:
+  podSelector: {matchLabels: {role: cli}}
+  policyTypes: [Ingress]
+EOF
+sleep 4
+dnsok=0
+for _ in $(seq 1 5); do
+  $K -n nptest exec npcli -- nslookup -timeout=3 kubernetes.default >/dev/null 2>&1 && { dnsok=1; break; }
+  sleep 2
+done
+[ "$dnsok" = "1" ] && pass "ingress-isolated pod's UDP DNS works (np_ct reply-pin)" \
+  || fail "isolated pod's DNS reply dropped (reply-pin broken)"
+
+# An empty from: rule admits everything (NP_SRC_ANY) — policies union.
+$K apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: npsrv-open, namespace: nptest}
+spec:
+  podSelector: {matchLabels: {app: npsrv}}
+  policyTypes: [Ingress]
+  ingress: [{}]
+EOF
+np_served nptest npcli "http://$NPSRV:8080/" && pass "empty-from rule reopens npsrv (NP_SRC_ANY union)" \
+  || fail "empty-from rule did not admit the client"
+
+$K delete ns nptest --wait=false >/dev/null 2>&1
+
 echo "[revocation]"
 $K -n team-a delete vpcbinding vpc-a >/dev/null
 sleep 6

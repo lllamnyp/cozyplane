@@ -763,6 +763,219 @@ static __attribute__((noinline)) void count_sg_drop(__u32 net)
 		(*d)++;
 }
 
+// --- NetworkPolicy at net 0 (docs/network-policy.md) ---
+//
+// The default network's own policy maps: the SecurityGroups enforcement shape
+// (destination-side in to_pod, TCP SYN-gate), but NOT the SG maps — NP needs
+// per-direction isolation, label-follows membership, and an identity space a
+// 62-id bitmap can't hold. Identities are u64 label-set hashes computed by the
+// agent; they never cross the wire (the destination node resolves the source's
+// identity from its own np_ident), so no TLV and no allocation coordination.
+
+#define NP_ING_ISOLATED 1
+#define NP_EG_ISOLATED 2 /* increment 2 (egress) — fed, not yet enforced */
+
+#define NP_DIR_IN 0
+#define NP_DIR_EG 1 /* increment 2 */
+
+// Reserved source identities (real hashes are remapped off 0/1 by the agent):
+// NP_SRC_ANY admits any source, external included (an empty `from:` rule);
+// NP_SRC_ANY_POD admits any source that resolves in np_ident (a
+// `namespaceSelector: {}` peer) — so the common allow-broadly policies cost
+// O(subjects) entries instead of O(subjects x peers).
+#define NP_SRC_ANY 0
+#define NP_SRC_ANY_POD 1
+
+// np_ident: fabric IP -> {identity, isolation flags}. Every net-0 pod the
+// agent knows lands here; absence (an external client, a node) means "no pod
+// identity". Isolation is a *flag*, not implied by presence: np_allow overflow
+// can therefore only over-drop, never over-admit (fail-closed by construction).
+struct np_ident_val {
+	__u64 id;
+	__u32 flags;
+	__u32 pad;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct addr128);
+	__type(value, struct np_ident_val);
+	__uint(max_entries, 65536);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} np_ident SEC(".maps");
+
+// np_allow: {dst identity, src identity, direction, proto, port} -> present =
+// allowed. Port 0 is the any-port rule. Sized generously and NO_PREALLOC; the
+// agent screams (metric + log) if a policy's entries don't fit — never a
+// silent cap, and a full map only over-drops (see np_ident).
+struct np_allow_key {
+	__u64 dst_id;
+	__u64 src_id;
+	__u16 port; // network order; 0 = any
+	__u8 dir;
+	__u8 proto;
+	__u32 pad;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct np_allow_key);
+	__type(value, __u8);
+	__uint(max_entries, 524288);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} np_allow SEC(".maps");
+
+// np_ct: the UDP reply-pin. Upstream NetworkPolicy is stateful in practice —
+// an isolated pod's DNS reply must come home — and UDP has no SYN to gate on,
+// so an isolated pod's *outbound* UDP (from_pod, on the pod's own node: the
+// reply is checked there too) pins {pod, peer, ports} and the reply direction
+// admits on the pin. TCP needs none of this (SYN-gate). LRU: eviction of an
+// idle pseudo-flow just means the next query re-pins.
+struct np_ct_key {
+	struct addr128 pod; // the isolated pod
+	struct addr128 peer;
+	__u16 pport; // the pod's port, network order
+	__u16 rport; // the peer's port
+	__u8 proto;
+	__u8 pad[3];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__type(key, struct np_ct_key);
+	__type(value, __u8);
+	__uint(max_entries, 131072);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} np_ct SEC(".maps");
+
+// np_nodes: node addresses (all nodes, both families, agent-fed from Node
+// objects). Node-origin plumbing — kubelet probes, hostNetwork pods — bypasses
+// ingress policy, per invariant #7 and every implementation's convention.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct addr128);
+	__type(value, __u8);
+	__uint(max_entries, 4096);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} np_nodes SEC(".maps");
+
+// np_drops: policy-drop counters by direction (PERCPU_ARRAY: pre-allocated,
+// nothing to seed). Exposed as cozyplane_np_drops_total.
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32); // NP_DIR_*
+	__type(value, __u64);
+	__uint(max_entries, 2);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} np_drops SEC(".maps");
+
+static __attribute__((noinline)) void count_np_drop(__u32 dir)
+{
+	__u64 *d = bpf_map_lookup_elem(&np_drops, &dir);
+	if (d)
+		(*d)++;
+}
+
+// np_scratch holds the query and both lookup keys per CPU: to_pod sits at
+// 432 bytes of its own frame and from_pod at 496 — neither can afford ~100
+// bytes of key-building on the stack (the combined-call-stack fights,
+// docs/lb-ingress.md). Fields are written with explicit stores and a compiler
+// barrier before every map call: clang provably elides "dead" stores to
+// per-CPU map values (same doc).
+struct np_query {
+	struct addr128 src;
+	struct addr128 dst;
+	__u16 dport; // network order
+	__u16 sport; // network order; only read for UDP
+	__u8 proto;
+	__u8 pad[3];
+};
+
+struct np_scratch_val {
+	struct np_query q;
+	struct np_allow_key ak;
+	struct np_ct_key ck;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, struct np_scratch_val);
+	__uint(max_entries, 1);
+} np_scratch SEC(".maps");
+
+// np_ingress decides a gated net-0 delivery (query pre-filled in scratch).
+// Returns 1 to admit. Noinline with a single map-value pointer arg: to_pod's
+// frame gains nothing, and this frame holds only spilled registers — the
+// sg_admit shape. Probe order: exact {dst,src} pair, its any-port row, the
+// ANY_POD rows (src must resolve as a pod), the ANY rows (external included),
+// then the UDP reply-pin.
+static __attribute__((noinline)) int np_ingress(struct np_scratch_val *s)
+{
+	struct np_ident_val *di = bpf_map_lookup_elem(&np_ident, &s->q.dst);
+	if (!di)
+		return 1; // not a pod the agent knows: not isolated
+	if (!(di->flags & NP_ING_ISOLATED))
+		return 1;
+	if (bpf_map_lookup_elem(&np_nodes, &s->q.src))
+		return 1; // node-origin plumbing (kubelet probes) — invariant #7
+
+	struct np_ident_val *si = bpf_map_lookup_elem(&np_ident, &s->q.src);
+
+	s->ak.dst_id = di->id;
+	s->ak.dir = NP_DIR_IN;
+	s->ak.proto = s->q.proto;
+	s->ak.pad = 0;
+	if (si) {
+		s->ak.src_id = si->id;
+		s->ak.port = s->q.dport;
+		asm volatile("" ::: "memory");
+		if (bpf_map_lookup_elem(&np_allow, &s->ak))
+			return 1;
+		s->ak.port = 0;
+		asm volatile("" ::: "memory");
+		if (bpf_map_lookup_elem(&np_allow, &s->ak))
+			return 1;
+		s->ak.src_id = NP_SRC_ANY_POD;
+		s->ak.port = s->q.dport;
+		asm volatile("" ::: "memory");
+		if (bpf_map_lookup_elem(&np_allow, &s->ak))
+			return 1;
+		s->ak.port = 0;
+		asm volatile("" ::: "memory");
+		if (bpf_map_lookup_elem(&np_allow, &s->ak))
+			return 1;
+	}
+	s->ak.src_id = NP_SRC_ANY;
+	s->ak.port = s->q.dport;
+	asm volatile("" ::: "memory");
+	if (bpf_map_lookup_elem(&np_allow, &s->ak))
+		return 1;
+	s->ak.port = 0;
+	asm volatile("" ::: "memory");
+	if (bpf_map_lookup_elem(&np_allow, &s->ak))
+		return 1;
+
+	if (s->q.proto == IPPROTO_UDP) {
+		// The reply half of a pinned outbound UDP flow: this pod asked first.
+		s->ck.pod = s->q.dst;
+		s->ck.peer = s->q.src;
+		s->ck.pport = s->q.dport;
+		s->ck.rport = s->q.sport;
+		s->ck.proto = IPPROTO_UDP;
+		s->ck.pad[0] = 0;
+		s->ck.pad[1] = 0;
+		s->ck.pad[2] = 0;
+		asm volatile("" ::: "memory");
+		if (bpf_map_lookup_elem(&np_ct, &s->ck))
+			return 1;
+	}
+	return 0;
+}
+
 // sg_query is the fully-initialized argument to sg_admit: a single PTR_TO_STACK
 // keeps the BPF-to-BPF call verifier-friendly (multiple scalar args tripped a
 // register-liveness check on the 6.12 verifier).
@@ -3622,6 +3835,36 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 			return lr;
 	}
 
+	// NetworkPolicy UDP reply-pin (docs/network-policy.md): an ingress-
+	// isolated net-0 pod's outbound UDP pins {pod, peer, ports} so the reply
+	// passes this pod's to_pod gate — upstream-stateful semantics, one LRU
+	// write on the pod's own node (the maps are per-node; the reply is
+	// checked here too). Inline: from_pod hosts no BPF-to-BPF callee; the
+	// key is built in per-CPU scratch, costing this frame nothing. Non-UDP
+	// and non-isolated sources pay one hash lookup at most.
+	if (!srcnet && !dstnet && p.proto == IPPROTO_UDP &&
+	    ifindex != cfg(CFG_UPLINK_IFINDEX)) {
+		struct np_ident_val *ni = bpf_map_lookup_elem(&np_ident, &p.src);
+		if (ni && (ni->flags & NP_ING_ISOLATED)) {
+			__u32 zero = 0;
+			struct np_scratch_val *s = bpf_map_lookup_elem(&np_scratch, &zero);
+			__u32 l4off = p.is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
+			if (s) {
+				s->ck.pod = p.src;
+				s->ck.peer = p.dst;
+				bpf_skb_load_bytes(skb, l4off, &s->ck.pport, 2);
+				bpf_skb_load_bytes(skb, l4off + 2, &s->ck.rport, 2);
+				s->ck.proto = IPPROTO_UDP;
+				s->ck.pad[0] = 0;
+				s->ck.pad[1] = 0;
+				s->ck.pad[2] = 0;
+				__u8 one = 1;
+				asm volatile("" ::: "memory");
+				bpf_map_update_elem(&np_ct, &s->ck, &one, BPF_ANY);
+			}
+		}
+	}
+
 	// The north-south bridge and floating IPs are v4-only today (v6 fabric IPs
 	// and an NDP responder are later phases), so a v6 packet skips straight to
 	// the family-agnostic overlay delivery below.
@@ -3925,6 +4168,37 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 			};
 			if (!sg_admit(&q) || !sg_egress_admit(&eq)) {
 				count_sg_drop(dstnet);
+				return TC_ACT_SHOT;
+			}
+		}
+	}
+
+	// NetworkPolicy ingress at net 0 (docs/network-policy.md): the same
+	// destination-side gate SecurityGroups use, on the default network's own
+	// maps. Everything delivered into a net-0 pod passes here — same-node
+	// redirects, decapsulated cross-node traffic (kernel-routed onto the
+	// veth), LB/NodePort deliveries post-DNAT with the client source
+	// preserved. Sanctioned replies returned earlier (svc_return). TCP is
+	// SYN-gated; an admitted UDP flow's reply enters via the np_ct pin its
+	// egress wrote; node-origin plumbing is exempt inside np_ingress.
+	if (!dstnet) {
+		__u16 dport;
+		__u32 l4off = p.is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
+		if (sg_l4(skb, p.proto, l4off, &dport)) {
+			__u32 zero = 0;
+			struct np_scratch_val *s = bpf_map_lookup_elem(&np_scratch, &zero);
+			if (!s)
+				return TC_ACT_SHOT; // unreachable (ARRAY); fail closed
+			s->q.src = p.src;
+			s->q.dst = p.dst;
+			s->q.proto = p.proto;
+			s->q.dport = dport;
+			s->q.sport = 0;
+			if (p.proto == IPPROTO_UDP)
+				bpf_skb_load_bytes(skb, l4off, &s->q.sport, 2);
+			asm volatile("" ::: "memory");
+			if (!np_ingress(s)) {
+				count_np_drop(NP_DIR_IN);
 				return TC_ACT_SHOT;
 			}
 		}

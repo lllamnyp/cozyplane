@@ -121,6 +121,48 @@ type overlayLpmKey struct {
 	Addr      overlayAddr128
 }
 
+type overlayNpAllowKey struct {
+	_     structs.HostLayout
+	DstId uint64
+	SrcId uint64
+	Port  uint16
+	Dir   uint8
+	Proto uint8
+	Pad   uint32
+}
+
+type overlayNpCtKey struct {
+	_     structs.HostLayout
+	Pod   overlayAddr128
+	Peer  overlayAddr128
+	Pport uint16
+	Rport uint16
+	Proto uint8
+	Pad   [3]uint8
+}
+
+type overlayNpIdentVal struct {
+	_     structs.HostLayout
+	Id    uint64
+	Flags uint32
+	Pad   uint32
+}
+
+type overlayNpScratchVal struct {
+	_ structs.HostLayout
+	Q struct {
+		_     structs.HostLayout
+		Src   overlayAddr128
+		Dst   overlayAddr128
+		Dport uint16
+		Sport uint16
+		Proto uint8
+		Pad   [3]uint8
+	}
+	Ak overlayNpAllowKey
+	Ck overlayNpCtKey
+}
+
 type overlayPeerKey struct {
 	_      structs.HostLayout
 	SrcNet uint32
@@ -257,6 +299,12 @@ const (
 	overlayMapNetworks              = "networks"
 	overlayMapNodeIp6               = "node_ip6"
 	overlayMapNodeRemotes           = "node_remotes"
+	overlayMapNpAllow               = "np_allow"
+	overlayMapNpCt                  = "np_ct"
+	overlayMapNpDrops               = "np_drops"
+	overlayMapNpIdent               = "np_ident"
+	overlayMapNpNodes               = "np_nodes"
+	overlayMapNpScratch             = "np_scratch"
 	overlayMapParams                = "params"
 	overlayMapPeers                 = "peers"
 	overlayMapPorts                 = "ports"
@@ -355,6 +403,12 @@ type overlayMapSpecs struct {
 	Networks       *ebpf.MapSpec `ebpf:"networks"`
 	NodeIp6        *ebpf.MapSpec `ebpf:"node_ip6"`
 	NodeRemotes    *ebpf.MapSpec `ebpf:"node_remotes"`
+	NpAllow        *ebpf.MapSpec `ebpf:"np_allow"`
+	NpCt           *ebpf.MapSpec `ebpf:"np_ct"`
+	NpDrops        *ebpf.MapSpec `ebpf:"np_drops"`
+	NpIdent        *ebpf.MapSpec `ebpf:"np_ident"`
+	NpNodes        *ebpf.MapSpec `ebpf:"np_nodes"`
+	NpScratch      *ebpf.MapSpec `ebpf:"np_scratch"`
 	Params         *ebpf.MapSpec `ebpf:"params"`
 	Peers          *ebpf.MapSpec `ebpf:"peers"`
 	Ports          *ebpf.MapSpec `ebpf:"ports"`
@@ -419,6 +473,12 @@ type overlayMaps struct {
 	Networks       *ebpf.Map `ebpf:"networks"`
 	NodeIp6        *ebpf.Map `ebpf:"node_ip6"`
 	NodeRemotes    *ebpf.Map `ebpf:"node_remotes"`
+	NpAllow        *ebpf.Map `ebpf:"np_allow"`
+	NpCt           *ebpf.Map `ebpf:"np_ct"`
+	NpDrops        *ebpf.Map `ebpf:"np_drops"`
+	NpIdent        *ebpf.Map `ebpf:"np_ident"`
+	NpNodes        *ebpf.Map `ebpf:"np_nodes"`
+	NpScratch      *ebpf.Map `ebpf:"np_scratch"`
 	Params         *ebpf.Map `ebpf:"params"`
 	Peers          *ebpf.Map `ebpf:"peers"`
 	Ports          *ebpf.Map `ebpf:"ports"`
@@ -459,6 +519,12 @@ func (m *overlayMaps) Close() error {
 		m.Networks,
 		m.NodeIp6,
 		m.NodeRemotes,
+		m.NpAllow,
+		m.NpCt,
+		m.NpDrops,
+		m.NpIdent,
+		m.NpNodes,
+		m.NpScratch,
 		m.Params,
 		m.Peers,
 		m.Ports,
