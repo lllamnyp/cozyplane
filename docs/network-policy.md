@@ -52,28 +52,56 @@ selectors once per *identity*, not per pod, and the datapath compares two
 u32s.
 
 - **Identity allocation must be cluster-consistent** (the destination node
-  derives the *source's* identity from its own map). A pure label-hash risks
-  collisions (unacceptable for policy); central allocation is the answer, and
-  cozyplane already owns the pattern: a system-internal aggregated kind
-  **`PodIdentity`** whose **name is the claim** (deterministic hash of the
-  canonical label-set; first creator wins, the apiserver's name uniqueness is
-  the lock — exactly the cross-kind claims discipline), with `status.id`
-  assigned by the controller's live-read allocator (the VNI/SG-id lesson).
-  Tenant RBAC never sees it (reason 2 above).
-- Each **agent** watches Pods + Namespaces + NetworkPolicies + PodIdentities
-  and independently compiles the same map contents — deterministic because
-  identity ids come from the shared claims and everything else is a pure
-  function of the watched objects. (Same trust model as SG v1: the map feed is
-  consistent cluster-wide because every agent computes from the same inputs.)
+  derives the *source's* identity from its own map) — but it needs **no API
+  and no coordination** (decided 2026-07-11): identity = the first **64 bits
+  of SHA-256** over the canonical `{namespace, filtered sorted labels}`
+  encoding. A pure function, so every agent computes identical ids from the
+  same watched objects. Collision safety at 64 bits: inheriting a *specific*
+  identity is a second preimage (2⁶⁴, infeasible); a birthday collision
+  (~2³², feasible offline) only conflates two label-sets the attacker himself
+  controls — both preimages carry his own namespace — and selectors match
+  labels, not hashes, so he gains nothing over just wearing the labels.
+  Accidental collision at ~10⁴ label-sets ≈ 10⁻¹². **Door left open**:
+  identities never cross the wire, so if compact ids are ever needed (a
+  Geneve TLV, map memory) a claims-allocated `PodIdentity` kind (name =
+  label-hash, the cross-kind-claims discipline) replaces one compiler
+  function — nothing else moves.
+- **Churn labels are excluded from identity** (Cilium's proven answer to
+  cardinality): `pod-template-hash`, `controller-revision-hash`,
+  `statefulset.kubernetes.io/pod-name`, `batch.kubernetes.io/job-*`. Without
+  the filter every rollout mints identities and a StatefulSet gets one per
+  pod; with it, identity count tracks application shapes. Consequence, same
+  as Cilium's: those labels are unusable in NP selectors — the compiler
+  warns when a policy references one.
+- Each **agent** watches Pods + Namespaces + NetworkPolicies and
+  independently compiles the same map contents — deterministic because
+  everything is a pure function of the watched objects. (Same trust model as
+  SG v1: the map feed is consistent cluster-wide because every agent computes
+  from the same inputs.)
 
 ### Maps (net-0 twins)
 
 | Map | Key | Value |
 |-----|-----|-------|
-| `np_ident` | fabric IP (addr128) | `{u32 identity, u8 flags}` — flags: ING_ISOLATED, EG_ISOLATED |
-| `np_allow` | `{u32 dst_id, u32 src_id, u8 dir, u8 proto, u16 port}` | presence = allow (`port` 0 = any; reserved src_id ANY_POD for empty-selector peers) |
-| `np_cidr` | LPM `{u32 id, u8 dir, prefix, addr128}` | allow / deny (ipBlock `except` = longer deny prefix) |
+| `np_ident` | fabric IP (addr128) | `{u64 identity, u32 flags}` — flags: ING_ISOLATED, EG_ISOLATED |
+| `np_allow` | `{u64 dst_id, u64 src_id, u8 dir, u8 proto, u16 port}` | presence = allow (`port` 0 = any) |
+| `np_cidr` | LPM `{u64 id, u8 dir, prefix, addr128}` | allow / deny (ipBlock `except` = longer deny prefix) |
+| `np_ct` | `{addr128 ×2, ports, proto}` LRU | UDP reply-pin (written at the admitted direction) |
 | `np_drops` | direction | drop counter (metrics, like `sg_drops`) |
+
+Reserved src ids keep the common policies flat instead of expanded: **0 =
+anything** (an empty `from:` rule — allow all, external included) and **1 =
+ANY_POD** (`namespaceSelector: {}` — any pod source, i.e. src resolves in
+`np_ident`), so "allow all within reason" costs O(subjects), not
+O(subjects × peers).
+
+**`np_allow` sizing (decided 2026-07-11)**: overflow is *inherently
+fail-closed* — isolation is a flag in `np_ident` and `np_allow` holds only
+allows, so a full map can only over-drop, never over-admit. Hence: HASH with
+`NO_PREALLOC` and a generous ceiling (~512k entries ≈ 12MB worst case), a
+sync-error metric plus an agent log naming the policy whose entries didn't
+fit (no silent caps), and cardinality controlled upstream by the identity
+label filter above.
 
 `dir` keeps ingress and egress unions independent (NP's directions are
 separate policy unions, unlike SG's symmetric-pair admission).
@@ -132,15 +160,15 @@ Non-goals initially: SCTP, named ports (need pod-spec resolution), policy on
 hostNetwork subjects, and the **host firewall** — that is the node-scoped
 sibling of this work and gets its own design once this lands.
 
-## Open questions (review)
+## Decisions (were review questions, resolved 2026-07-11)
 
-1. **UDP reply-pin vs. deferring UDP gating** — the pin is per-flow LRU state
-   on the policy path (the datapath's first, outside NAT). Acceptable, or
-   should increment 1 gate TCP only and document the UDP gap (SG-v1-style)?
-2. **PodIdentity as an aggregated kind** — agreed as system-internal API
-   surface? (Alternative — per-agent pure label-hash — rejected above for
-   collision risk; alternative — controller-annotated pods — rejected for
-   write churn on objects cozyplane doesn't own.)
-3. **`np_allow` sizing**: HASH (non-evicting) with generous headroom and a
-   drop-to-log on cap, or is there appetite for a hard bound + degraded-mode
-   (fail-closed for affected identities)?
+1. **UDP is gated statefully via the LRU reply-pin** — a stateless-UDP gap
+   would be too big (every isolated pod's DNS breaks). The pin is written at
+   the admitted direction and checked on the reply: the `svc_rev`/`dns_ct`
+   shape, the policy path's first per-flow state.
+2. **No PodIdentity API for now** — identity is the coordination-free 64-bit
+   label-set hash (see "The model"); the claims-allocated kind remains the
+   documented evolution path if compact ids are ever needed.
+3. **`np_allow`**: NO_PREALLOC HASH, ~512k ceiling, loud overflow (metric +
+   log), fail-closed by construction; cardinality controlled by the identity
+   label filter. (See the sizing note under "Maps".)
