@@ -805,21 +805,26 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } np_ident SEC(".maps");
 
-// np_allow: {dst identity, src identity, direction, proto, port} -> present =
-// allowed. Port 0 is the any-port rule. Sized generously and NO_PREALLOC; the
-// agent screams (metric + log) if a policy's entries don't fit — never a
-// silent cap, and a full map only over-drops (see np_ident).
+// np_allow: {direction, proto, dst identity, src identity} + a big-endian
+// PORT SUFFIX, as an LPM -> present = allowed. An exact port is a /16
+// suffix, the any-port rule is /0, and an endPort range decomposes into
+// maximal aligned prefixes (increment 3) — so a range costs O(log) entries
+// and the datapath pays ONE probe per peer id (LPM finds the longest of
+// exact/range/any). Sized generously and NO_PREALLOC; the agent screams
+// (metric + log) if a policy's entries don't fit — never a silent cap, and
+// a full map only over-drops (see np_ident).
 struct np_allow_key {
-	__u64 dst_id;
-	__u64 src_id;
-	__u16 port; // network order; 0 = any
+	__u32 prefixlen; // 160 (dir+proto+pad+ids) + port prefix bits (0..16)
 	__u8 dir;
 	__u8 proto;
-	__u32 pad;
+	__u16 pad;
+	__u64 dst_id;
+	__u64 src_id;
+	__u16 port; // network order (big-endian, so prefixes nest)
 };
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
 	__type(key, struct np_allow_key);
 	__type(value, __u8);
 	__uint(max_entries, 524288);
@@ -993,36 +998,26 @@ static __attribute__((noinline)) int np_ingress(struct np_scratch_val *s)
 
 	struct np_ident_val *si = bpf_map_lookup_elem(&np_ident, &s->q.src);
 
+	// One LPM probe per peer id: the entry's own prefixlen distinguishes
+	// exact port, range prefix, and any-port — the lookup key is always
+	// fully specified (/176).
+	s->ak.prefixlen = 160 + 16;
 	s->ak.dst_id = di->id;
 	s->ak.dir = NP_DIR_IN;
 	s->ak.proto = s->q.proto;
 	s->ak.pad = 0;
+	s->ak.port = s->q.dport;
 	if (si) {
 		s->ak.src_id = si->id;
-		s->ak.port = s->q.dport;
-		asm volatile("" ::: "memory");
-		if (bpf_map_lookup_elem(&np_allow, &s->ak))
-			return 1;
-		s->ak.port = 0;
 		asm volatile("" ::: "memory");
 		if (bpf_map_lookup_elem(&np_allow, &s->ak))
 			return 1;
 		s->ak.src_id = NP_SRC_ANY_POD;
-		s->ak.port = s->q.dport;
-		asm volatile("" ::: "memory");
-		if (bpf_map_lookup_elem(&np_allow, &s->ak))
-			return 1;
-		s->ak.port = 0;
 		asm volatile("" ::: "memory");
 		if (bpf_map_lookup_elem(&np_allow, &s->ak))
 			return 1;
 	}
 	s->ak.src_id = NP_SRC_ANY;
-	s->ak.port = s->q.dport;
-	asm volatile("" ::: "memory");
-	if (bpf_map_lookup_elem(&np_allow, &s->ak))
-		return 1;
-	s->ak.port = 0;
 	asm volatile("" ::: "memory");
 	if (bpf_map_lookup_elem(&np_allow, &s->ak))
 		return 1;
@@ -1043,36 +1038,23 @@ static __attribute__((noinline)) int np_egress(struct np_scratch_val *s)
 
 	struct np_ident_val *di = bpf_map_lookup_elem(&np_ident, &s->q.dst);
 
+	s->ak.prefixlen = 160 + 16;
 	s->ak.src_id = si->id;
 	s->ak.dir = NP_DIR_EG;
 	s->ak.proto = s->q.proto;
 	s->ak.pad = 0;
+	s->ak.port = s->q.dport;
 	if (di) {
 		s->ak.dst_id = di->id;
-		s->ak.port = s->q.dport;
-		asm volatile("" ::: "memory");
-		if (bpf_map_lookup_elem(&np_allow, &s->ak))
-			return 1;
-		s->ak.port = 0;
 		asm volatile("" ::: "memory");
 		if (bpf_map_lookup_elem(&np_allow, &s->ak))
 			return 1;
 		s->ak.dst_id = NP_SRC_ANY_POD;
-		s->ak.port = s->q.dport;
-		asm volatile("" ::: "memory");
-		if (bpf_map_lookup_elem(&np_allow, &s->ak))
-			return 1;
-		s->ak.port = 0;
 		asm volatile("" ::: "memory");
 		if (bpf_map_lookup_elem(&np_allow, &s->ak))
 			return 1;
 	}
 	s->ak.dst_id = NP_SRC_ANY;
-	s->ak.port = s->q.dport;
-	asm volatile("" ::: "memory");
-	if (bpf_map_lookup_elem(&np_allow, &s->ak))
-		return 1;
-	s->ak.port = 0;
 	asm volatile("" ::: "memory");
 	if (bpf_map_lookup_elem(&np_allow, &s->ak))
 		return 1;
@@ -4005,6 +3987,7 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 				}
 				if (gate) {
 					int ok = 0;
+					s->ak.prefixlen = 160 + 16;
 					s->ak.dst_id = NP_SRC_ANY; // empty to: admits external
 					s->ak.src_id = ni->id;
 					s->ak.dir = NP_DIR_EG;
@@ -4014,12 +3997,6 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 					asm volatile("" ::: "memory");
 					if (bpf_map_lookup_elem(&np_allow, &s->ak))
 						ok = 1;
-					if (!ok) {
-						s->ak.port = 0;
-						asm volatile("" ::: "memory");
-						if (bpf_map_lookup_elem(&np_allow, &s->ak))
-							ok = 1;
-					}
 					if (!ok) {
 						s->cd.prefixlen = 96 + 128;
 						s->cd.dir = NP_DIR_EG;

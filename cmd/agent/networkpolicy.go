@@ -153,15 +153,18 @@ func npSelectorWarnings(policy string, sel *metav1.LabelSelector, warns *[]strin
 	}
 }
 
-// npPort is one compiled (proto, port) pair; port 0 = any.
+// npPort is one compiled (proto, port[, endPort]) item; port 0 = any,
+// endPort != 0 makes [port, endPort] a range (increment 3).
 type npPort struct {
-	proto uint8
-	port  uint16
+	proto   uint8
+	port    uint16
+	endPort uint16
 }
 
-// npCompilePorts expands a rule's ports. An empty list means all ports of the
-// gated protocols. Named ports and endPort ranges are not served yet
-// (increments 2/3): warn, and compile that entry to nothing — fail closed.
+// npCompilePorts expands a rule's ports. An empty list means all ports of
+// the gated protocols. Named ports are not served (identity filtering has
+// no pod spec to resolve them against): warn, and compile that entry to
+// nothing — fail closed.
 func npCompilePorts(policy string, ports []networkingv1.NetworkPolicyPort, warns *[]string) []npPort {
 	if len(ports) == 0 {
 		return []npPort{{proto: 6, port: 0}, {proto: 17, port: 0}}
@@ -180,19 +183,23 @@ func npCompilePorts(policy string, ports []networkingv1.NetworkPolicyPort, warns
 				continue
 			}
 		}
-		if p.EndPort != nil {
-			*warns = append(*warns, fmt.Sprintf("%s: endPort ranges not served yet — entry compiled closed", policy))
-			continue
-		}
 		if p.Port == nil {
 			out = append(out, npPort{proto: proto, port: 0})
 			continue
 		}
 		if p.Port.IntValue() == 0 {
-			*warns = append(*warns, fmt.Sprintf("%s: named port %q not served yet — entry compiled closed", policy, p.Port.String()))
+			*warns = append(*warns, fmt.Sprintf("%s: named port %q not served — entry compiled closed", policy, p.Port.String()))
 			continue
 		}
-		out = append(out, npPort{proto: proto, port: uint16(p.Port.IntValue())})
+		item := npPort{proto: proto, port: uint16(p.Port.IntValue())}
+		if p.EndPort != nil {
+			if *p.EndPort < int32(item.port) || *p.EndPort > 65535 {
+				*warns = append(*warns, fmt.Sprintf("%s: bad endPort %d — entry compiled closed", policy, *p.EndPort))
+				continue
+			}
+			item.endPort = uint16(*p.EndPort)
+		}
+		out = append(out, item)
 	}
 	return out
 }
@@ -325,8 +332,33 @@ func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*
 		}
 
 		// compileBlocks turns one ipBlock into np_cidr entries for one
-		// isolated identity: the allow range plus a deny per except.
+		// isolated identity: the allow range plus a deny per except. The
+		// np_cidr LPM ranges over the ADDRESS, so a port can't also be a
+		// prefix there — an endPort range on an ipBlock rule expands
+		// per-port, capped at 64 (warned and compiled closed beyond; the
+		// documented increment-3 limitation).
+		expandPorts := func(ports []npPort) []npPort {
+			var out []npPort
+			for _, p := range ports {
+				if p.endPort == 0 {
+					out = append(out, p)
+					continue
+				}
+				if int(p.endPort)-int(p.port) >= 64 {
+					c.warnings = append(c.warnings, fmt.Sprintf("%s: ipBlock endPort range %d-%d wider than 64 — compiled closed", policy, p.port, p.endPort))
+					continue
+				}
+				for q := uint32(p.port); q <= uint32(p.endPort); q++ {
+					out = append(out, npPort{proto: p.proto, port: uint16(q)})
+				}
+			}
+			return out
+		}
 		compileBlocks := func(blocks []*networkingv1.IPBlock, self uint64, dir uint8, ports []npPort) {
+			if len(blocks) == 0 {
+				return
+			}
+			ports = expandPorts(ports)
 			for _, b := range blocks {
 				_, cidr, err := net.ParseCIDR(strings.TrimSpace(b.CIDR))
 				if err != nil {
@@ -376,11 +408,12 @@ func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*
 					for _, src := range peerIDs {
 						for _, p := range ports {
 							allows[datapath.NPAllow{
-								DstID: dst,
-								SrcID: src,
-								Dir:   datapath.NPDirIn,
-								Proto: p.proto,
-								Port:  p.port,
+								DstID:   dst,
+								SrcID:   src,
+								Dir:     datapath.NPDirIn,
+								Proto:   p.proto,
+								Port:    p.port,
+								EndPort: p.endPort,
 							}] = true
 						}
 					}
@@ -408,11 +441,12 @@ func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*
 					for _, dst := range peerIDs {
 						for _, p := range ports {
 							allows[datapath.NPAllow{
-								DstID: dst, // the peer side for egress
-								SrcID: src, // the isolated subject
-								Dir:   datapath.NPDirEg,
-								Proto: p.proto,
-								Port:  p.port,
+								DstID:   dst, // the peer side for egress
+								SrcID:   src, // the isolated subject
+								Dir:     datapath.NPDirEg,
+								Proto:   p.proto,
+								Port:    p.port,
+								EndPort: p.endPort,
 							}] = true
 						}
 					}

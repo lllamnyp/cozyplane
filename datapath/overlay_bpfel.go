@@ -122,13 +122,15 @@ type overlayLpmKey struct {
 }
 
 type overlayNpAllowKey struct {
-	_     structs.HostLayout
-	DstId uint64
-	SrcId uint64
-	Port  uint16
-	Dir   uint8
-	Proto uint8
-	Pad   uint32
+	_         structs.HostLayout
+	Prefixlen uint32
+	Dir       uint8
+	Proto     uint8
+	Pad       uint16
+	DstId     uint64
+	SrcId     uint64
+	Port      uint16
+	_         [6]byte
 }
 
 type overlayNpCidrKey struct {

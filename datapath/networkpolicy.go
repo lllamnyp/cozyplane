@@ -50,13 +50,53 @@ type NPIdent struct {
 }
 
 // NPAllow is one compiled identity-pair rule. Port is host order (stored
-// network order); 0 = any port.
+// network order); 0 = any port. EndPort != 0 makes [Port, EndPort] a range
+// (upstream endPort), decomposed into LPM prefixes by the sync.
 type NPAllow struct {
-	DstID uint64
-	SrcID uint64
-	Dir   uint8
-	Proto uint8
-	Port  uint16
+	DstID   uint64
+	SrcID   uint64
+	Dir     uint8
+	Proto   uint8
+	Port    uint16
+	EndPort uint16
+}
+
+// npPortPrefix is one big-endian port prefix: `bits` leading bits of `port`.
+type npPortPrefix struct {
+	port uint16 // host order here; stored network order
+	bits uint32 // 0..16
+}
+
+// npPortPrefixes covers [lo, hi] with maximal aligned power-of-two blocks —
+// the standard range-to-prefix decomposition (≤ 2*16-1 prefixes). lo == 0
+// with hi == 0 is the any-port rule: one /0.
+func npPortPrefixes(lo, hi uint16) []npPortPrefix {
+	if lo == 0 && hi == 0 {
+		return []npPortPrefix{{port: 0, bits: 0}}
+	}
+	var out []npPortPrefix
+	l, h := uint32(lo), uint32(hi)
+	for l <= h {
+		// The largest block aligned at l that fits within [l, h].
+		size := uint32(1)
+		for {
+			next := size << 1
+			if l&(next-1) != 0 || l+next-1 > h {
+				break
+			}
+			size = next
+		}
+		bits := uint32(16)
+		for s := size; s > 1; s >>= 1 {
+			bits--
+		}
+		out = append(out, npPortPrefix{port: uint16(l), bits: bits})
+		l += size
+		if l == 0 {
+			break // uint32 keeps this unreachable; belt and braces
+		}
+	}
+	return out
 }
 
 // SyncNPIdents makes np_ident exactly `idents` (full-state diff). An address
@@ -73,17 +113,29 @@ func (m *Manager) SyncNPIdents(idents []NPIdent) error {
 	return syncMap(m.objs.NpIdent, want)
 }
 
-// SyncNPAllows makes np_allow exactly `allows` (full-state diff).
+// SyncNPAllows makes np_allow exactly `allows` (full-state diff). The port
+// is an LPM suffix behind 160 fixed bits: exact = /16, any = /0, a range =
+// its prefix decomposition. Stored network order so prefixes nest.
 func (m *Manager) SyncNPAllows(allows []NPAllow) error {
 	want := map[overlayNpAllowKey]uint8{}
 	for _, r := range allows {
-		want[overlayNpAllowKey{
-			DstId: r.DstID,
-			SrcId: r.SrcID,
-			Port:  htons(r.Port),
-			Dir:   r.Dir,
-			Proto: r.Proto,
-		}] = 1
+		lo, hi := r.Port, r.Port
+		if r.EndPort != 0 {
+			hi = r.EndPort
+		}
+		if lo == 0 {
+			hi = 0 // any-port: a single /0
+		}
+		for _, pp := range npPortPrefixes(lo, hi) {
+			want[overlayNpAllowKey{
+				Prefixlen: 160 + pp.bits,
+				Dir:       r.Dir,
+				Proto:     r.Proto,
+				DstId:     r.DstID,
+				SrcId:     r.SrcID,
+				Port:      htons(pp.port),
+			}] = 1
+		}
 	}
 	return syncMap(m.objs.NpAllow, want)
 }

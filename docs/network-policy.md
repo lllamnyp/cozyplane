@@ -86,7 +86,7 @@ u32s.
 | Map | Key | Value |
 |-----|-----|-------|
 | `np_ident` | fabric IP (addr128) | `{u64 identity, u32 flags}` — flags: ING_ISOLATED, EG_ISOLATED |
-| `np_allow` | `{u64 dst_id, u64 src_id, u8 dir, u8 proto, u16 port}` | presence = allow (`port` 0 = any) |
+| `np_allow` | LPM `{prefixlen, u8 dir, u8 proto, u64 dst_id, u64 src_id} + u16 port suffix` | presence = allow. The port is a big-endian LPM *suffix* (increment 3): an exact port is a /16, any-port is /0, and an `endPort` range decomposes into ≤ 31 maximal aligned prefixes — ranges cost O(log) entries and the datapath one probe per peer id instead of exact+any-port pairs |
 | `np_cidr` | LPM `{prefixlen, u8 dir, u8 proto, u16 port, u64 id, addr128}` | allow / deny (ipBlock `except` = longer deny prefix; port 0 = any, probed second) |
 | `np_ct` | `{addr128 ×2, ports, proto}` LRU | UDP reply-pin (written at the admitted direction) |
 | `np_drops` | direction | drop counter (metrics, like `sg_drops`) |
@@ -204,8 +204,17 @@ separate policy unions, unlike SG's symmetric-pair admission).
    scratch. Different kernels explore different verifier states: a load
    that succeeds on one kernel proves nothing about the floor the project
    supports — kind's 6.8 is the gate.
-3. **Conformance + scale** — run the upstream netpol conformance/cyclonus
-   suite against kind; map sizing under identity churn; `endPort` ranges.
+3. **Conformance + scale** — `endPort` ranges via the `np_allow` port-suffix
+   LPM (above): general for identity-pair rules; for **ipBlock × endPort**
+   the two variable dimensions (address prefix, port prefix) cannot share
+   one LPM, so ranges on ipBlock rules expand per-port up to 64 ports and
+   compile closed (with a warning) beyond — a documented cap, not a silent
+   one. The pinned `np_allow` type change is absorbed by `reconcilePins`
+   (incompatible pin removed on agent restart, re-seeded by the first
+   resync; running pods keep the old program+maps until re-attach, so
+   there is no fail-open window). Then: the cyclonus suite against kind
+   (named ports and SCTP stay out — excluded and documented), and a
+   compiler benchmark for identity-churn scale.
 
 Non-goals initially: SCTP, named ports (need pod-spec resolution), policy on
 hostNetwork subjects, and the **host firewall** — that is the node-scoped

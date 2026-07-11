@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -391,6 +392,121 @@ func TestNPCompileEgress(t *testing.T) {
 	}
 	if !v4any {
 		t.Fatalf("missing egress cidr entry: %+v", c.cidrs)
+	}
+}
+
+func TestNPCompileEndPort(t *testing.T) {
+	pods := []*corev1.Pod{
+		npPod("prod", "web-1", "10.244.0.10", map[string]string{"app": "web"}),
+		npPod("prod", "cli-1", "10.244.0.11", map[string]string{"role": "cli"}),
+	}
+	nss := []*corev1.Namespace{npNS("prod", nil)}
+	endPort := int32(8999)
+	nps := []*networkingv1.NetworkPolicy{{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "range"},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{{
+				From: []networkingv1.NetworkPolicyPeer{{
+					PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"role": "cli"}},
+				}},
+				Ports: []networkingv1.NetworkPolicyPort{{
+					Port: ptrIntOrString(8000), EndPort: &endPort,
+				}},
+			}},
+		},
+	}}
+	c := compileNetworkPolicies(pods, nss, nps)
+	w, _ := identOf(c, "10.244.0.10")
+	cli, _ := identOf(c, "10.244.0.11")
+	found := false
+	for _, a := range c.allows {
+		if a.DstID == w.ID && a.SrcID == cli.ID && a.Port == 8000 && a.EndPort == 8999 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing endPort pair row: %+v", c.allows)
+	}
+
+	// An ipBlock with a wide range compiles closed with a warning; a narrow
+	// one expands per-port.
+	wide := int32(9999)
+	nps[0].Spec.Ingress[0].From = []networkingv1.NetworkPolicyPeer{{
+		IPBlock: &networkingv1.IPBlock{CIDR: "192.0.2.0/24"},
+	}}
+	nps[0].Spec.Ingress[0].Ports = []networkingv1.NetworkPolicyPort{{
+		Port: ptrIntOrString(8000), EndPort: &wide,
+	}}
+	c = compileNetworkPolicies(pods, nss, nps)
+	if len(c.cidrs) != 0 {
+		t.Fatalf("wide ipBlock range leaked cidr entries: %d", len(c.cidrs))
+	}
+	sawCap := false
+	for _, wmsg := range c.warnings {
+		sawCap = sawCap || strings.Contains(wmsg, "wider than 64")
+	}
+	if !sawCap {
+		t.Fatalf("missing wide-range warning: %v", c.warnings)
+	}
+	narrow := int32(8003)
+	nps[0].Spec.Ingress[0].Ports = []networkingv1.NetworkPolicyPort{{
+		Port: ptrIntOrString(8000), EndPort: &narrow,
+	}}
+	c = compileNetworkPolicies(pods, nss, nps)
+	if len(c.cidrs) != 4 {
+		t.Fatalf("narrow ipBlock range = %d cidr entries, want 4", len(c.cidrs))
+	}
+}
+
+// BenchmarkCompileNetworkPolicies is the identity-churn scale check
+// (network-policy.md increment 3): 5000 pods over 120 application shapes in
+// 60 namespaces, 200 policies. Every watched event triggers one full
+// compile, so this is the steady-state cost of pod churn.
+func BenchmarkCompileNetworkPolicies(b *testing.B) {
+	var pods []*corev1.Pod
+	var nss []*corev1.Namespace
+	for n := 0; n < 60; n++ {
+		ns := fmt.Sprintf("ns-%d", n)
+		nss = append(nss, npNS(ns, map[string]string{"team": fmt.Sprintf("team-%d", n%10)}))
+		for s := 0; s < 2; s++ { // 2 shapes per namespace
+			shape := map[string]string{
+				"app":  fmt.Sprintf("app-%d-%d", n, s),
+				"tier": []string{"web", "db"}[s],
+				// churn labels, erased by the filter:
+				"pod-template-hash": fmt.Sprintf("h%d", s),
+			}
+			for p := 0; p < 42; p++ { // ~5000 pods total
+				pods = append(pods, npPod(ns, fmt.Sprintf("p-%d-%d-%d", n, s, p),
+					fmt.Sprintf("10.%d.%d.%d", n%200, s*100+p/250, p%250+1), shape))
+			}
+		}
+	}
+	var nps []*networkingv1.NetworkPolicy
+	for i := 0; i < 200; i++ {
+		ns := fmt.Sprintf("ns-%d", i%60)
+		nps = append(nps, &networkingv1.NetworkPolicy{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: fmt.Sprintf("np-%d", i)},
+			Spec: networkingv1.NetworkPolicySpec{
+				PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tier": "web"}},
+				PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+				Ingress: []networkingv1.NetworkPolicyIngressRule{{
+					From: []networkingv1.NetworkPolicyPeer{{
+						NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"team": fmt.Sprintf("team-%d", i%10)}},
+						PodSelector:       &metav1.LabelSelector{MatchLabels: map[string]string{"tier": "db"}},
+					}},
+					Ports: []networkingv1.NetworkPolicyPort{{Port: ptrIntOrString(8080)}},
+				}},
+			},
+		})
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		c := compileNetworkPolicies(pods, nss, nps)
+		if len(c.idents) == 0 || len(c.allows) == 0 {
+			b.Fatal("empty compile")
+		}
 	}
 }
 

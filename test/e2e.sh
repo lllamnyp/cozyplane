@@ -1483,6 +1483,35 @@ for _ in $(seq 1 10); do
 done
 [ "$egany" = "1" ] && pass "empty egress rule = allow-all destinations (reserved ANY)" \
   || fail "empty egress rule did not allow the external destination"
+
+# endPort ranges (increment 3): the np_allow port-suffix LPM. A range
+# covering 8080 admits; sliding it off 8080 refuses.
+$K apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: npsrv-range, namespace: nptest}
+spec:
+  podSelector: {matchLabels: {app: npsrv}}
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {role: cli}}}]
+      ports: [{port: 8000, endPort: 8999}]
+EOF
+np_served nptest npcli "http://$NPSRV:8080/" && pass "endPort range 8000-8999 admits port 8080" \
+  || fail "endPort range did not admit a port inside it"
+$K apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: npsrv-range, namespace: nptest}
+spec:
+  podSelector: {matchLabels: {app: npsrv}}
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {role: cli}}}]
+      ports: [{port: 9000, endPort: 9999}]
+EOF
+np_refused nptest npcli "http://$NPSRV:8080/" && pass "port outside the endPort range refused" \
+  || fail "a port outside the endPort range was admitted"
 docker rm -f npext >/dev/null 2>&1
 
 $K delete ns nptest --wait=false >/dev/null 2>&1
