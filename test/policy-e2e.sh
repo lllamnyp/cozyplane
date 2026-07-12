@@ -91,8 +91,7 @@ echo "nodes: subject=$W peer=$W2"
 
 WIP4=$($K get node "$W" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' | tr ' ' '\n' | grep -v : | head -1)
 WIP6=$($K get node "$W" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' | tr ' ' '\n' | grep : | head -1)
-PODCIDR=$($K get node "$W" -o jsonpath='{.spec.podCIDR}')
-echo "subject node: $WIP4 ${WIP6:-(no v6)}; podCIDR $PODCIDR"
+echo "subject node: $WIP4 ${WIP6:-(no v6)}"
 
 $K delete ns "$NS" --ignore-not-found --wait=true >/dev/null 2>&1
 $K create ns "$NS" >/dev/null
@@ -156,7 +155,11 @@ $K -n "$NS" wait --for=condition=Ready pod/srv pod/same pod/cli pod/host1 pod/ho
 
 SRV=$($K -n "$NS" get pod srv -o jsonpath='{.status.podIP}')
 SAME=$($K -n "$NS" get pod same -o jsonpath='{.status.podIP}')
+SAMEIP="$SAME"
 CLI=$($K -n "$NS" get pod cli -o jsonpath='{.status.podIP}')
+# Under a flat pool a pod's address is unrelated to its node (docs/api-groups.md),
+# so rules name pods, not node slices.
+echo "pods: srv=$SRV same=$SAME cli=$CLI (flat pool: addresses are not node-carved)"
 
 # ===========================================================================
 phase "NetworkPolicy: baseline + isolation"
@@ -267,13 +270,13 @@ spec:
   ingress:
     - from: [{cidr: 0.0.0.0/0}, {cidr: "::/0"}]
       ports: [{protocol: TCP, port: 6443}]
-    - from: [{cidr: $PODCIDR}]
+    - from: [{cidr: $SAMEIP/32}]
       ports: [{protocol: TCP, port: 9411, endPort: 9413}]
 EOF
-served same "http://$WIP4:9411/metrics" && pass "a podCIDR+endPort rule reopens same-node pod->node" \
+served same "http://$WIP4:9411/metrics" && pass "a cidr+endPort rule reopens the named pod->node" \
   || fail "the ingress allow rule did not reopen pod->node"
-refused cli "http://$WIP4:9411/metrics" && pass "the allow is scoped to the declared CIDR (other-node pod still refused)" \
-  || fail "a podCIDR allow leaked to a pod outside it"
+refused cli "http://$WIP4:9411/metrics" && pass "the allow is scoped to the declared CIDR (the other pod still refused)" \
+  || fail "a /32 allow leaked to a pod outside it"
 $K delete hostfirewall pol-e2e-in >/dev/null
 served cli "http://$WIP4:9411/metrics" && pass "deleting the HostFirewall reopens the node" \
   || fail "the node stayed isolated after deletion"
