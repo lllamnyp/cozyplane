@@ -376,6 +376,9 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		go ensurePoolUplinks(ctx, sdnClient, mgr, log)
 		watchServiceVIPs(ctx, factory, mgr, log)
 		watchSecurityGroups(ctx, factory, mgr, log)
+		if err := watchHostFirewalls(ctx, factory, client, mgr, nodeName, log); err != nil {
+			log.Error("watch hostfirewalls", "err", err)
+		}
 		// Per-VPC traffic metrics (#2): serve the datapath counters, labeled by
 		// VPC via the same VPC lister the networks map is built from.
 		serveMetrics(ctx, mgr, factory.Sdn().V1alpha1().VPCs(), nodeName, log)
@@ -418,20 +421,16 @@ func advertiseNodeAddrs(ctx context.Context, client kubernetes.Interface, nodeNa
 	log.Info("advertised node address", "addr", src.String())
 }
 
-// nodeAddresses returns the set of a node's own addresses to encapsulate replies
-// to: its InternalIP(s) plus any advertised in the annotation.
-func nodeAddresses(node *corev1.Node) []net.IP {
-	var out []net.IP
-	if ip := net.ParseIP(internalIP(node)); ip != nil {
-		out = append(out, ip)
-	}
-	for _, s := range strings.Split(node.Annotations[nodeAddrsAnnotation], ",") {
-		if ip := net.ParseIP(strings.TrimSpace(s)); ip != nil {
-			out = append(out, ip)
-		}
-	}
-	return out
-}
+// nodeAddresses returns the set of a node's own addresses that node_remotes
+// maps to its Geneve endpoint — the same set the policy exemptions use
+// (npNodeAddresses): every InternalIP/ExternalIP, BOTH families, plus the
+// annotation. v6 matters: without a v6 entry a pod's dial of a node's v6
+// address takes the kernel route to the uplink, where the cluster-egress
+// masquerade rewrites it to a NODE source — invisible to a spoof-guarding
+// underlay, but it laundered the pod identity straight through the host
+// firewall's node exemption (docs/host-firewall.md; caught by its e2e). On
+// the overlay the true source survives and the destination node gates it.
+func nodeAddresses(node *corev1.Node) []net.IP { return npNodeAddresses(node) }
 
 // watchNodes starts a Node informer that mirrors every other node's pod CIDR
 // into the remotes map, and every other node's addresses into node_remotes. It
@@ -507,6 +506,13 @@ func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.
 		for _, addr := range npNodeAddresses(node) {
 			if err := mgr.SetNPNode(addr); err != nil {
 				log.Error("set np node", "node", node.Name, "addr", addr, "err", err)
+			}
+		}
+		// The same self address set is what "host-destined" means to the
+		// host firewall (docs/host-firewall.md).
+		if node.Name == selfName {
+			if err := mgr.SyncHFSelf(npNodeAddresses(node)); err != nil {
+				log.Error("sync hf self", "node", node.Name, "err", err)
 			}
 		}
 	}
@@ -1880,6 +1886,14 @@ func serveMetrics(ctx context.Context, mgr *datapath.Manager, vpcs sdnv1alpha1in
 		}
 		fmt.Fprintf(&b, "# HELP cozyplane_np_sync_errors_total NetworkPolicy compiler sync failures (this node).\n# TYPE cozyplane_np_sync_errors_total counter\n")
 		fmt.Fprintf(&b, "cozyplane_np_sync_errors_total{node=\"%s\"} %d\n", nodeName, npSyncErrors.Load())
+
+		// Host firewall (docs/host-firewall.md).
+		if drops, err := mgr.HFDrops(); err == nil {
+			fmt.Fprintf(&b, "# HELP cozyplane_hf_drops_total Packets dropped by the host firewall (this node).\n# TYPE cozyplane_hf_drops_total counter\n")
+			fmt.Fprintf(&b, "cozyplane_hf_drops_total{node=\"%s\"} %d\n", nodeName, drops)
+		}
+		fmt.Fprintf(&b, "# HELP cozyplane_hf_sync_errors_total HostFirewall compiler sync failures (this node).\n# TYPE cozyplane_hf_sync_errors_total counter\n")
+		fmt.Fprintf(&b, "cozyplane_hf_sync_errors_total{node=\"%s\"} %d\n", nodeName, hfSyncErrors.Load())
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		_, _ = w.Write([]byte(b.String()))
 	})

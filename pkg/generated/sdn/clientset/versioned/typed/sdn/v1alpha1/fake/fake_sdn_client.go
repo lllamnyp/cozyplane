@@ -36,6 +36,10 @@ func (c *FakeSdnV1alpha1) FloatingIPs(namespace string) v1alpha1.FloatingIPInter
 	return newFakeFloatingIPs(c, namespace)
 }
 
+func (c *FakeSdnV1alpha1) HostFirewalls() v1alpha1.HostFirewallInterface {
+	return newFakeHostFirewalls(c)
+}
+
 func (c *FakeSdnV1alpha1) Ports() v1alpha1.PortInterface {
 	return newFakePorts(c)
 }

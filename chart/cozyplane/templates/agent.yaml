@@ -58,6 +58,11 @@ rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["securitygroups"]
     verbs: ["get", "list", "watch"]
+  # HostFirewalls: the agent compiles the objects selecting its node into the
+  # hf_allow map and arms enforcement (docs/host-firewall.md).
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["hostfirewalls"]
+    verbs: ["get", "list", "watch"]
   # FloatingIPs: the agent programs the floating map and advertises the address
   # for those whose target Port is on this node.
   - apiGroups: ["sdn.cozystack.io"]

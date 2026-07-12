@@ -46,6 +46,18 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &sdnv1alpha1.FloatingIPSpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("FloatingIPStatus"):
 		return &sdnv1alpha1.FloatingIPStatusApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("HostFirewall"):
+		return &sdnv1alpha1.HostFirewallApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("HostFirewallPeer"):
+		return &sdnv1alpha1.HostFirewallPeerApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("HostFirewallPort"):
+		return &sdnv1alpha1.HostFirewallPortApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("HostFirewallRule"):
+		return &sdnv1alpha1.HostFirewallRuleApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("HostFirewallSpec"):
+		return &sdnv1alpha1.HostFirewallSpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("HostFirewallStatus"):
+		return &sdnv1alpha1.HostFirewallStatusApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("LocalVPCRef"):
 		return &sdnv1alpha1.LocalVPCRefApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("Port"):

@@ -1516,6 +1516,192 @@ docker rm -f npext >/dev/null 2>&1
 
 $K delete ns nptest --wait=false >/dev/null 2>&1
 
+# --- Host firewall (docs/host-firewall.md) ---
+# A HostFirewall selecting $W makes the node itself default-deny for new
+# TCP/UDP flows: external and pod sources are gated, node sources / ICMP /
+# the overlay / replies stay exempt, and node-originated UDP returns via the
+# hf_ct pins (all three write points exercised below).
+echo "[HostFirewall (host-firewall.md)]"
+WADDRS=$($K get node "$W" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+WIP4=$(echo "$WADDRS" | tr ' ' '\n' | grep -v : | head -1)
+WIP6=$(echo "$WADDRS" | tr ' ' '\n' | grep : | head -1)
+$K create ns hftest >/dev/null
+$K apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: hfsrv, namespace: hftest}
+spec:
+  nodeName: $W
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  containers:
+    - name: s
+      image: nicolaka/netshoot
+      command: [python3, -m, http.server, "18080", --bind, "::"]
+      readinessProbe: {tcpSocket: {port: 18080}, periodSeconds: 2}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: hfcli, namespace: hftest}
+spec:
+  nodeName: $W2
+  containers:
+    - {name: s, image: nicolaka/netshoot, command: [sleep, infinity]}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: hfsame, namespace: hftest}
+spec:
+  nodeName: $W
+  containers:
+    - name: s
+      image: nicolaka/netshoot
+      command: [socat, -T3, "UDP4-LISTEN:5354,reuseaddr,fork", "EXEC:/bin/cat"]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: hfnode2, namespace: hftest}
+spec:
+  nodeName: $W2
+  hostNetwork: true
+  containers:
+    - {name: s, image: nicolaka/netshoot, command: [sleep, infinity]}
+EOF
+$K -n hftest wait --for=condition=Ready pod/hfsrv pod/hfcli pod/hfsame pod/hfnode2 --timeout=120s >/dev/null 2>&1
+HFSAME=$($K -n hftest get pod hfsame -o jsonpath='{.status.podIP}')
+docker run -d --rm --name hfext --network kind nicolaka/netshoot sleep 900 >/dev/null 2>&1
+HFEXTIP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' hfext)
+docker exec -d hfext socat -T3 "UDP4-LISTEN:5354,reuseaddr,fork" "EXEC:/bin/cat" >/dev/null 2>&1
+
+hf_ext_served() {
+  for _ in $(seq 1 10); do
+    docker exec hfext curl -s -m3 "http://$WIP4:18080/" >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  return 1
+}
+hf_ext_refused() {
+  for _ in $(seq 1 10); do
+    docker exec hfext curl -s -m3 "http://$WIP4:18080/" >/dev/null 2>&1 || return 0
+    sleep 2
+  done
+  return 1
+}
+
+hf_ext_served && pass "node service serves the external client before any HostFirewall" \
+  || fail "node service unreachable before any HostFirewall"
+HFNP=$($K -n default get svc lbclu -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null)
+hfnp_pre=""
+[ -n "$HFNP" ] && docker exec hfext curl -s -m3 "http://$WIP4:$HFNP/" >/dev/null 2>&1 && hfnp_pre=ok
+
+$K label node "$W" cozyplane-e2e/hf=isolated --overwrite >/dev/null
+$K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: HostFirewall
+metadata: {name: hf-e2e}
+spec:
+  nodeSelector: {matchLabels: {cozyplane-e2e/hf: isolated}}
+EOF
+
+hf_ext_refused && pass "isolated node refuses the external client (default-deny)" \
+  || fail "isolated node still serves the external client"
+np_refused hftest hfcli "http://$WIP4:18080/" && pass "cross-node pod->node refused (from_overlay gate)" \
+  || fail "cross-node pod->node still served while isolated"
+np_refused hftest hfsame "http://$WIP4:18080/" && pass "same-node pod->node refused (from_pod gate)" \
+  || fail "same-node pod->node still served while isolated"
+np_served hftest hfnode2 "http://$WIP4:18080/" && pass "node-sourced client exempt (apiserver/kubelet plumbing shape)" \
+  || fail "node-sourced client gated (the exemption is broken)"
+[ -n "$WIP6" ] && { np_refused hftest hfcli "http://[$WIP6]:18080/" \
+  && pass "v6 node address equally isolated" || fail "v6 node address not gated"; }
+
+# The cluster around the isolated node keeps working.
+got=$($K -n hftest exec hfcli -- sh -c "echo overlaycheck | socat -T3 - UDP4:$HFSAME:5354" 2>/dev/null)
+[ "$got" = "overlaycheck" ] && pass "cross-node pod->pod overlay unharmed while isolated" \
+  || fail "overlay pod->pod broken while isolated (got '$got')"
+ready=$($K get node "$W" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+[ "$ready" = "True" ] && pass "isolated node stays Ready (kubelet->apiserver exempt)" \
+  || fail "isolated node went NotReady"
+$K -n hftest get pod hfsrv -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' | grep -q True \
+  && pass "hostNetwork pod on the isolated node stays Ready" \
+  || fail "hostNetwork pod readiness broke under isolation"
+docker exec hfext ping -c1 -W2 "$WIP4" >/dev/null 2>&1 \
+  && pass "ICMP to the isolated node passes (never gated)" \
+  || fail "ICMP to the isolated node dropped"
+if [ "$hfnp_pre" = "ok" ]; then
+  docker exec hfext curl -s -m3 "http://$WIP4:$HFNP/" >/dev/null 2>&1 \
+    && pass "NodePort still served while isolated (LB interception is not host traffic)" \
+    || fail "NodePort gated by the host firewall (it must be intercepted first)"
+fi
+
+# Node-originated UDP replies come back through all three pin write points.
+dnsok=""
+for _ in $(seq 1 10); do
+  $K -n hftest exec hfsrv -- nslookup -timeout=3 kubernetes.default.svc.cluster.local >/dev/null 2>&1 && { dnsok=1; break; }
+  sleep 2
+done
+[ -n "$dnsok" ] && pass "hostNetwork cluster DNS works while isolated (node->pod UDP pin)" \
+  || fail "hostNetwork cluster DNS broken while isolated"
+got=$($K -n hftest exec hfsrv -- sh -c "echo localpin | socat -T3 - UDP4:$HFSAME:5354" 2>/dev/null)
+[ "$got" = "localpin" ] && pass "node->local-pod UDP reply admitted (to_pod pin)" \
+  || fail "node->local-pod UDP reply dropped (got '$got')"
+got=$($K -n hftest exec hfsrv -- sh -c "echo extpin | socat -T3 - UDP4:$HFEXTIP:5354" 2>/dev/null)
+[ "$got" = "extpin" ] && pass "node->external UDP reply admitted (uplink pin)" \
+  || fail "node->external UDP reply dropped (got '$got')"
+
+# Rules union open: the external client by /32+port, pods by the pod CIDR.
+$K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: HostFirewall
+metadata: {name: hf-e2e}
+spec:
+  nodeSelector: {matchLabels: {cozyplane-e2e/hf: isolated}}
+  ingress:
+    - from: [{cidr: $HFEXTIP/32}]
+      ports: [{protocol: TCP, port: 18080}]
+EOF
+hf_ext_served && pass "cidr+port rule admits the external client" \
+  || fail "cidr+port rule did not open the node service"
+np_refused hftest hfcli "http://$WIP4:18080/" && pass "pod clients still refused (allow scoped to the client /32)" \
+  || fail "a /32 allow leaked to pod sources"
+$K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: HostFirewall
+metadata: {name: hf-e2e-pods}
+spec:
+  nodeSelector: {matchLabels: {cozyplane-e2e/hf: isolated}}
+  ingress:
+    - from: [{cidr: 10.244.0.0/16}]
+      ports: [{protocol: TCP, port: 18080, endPort: 18083}]
+EOF
+np_served hftest hfcli "http://$WIP4:18080/" && pass "pod-CIDR rule (second object, endPort range) opens cross-node pod->node" \
+  || fail "pod-CIDR rule did not open cross-node pod->node"
+np_served hftest hfsame "http://$WIP4:18080/" && pass "pod-CIDR rule opens same-node pod->node" \
+  || fail "pod-CIDR rule did not open same-node pod->node"
+
+# except carves the external client back out of a wide allow.
+$K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: HostFirewall
+metadata: {name: hf-e2e}
+spec:
+  nodeSelector: {matchLabels: {cozyplane-e2e/hf: isolated}}
+  ingress:
+    - from: [{cidr: 0.0.0.0/0, except: [$HFEXTIP/32]}]
+      ports: [{protocol: TCP, port: 18080}]
+EOF
+hf_ext_refused && pass "except masks the external client inside a wide allow" \
+  || fail "except did not mask the external client"
+np_served hftest hfcli "http://$WIP4:18080/" && pass "the wide allow still admits pod clients around the except" \
+  || fail "the wide allow lost pod clients to the except"
+
+$K delete hostfirewall hf-e2e hf-e2e-pods >/dev/null
+hf_ext_served && pass "deleting the HostFirewalls reopens the node" \
+  || fail "node still isolated after HostFirewall deletion"
+
+$K label node "$W" cozyplane-e2e/hf- >/dev/null 2>&1
+docker rm -f hfext >/dev/null 2>&1
+$K delete ns hftest --wait=false >/dev/null 2>&1
+
 echo "[revocation]"
 $K -n team-a delete vpcbinding vpc-a >/dev/null
 sleep 6

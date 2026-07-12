@@ -493,6 +493,12 @@ struct {
                              // off-subnet destinations via the *default* uplink,
                              // whose neighbour would be wrong for this link.
                              // 0 = resolve via the FIB (single-NIC default).
+#define CFG_GENEVE_PORT    8 // host order; the overlay's UDP port, so the host
+                             // firewall can never sever the datapath's own
+                             // transport (docs/host-firewall.md).
+#define CFG_HF_ENABLED     9 // 1 while a HostFirewall selects this node: arms
+                             // the hf_ingress tail calls and the hf_ct pin
+                             // writes. Set after the rule sync, cleared first.
 
 // bpf-masquerade port range for cluster-egress SNAT (#10): disjoint from the
 // host ephemeral range (32768+) so a reverse lookup can never capture the
@@ -509,7 +515,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__type(key, __u32);
 	__type(value, __u32);
-	__uint(max_entries, 8);
+	__uint(max_entries, 16);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } params SEC(".maps");
 
@@ -937,6 +943,73 @@ struct {
 	__uint(max_entries, 1);
 } np_scratch SEC(".maps");
 
+// --- Host firewall (docs/host-firewall.md) ---
+//
+// Ingress policy for the node ITSELF — the delivery target NetworkPolicy and
+// SecurityGroups deliberately leave alone. Enforcement lives in the
+// tail-called cozyplane_hf_ingress (lb_prog slot 2), reached from every
+// fall-through that hands a packet to the host stack; these maps are its
+// state. Armed by CFG_HF_ENABLED (set only while a HostFirewall selects this
+// node), so the disabled cost is one params lookup per fall-through packet.
+
+// hf_self: this node's own addresses (the same set the agent feeds np_nodes
+// for itself) — "is this packet host-destined". Broadcast/multicast/transit
+// destinations miss and stay ungated.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct addr128);
+	__type(value, __u8);
+	__uint(max_entries, 64);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} hf_self SEC(".maps");
+
+// hf_allow: {proto, port} + source-CIDR LPM. Unlike np_allow the port cannot
+// be an LPM suffix (the address is the variable tail here), so it sits exact
+// in the fixed bits: 0 = the any-port row, and endPort ranges expand to
+// per-port entries (capped in the compiler — node services don't span wide
+// ranges). A v4 source is NAT64-form: prefixlen 32+96+n; v6 is 32+n. Value:
+// 1 = allow, 0 = deny (an `except` — a longer prefix masking its rule's
+// allow). Fail-closed by construction: isolation is the CFG_HF_ENABLED flag,
+// this map holds only admissions.
+struct hf_allow_key {
+	__u32 prefixlen;
+	__u8 proto;
+	__u8 pad;
+	__u16 port; // network order; 0 = any-port row
+	struct addr128 src;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__type(key, struct hf_allow_key);
+	__type(value, __u8);
+	__uint(max_entries, 16384);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} hf_allow SEC(".maps");
+
+// hf_ct: replies to node-ORIGINATED UDP (host DNS/NTP; hostNetwork pods
+// resolving cluster DNS) — the np_ct shape with pod := the node's own
+// address. Written wherever the outbound query crosses the datapath: the
+// hf_ingress tail call itself (uplink egress, off-cluster peers), from_pod's
+// remotes-hit encap (remote-pod peers), and to_pod (local-pod peers).
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__type(key, struct np_ct_key);
+	__type(value, __u8);
+	__uint(max_entries, 65536);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} hf_ct SEC(".maps");
+
+// hf_drops: exposed as cozyplane_hf_drops_total.
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, __u64);
+	__uint(max_entries, 1);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} hf_drops SEC(".maps");
+
 // np_cidr_check probes the ipBlock LPM for one direction (the queried address
 // pre-copied into s->cd.addr): exact port then any-port. Returns 1 on an
 // allow match; a deny match (an `except`) or no match returns 0 — the deny
@@ -1063,6 +1136,28 @@ static __attribute__((noinline)) int np_egress(struct np_scratch_val *s)
 	if (np_cidr_check(s, NP_DIR_EG, si->id))
 		return 1;
 	return np_pin_check(s);
+}
+
+// hf_pin_local: the host firewall's UDP reply-pin for node→LOCAL-pod flows
+// (docs/host-firewall.md) — their only datapath crossing is the destination's
+// to_pod, so the pin is written here (a sibling callee: frames don't stack;
+// the np_ingress/np_egress precedent). Scratch is pre-filled by to_pod's NP
+// block; self-sourced only.
+static __attribute__((noinline)) void hf_pin_local(struct np_scratch_val *s)
+{
+	if (!bpf_map_lookup_elem(&hf_self, &s->q.src))
+		return;
+	s->ck.pod = s->q.src;
+	s->ck.peer = s->q.dst;
+	s->ck.pport = s->q.sport;
+	s->ck.rport = s->q.dport;
+	s->ck.proto = IPPROTO_UDP;
+	s->ck.pad[0] = 0;
+	s->ck.pad[1] = 0;
+	s->ck.pad[2] = 0;
+	__u8 one = 1;
+	asm volatile("" ::: "memory");
+	bpf_map_update_elem(&hf_ct, &s->ck, &one, BPF_ANY);
 }
 
 // sg_query is the fully-initialized argument to sg_admit: a single PTR_TO_STACK
@@ -3425,7 +3520,9 @@ struct {
 // else affected).
 struct {
 	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-	__uint(max_entries, 2); // 0: lb_ingress (from_uplink), 1: lb_dsr (from_overlay)
+	__uint(max_entries, 3); // 0: lb_ingress (from_uplink), 1: lb_dsr
+	                        // (from_overlay), 2: hf_ingress (host firewall,
+	                        // every host-stack fall-through)
 	__type(key, __u32);
 	__type(value, __u32);
 } lb_prog SEC(".maps");
@@ -3462,7 +3559,7 @@ int cozyplane_lb_ingress(struct __sk_buff *skb)
 	if (!p.is_v6) {
 		struct iphdr *ip;
 		if (parse_ipv4(skb, &ip) < 0 || ip->ihl != 5)
-			return TC_ACT_OK;
+			goto miss; // IP options: not an LB row, but maybe host-destined
 	}
 	__u16 sport, dport;
 	if (p.is_v6 ? l4_ports6(skb, &sport, &dport) < 0
@@ -3495,7 +3592,7 @@ int cozyplane_lb_ingress(struct __sk_buff *skb)
 	asm volatile("" ::: "memory");
 	struct svc_val *sv = bpf_map_lookup_elem(&svc_vips, &s->sk);
 	if (!sv || !sv->n)
-		return TC_ACT_OK;
+		goto miss;
 
 	if (sv->flags & SVC_F_SRC_RANGES) {
 		s->lk.prefixlen = 256; // full vip + full client: longest possible match
@@ -3611,6 +3708,107 @@ int cozyplane_lb_ingress(struct __sk_buff *skb)
 	if (be)
 		return l ? deliver_local(skb, l) : TC_ACT_OK;
 	return l ? deliver_local(skb, l) : deliver_net0(skb, s->dst);
+
+miss:
+	// No LB row claimed it: this is host-destined (or transit) traffic on
+	// its way to the kernel — the host firewall sees it first
+	// (docs/host-firewall.md).
+	if (cfg(CFG_HF_ENABLED))
+		bpf_tail_call(skb, &lb_prog, 2);
+	return TC_ACT_OK;
+}
+
+// cozyplane_hf_ingress: the host firewall (docs/host-firewall.md), lb_prog
+// slot 2 — tail-called (only under CFG_HF_ENABLED) from every fall-through
+// that hands a packet to this node's host stack: from_uplink / lb_ingress
+// miss (external and node→node), from_overlay's net-0 exit (cross-node
+// pod→node via the node_remotes encap), and from_pod's final exit (same-node
+// pod→node; at the uplink egress the same call carries node-ORIGINATED
+// traffic, which only feeds the UDP reply-pin). A tail call means a fresh
+// 512-byte stack and its own verifier budget — the policy from_pod's
+// 496-byte frame could never host inline.
+SEC("tc")
+int cozyplane_hf_ingress(struct __sk_buff *skb)
+{
+	struct pkt p;
+	if (parse_ip(skb, &p) < 0)
+		return TC_ACT_OK;
+	if (p.proto != IPPROTO_TCP && p.proto != IPPROTO_UDP)
+		return TC_ACT_OK; // ICMP/ARP/NDP are never gated (PMTU, ping, ND)
+	__u16 sport, dport;
+	if (p.is_v6 ? l4_ports6(skb, &sport, &dport) < 0
+		    : l4_ports(skb, &sport, &dport) < 0)
+		return TC_ACT_OK;
+
+	if (!bpf_map_lookup_elem(&hf_self, &p.dst)) {
+		// Not host-destined (broadcast/multicast/transit stay ungated).
+		// Node-originated UDP passing the uplink-egress fall-through pins
+		// its reply — host DNS/NTP to off-cluster peers. (A forged
+		// self-sourced packet could seed pins from the outside, but the
+		// same forgery already rides the np_nodes exemption below — the
+		// node-address trust model is the underlay's anti-spoofing, as
+		// with NetworkPolicy's node exemption.)
+		if (p.proto == IPPROTO_UDP &&
+		    bpf_map_lookup_elem(&hf_self, &p.src)) {
+			struct np_ct_key ck = {
+				.pod = p.src,
+				.peer = p.dst,
+				.pport = sport,
+				.rport = dport,
+				.proto = IPPROTO_UDP,
+			};
+			__u8 one = 1;
+			bpf_map_update_elem(&hf_ct, &ck, &one, BPF_ANY);
+		}
+		return TC_ACT_OK;
+	}
+
+	// Host-destined. Baseline exemptions first (docs/host-firewall.md): the
+	// firewall must not be able to kill the cluster it runs on.
+	if (bpf_map_lookup_elem(&np_nodes, &p.src))
+		return TC_ACT_OK; // node-sourced: kubelet/apiserver plumbing, Geneve outers
+	if (p.proto == IPPROTO_TCP) {
+		__u8 flags = 0;
+		__u32 l4off = p.is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
+		bpf_skb_load_bytes(skb, l4off + 13, &flags, 1);
+		if (!(flags & 0x02) || (flags & 0x10))
+			return TC_ACT_OK; // not a bare SYN: established, or a reply
+	} else {
+		if (dport == bpf_htons((__u16)cfg(CFG_GENEVE_PORT)))
+			return TC_ACT_OK; // never sever the overlay's own transport
+		struct np_ct_key ck = {
+			.pod = p.dst,
+			.peer = p.src,
+			.pport = dport,
+			.rport = sport,
+			.proto = IPPROTO_UDP,
+		};
+		if (bpf_map_lookup_elem(&hf_ct, &ck))
+			return TC_ACT_OK; // the reply to a node-originated flow
+	}
+
+	// The rule probe: exact port, then the any-port row. A deny hit (an
+	// `except`) masks only its own port level — the other level's allow
+	// still admits, keeping cross-policy unions monotone.
+	struct hf_allow_key ak = {
+		.prefixlen = 32 + 128,
+		.proto = p.proto,
+		.port = dport,
+		.src = p.src,
+	};
+	__u8 *v = bpf_map_lookup_elem(&hf_allow, &ak);
+	if (!v || !*v) {
+		ak.port = 0;
+		v = bpf_map_lookup_elem(&hf_allow, &ak);
+	}
+	if (v && *v)
+		return TC_ACT_OK;
+
+	__u32 zero = 0;
+	__u64 *d = bpf_map_lookup_elem(&hf_drops, &zero);
+	if (d)
+		(*d)++;
+	return TC_ACT_SHOT;
 }
 
 // cozyplane_lb_dsr: the receiving half of etp: Cluster (docs/lb-ingress.md),
@@ -4140,6 +4338,30 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 			if (sm)
 				srcmap = *sm;
 		}
+		// Node-originated UDP to a remote pod (a hostNetwork pod resolving
+		// cluster DNS via socket-LB is exactly this): pin the reply for the
+		// host firewall (docs/host-firewall.md) — it never reaches the
+		// fall-through where hf_ingress would pin it. Keys via scratch:
+		// from_pod affords no new stack (the 544 lesson).
+		if (!srcnet && p.proto == IPPROTO_UDP && cfg(CFG_HF_ENABLED) &&
+		    bpf_map_lookup_elem(&hf_self, &p.src)) {
+			__u32 z = 0;
+			struct np_scratch_val *s = bpf_map_lookup_elem(&np_scratch, &z);
+			if (s) {
+				__u32 l4o = p.is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
+				s->ck.pod = p.src;
+				s->ck.peer = p.dst;
+				bpf_skb_load_bytes(skb, l4o, &s->ck.pport, 2);
+				bpf_skb_load_bytes(skb, l4o + 2, &s->ck.rport, 2);
+				s->ck.proto = IPPROTO_UDP;
+				s->ck.pad[0] = 0;
+				s->ck.pad[1] = 0;
+				s->ck.pad[2] = 0;
+				__u8 one = 1;
+				asm volatile("" ::: "memory");
+				bpf_map_update_elem(&hf_ct, &s->ck, &one, BPF_ANY);
+			}
+		}
 		return encap_sg(skb, dstnet, *node_ip, is_gw, srcnet, srcmap);
 	}
 
@@ -4170,7 +4392,13 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 		}
 	}
 
-	return TC_ACT_OK; // off-cluster / node: kernel handles it
+	// Off-cluster / node: the kernel handles it — after the host firewall
+	// (docs/host-firewall.md). Same-node pod→node ends here; at the uplink
+	// egress the same tail call carries node-originated traffic, whose UDP
+	// pins its reply inside hf_ingress. A tail call costs from_pod no stack.
+	if (cfg(CFG_HF_ENABLED))
+		bpf_tail_call(skb, &lb_prog, 2);
+	return TC_ACT_OK;
 }
 
 // cozyplane_to_pod: destination-side hook (pod ingress). Every delivery path
@@ -4373,6 +4601,11 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 				count_np_drop(NP_DIR_EG);
 				return TC_ACT_SHOT;
 			}
+			// Node-originated UDP into a local pod: its only datapath
+			// crossing is this delivery, so the host firewall's reply-pin
+			// is written here (self-sourced only, inside the callee).
+			if (p.proto == IPPROTO_UDP && cfg(CFG_HF_ENABLED))
+				hf_pin_local(s);
 		}
 	}
 
@@ -4435,6 +4668,11 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 				return deliver_local(skb, l);
 			}
 		}
+		// Handed to the kernel. Cross-node pod→node (the node_remotes
+		// encap) exits here — if it is addressed to this node itself, the
+		// host firewall gets it first (docs/host-firewall.md).
+		if (cfg(CFG_HF_ENABLED))
+			bpf_tail_call(skb, &lb_prog, 2);
 		return TC_ACT_OK;
 	}
 
@@ -4590,6 +4828,12 @@ int cozyplane_from_uplink(struct __sk_buff *skb)
 					return deliver_local(skb, l6);
 			}
 		}
+		// v6 exits here without the v4 path's LB tail call below — but
+		// host-destined v6 (external clients; pod→node v6 rides the
+		// overlay now that node_remotes is dual-family) still owes the
+		// host firewall a look (docs/host-firewall.md).
+		if (cfg(CFG_HF_ENABLED))
+			bpf_tail_call(skb, &lb_prog, 2);
 		return TC_ACT_OK;
 	}
 
@@ -4616,7 +4860,11 @@ int cozyplane_from_uplink(struct __sk_buff *skb)
 	// LoadBalancer/NodePort ingress (docs/lb-ingress.md): dst may be a
 	// Service LB IP or this node's address on a NodePort — a tail call into
 	// its own program (fresh stack + budget; see lb_prog). Falls through to
-	// TC_ACT_OK when the agent hasn't populated the slot.
+	// TC_ACT_OK when the agent hasn't populated the slot. An LB miss chains
+	// into the host firewall from inside lb_ingress; if the LB slot itself
+	// is unpopulated, run the firewall from here.
 	bpf_tail_call(skb, &lb_prog, 0);
+	if (cfg(CFG_HF_ENABLED))
+		bpf_tail_call(skb, &lb_prog, 2);
 	return TC_ACT_OK;
 }

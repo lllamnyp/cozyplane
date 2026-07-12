@@ -22,6 +22,8 @@ type ExternalPoolExpansion interface{}
 
 type FloatingIPExpansion interface{}
 
+type HostFirewallExpansion interface{}
+
 type PortExpansion interface{}
 
 type SecurityGroupExpansion interface{}

@@ -555,3 +555,59 @@ type SecurityGroupList struct {
 
 	Items []SecurityGroup
 }
+
+// HostFirewallSpec selects nodes and declares what may reach them.
+type HostFirewallSpec struct {
+	NodeSelector metav1.LabelSelector
+	Ingress      []HostFirewallRule
+}
+
+// HostFirewallRule admits sources to ports. An empty From admits any source;
+// an empty Ports admits every TCP and UDP port.
+type HostFirewallRule struct {
+	From  []HostFirewallPeer
+	Ports []HostFirewallPort
+}
+
+// HostFirewallPeer is an admitted source range.
+type HostFirewallPeer struct {
+	CIDR   string
+	Except []string
+}
+
+// HostFirewallPort is a protocol/port an ingress rule admits.
+type HostFirewallPort struct {
+	Protocol string
+	Port     int32
+	EndPort  int32
+}
+
+// HostFirewallStatus is the observed state of a HostFirewall.
+type HostFirewallStatus struct {
+	Conditions []metav1.Condition
+}
+
+// +genclient
+// +genclient:nonNamespaced
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// HostFirewall is a cluster-scoped, operator-owned ingress policy for the
+// nodes themselves — the node-scoped sibling of NetworkPolicy (default-network
+// pods) and SecurityGroup (VPC ports). See docs/host-firewall.md.
+type HostFirewall struct {
+	metav1.TypeMeta
+	metav1.ObjectMeta
+
+	Spec   HostFirewallSpec
+	Status HostFirewallStatus
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// HostFirewallList is a list of HostFirewall objects.
+type HostFirewallList struct {
+	metav1.TypeMeta
+	metav1.ListMeta
+
+	Items []HostFirewall
+}

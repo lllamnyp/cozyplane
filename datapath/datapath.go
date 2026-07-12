@@ -40,8 +40,8 @@ type Manager struct {
 	uplinkMAC     net.HardwareAddr
 	// The floating uplink, when floating addresses live on a different link
 	// than the default route (EnsureFloatingUplink); zero = same as uplink.
-	floatIfindex int
-	floatMAC     net.HardwareAddr
+	floatIfindex  int
+	floatMAC      net.HardwareAddr
 	recreatedPins []string
 }
 
@@ -107,6 +107,11 @@ func (m *Manager) Load(vni uint32) error {
 	if err := m.objs.LbProg.Put(uint32(1), uint32(m.objs.CozyplaneLbDsr.FD())); err != nil {
 		return fmt.Errorf("populate lb tail-call slot 1: %w", err)
 	}
+	// Slot 2 is the host firewall (docs/host-firewall.md) — always populated;
+	// the call sites are armed by CFG_HF_ENABLED.
+	if err := m.objs.LbProg.Put(uint32(2), uint32(m.objs.CozyplaneHfIngress.FD())); err != nil {
+		return fmt.Errorf("populate hf tail-call slot 2: %w", err)
+	}
 
 	return nil
 }
@@ -141,6 +146,9 @@ func (m *Manager) EnsureGeneve(port uint16) error {
 
 	if err := m.objs.Params.Put(cfgGeneveIfindex, uint32(m.geneveIfindex)); err != nil {
 		return fmt.Errorf("set geneve ifindex: %w", err)
+	}
+	if err := m.objs.Params.Put(cfgGenevePort, uint32(port)); err != nil {
+		return fmt.Errorf("set geneve port: %w", err)
 	}
 
 	// Decapsulated traffic arrives on the Geneve device from a tunnel whose

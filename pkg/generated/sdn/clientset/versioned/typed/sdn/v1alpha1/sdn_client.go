@@ -30,6 +30,7 @@ type SdnV1alpha1Interface interface {
 	RESTClient() rest.Interface
 	ExternalPoolsGetter
 	FloatingIPsGetter
+	HostFirewallsGetter
 	PortsGetter
 	SecurityGroupsGetter
 	ServiceVIPsGetter
@@ -49,6 +50,10 @@ func (c *SdnV1alpha1Client) ExternalPools() ExternalPoolInterface {
 
 func (c *SdnV1alpha1Client) FloatingIPs(namespace string) FloatingIPInterface {
 	return newFloatingIPs(c, namespace)
+}
+
+func (c *SdnV1alpha1Client) HostFirewalls() HostFirewallInterface {
+	return newHostFirewalls(c)
 }
 
 func (c *SdnV1alpha1Client) Ports() PortInterface {

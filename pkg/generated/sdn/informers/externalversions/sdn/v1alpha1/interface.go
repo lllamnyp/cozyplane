@@ -28,6 +28,8 @@ type Interface interface {
 	ExternalPools() ExternalPoolInformer
 	// FloatingIPs returns a FloatingIPInformer.
 	FloatingIPs() FloatingIPInformer
+	// HostFirewalls returns a HostFirewallInformer.
+	HostFirewalls() HostFirewallInformer
 	// Ports returns a PortInformer.
 	Ports() PortInformer
 	// SecurityGroups returns a SecurityGroupInformer.
@@ -61,6 +63,11 @@ func (v *version) ExternalPools() ExternalPoolInformer {
 // FloatingIPs returns a FloatingIPInformer.
 func (v *version) FloatingIPs() FloatingIPInformer {
 	return &floatingIPInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// HostFirewalls returns a HostFirewallInformer.
+func (v *version) HostFirewalls() HostFirewallInformer {
+	return &hostFirewallInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
 }
 
 // Ports returns a PortInformer.

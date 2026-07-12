@@ -89,6 +89,10 @@ Two tiers: **declarative** (authored by tenants/operators, desired state) and
 - **`ExternalPool`** (cluster-scoped) — `{ cidrs[], advertisement (L2|BGP) }`. An
   admin-defined range of externally-routable addresses; the MetalLB
   IPAddressPool analog. `status` tracks allocation counts.
+- **`HostFirewall`** (cluster-scoped, operator-only) — `{ nodeSelector,
+  ingress[] (cidr/except → proto/port) }`. Ingress policy for the nodes
+  themselves — the node-scoped sibling of NetworkPolicy (net-0 pods) and
+  SecurityGroup (VPC ports). [host-firewall.md](host-firewall.md).
 - **`FloatingIP`** — `{ vpcRef (local), target (tenant IP), poolRef?, address? }`.
   Binds one pool address 1:1 to a workload in a VPC, source-preserving (the
   ingress door in `design.md` §10). `status` carries the assigned `address` +

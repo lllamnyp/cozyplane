@@ -24,6 +24,7 @@ import (
 	"github.com/lllamnyp/cozyplane/pkg/registry/sdn/claim"
 	externalpoolstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/externalpool"
 	floatingipstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/floatingip"
+	hostfirewallstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/hostfirewall"
 	portstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/port"
 	securitygroupstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/securitygroup"
 	servicevipstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/servicevip"
@@ -93,6 +94,10 @@ func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOpt
 	if err != nil {
 		panic(err)
 	}
+	hostFirewallREST, hostFirewallStatusREST, err := hostfirewallstorage.NewREST(scheme, restOptionsGetter)
+	if err != nil {
+		panic(err)
+	}
 
 	v1alpha1storage := map[string]rest.Storage{}
 	v1alpha1storage["vpcs"] = vpcREST
@@ -110,6 +115,8 @@ func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOpt
 	v1alpha1storage["servicevips/status"] = serviceVIPStatusREST
 	v1alpha1storage["securitygroups"] = securityGroupREST
 	v1alpha1storage["securitygroups/status"] = securityGroupStatusREST
+	v1alpha1storage["hostfirewalls"] = hostFirewallREST
+	v1alpha1storage["hostfirewalls/status"] = hostFirewallStatusREST
 	apiGroupInfo.VersionedResourcesStorageMap["v1alpha1"] = v1alpha1storage
 
 	return &apiGroupInfo

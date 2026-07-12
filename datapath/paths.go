@@ -68,6 +68,12 @@ const (
 	// the FIB would route off-subnet destinations via the *default* gateway,
 	// whose neighbour is wrong for that link. 0 = resolve via the FIB.
 	cfgFloatNH = uint32(7)
+	// cfgGenevePort is the overlay's UDP port (host order) — the host
+	// firewall's transport exemption (docs/host-firewall.md).
+	cfgGenevePort = uint32(8)
+	// cfgHFEnabled arms host-firewall enforcement: 1 while a HostFirewall
+	// selects this node (set after the rule sync, cleared before the wipe).
+	cfgHFEnabled = uint32(9)
 )
 
 // ResolverPort is the port the split-horizon resolver binds on the node

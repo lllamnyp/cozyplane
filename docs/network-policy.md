@@ -134,8 +134,10 @@ separate policy unions, unlike SG's symmetric-pair admission).
   `to_pod` anywhere) — reserved-ANY `np_allow` probes plus the `np_cidr`
   LPM, keys through the same per-CPU scratch (from_pod hosts no callee).
   Two documented deviations/gaps here: **node-destined egress is exempt**
-  (apiserver/kubelet plumbing keeps working — invariant #7's spirit; some
-  implementations gate this, revisit with the host firewall), and a net-0
+  (apiserver/kubelet plumbing keeps working — invariant #7's spirit; resolved
+  as designed by the **host firewall** ([host-firewall.md](host-firewall.md)):
+  pod→node is gated at the destination *node's* HostFirewall, one owner per
+  contract), and a net-0
   **VM guest's per-packet-DNAT'd ClusterIP egress is checked against the
   VIP, not the backend** (socket-LB'd pods — the normal case — present the
   post-translation backend address, matching upstream implementations).
@@ -244,8 +246,8 @@ separate policy unions, unlike SG's symmetric-pair admission).
    event costs one recompute, so pod churn is a non-issue.
 
 Non-goals initially: SCTP, named ports (need pod-spec resolution), policy on
-hostNetwork subjects, and the **host firewall** — that is the node-scoped
-sibling of this work and gets its own design once this lands.
+hostNetwork subjects, and the **host firewall** — the node-scoped sibling of
+this work, since built: [host-firewall.md](host-firewall.md).
 
 ## Decisions (were review questions, resolved 2026-07-11)
 

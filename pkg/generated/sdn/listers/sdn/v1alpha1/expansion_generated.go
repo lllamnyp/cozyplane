@@ -30,6 +30,10 @@ type FloatingIPListerExpansion interface{}
 // FloatingIPNamespaceLister.
 type FloatingIPNamespaceListerExpansion interface{}
 
+// HostFirewallListerExpansion allows custom methods to be added to
+// HostFirewallLister.
+type HostFirewallListerExpansion interface{}
+
 // PortListerExpansion allows custom methods to be added to
 // PortLister.
 type PortListerExpansion interface{}

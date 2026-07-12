@@ -61,6 +61,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&ServiceVIPList{},
 		&SecurityGroup{},
 		&SecurityGroupList{},
+		&HostFirewall{},
+		&HostFirewallList{},
 	)
 	metav1.AddToGroupVersion(scheme, SchemeGroupVersion)
 

@@ -63,6 +63,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&ServiceVIPList{},
 		&SecurityGroup{},
 		&SecurityGroupList{},
+		&HostFirewall{},
+		&HostFirewallList{},
 	)
 
 	return nil
