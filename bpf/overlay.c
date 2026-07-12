@@ -499,6 +499,10 @@ struct {
 #define CFG_HF_ENABLED     9 // 1 while a HostFirewall selects this node: arms
                              // the hf_ingress tail calls and the hf_ct pin
                              // writes. Set after the rule sync, cleared first.
+#define CFG_HF_EG_ENABLED 10 // 1 while a selecting HostFirewall declares
+                             // policyTypes: Egress — the node's OWN new flows
+                             // are default-deny (node->node and node->local-pod
+                             // stay exempt; docs/host-firewall.md).
 
 // bpf-masquerade port range for cluster-egress SNAT (#10): disjoint from the
 // host ephemeral range (32768+) so a reverse lookup can never capture the
@@ -784,13 +788,35 @@ static __attribute__((noinline)) void count_sg_drop(__u32 net)
 #define NP_DIR_IN 0
 #define NP_DIR_EG 1 /* increment 2 */
 
-// Reserved source identities (real hashes are remapped off 0/1 by the agent):
+// Reserved source identities (real hashes are remapped off 0-7 by the agent):
 // NP_SRC_ANY admits any source, external included (an empty `from:` rule);
 // NP_SRC_ANY_POD admits any source that resolves in np_ident (a
 // `namespaceSelector: {}` peer) — so the common allow-broadly policies cost
 // O(subjects) entries instead of O(subjects x peers).
+//
+// The ENTITY peers (docs/policy-layers.md § entities) are the vocabulary
+// upstream NetworkPolicy lacks, compiled from a reserved namespaceSelector
+// label:
+//   NP_SRC_NODES      any cluster node address (an np_nodes hit). Needed
+//                     because the node exemption below narrowed to the LOCAL
+//                     node: remote-node sources (apiserver -> webhook) are
+//                     gated like anything else once a pod is isolated.
+//   NP_SRC_LOCAL_PODS a net-0 pod co-scheduled on the subject's node (a
+//                     `locals` hit at net 0). Author-declared placement
+//                     dependence — tenet 6 forbids ENFORCEMENT from silently
+//                     depending on co-location, not the author from naming it.
+//   NP_SRC_LOCAL_NODE the subject's own node. Compiled but NOT probed: the
+//                     structural local-node exemption in np_ingress already
+//                     admits it. The rows are the forward path to a strict
+//                     mode that drops the exemption.
 #define NP_SRC_ANY 0
 #define NP_SRC_ANY_POD 1
+#define NP_SRC_NODES 2
+#define NP_SRC_LOCAL_PODS 3
+#define NP_SRC_LOCAL_NODE 4
+
+// np_nodes value bits.
+#define NP_NODE_LOCAL 1 /* this node's own address */
 
 // np_ident: fabric IP -> {identity, isolation flags}. Every net-0 pod the
 // agent knows lands here; absence (an external client, a node) means "no pod
@@ -886,8 +912,14 @@ struct {
 } np_cidr SEC(".maps");
 
 // np_nodes: node addresses (all nodes, both families, agent-fed from Node
-// objects). Node-origin plumbing — kubelet probes, hostNetwork pods — bypasses
-// ingress policy, per invariant #7 and every implementation's convention.
+// objects); the value carries NP_NODE_LOCAL for THIS node's own addresses.
+// Local-node origin — kubelet probes, same-node hostNetwork pods — bypasses
+// ingress policy unconditionally (invariant #7: the K8s contract is plumbing,
+// not revocable policy). Remote-node origin is GATED, admitted by the
+// NP_SRC_NODES entity (docs/policy-layers.md § trust model: this narrowing
+// shrinks the address-minting attack surface from "any node address in the
+// cluster" to "this node's own"). Presence alone still answers "is this a
+// node?" for from_pod's egress exemption and the host firewall.
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, struct addr128);
@@ -934,6 +966,9 @@ struct np_scratch_val {
 	struct np_allow_key ak;
 	struct np_ct_key ck;
 	struct np_cidr_key cd;
+	struct local_key lk; // the local-pods entity probe (never on the stack:
+	                     // to_pod(432) + np_ingress must stay under the 512
+	                     // combined-stack limit — the 544 lesson)
 };
 
 struct {
@@ -988,6 +1023,17 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } hf_allow SEC(".maps");
 
+// hf_eallow: the egress twin of hf_allow — {proto, port} + DESTINATION-CIDR
+// LPM, armed by CFG_HF_EG_ENABLED. Same value semantics (allow 1 / except 0).
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__type(key, struct hf_allow_key); // .src holds the DESTINATION here
+	__type(value, __u8);
+	__uint(max_entries, 16384);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} hf_eallow SEC(".maps");
+
 // hf_ct: replies to node-ORIGINATED UDP (host DNS/NTP; hostNetwork pods
 // resolving cluster DNS) — the np_ct shape with pod := the node's own
 // address. Written wherever the outbound query crosses the datapath: the
@@ -1001,14 +1047,44 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } hf_ct SEC(".maps");
 
-// hf_drops: exposed as cozyplane_hf_drops_total.
+// hf_drops: exposed as cozyplane_hf_drops_total, by direction (NP_DIR_IN /
+// NP_DIR_EG — the same encoding np_drops uses).
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, __u32);
 	__type(value, __u64);
-	__uint(max_entries, 1);
+	__uint(max_entries, 2);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } hf_drops SEC(".maps");
+
+// hf_gate probes one direction's rule map: exact port, then the any-port row.
+// A deny hit (an `except`) masks only its own port level, so cross-policy
+// unions stay monotone. Always-inline: both callers are already tail-called
+// programs with their own fresh stacks.
+static __always_inline int hf_gate(void *rules, __u8 proto, __u16 port, struct addr128 *addr)
+{
+	struct hf_allow_key ak = {
+		.prefixlen = 32 + 128,
+		.proto = proto,
+		.port = port,
+		.src = *addr,
+	};
+	__u8 *v = bpf_map_lookup_elem(rules, &ak);
+	if (v && *v)
+		return 1;
+	if (v && !*v)
+		return 0; // an except at the longest match: denied
+	ak.port = 0;
+	v = bpf_map_lookup_elem(rules, &ak);
+	return v && *v;
+}
+
+static __always_inline void hf_count_drop(__u32 dir)
+{
+	__u64 *d = bpf_map_lookup_elem(&hf_drops, &dir);
+	if (d)
+		(*d)++;
+}
 
 // np_cidr_check probes the ipBlock LPM for one direction (the queried address
 // pre-copied into s->cd.addr): exact port then any-port. Returns 1 on an
@@ -1066,8 +1142,14 @@ static __attribute__((noinline)) int np_ingress(struct np_scratch_val *s)
 		return 1; // not a pod the agent knows: not isolated
 	if (!(di->flags & NP_ING_ISOLATED))
 		return 1;
-	if (bpf_map_lookup_elem(&np_nodes, &s->q.src))
-		return 1; // node-origin plumbing (kubelet probes) — invariant #7
+
+	// The node exemption, narrowed (docs/policy-layers.md): only the LOCAL
+	// node is unconditionally exempt — kubelet probes are plumbing and must
+	// never be revocable. A REMOTE node (apiserver -> webhook) falls through
+	// and is gated, admissible via the NP_SRC_NODES entity below.
+	__u8 *nn = bpf_map_lookup_elem(&np_nodes, &s->q.src);
+	if (nn && (*nn & NP_NODE_LOCAL))
+		return 1; // invariant #7
 
 	struct np_ident_val *si = bpf_map_lookup_elem(&np_ident, &s->q.src);
 
@@ -1086,6 +1168,27 @@ static __attribute__((noinline)) int np_ingress(struct np_scratch_val *s)
 		if (bpf_map_lookup_elem(&np_allow, &s->ak))
 			return 1;
 		s->ak.src_id = NP_SRC_ANY_POD;
+		asm volatile("" ::: "memory");
+		if (bpf_map_lookup_elem(&np_allow, &s->ak))
+			return 1;
+		// The local-pods entity: source is a net-0 pod on THIS node (the
+		// subject is local by construction — to_pod is its delivery hook).
+		// Key via scratch; this frame has no room (see np_scratch_val).
+		s->lk.net = 0;
+		s->lk.ip = s->q.src;
+		asm volatile("" ::: "memory");
+		if (bpf_map_lookup_elem(&locals, &s->lk)) {
+			s->ak.src_id = NP_SRC_LOCAL_PODS;
+			asm volatile("" ::: "memory");
+			if (bpf_map_lookup_elem(&np_allow, &s->ak))
+				return 1;
+		}
+	}
+	// The nodes entity: any cluster node address. Only a REMOTE node reaches
+	// here (the local node returned above), which is exactly the traffic the
+	// narrowed exemption newly gates.
+	if (nn) {
+		s->ak.src_id = NP_SRC_NODES;
 		asm volatile("" ::: "memory");
 		if (bpf_map_lookup_elem(&np_allow, &s->ak))
 			return 1;
@@ -1126,6 +1229,18 @@ static __attribute__((noinline)) int np_egress(struct np_scratch_val *s)
 		asm volatile("" ::: "memory");
 		if (bpf_map_lookup_elem(&np_allow, &s->ak))
 			return 1;
+		// local-pods as an egress `to` peer: the destination is a net-0 pod
+		// on this node. (nodes/local-node are refused in egress by the
+		// compiler — node-destined egress is HostFirewall's contract.)
+		s->lk.net = 0;
+		s->lk.ip = s->q.dst;
+		asm volatile("" ::: "memory");
+		if (bpf_map_lookup_elem(&locals, &s->lk)) {
+			s->ak.dst_id = NP_SRC_LOCAL_PODS;
+			asm volatile("" ::: "memory");
+			if (bpf_map_lookup_elem(&np_allow, &s->ak))
+				return 1;
+		}
 	}
 	s->ak.dst_id = NP_SRC_ANY;
 	asm volatile("" ::: "memory");
@@ -1529,6 +1644,10 @@ struct {
 	__uint(max_entries, 262144);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } svc_rev SEC(".maps");
+
+// HF_ARMED: the host firewall is live in either direction. The tail calls at
+// every host-stack fall-through cost one params lookup when it is not.
+#define HF_ARMED() (cfg(CFG_HF_ENABLED) || cfg(CFG_HF_EG_ENABLED))
 
 static __always_inline __u32 cfg(__u32 idx)
 {
@@ -3520,9 +3639,10 @@ struct {
 // else affected).
 struct {
 	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-	__uint(max_entries, 3); // 0: lb_ingress (from_uplink), 1: lb_dsr
+	__uint(max_entries, 4); // 0: lb_ingress (from_uplink), 1: lb_dsr
 	                        // (from_overlay), 2: hf_ingress (host firewall,
-	                        // every host-stack fall-through)
+	                        // every host-stack fall-through), 3: hf_egress
+	                        // (node -> remote pod, from_pod's remotes hit)
 	__type(key, __u32);
 	__type(value, __u32);
 } lb_prog SEC(".maps");
@@ -3713,7 +3833,7 @@ miss:
 	// No LB row claimed it: this is host-destined (or transit) traffic on
 	// its way to the kernel — the host firewall sees it first
 	// (docs/host-firewall.md).
-	if (cfg(CFG_HF_ENABLED))
+	if (HF_ARMED())
 		bpf_tail_call(skb, &lb_prog, 2);
 	return TC_ACT_OK;
 }
@@ -3742,14 +3862,37 @@ int cozyplane_hf_ingress(struct __sk_buff *skb)
 
 	if (!bpf_map_lookup_elem(&hf_self, &p.dst)) {
 		// Not host-destined (broadcast/multicast/transit stay ungated).
-		// Node-originated UDP passing the uplink-egress fall-through pins
-		// its reply — host DNS/NTP to off-cluster peers. (A forged
-		// self-sourced packet could seed pins from the outside, but the
-		// same forgery already rides the np_nodes exemption below — the
-		// node-address trust model is the underlay's anti-spoofing, as
-		// with NetworkPolicy's node exemption.)
-		if (p.proto == IPPROTO_UDP &&
-		    bpf_map_lookup_elem(&hf_self, &p.src)) {
+		// NODE-ORIGINATED traffic passing the uplink-egress fall-through:
+		// the egress half (docs/host-firewall.md). (A forged self-sourced
+		// packet could seed pins from outside, but the same forgery already
+		// rides the np_nodes exemption below — the node-address trust model
+		// is the underlay's anti-spoofing; path-trust is the fix, see
+		// docs/policy-layers.md.)
+		if (!bpf_map_lookup_elem(&hf_self, &p.src))
+			return TC_ACT_OK;
+
+		// node -> node stays exempt, always: kubelet<->apiserver, etcd, and
+		// the agent's own API access ride it. This is what makes egress
+		// isolation impossible to self-lock-out with.
+		if (bpf_map_lookup_elem(&np_nodes, &p.dst))
+			return TC_ACT_OK;
+
+		if (cfg(CFG_HF_EG_ENABLED)) {
+			int gate = 1;
+			if (p.proto == IPPROTO_TCP) {
+				__u8 flags = 0;
+				__u32 l4o = p.is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
+				bpf_skb_load_bytes(skb, l4o + 13, &flags, 1);
+				gate = (flags & 0x02) && !(flags & 0x10);
+			}
+			if (gate && !hf_gate(&hf_eallow, p.proto, dport, &p.dst)) {
+				hf_count_drop(NP_DIR_EG);
+				return TC_ACT_SHOT;
+			}
+		}
+		// Admitted (or egress not isolated): pin the UDP reply so it passes
+		// the INGRESS gate on the way back.
+		if (p.proto == IPPROTO_UDP) {
 			struct np_ct_key ck = {
 				.pod = p.src,
 				.peer = p.dst,
@@ -3787,28 +3930,86 @@ int cozyplane_hf_ingress(struct __sk_buff *skb)
 			return TC_ACT_OK; // the reply to a node-originated flow
 	}
 
-	// The rule probe: exact port, then the any-port row. A deny hit (an
-	// `except`) masks only its own port level — the other level's allow
-	// still admits, keeping cross-policy unions monotone.
-	struct hf_allow_key ak = {
-		.prefixlen = 32 + 128,
-		.proto = p.proto,
-		.port = dport,
-		.src = p.src,
-	};
-	__u8 *v = bpf_map_lookup_elem(&hf_allow, &ak);
-	if (!v || !*v) {
-		ak.port = 0;
-		v = bpf_map_lookup_elem(&hf_allow, &ak);
+	if (!cfg(CFG_HF_ENABLED))
+		return TC_ACT_OK; // egress-only object: ingress is not isolated
+
+	if (!hf_gate(&hf_allow, p.proto, dport, &p.src)) {
+		hf_count_drop(NP_DIR_IN);
+		return TC_ACT_SHOT;
 	}
-	if (v && *v)
+	// Admitted inbound UDP: pin the node's REPLY so it passes the egress
+	// gate (statefulness is symmetric — the key is the one just computed).
+	if (p.proto == IPPROTO_UDP) {
+		struct np_ct_key ck = {
+			.pod = p.dst,   // the node
+			.peer = p.src,  // the client
+			.pport = dport,
+			.rport = sport,
+			.proto = IPPROTO_UDP,
+		};
+		__u8 one = 1;
+		bpf_map_update_elem(&hf_ct, &ck, &one, BPF_ANY);
+	}
+	return TC_ACT_OK;
+}
+
+// cozyplane_hf_egress: the host firewall's egress half for node -> REMOTE POD
+// (docs/host-firewall.md) — the one node-originated path that never reaches a
+// fall-through, because from_pod's remotes-hit encapsulates it. Tail-called
+// from there (lb_prog slot 3) for node-sourced TCP/UDP; a tail call never
+// returns, so on admit this program performs the encap itself. An unpopulated
+// slot falls through to from_pod's inline encap: fail-OPEN on delivery, never
+// a black hole.
+SEC("tc")
+int cozyplane_hf_egress(struct __sk_buff *skb)
+{
+	struct pkt p;
+	if (parse_ip(skb, &p) < 0)
+		return TC_ACT_OK;
+	__u16 sport, dport;
+	if (p.is_v6 ? l4_ports6(skb, &sport, &dport) < 0
+		    : l4_ports(skb, &sport, &dport) < 0)
 		return TC_ACT_OK;
 
-	__u32 zero = 0;
-	__u64 *d = bpf_map_lookup_elem(&hf_drops, &zero);
-	if (d)
-		(*d)++;
-	return TC_ACT_SHOT;
+	// node -> local pod never gets here (it is delivered, not encapsulated);
+	// node -> node is exempt at the call site. This is node -> remote pod.
+	//
+	// The gate runs ONLY when egress is isolated: this program is reached
+	// whenever EITHER direction is armed (one tail call serves both), so an
+	// ingress-only firewall must fall straight through to the encap — gating
+	// against an empty hf_eallow here would drop every node->remote-pod flow
+	// (hostNetwork cluster DNS among them).
+	if (cfg(CFG_HF_EG_ENABLED)) {
+		int gate = 1;
+		if (p.proto == IPPROTO_TCP) {
+			__u8 flags = 0;
+			__u32 l4o = p.is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
+			bpf_skb_load_bytes(skb, l4o + 13, &flags, 1);
+			gate = (flags & 0x02) && !(flags & 0x10);
+		}
+		if (gate && !hf_gate(&hf_eallow, p.proto, dport, &p.dst)) {
+			hf_count_drop(NP_DIR_EG);
+			return TC_ACT_SHOT;
+		}
+	}
+	if (p.proto == IPPROTO_UDP) {
+		struct np_ct_key ck = {
+			.pod = p.src,
+			.peer = p.dst,
+			.pport = sport,
+			.rport = dport,
+			.proto = IPPROTO_UDP,
+		};
+		__u8 one = 1;
+		bpf_map_update_elem(&hf_ct, &ck, &one, BPF_ANY);
+	}
+
+	// Admitted: re-resolve the destination and do the encap from_pod would
+	// have done (net 0 — a node source is never in a VPC).
+	__u32 *node_ip = remote_of(0, p.dst);
+	if (!node_ip)
+		return TC_ACT_OK; // raced with a remotes update: let the kernel try
+	return encap(skb, 0, *node_ip, 0);
 }
 
 // cozyplane_lb_dsr: the receiving half of etp: Cluster (docs/lb-ingress.md),
@@ -4338,30 +4539,18 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 			if (sm)
 				srcmap = *sm;
 		}
-		// Node-originated UDP to a remote pod (a hostNetwork pod resolving
-		// cluster DNS via socket-LB is exactly this): pin the reply for the
-		// host firewall (docs/host-firewall.md) — it never reaches the
-		// fall-through where hf_ingress would pin it. Keys via scratch:
-		// from_pod affords no new stack (the 544 lesson).
-		if (!srcnet && p.proto == IPPROTO_UDP && cfg(CFG_HF_ENABLED) &&
-		    bpf_map_lookup_elem(&hf_self, &p.src)) {
-			__u32 z = 0;
-			struct np_scratch_val *s = bpf_map_lookup_elem(&np_scratch, &z);
-			if (s) {
-				__u32 l4o = p.is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
-				s->ck.pod = p.src;
-				s->ck.peer = p.dst;
-				bpf_skb_load_bytes(skb, l4o, &s->ck.pport, 2);
-				bpf_skb_load_bytes(skb, l4o + 2, &s->ck.rport, 2);
-				s->ck.proto = IPPROTO_UDP;
-				s->ck.pad[0] = 0;
-				s->ck.pad[1] = 0;
-				s->ck.pad[2] = 0;
-				__u8 one = 1;
-				asm volatile("" ::: "memory");
-				bpf_map_update_elem(&hf_ct, &s->ck, &one, BPF_ANY);
-			}
-		}
+		// Node-originated to a REMOTE POD (a hostNetwork pod resolving
+		// cluster DNS via socket-LB is exactly this): the one node-origin
+		// path that never reaches a host-stack fall-through, because this
+		// encap consumes it. Hand it to the host firewall's egress program
+		// (docs/host-firewall.md) — a tail call costs from_pod no stack (the
+		// 544 lesson) and it performs the encap itself on admit. An
+		// unpopulated slot falls through to the inline encap below.
+		if (!srcnet && HF_ARMED() &&
+		    (p.proto == IPPROTO_TCP || p.proto == IPPROTO_UDP) &&
+		    bpf_map_lookup_elem(&hf_self, &p.src) &&
+		    !bpf_map_lookup_elem(&np_nodes, &p.dst))
+			bpf_tail_call(skb, &lb_prog, 3);
 		return encap_sg(skb, dstnet, *node_ip, is_gw, srcnet, srcmap);
 	}
 
@@ -4396,7 +4585,7 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	// (docs/host-firewall.md). Same-node pod→node ends here; at the uplink
 	// egress the same tail call carries node-originated traffic, whose UDP
 	// pins its reply inside hf_ingress. A tail call costs from_pod no stack.
-	if (cfg(CFG_HF_ENABLED))
+	if (HF_ARMED())
 		bpf_tail_call(skb, &lb_prog, 2);
 	return TC_ACT_OK;
 }
@@ -4604,7 +4793,7 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 			// Node-originated UDP into a local pod: its only datapath
 			// crossing is this delivery, so the host firewall's reply-pin
 			// is written here (self-sourced only, inside the callee).
-			if (p.proto == IPPROTO_UDP && cfg(CFG_HF_ENABLED))
+			if (p.proto == IPPROTO_UDP && HF_ARMED())
 				hf_pin_local(s);
 		}
 	}
@@ -4671,7 +4860,7 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 		// Handed to the kernel. Cross-node pod→node (the node_remotes
 		// encap) exits here — if it is addressed to this node itself, the
 		// host firewall gets it first (docs/host-firewall.md).
-		if (cfg(CFG_HF_ENABLED))
+		if (HF_ARMED())
 			bpf_tail_call(skb, &lb_prog, 2);
 		return TC_ACT_OK;
 	}
@@ -4832,7 +5021,7 @@ int cozyplane_from_uplink(struct __sk_buff *skb)
 		// host-destined v6 (external clients; pod→node v6 rides the
 		// overlay now that node_remotes is dual-family) still owes the
 		// host firewall a look (docs/host-firewall.md).
-		if (cfg(CFG_HF_ENABLED))
+		if (HF_ARMED())
 			bpf_tail_call(skb, &lb_prog, 2);
 		return TC_ACT_OK;
 	}
@@ -4864,7 +5053,7 @@ int cozyplane_from_uplink(struct __sk_buff *skb)
 	// into the host firewall from inside lb_ingress; if the LB slot itself
 	// is unpopulated, run the firewall from here.
 	bpf_tail_call(skb, &lb_prog, 0);
-	if (cfg(CFG_HF_ENABLED))
+	if (HF_ARMED())
 		bpf_tail_call(skb, &lb_prog, 2);
 	return TC_ACT_OK;
 }

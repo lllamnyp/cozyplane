@@ -112,6 +112,9 @@ func (m *Manager) Load(vni uint32) error {
 	if err := m.objs.LbProg.Put(uint32(2), uint32(m.objs.CozyplaneHfIngress.FD())); err != nil {
 		return fmt.Errorf("populate hf tail-call slot 2: %w", err)
 	}
+	if err := m.objs.LbProg.Put(uint32(3), uint32(m.objs.CozyplaneHfEgress.FD())); err != nil {
+		return fmt.Errorf("populate hf tail-call slot 3: %w", err)
+	}
 
 	return nil
 }

@@ -136,6 +136,47 @@ type npCompiled struct {
 	warnings []string
 }
 
+// npEntityLabel is the reserved namespaceSelector key that names an entity
+// peer (docs/policy-layers.md § entities) — the vocabulary upstream
+// NetworkPolicy lacks. It lives in-schema (a plain namespaceSelector), so a
+// policy carrying it is portable: on any other CNI the label matches no
+// namespace and the rule simply admits nothing (fails closed).
+const npEntityLabel = "policy.cozyplane.io/entity"
+
+// npEntityPeer recognizes an entity peer. It is deliberately strict: the
+// entity label must be the selector's ONLY matchLabels entry, with no
+// matchExpressions and no podSelector beside it — anything else is a literal
+// namespace selector (a namespace really could carry the label) and is
+// compiled as one.
+func npEntityPeer(peer networkingv1.NetworkPolicyPeer) (string, bool) {
+	ns := peer.NamespaceSelector
+	if ns == nil || peer.PodSelector != nil || peer.IPBlock != nil {
+		return "", false
+	}
+	if len(ns.MatchExpressions) != 0 || len(ns.MatchLabels) != 1 {
+		return "", false
+	}
+	v, ok := ns.MatchLabels[npEntityLabel]
+	return v, ok
+}
+
+// npEntityID maps an entity name to its reserved identity, and reports
+// whether it is legal in the given direction. `nodes` and `local-node` are
+// ingress-only: node-destined egress is the HostFirewall's contract
+// (docs/policy-layers.md — one owner per flow), so admitting them here would
+// create a second owner that the datapath never consults.
+func npEntityID(name string, dir uint8) (uint64, bool) {
+	switch name {
+	case "nodes":
+		return datapath.NPSrcNodes, dir == datapath.NPDirIn
+	case "local-node":
+		return datapath.NPSrcLocalNode, dir == datapath.NPDirIn
+	case "local-pods":
+		return datapath.NPSrcLocalPods, true
+	}
+	return 0, false
+}
+
 // npSelectorWarnings flags selector keys the identity filter erases.
 func npSelectorWarnings(policy string, sel *metav1.LabelSelector, warns *[]string) {
 	if sel == nil {
@@ -276,12 +317,30 @@ func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*
 
 		// resolvePeers compiles one rule's peer list into identity ids
 		// (reserved ANY_POD for namespaceSelector:{}) and ipBlocks.
-		resolvePeers := func(peers []networkingv1.NetworkPolicyPeer) ([]uint64, []*networkingv1.IPBlock) {
+		resolvePeers := func(peers []networkingv1.NetworkPolicyPeer, dir uint8) ([]uint64, []*networkingv1.IPBlock) {
 			var ids []uint64
 			var blocks []*networkingv1.IPBlock
 			for _, peer := range peers {
 				if peer.IPBlock != nil {
 					blocks = append(blocks, peer.IPBlock)
+					continue
+				}
+				// Entity peers before the ordinary selector paths — the
+				// reserved label would otherwise compile as a literal
+				// namespace selector matching nothing.
+				if name, ok := npEntityPeer(peer); ok {
+					id, legal := npEntityID(name, dir)
+					if !legal {
+						where := "egress"
+						if dir == datapath.NPDirIn {
+							where = "ingress"
+						}
+						c.warnings = append(c.warnings, fmt.Sprintf(
+							"%s: entity %q is not served as an %s peer (node-destined egress is HostFirewall's; see docs/policy-layers.md): rule compiled closed",
+							policy, name, where))
+						continue
+					}
+					ids = append(ids, id)
 					continue
 				}
 				npSelectorWarnings(policy, peer.PodSelector, &c.warnings)
@@ -399,7 +458,7 @@ func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*
 				if len(rule.From) == 0 {
 					peerIDs = []uint64{datapath.NPSrcAny}
 				} else {
-					peerIDs, blocks = resolvePeers(rule.From)
+					peerIDs, blocks = resolvePeers(rule.From, datapath.NPDirIn)
 				}
 				if len(ports) == 0 {
 					continue
@@ -432,7 +491,7 @@ func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*
 				if len(rule.To) == 0 {
 					peerIDs = []uint64{datapath.NPSrcAny}
 				} else {
-					peerIDs, blocks = resolvePeers(rule.To)
+					peerIDs, blocks = resolvePeers(rule.To, datapath.NPDirEg)
 				}
 				if len(ports) == 0 {
 					continue

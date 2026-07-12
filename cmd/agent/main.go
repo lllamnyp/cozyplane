@@ -503,14 +503,18 @@ func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.
 		if !ok {
 			return
 		}
+		// Only the LOCAL node's addresses are unconditionally ingress-exempt
+		// (docs/policy-layers.md): remote-node origin is gated, admitted by
+		// the `nodes` entity. The flag rides in the np_nodes value.
+		local := node.Name == selfName
 		for _, addr := range npNodeAddresses(node) {
-			if err := mgr.SetNPNode(addr); err != nil {
+			if err := mgr.SetNPNode(addr, local); err != nil {
 				log.Error("set np node", "node", node.Name, "addr", addr, "err", err)
 			}
 		}
 		// The same self address set is what "host-destined" means to the
 		// host firewall (docs/host-firewall.md).
-		if node.Name == selfName {
+		if local {
 			if err := mgr.SyncHFSelf(npNodeAddresses(node)); err != nil {
 				log.Error("sync hf self", "node", node.Name, "err", err)
 			}
@@ -1887,10 +1891,13 @@ func serveMetrics(ctx context.Context, mgr *datapath.Manager, vpcs sdnv1alpha1in
 		fmt.Fprintf(&b, "# HELP cozyplane_np_sync_errors_total NetworkPolicy compiler sync failures (this node).\n# TYPE cozyplane_np_sync_errors_total counter\n")
 		fmt.Fprintf(&b, "cozyplane_np_sync_errors_total{node=\"%s\"} %d\n", nodeName, npSyncErrors.Load())
 
-		// Host firewall (docs/host-firewall.md).
+		// Host firewall (docs/host-firewall.md), by direction.
 		if drops, err := mgr.HFDrops(); err == nil {
 			fmt.Fprintf(&b, "# HELP cozyplane_hf_drops_total Packets dropped by the host firewall (this node).\n# TYPE cozyplane_hf_drops_total counter\n")
-			fmt.Fprintf(&b, "cozyplane_hf_drops_total{node=\"%s\"} %d\n", nodeName, drops)
+			dirs := map[uint8]string{datapath.NPDirIn: "ingress", datapath.NPDirEg: "egress"}
+			for dir, d := range drops {
+				fmt.Fprintf(&b, "cozyplane_hf_drops_total{direction=\"%s\",node=\"%s\"} %d\n", dirs[dir], nodeName, d)
+			}
 		}
 		fmt.Fprintf(&b, "# HELP cozyplane_hf_sync_errors_total HostFirewall compiler sync failures (this node).\n# TYPE cozyplane_hf_sync_errors_total counter\n")
 		fmt.Fprintf(&b, "cozyplane_hf_sync_errors_total{node=\"%s\"} %d\n", nodeName, hfSyncErrors.Load())

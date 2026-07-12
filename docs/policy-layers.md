@@ -36,15 +36,18 @@ key on labels), but it never gates that pod's VPC traffic:
 |------|-------|---------------------------|
 | to/from a **VPC IP** (east-west, peering, gateway, floating, LB→VPC backend) | SecurityGroup | NP's gate lives in `to_pod`'s net-0 branch (`!dstnet`) — structurally skipped; HF looks only at host-destined traffic |
 | to a **net-0 pod IP** — from another net-0 pod, from an LB/NodePort delivery (client source preserved), or raw routed external ingress | NetworkPolicy | SG never sees VNI 0; HF not host-destined |
-| **pod → node address** | HostFirewall (at the destination node) | NP's node-destined egress is exempt by design — one owner per contract, no double jeopardy |
-| **node-originated** (kubelet probes, apiserver→pod/webhook, node→anything) | *nobody — structurally exempt from all three* (see below) |
+| **pod → node address** | HostFirewall ingress (at the destination node) | NP's node-destined egress is exempt by design — one owner per contract, no double jeopardy |
+| **local-node-originated** (kubelet probes, same-node plumbing) | *nobody — structurally exempt from all three* (see below) |
+| **remote-node-originated** into a net-0 pod (apiserver→webhook and friends) | NetworkPolicy — gated once the pod is ingress-isolated, expressible via the `nodes` entity (below) | was blanket-exempt before the entity work; SG's north-south gate keys on pod-origin only; HF gates only host-destined |
+| **node-originated egress** (node→remote pod, node→external) | HostFirewall egress (opt-in via `policyTypes: [Ingress, Egress]`) | node→node and node→local-pod stay exempt: the former carries kubelet↔apiserver/etcd (and the agent's own API access — no self-lockout), the latter is kubelet-probe plumbing, indistinguishable at L3/4 until path-trust |
 
 Consequences worth spelling out:
 
 - **No SecurityGroup can break kubelet health checks.** A probe rides the
   fabric bridge with no `NS_MARK` and is delivered before any SG code runs;
-  NP exempts node sources via `np_nodes`; HF doesn't gate node→pod. This
-  holds for any pod, net-0 or VPC (e.g. a tenant etcd's readiness). What a
+  NP exempts local-node sources via `np_nodes`; HF exempts node→local-pod
+  even under egress isolation. This holds for any pod, net-0 or VPC (e.g. a
+  tenant etcd's readiness). What a
   restrictive SG *does* gate — by design — is the tenant's own east-west
   (etcd peer traffic on VPC IPs) and their own health-checking *pods*: the
   exemption is deliberately narrow so workloads can't ride it.
@@ -60,20 +63,52 @@ Consequences worth spelling out:
   from `np_ident`, making their fabric IPs "external" to NP (`ipBlock`
   territory); alternative: document as intended. Neither done yet.
 
+## NetworkPolicy entities: `local-node`, `nodes`, `local-pods`
+
+Upstream NetworkPolicy has no vocabulary for nodes or for locality, so
+cozyplane defines three **entity peers**, encoded as a reserved
+namespaceSelector label (in-schema, portable — on any other CNI the
+selector matches no namespace and fails closed):
+
+```yaml
+from:
+  - namespaceSelector:
+      matchLabels: {policy.cozyplane.io/entity: nodes}
+```
+
+- **`local-node`** — the subject pod's own node. Redundant with the
+  structural exemption today; compiling it anyway is deliberate: it is the
+  *explicit and recommended* form of "kubelet may reach me", and the
+  migration path if a strict mode ever drops the structural exemption.
+- **`nodes`** — any cluster node address. The peer to write for pods that
+  receive **remote** node-origin traffic (admission webhooks called by a
+  hostNetwork apiserver, aggregated APIs) — because with the entity work
+  the blanket node exemption **narrowed to the local node**: remote-node
+  sources are gated like any other once a pod is ingress-isolated.
+- **`local-pods`** — pods co-scheduled on the subject's node (the per-node
+  agent/scraper pattern). Deliberate, policy-author-declared placement
+  dependence: tenet 6 (placement independence) forbids *enforcement* from
+  silently depending on co-location, not the author from naming it.
+
+Entities are ingress peers and (for `local-pods` only) egress peers;
+`nodes`/`local-node` in egress rules are refused — node-destined egress is
+HostFirewall territory (one owner per contract).
+
 ## The node-origin exemption is plumbing, not policy
 
-All three layers exempt node-originated traffic unconditionally. This is
-invariant #7 (the Kubernetes contract is plumbing): probes, apiserver→
-webhook, and kubelet↔apiserver must keep working *no matter what anyone
-writes*. It is deliberately **not** an explicit default-allow policy
-object: a deletable "allow kubelet" rule is one `kubectl delete` — or one
+All three layers exempt the **local** node's origin traffic and node→node
+plumbing unconditionally. This is invariant #7 (the Kubernetes contract is
+plumbing): probes and kubelet↔apiserver must keep working *no matter what
+anyone writes*. (Remote-node→pod — apiserver→webhook — moved from exempt
+to *expressible*: the `nodes` entity.) The exemption is deliberately
+**not** an explicit default-allow policy object: a deletable "allow kubelet" rule is one `kubectl delete` — or one
 not-yet-synced watch at pod start — away from every isolated pod in the
 cluster going NotReady. Plumbing must not be revocable from the policy
 surface, any more than the Geneve port should be.
 
 What *is* legitimate policy is everything beyond that contract minimum:
-node→pod scrapes, node→internet. Those become expressible when the
-HostFirewall's **egress** increment lands (roadmap §6) — the natural home
+node→pod scrapes, node→internet. Those are expressible in the
+HostFirewall's **egress** increment (host-firewall.md) — the natural home
 for gating node-originated traffic, since upstream NetworkPolicy has no
 vocabulary for "the kubelet" as a peer, while HostFirewall already has the
 node as its subject and the operator as its author.
@@ -100,3 +135,10 @@ traffic arrives on the uplink, not through a node channel, whatever source
 it carries. Until then, the exemption should be *visible* even though it is
 not revocable — a per-layer `*_node_exempt_total` counter is the cheap
 first step.
+
+The first narrowing shipped with the entity work: NetworkPolicy's
+unconditional exemption now covers only the **local** node (`np_nodes`
+carries a locality flag); remote-node sources are ordinary gated sources,
+admitted by the `nodes` entity when a policy wants them. The exempt surface
+an address-minting bug can ride shrank from "any node address in the
+cluster" to "this node's own addresses".

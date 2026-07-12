@@ -42,6 +42,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.FloatingIPSpec":          schema_cozyplane_api_sdn_v1alpha1_FloatingIPSpec(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.FloatingIPStatus":        schema_cozyplane_api_sdn_v1alpha1_FloatingIPStatus(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.HostFirewall":            schema_cozyplane_api_sdn_v1alpha1_HostFirewall(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.HostFirewallEgressRule":  schema_cozyplane_api_sdn_v1alpha1_HostFirewallEgressRule(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.HostFirewallList":        schema_cozyplane_api_sdn_v1alpha1_HostFirewallList(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.HostFirewallPeer":        schema_cozyplane_api_sdn_v1alpha1_HostFirewallPeer(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.HostFirewallPort":        schema_cozyplane_api_sdn_v1alpha1_HostFirewallPort(ref),
@@ -580,6 +581,49 @@ func schema_cozyplane_api_sdn_v1alpha1_HostFirewall(ref common.ReferenceCallback
 	}
 }
 
+func schema_cozyplane_api_sdn_v1alpha1_HostFirewallEgressRule(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "HostFirewallEgressRule admits node-originated traffic to destinations. An empty To admits any destination; an empty Ports admits every TCP and UDP port.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"to": {
+						SchemaProps: spec.SchemaProps{
+							Description: "To lists admitted destination ranges. Empty means any destination.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.HostFirewallPeer"),
+									},
+								},
+							},
+						},
+					},
+					"ports": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Ports narrows the rule to specific destination ports. Empty means every port, TCP and UDP.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.HostFirewallPort"),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.HostFirewallPeer", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.HostFirewallPort"},
+	}
+}
+
 func schema_cozyplane_api_sdn_v1alpha1_HostFirewallList(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
@@ -759,6 +803,21 @@ func schema_cozyplane_api_sdn_v1alpha1_HostFirewallSpec(ref common.ReferenceCall
 							Ref:         ref(v1.LabelSelector{}.OpenAPIModelName()),
 						},
 					},
+					"policyTypes": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PolicyTypes selects the directions this object isolates, mirroring NetworkPolicy: empty defaults to [Ingress], plus Egress when Egress rules are present. A node selected by an object whose types include Egress is host-EGRESS isolated: its own new TCP/UDP flows out are default-deny. node->node and node->local-pod stay exempt regardless (kubelet↔apiserver, the agent's own API access, kubelet probes — docs/host-firewall.md).",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: "",
+										Type:    []string{"string"},
+										Format:  "",
+									},
+								},
+							},
+						},
+					},
 					"ingress": {
 						SchemaProps: spec.SchemaProps{
 							Description: "Ingress rules union across all HostFirewalls selecting a node.",
@@ -773,11 +832,25 @@ func schema_cozyplane_api_sdn_v1alpha1_HostFirewallSpec(ref common.ReferenceCall
 							},
 						},
 					},
+					"egress": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Egress rules union across all HostFirewalls selecting a node. `to` peers are CIDRs, like ingress `from`.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.HostFirewallEgressRule"),
+									},
+								},
+							},
+						},
+					},
 				},
 			},
 		},
 		Dependencies: []string{
-			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.HostFirewallRule", v1.LabelSelector{}.OpenAPIModelName()},
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.HostFirewallEgressRule", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.HostFirewallRule", v1.LabelSelector{}.OpenAPIModelName()},
 	}
 }
 

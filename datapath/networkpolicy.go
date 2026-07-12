@@ -37,10 +37,24 @@ const (
 
 	NPSrcAny    uint64 = 0
 	NPSrcAnyPod uint64 = 1
+	// Entity peers (docs/policy-layers.md § entities): the vocabulary
+	// upstream NetworkPolicy lacks. NPSrcLocalNode is compiled but not
+	// probed — the structural local-node exemption supersedes it (the
+	// forward path to a strict mode that drops the exemption).
+	NPSrcNodes     uint64 = 2
+	NPSrcLocalPods uint64 = 3
+	NPSrcLocalNode uint64 = 4
 	// NPFirstRealID is the smallest identity the compiler may emit; hashes
-	// below it are remapped so the reserved ids stay unambiguous.
-	NPFirstRealID uint64 = 2
+	// below it are remapped so the reserved ids stay unambiguous (5-7 are
+	// spare headroom for further entities).
+	NPFirstRealID uint64 = 8
 )
+
+// NPNodeLocal marks an np_nodes entry as one of THIS node's own addresses:
+// only the local node's origin traffic is unconditionally ingress-exempt
+// (kubelet probes — plumbing); remote-node origin is gated and admitted by
+// the `nodes` entity.
+const NPNodeLocal uint8 = 1
 
 // NPIdent is one pod address's identity row.
 type NPIdent struct {
@@ -197,15 +211,19 @@ func (m *Manager) SyncNPCidrs(entries []NPCidr) error {
 	return syncMap(m.objs.NpCidr, want)
 }
 
-// SetNPNode marks an address as node-origin (ingress-policy exempt);
-// DelNPNode unmarks it. Incremental, like SetNodeRemote.
-func (m *Manager) SetNPNode(ip net.IP) error {
+// SetNPNode records an address as a node's. `local` marks this node's own
+// addresses — the only ones unconditionally exempt from ingress policy.
+// DelNPNode removes it. Incremental, like SetNodeRemote.
+func (m *Manager) SetNPNode(ip net.IP, local bool) error {
 	a, err := addr128(ip)
 	if err != nil {
 		return fmt.Errorf("np node IP: %w", err)
 	}
-	one := uint8(1)
-	return m.objs.NpNodes.Put(&a, &one)
+	var v uint8
+	if local {
+		v = NPNodeLocal
+	}
+	return m.objs.NpNodes.Put(&a, &v)
 }
 
 func (m *Manager) DelNPNode(ip net.IP) error {

@@ -183,6 +183,8 @@ type overlayNpScratchVal struct {
 	Ak overlayNpAllowKey
 	Ck overlayNpCtKey
 	Cd overlayNpCidrKey
+	Lk overlayLocalKey
+	_  [4]byte
 }
 
 type overlayPeerKey struct {
@@ -314,6 +316,7 @@ const (
 	overlayMapHfAllow               = "hf_allow"
 	overlayMapHfCt                  = "hf_ct"
 	overlayMapHfDrops               = "hf_drops"
+	overlayMapHfEallow              = "hf_eallow"
 	overlayMapHfSelf                = "hf_self"
 	overlayMapInternal              = "internal"
 	overlayMapLbProg                = "lb_prog"
@@ -350,6 +353,7 @@ const (
 	overlayProgCozyplaneFromOverlay = "cozyplane_from_overlay"
 	overlayProgCozyplaneFromPod     = "cozyplane_from_pod"
 	overlayProgCozyplaneFromUplink  = "cozyplane_from_uplink"
+	overlayProgCozyplaneHfEgress    = "cozyplane_hf_egress"
 	overlayProgCozyplaneHfIngress   = "cozyplane_hf_ingress"
 	overlayProgCozyplaneLbDsr       = "cozyplane_lb_dsr"
 	overlayProgCozyplaneLbIngress   = "cozyplane_lb_ingress"
@@ -401,6 +405,7 @@ type overlayProgramSpecs struct {
 	CozyplaneFromOverlay *ebpf.ProgramSpec `ebpf:"cozyplane_from_overlay"`
 	CozyplaneFromPod     *ebpf.ProgramSpec `ebpf:"cozyplane_from_pod"`
 	CozyplaneFromUplink  *ebpf.ProgramSpec `ebpf:"cozyplane_from_uplink"`
+	CozyplaneHfEgress    *ebpf.ProgramSpec `ebpf:"cozyplane_hf_egress"`
 	CozyplaneHfIngress   *ebpf.ProgramSpec `ebpf:"cozyplane_hf_ingress"`
 	CozyplaneLbDsr       *ebpf.ProgramSpec `ebpf:"cozyplane_lb_dsr"`
 	CozyplaneLbIngress   *ebpf.ProgramSpec `ebpf:"cozyplane_lb_ingress"`
@@ -425,6 +430,7 @@ type overlayMapSpecs struct {
 	HfAllow        *ebpf.MapSpec `ebpf:"hf_allow"`
 	HfCt           *ebpf.MapSpec `ebpf:"hf_ct"`
 	HfDrops        *ebpf.MapSpec `ebpf:"hf_drops"`
+	HfEallow       *ebpf.MapSpec `ebpf:"hf_eallow"`
 	HfSelf         *ebpf.MapSpec `ebpf:"hf_self"`
 	Internal       *ebpf.MapSpec `ebpf:"internal"`
 	LbProg         *ebpf.MapSpec `ebpf:"lb_prog"`
@@ -500,6 +506,7 @@ type overlayMaps struct {
 	HfAllow        *ebpf.Map `ebpf:"hf_allow"`
 	HfCt           *ebpf.Map `ebpf:"hf_ct"`
 	HfDrops        *ebpf.Map `ebpf:"hf_drops"`
+	HfEallow       *ebpf.Map `ebpf:"hf_eallow"`
 	HfSelf         *ebpf.Map `ebpf:"hf_self"`
 	Internal       *ebpf.Map `ebpf:"internal"`
 	LbProg         *ebpf.Map `ebpf:"lb_prog"`
@@ -551,6 +558,7 @@ func (m *overlayMaps) Close() error {
 		m.HfAllow,
 		m.HfCt,
 		m.HfDrops,
+		m.HfEallow,
 		m.HfSelf,
 		m.Internal,
 		m.LbProg,
@@ -600,6 +608,7 @@ type overlayPrograms struct {
 	CozyplaneFromOverlay *ebpf.Program `ebpf:"cozyplane_from_overlay"`
 	CozyplaneFromPod     *ebpf.Program `ebpf:"cozyplane_from_pod"`
 	CozyplaneFromUplink  *ebpf.Program `ebpf:"cozyplane_from_uplink"`
+	CozyplaneHfEgress    *ebpf.Program `ebpf:"cozyplane_hf_egress"`
 	CozyplaneHfIngress   *ebpf.Program `ebpf:"cozyplane_hf_ingress"`
 	CozyplaneLbDsr       *ebpf.Program `ebpf:"cozyplane_lb_dsr"`
 	CozyplaneLbIngress   *ebpf.Program `ebpf:"cozyplane_lb_ingress"`
@@ -611,6 +620,7 @@ func (p *overlayPrograms) Close() error {
 		p.CozyplaneFromOverlay,
 		p.CozyplaneFromPod,
 		p.CozyplaneFromUplink,
+		p.CozyplaneHfEgress,
 		p.CozyplaneHfIngress,
 		p.CozyplaneLbDsr,
 		p.CozyplaneLbIngress,

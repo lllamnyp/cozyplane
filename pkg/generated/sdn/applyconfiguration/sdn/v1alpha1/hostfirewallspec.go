@@ -19,6 +19,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
 	v1 "k8s.io/client-go/applyconfigurations/meta/v1"
 )
 
@@ -34,8 +35,19 @@ type HostFirewallSpecApplyConfiguration struct {
 	// traffic, the overlay transport, ICMP, established TCP, and replies to
 	// node-originated UDP are never gated (docs/host-firewall.md).
 	NodeSelector *v1.LabelSelectorApplyConfiguration `json:"nodeSelector,omitempty"`
+	// PolicyTypes selects the directions this object isolates, mirroring
+	// NetworkPolicy: empty defaults to [Ingress], plus Egress when Egress
+	// rules are present. A node selected by an object whose types include
+	// Egress is host-EGRESS isolated: its own new TCP/UDP flows out are
+	// default-deny. node->node and node->local-pod stay exempt regardless
+	// (kubelet↔apiserver, the agent's own API access, kubelet probes —
+	// docs/host-firewall.md).
+	PolicyTypes []sdnv1alpha1.HostFirewallPolicyType `json:"policyTypes,omitempty"`
 	// Ingress rules union across all HostFirewalls selecting a node.
 	Ingress []HostFirewallRuleApplyConfiguration `json:"ingress,omitempty"`
+	// Egress rules union across all HostFirewalls selecting a node. `to`
+	// peers are CIDRs, like ingress `from`.
+	Egress []HostFirewallEgressRuleApplyConfiguration `json:"egress,omitempty"`
 }
 
 // HostFirewallSpecApplyConfiguration constructs a declarative configuration of the HostFirewallSpec type for use with
@@ -52,6 +64,16 @@ func (b *HostFirewallSpecApplyConfiguration) WithNodeSelector(value *v1.LabelSel
 	return b
 }
 
+// WithPolicyTypes adds the given value to the PolicyTypes field in the declarative configuration
+// and returns the receiver, so that objects can be build by chaining "With" function invocations.
+// If called multiple times, values provided by each call will be appended to the PolicyTypes field.
+func (b *HostFirewallSpecApplyConfiguration) WithPolicyTypes(values ...sdnv1alpha1.HostFirewallPolicyType) *HostFirewallSpecApplyConfiguration {
+	for i := range values {
+		b.PolicyTypes = append(b.PolicyTypes, values[i])
+	}
+	return b
+}
+
 // WithIngress adds the given value to the Ingress field in the declarative configuration
 // and returns the receiver, so that objects can be build by chaining "With" function invocations.
 // If called multiple times, values provided by each call will be appended to the Ingress field.
@@ -61,6 +83,19 @@ func (b *HostFirewallSpecApplyConfiguration) WithIngress(values ...*HostFirewall
 			panic("nil value passed to WithIngress")
 		}
 		b.Ingress = append(b.Ingress, *values[i])
+	}
+	return b
+}
+
+// WithEgress adds the given value to the Egress field in the declarative configuration
+// and returns the receiver, so that objects can be build by chaining "With" function invocations.
+// If called multiple times, values provided by each call will be appended to the Egress field.
+func (b *HostFirewallSpecApplyConfiguration) WithEgress(values ...*HostFirewallEgressRuleApplyConfiguration) *HostFirewallSpecApplyConfiguration {
+	for i := range values {
+		if values[i] == nil {
+			panic("nil value passed to WithEgress")
+		}
+		b.Egress = append(b.Egress, *values[i])
 	}
 	return b
 }

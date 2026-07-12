@@ -3,9 +3,10 @@
 > One of three policy layers; flow ownership and the node-origin trust
 > model are recorded in [policy-layers.md](policy-layers.md).
 
-Status: **increment 1 complete** (design + build 2026-07-12; e2e 160/160;
+Status: **increments 1-2 complete** (2026-07-12). Increment 1 (ingress) is
 dev-cluster-validated live — a control-plane node isolated behind the
-apiserver LB, monitoring scrapes gated and counted, per-CIDR reopen). The node-scoped sibling of
+apiserver LB, monitoring scrapes gated and counted, per-CIDR reopen.
+Increment 2 (egress) is built and e2e-covered. The node-scoped sibling of
 default-net NetworkPolicy ([network-policy.md](network-policy.md)): gates
 traffic addressed to **the node itself** — the one delivery target the other
 two policy layers deliberately leave alone (NetworkPolicy gates net-0 pods,
@@ -201,10 +202,13 @@ retries, and the next query re-pins.
 |-----|------|-------------|
 | `hf_self` | HASH | this node's addresses (`addr128`) → 1 |
 | `hf_allow` | LPM_TRIE | `{prefixlen; u8 proto; u8 pad; u16 port(be); addr128 src}` → u8 allow(1)/deny(0). Fixed 32 bits ahead of the address; a v4 CIDR /n is `prefixlen 32+96+n` (NAT64 form), v6 /n is `32+n`. Port is exact in the fixed section (`0` = any-port row); `endPort` ranges expand to ≤64 per-port rows (warn + fail closed beyond — the NetworkPolicy `ipBlock×endPort` precedent, and node services don't span wide ranges) |
-| `hf_ct` | LRU_HASH | `{self, peer, sport(be), dport(be), proto}` → 1 (the `np_ct` shape) |
-| `hf_drops` | PERCPU_ARRAY(1) | drop counter → `cozyplane_hf_drops_total` |
+| `hf_eallow` | LPM_TRIE | the egress twin of `hf_allow`; the address is the **destination** |
+| `hf_ct` | LRU_HASH | `{self, peer, sport(be), dport(be), proto}` → 1 (the `np_ct` shape). Written on BOTH admitted directions, so each direction's reply passes the other's gate |
+| `hf_drops` | PERCPU_ARRAY(2) | drops by direction → `cozyplane_hf_drops_total{direction}` |
 
-`CFG_HF_ENABLED` (params) arms the tail calls and pin writes; the agent
+`CFG_HF_ENABLED` / `CFG_HF_EG_ENABLED` (params 9/10) arm each direction
+independently — an Egress-only object leaves ingress open, and vice versa; the
+tail calls fire when either is set. `CFG_HF_ENABLED` arms the tail calls and pin writes; the agent
 sets it **after** the rule sync on enable and **before** clearing on
 disable, so there is no fail-open window. `CFG_GENEVE_PORT` carries the
 overlay port for the baseline exemption. Like `np_allow`, `hf_allow`
@@ -241,12 +245,51 @@ The two layers compose: pod→pod is NetworkPolicy's, pod→node is
 HostFirewall's, and a flow crossing both (pod→node) sees only HostFirewall
 (NP's exemption) — one owner per contract, no double jeopardy.
 
-## Non-goals (increment 1)
+## Egress (increment 2)
 
-- **Host egress gating** (node-originated traffic outbound). Meaningful
-  (exfiltration posture) but a different risk class — and the failure mode
-  is the agent cutting its own apiserver access. Needs its own design pass
-  with an explicit always-allow control-plane story.
+`spec.policyTypes` mirrors upstream NetworkPolicy: default `[Ingress]`,
+plus `Egress` when `spec.egress` is present; a node selected by an object
+whose types include `Egress` is **host-egress isolated** — its own new
+TCP/UDP flows to gated destinations are default-deny, opened by
+`egress: [{to: [{cidr, except}], ports: [...]}]` rules (same shapes,
+unions, and fail-closed compilation as ingress).
+
+What egress isolation gates — and deliberately does not:
+
+- **node → external** and **node → remote pod**: gated. The second is the
+  apiserver→webhook shape — isolating egress on control-plane nodes is the
+  operator explicitly signing up to allowlist their webhook/aggregated-API
+  destinations (pod CIDRs, specific ports).
+- **node → node: exempt, structurally.** This is what makes egress
+  isolation safe to ship at all: kubelet↔apiserver, etcd peering, and the
+  **agent's own apiserver access** are all node→node, so the self-lockout
+  failure mode ("the firewall cuts the agent off from the API that could
+  fix it") cannot occur. Gating node→node remains a non-goal.
+- **node → local pod: exempt** in this increment. Kubelet probes are
+  same-node node→pod and indistinguishable at L3/4 from any other local
+  node→pod flow; gating them would put readiness one bad rule away from
+  cluster-wide NotReady (the plumbing argument, policy-layers.md).
+  Revisit under path-trust if kubelet-socket provenance ever becomes
+  attributable.
+
+Statefulness is symmetric with ingress via the same `hf_ct` map: an
+ingress-**admitted** pod→node UDP flow now writes the pin (the key the
+ingress check already computes), so the node's reply passes the egress
+gate; a node-originated UDP flow is gated first and pins on admit, so its
+reply passes the ingress gate. TCP is SYN-gated in both directions.
+
+Datapath: `hf_eallow` (an LPM twin of `hf_allow`), `CFG_HF_EG_ENABLED`
+(params 10, armed after sync like ingress). Two enforcement points:
+node→external rides the existing `hf_ingress` node-originated arm (the
+uplink-egress fall-through), which gains the gate ahead of its pin write;
+node→remote-pod leaves through `from_pod`'s remotes-hit encap, which
+tail-calls a new `cozyplane_hf_egress` program (lb_prog slot 3) for
+TCP/UDP node-sourced flows — it re-resolves the remote and performs the
+encap itself on admit (a tail call never returns), drops on deny, and an
+unpopulated slot falls through open to the inline encap.
+
+## Non-goals (increment 2)
+
 - **Entity/selector peers** (`from: {pods: ...}` by label): sources are
   CIDRs in v1. Pod fabric CIDRs are cluster-assigned and non-overlapping,
   so "all pods" is expressible today; identity-based peers can reuse the

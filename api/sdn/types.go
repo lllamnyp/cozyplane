@@ -559,7 +559,25 @@ type SecurityGroupList struct {
 // HostFirewallSpec selects nodes and declares what may reach them.
 type HostFirewallSpec struct {
 	NodeSelector metav1.LabelSelector
+	PolicyTypes  []HostFirewallPolicyType
 	Ingress      []HostFirewallRule
+	Egress       []HostFirewallEgressRule
+}
+
+// HostFirewallPolicyType is a direction a HostFirewall isolates.
+type HostFirewallPolicyType string
+
+const (
+	// HostFirewallPolicyTypeIngress isolates traffic TO the node.
+	HostFirewallPolicyTypeIngress HostFirewallPolicyType = "Ingress"
+	// HostFirewallPolicyTypeEgress isolates traffic FROM the node.
+	HostFirewallPolicyTypeEgress HostFirewallPolicyType = "Egress"
+)
+
+// HostFirewallEgressRule admits node-originated traffic to destinations.
+type HostFirewallEgressRule struct {
+	To    []HostFirewallPeer
+	Ports []HostFirewallPort
 }
 
 // HostFirewallRule admits sources to ports. An empty From admits any source;

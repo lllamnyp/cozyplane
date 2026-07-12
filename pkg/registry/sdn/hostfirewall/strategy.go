@@ -93,36 +93,53 @@ func (hostFirewallStrategy) Validate(ctx context.Context, obj runtime.Object) fi
 // beyond the datapath's per-port expansion cap (docs/host-firewall.md).
 func validateSpec(hf *sdn.HostFirewall) field.ErrorList {
 	errs := field.ErrorList{}
+	for i, rule := range hf.Spec.Egress {
+		rp := field.NewPath("spec", "egress").Index(i)
+		errs = append(errs, validatePeers(rp.Child("to"), rule.To)...)
+		errs = append(errs, validatePorts(rp.Child("ports"), rule.Ports)...)
+	}
 	for i, rule := range hf.Spec.Ingress {
 		rp := field.NewPath("spec", "ingress").Index(i)
-		for j, peer := range rule.From {
-			pp := rp.Child("from").Index(j)
-			if _, _, err := net.ParseCIDR(peer.CIDR); err != nil {
-				errs = append(errs, field.Invalid(pp.Child("cidr"), peer.CIDR, "must be a valid CIDR"))
-			}
-			for k, ex := range peer.Except {
-				if _, _, err := net.ParseCIDR(ex); err != nil {
-					errs = append(errs, field.Invalid(pp.Child("except").Index(k), ex, "must be a valid CIDR"))
-				}
+		errs = append(errs, validatePeers(rp.Child("from"), rule.From)...)
+		errs = append(errs, validatePorts(rp.Child("ports"), rule.Ports)...)
+	}
+	return errs
+}
+
+func validatePeers(path *field.Path, peers []sdn.HostFirewallPeer) field.ErrorList {
+	errs := field.ErrorList{}
+	for j, peer := range peers {
+		pp := path.Index(j)
+		if _, _, err := net.ParseCIDR(peer.CIDR); err != nil {
+			errs = append(errs, field.Invalid(pp.Child("cidr"), peer.CIDR, "must be a valid CIDR"))
+		}
+		for k, ex := range peer.Except {
+			if _, _, err := net.ParseCIDR(ex); err != nil {
+				errs = append(errs, field.Invalid(pp.Child("except").Index(k), ex, "must be a valid CIDR"))
 			}
 		}
-		for j, port := range rule.Ports {
-			pp := rp.Child("ports").Index(j)
-			if port.Protocol != "TCP" && port.Protocol != "UDP" {
-				errs = append(errs, field.NotSupported(pp.Child("protocol"), port.Protocol, []string{"TCP", "UDP"}))
-			}
-			if port.Port < 0 || port.Port > 65535 {
-				errs = append(errs, field.Invalid(pp.Child("port"), port.Port, "must be 0-65535"))
-			}
-			if port.EndPort != 0 {
-				switch {
-				case port.Port == 0:
-					errs = append(errs, field.Invalid(pp.Child("endPort"), port.EndPort, "requires port"))
-				case port.EndPort < port.Port || port.EndPort > 65535:
-					errs = append(errs, field.Invalid(pp.Child("endPort"), port.EndPort, "must be port-65535"))
-				case int(port.EndPort)-int(port.Port)+1 > 64:
-					errs = append(errs, field.Invalid(pp.Child("endPort"), port.EndPort, "ranges expand per-port and are capped at 64 ports"))
-				}
+	}
+	return errs
+}
+
+func validatePorts(path *field.Path, ports []sdn.HostFirewallPort) field.ErrorList {
+	errs := field.ErrorList{}
+	for j, port := range ports {
+		pp := path.Index(j)
+		if port.Protocol != "TCP" && port.Protocol != "UDP" {
+			errs = append(errs, field.NotSupported(pp.Child("protocol"), port.Protocol, []string{"TCP", "UDP"}))
+		}
+		if port.Port < 0 || port.Port > 65535 {
+			errs = append(errs, field.Invalid(pp.Child("port"), port.Port, "must be 0-65535"))
+		}
+		if port.EndPort != 0 {
+			switch {
+			case port.Port == 0:
+				errs = append(errs, field.Invalid(pp.Child("endPort"), port.EndPort, "requires port"))
+			case port.EndPort < port.Port || port.EndPort > 65535:
+				errs = append(errs, field.Invalid(pp.Child("endPort"), port.EndPort, "must be port-65535"))
+			case int(port.EndPort)-int(port.Port)+1 > 64:
+				errs = append(errs, field.Invalid(pp.Child("endPort"), port.EndPort, "ranges expand per-port and are capped at 64 ports"))
 			}
 		}
 	}

@@ -20,8 +20,30 @@ K="kubectl --context ${KCTX}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FAILED=0
 
-pass() { echo "  PASS: $*"; }
-fail() { echo "  FAIL: $*"; FAILED=1; }
+# --- progress harness -------------------------------------------------------
+# Long runs must show they are alive even when everything passes: every check
+# prints its running index, and every phase prints how far through the suite it
+# is. TOTAL is derived from the script itself (the number of pass/fail call
+# sites is the check ceiling; conditional checks make the real count <= it), so
+# it never goes stale as checks are added.
+CHECKS=0
+PASSED=0
+SKIPPED=0
+TOTAL=$(grep -cE '(^|[[:space:]])(pass|fail) "' "${BASH_SOURCE[0]}" 2>/dev/null || echo 0)
+TOTAL=$((TOTAL / 2)) # each check has a pass and a fail arm
+PHASE=0
+PHASE_TOTAL=$(grep -cE '^phase "' "${BASH_SOURCE[0]}" 2>/dev/null || echo 0)
+START=$(date +%s)
+
+phase() {
+  PHASE=$((PHASE + 1))
+  echo
+  echo "[phase ${PHASE}/${PHASE_TOTAL}] $* — ${CHECKS}/~${TOTAL} checks done, ${PASSED} passed, $((CHECKS - PASSED)) failed, $(( $(date +%s) - START ))s elapsed"
+}
+
+pass() { CHECKS=$((CHECKS + 1)); PASSED=$((PASSED + 1)); echo "  [${CHECKS}/~${TOTAL}] PASS: $*"; }
+fail() { CHECKS=$((CHECKS + 1)); FAILED=1; echo "  [${CHECKS}/~${TOTAL}] FAIL: $*"; }
+skip() { SKIPPED=$((SKIPPED + 1)); echo "  [skip] $* (not available in this environment)"; }
 
 # check <description> <expected> <cmd...> : run cmd, compare trimmed stdout.
 check() {
@@ -138,7 +160,7 @@ $K wait --for=condition=Ready pod/cli --timeout=120s >/dev/null
 
 echo "== assertions =="
 
-echo "[default network]"
+phase "default network"
 CD=$($K -n kube-system get pods -l k8s-app=kube-dns -o jsonpath='{.items[0].status.podIP}')
 check_ok "cli -> coredns (default overlay)" $K exec cli -- ping -c2 -W2 "$CD"
 # A mis-masked fe80::1/0 on a host veth makes the kernel install
@@ -149,11 +171,11 @@ for n in $(kind get nodes --name "$CLUSTER" 2>/dev/null); do
     bash -c "docker exec $n ip -6 route show default | grep -qE 'dev (cph|cpg)'"
 done
 
-echo "[default-deny attachment]"
+phase "default-deny attachment"
 check_fail "pod without a VPCBinding never becomes Ready" \
   $K -n team-x wait --for=condition=Ready pod/nobind --timeout=20s
 
-echo "[overlapping CIDRs: the same VPC IP resolves within each VPC]"
+phase "overlapping CIDRs: the same VPC IP resolves within each VPC"
 # IPAM order isn't fixed, so resolve a2's real IP and prove that same numeric
 # address is also assigned in vpc-b to a *different* pod. Delivery from each VPC
 # must reach that VPC's pod (net-scoped), never cross the CIDR collision.
@@ -163,7 +185,7 @@ BPEER=""; for p in bw1 bw2; do [ "$(vpcip "$p")" = "$A2" ] && BPEER=$p; done
 BSRC=$([ "$BPEER" = bw1 ] && echo bw2 || echo bw1)
 check "$BSRC -> $A2 reaches $BPEER (vpc-b), not a2" "$BPEER" httpid team-b "$BSRC" "$A2"
 
-echo "[north-south bridge to same-node same-IP pods]"
+phase "north-south bridge to same-node same-IP pods"
 check "cli -> a1.fabric  ($(fabric a1))"  "a1"  bash -c "$K exec cli -- wget -qO- -T4 http://$(fabric a1)/  2>/dev/null"
 check "cli -> bw1.fabric ($(fabric bw1))" "bw1" bash -c "$K exec cli -- wget -qO- -T4 http://$(fabric bw1)/ 2>/dev/null"
 check "cli -> a2.fabric  ($(fabric a2))"  "a2"  bash -c "$K exec cli -- wget -qO- -T4 http://$(fabric a2)/  2>/dev/null"
@@ -176,10 +198,10 @@ check_ok "cli -> a1.fabric ping (north-south ICMP)" $K exec cli -- ping -c2 -W3 
 check "node($W) -> a1.fabric (node-originated bridge, fabric neighbour)" "a1" \
   bash -c "docker run --rm --net container:$W curlimages/curl:8.11.0 -s -m4 http://$(fabric a1)/"
 
-echo "[isolation]"
+phase "isolation"
 check_fail "cli(default) -> VPC IP 10.0.0.2 directly" bash -c "$K exec cli -- wget -qO- -T3 http://10.0.0.2/ 2>/dev/null | grep -q ."
 
-echo "[peering: disjoint peers, overlapping cannot]"
+phase "peering: disjoint peers, overlapping cannot"
 $K apply -f - >/dev/null <<EOF
 apiVersion: sdn.cozystack.io/v1alpha1
 kind: VPCPeering
@@ -201,7 +223,7 @@ check "a1(vpc-a) -> c1(vpc-c, peered disjoint)" "c1" httpid team-a a1 "$(vpcip c
 check "overlapping a<->b peering stays Pending" "Pending" \
   $K -n team-a get vpcpeering a-to-b -o jsonpath='{.status.phase}'
 
-echo "[IPv6 VPC overlay: intra-VPC cross-node, isolation, peering]"
+phase "IPv6 VPC overlay: intra-VPC cross-node, isolation, peering"
 V6A2=$(vpcip v6a2); V6B1=$(vpcip v6b1)
 # Intra-VPC across nodes: proves v6 inner over the v4 Geneve underlay (encap +
 # from_overlay delivery on the 128-bit maps).
@@ -225,7 +247,7 @@ EOF
 sleep 5
 check "v6a1(vpc6a) -> v6b1(vpc6b) after peering (v6 peering)" "v6b1" httpid team-a v6a1 "[$V6B1]"
 
-echo "[IPv6 north-south: default client -> v6 fabric IP]"
+phase "IPv6 north-south: default client -> v6 fabric IP"
 # v6a1's fabric IP is a v6 address from the node's v6 pod CIDR; a default-network
 # client (dual-stack cli) reaches it, and to_pod's bridge_forward6 DNATs
 # fabric->VPC while masquerading the client to fe80::1 (reversed in from_pod).
@@ -234,7 +256,7 @@ check "cli(default) -> v6a1 v6 fabric ($V6AFAB) (north-south TCP)" "v6a1" httpid
 check_ok "cli(default) -> v6a1 v6 fabric ping (north-south ICMPv6)" \
   $K exec cli -- ping -c2 -W3 "$V6AFAB"
 
-echo "[egress via per-VPC gateway]"
+phase "egress via per-VPC gateway"
 $K -n team-a patch vpc vpc-a --type=merge -p '{"spec":{"egress":{"natGateway":true}}}' >/dev/null
 $K -n kube-system wait --for=condition=Ready pod -l app=cozyplane-gateway --timeout=120s >/dev/null 2>&1 || sleep 15
 check "a1(vpc-a, egress on) -> internet 1.1.1.1" "" bash -c "$K -n team-a exec a1 -- ping -c2 -W3 1.1.1.1 >/dev/null 2>&1 && echo"
@@ -253,7 +275,7 @@ check_ok "v6a1(vpc6a, egress on) -> off-cluster v6 $EGW6 (gateway + masq6)" \
 check_fail "v6b1(vpc6b, no egress) -> off-cluster v6 $EGW6" \
   bash -c "$K -n team-a exec v6b1 -- ping -6 -c1 -W2 $EGW6 >/dev/null 2>&1"
 
-echo "[bpf cluster-egress masquerade (#10): netfilter does no NAT]"
+phase "bpf cluster-egress masquerade (#10): netfilter does no NAT"
 # --masquerade defaults to bpf: the agent removes the kernel MASQUERADE rule
 # and SNATs pod egress in the datapath at the uplink. Assert the kernel rule
 # is gone on every node while egress still works — TCP, ICMP echo, and the
@@ -277,7 +299,7 @@ check "cli traceroute hop2 = docker gw $MKGW (masq ICMP-error un-SNAT)" "ok" \
 check_ok "cli -> external v6 $EGW6 ping (bpf masq6, ICMPv6 echo)" \
   $K exec cli -- ping -6 -c2 -W3 "$EGW6"
 
-echo "[stale gateway .1 claim: abandoned-port GC unwedges the replacement]"
+phase "stale gateway .1 claim: abandoned-port GC unwedges the replacement"
 # A gateway pod that dies uncleanly (node reboot) never runs CNI DEL, so its
 # fixed .1 Port survives with a claimant that no longer exists; the replacement
 # then loops on AlreadyExists forever. Fabricate exactly that: a stale .1 Port
@@ -310,7 +332,7 @@ check_ok "vpc-c gateway Ready despite the stale .1 claim (GC freed it)" \
   $K -n kube-system wait --for=condition=Ready pod -l "app=cozyplane-gateway,sdn.cozystack.io/vpc=vpc-c" --timeout=120s
 check "c1(vpc-c, egress on) -> internet 1.1.1.1" "" bash -c "$K -n team-a exec c1 -- ping -c2 -W3 1.1.1.1 >/dev/null 2>&1 && echo"
 
-echo "[v6 floating IP: NDP advertisement, stateless DNAT, EIP egress]"
+phase "v6 floating IP: NDP advertisement, stateless DNAT, EIP egress"
 # The v6 twin of the floating phase: the pool sits inside the kind network's
 # on-link ULA /64, so the external client resolves the address by NDP — which
 # only works if from_uplink's floating_ndp answers the solicitation.
@@ -359,7 +381,7 @@ docker rm -f eipcap6 >/dev/null 2>&1
 extlast6=$(docker run --rm --network kind nicolaka/netshoot traceroute6 -q1 -w3 -m6 "$FIP6" 2>/dev/null | tail -1)
 if echo "$extlast6" | grep -qi "$FIP6"; then pass "external traceroute6 reaches $FIP6 (v6 floating error rewrite)"; else fail "external traceroute6 reaches $FIP6 (last hop: $extlast6)"; fi
 
-echo "[ICMP errors through the bridge (#3): traceroute correlates embedded headers]"
+phase "ICMP errors through the bridge (#3): traceroute correlates embedded headers"
 # A UDP traceroute prints a hop only when the returned ICMP error's EMBEDDED
 # packet matches the probe it sent, so reaching the destination proves the
 # error path end to end — including the embedded-header NAT (a bad checksum
@@ -374,7 +396,7 @@ V6FAB=$(fabric v6a1)
 check "cli UDP-traceroute6 reaches v6a1's v6 fabric (v6 bridge error un-NAT)" "ok" \
   bash -c "$K exec cli -- traceroute6 -q1 -w3 -m4 $V6FAB 2>/dev/null | grep -q \"($V6FAB)\" && echo ok"
 
-echo "[VPC DNS: split-horizon resolver (services-in-vpc.md, increment 1)]"
+phase "VPC DNS: split-horizon resolver (services-in-vpc.md, increment 1)"
 # A VPC pod can't reach kube-dns (default-deny precedes everything), so the
 # datapath steers its cluster-DNS queries to the node-local resolver: src ->
 # the pod's fabric IP (the per-Port identity handle), dst -> node:15353, both
@@ -462,7 +484,7 @@ check "a1(vpc-a) -> peersvc (attached to peered vpc-c) resolves and delivers" "c
 check_fail "bw1(vpc-b, unpeered) cannot resolve vpc-c's peersvc" \
   bash -c "$K -n team-b exec bw1 -- nslookup peersvc.team-a.svc.cluster.local >/dev/null 2>&1"
 
-echo "[ServiceVIP: ClusterIP-equivalent inside a VPC (services-in-vpc.md, increment 2)]"
+phase "ServiceVIP: ClusterIP-equivalent inside a VPC (services-in-vpc.md, increment 2)"
 # An attached non-headless Service gets a VIP from the VPC's OWN space (never
 # the cluster ClusterIP): the controller materializes a ServiceVIP (allocated
 # from the top of the CIDR; the CNI walks bottom-up), the resolver answers the
@@ -529,7 +551,7 @@ check "affinity: 12 fresh flows from affcli pin to ONE backend" "1" \
   bash -c "for i in \$(seq 1 12); do $K -n team-a exec affcli -- wget -qO- -T4 http://vipsvc.team-a.svc.cluster.local/ 2>/dev/null; done | sort -u | grep -cE '^dns[12]\$'"
 $K patch service vipsvc -n team-a --type=merge -p '{"spec":{"sessionAffinity":"None"}}' >/dev/null
 
-echo "[net-0 ClusterIP DNAT (kube-proxy-replacement.md, increment 3 Half A)]"
+phase "net-0 ClusterIP DNAT (kube-proxy-replacement.md, increment 3 Half A)"
 # svc_forward/svc_return un-gated for net 0 serve default-network ClusterIPs
 # per-packet — the path a bridge-bound VM guest takes (its traffic never makes
 # a host socket syscall, so socket-LB can't rewrite it; this harness attaches
@@ -564,7 +586,7 @@ check_fail "the fake VIP goes dark once its net-0 svc_vips entry is removed (it 
   bash -c "$K exec cli -- timeout 3 wget -qO- http://$FAKEVIP/ >/dev/null 2>&1"
 $K delete pod n0web --wait=false >/dev/null 2>&1
 
-echo "[per-VPC traffic counters (#2): the datapath meters east-west by VPC]"
+phase "per-VPC traffic counters (#2): the datapath meters east-west by VPC"
 # The agent serves per-VPC byte/packet counters on each node's :9411 (the
 # DaemonSet is hostNetwork). Generate sustained intra-VPC traffic a1->a2 and
 # assert vpc-a's tx bytes were metered on a1's node (W).
@@ -589,7 +611,7 @@ else
   pass "default network (vni 0) is not metered"
 fi
 
-echo "[guest autoconfiguration (#8): RA (M=1) + DHCPv6 hand out the pinned /128]"
+phase "guest autoconfiguration (#8): RA (M=1) + DHCPv6 hand out the pinned /128"
 # Linux ignores a /128 Prefix Information Option (addrconf requires /64 on
 # ethernet), so the agent's RA sets the Managed flag and a per-veth DHCPv6
 # server answers with the exact pinned address — the same mechanism KubeVirt's
@@ -627,7 +649,7 @@ check "DHCPv6 leased the pinned address $V6RAIP" "ok" \
 sleep 2
 check "v6a1 -> v6ra after re-acquisition (datapath unchanged)" "v6ra" httpid team-a v6a1 "[$V6RAIP]"
 
-echo "[stale locals pruning: a dead veth's entry must not shadow a reallocated IP]"
+phase "stale locals pruning: a dead veth's entry must not shadow a reallocated IP"
 # A pod that dies uncleanly leaves its locals/ports/bridges entries behind
 # (no CNI DEL ran). The leak turns into a blackhole when its VPC IP is later
 # reallocated to a pod on ANOTHER node: same-node senders hit the stale locals
@@ -661,7 +683,7 @@ CYIP=$(vpcip cy)
 [ "$CYIP" = "$CXIP" ] || echo "  note: cy got $CYIP (cx had $CXIP) — reuse not exercised"
 check "cz($W) -> $CYIP reaches cy($W2) (stale local pruned, remote wins)" "cy" httpid team-a cz "$CYIP"
 
-echo "[floating IP: external ingress, source-preserving]"
+phase "floating IP: external ingress, source-preserving"
 # Bind a public IP to a1's VPC IP; an off-cluster client (a container on the
 # kind L2, off the overlay) must reach a1 through it. Exercises from_uplink ->
 # to_pod floating DNAT -> pod, the source-preserving reply, and ARP advertisement
@@ -717,7 +739,7 @@ docker rm -f eipcap >/dev/null 2>&1
 extlast=$(docker run --rm --network kind nicolaka/netshoot traceroute -q1 -w3 -m6 "$FIP" 2>/dev/null | tail -1)
 if echo "$extlast" | grep -q "$FIP"; then pass "external UDP-traceroute reaches $FIP (floating error rewrite)"; else fail "external UDP-traceroute reaches $FIP (last hop: $extlast)"; fi
 
-echo "[map recreation: agent restart heals existing pods (no reboot)]"
+phase "map recreation: agent restart heals existing pods (no reboot)"
 # Simulate the effect of a map-ABI upgrade: remove the CNI-written pinned maps
 # (exactly what reconcilePins does to incompatible pins — the load then creates
 # them fresh and empty) on every node, and roll the agents. The restarted agents
@@ -742,7 +764,7 @@ check "a1 -> vipsvc after map recreation (agents re-sync svc_vips)" "ok" \
 check_fail "cli(default) -> VPC IP still blocked after map recreation" \
   bash -c "$K exec cli -- wget -qO- -T3 http://10.0.0.2/ 2>/dev/null | grep -q ."
 
-echo "[security groups: intra-VPC policy (#7)]"
+phase "security groups: intra-VPC policy (#7)"
 # Labeled pods in vpc-a (all run the identity httpd on :80). Membership is
 # claim-time from the pod labels the CNI stamps, so the labels must be set here.
 sglpod() { # sglpod <name> <label-yaml>
@@ -794,7 +816,7 @@ check_fail "sgnone -> sgweb (ungrouped source, default-deny)" \
 check_fail "sgweb -> sgcli (client has no ingress, default-deny)" \
   bash -c "$K -n team-a exec sgweb -- wget -qO- -T3 http://$(vpcip sgcli)/ 2>/dev/null | grep -q ."
 
-echo "[security groups: egress (v2, symmetric default-deny)]"
+phase "security groups: egress (v2, symmetric default-deny)"
 # Drop client's egress rule: sgcli can no longer reach web even though web's
 # ingress still admits client (both directions must allow).
 $K apply -f - >/dev/null <<EOF
@@ -819,7 +841,7 @@ EOF
 sleep 3
 check "sgcli -> sgweb:80 after restoring client egress (both directions allow)" "sgweb" httpid team-a sgcli "$SGWEB"
 
-echo "[security groups: north-south egress to.cidr (v2)]"
+phase "security groups: north-south egress to.cidr (v2)"
 # sgcli is grouped (client) with only an east-west egress rule, so its off-VPC
 # egress (through vpc-a's NAT gateway, enabled far above) is default-denied.
 # This is the hop the off-VPC-transit fix rescued: the pod->gateway delivery
@@ -855,7 +877,7 @@ spec:
 EOF
 sleep 3
 
-echo "[security groups: peered-group reference (v2, Geneve TLV)]"
+phase "security groups: peered-group reference (v2, Geneve TLV)"
 # A labeled pod in the peered vpc-c, on the OTHER worker so its traffic to sgweb
 # ($W) crosses a node and exercises the TLV path (from_pod stamps, from_overlay
 # enforces). vpc-c is peered with vpc-a (a-to-c above).
@@ -903,7 +925,7 @@ done
 check "sgpeer(vpc-c) -> sgweb:80 admitted by peer rule (cross-node, TLV authoritative)" "sgweb" httpid team-a sgpeer "$SGWEB"
 check "same-VPC sgcli -> sgweb:80 still admitted alongside the peer rule" "sgweb" httpid team-a sgcli "$SGWEB"
 
-echo "[security groups: north-south from.cidr (v2)]"
+phase "security groups: north-south from.cidr (v2)"
 SGWEBFAB="$(fabric sgweb)"
 # sgweb (grouped, no cidr rule) is default-denied to a default-network client.
 check_fail "cli(default) -> sgweb.fabric before a cidr rule (N-S default-deny)" \
@@ -962,7 +984,7 @@ check_fail "cli -> sgweb.fabric with from:{cidr:unrelated/24} (specific CIDR den
   bash -c "$K exec cli -- wget -qO- -T3 http://$SGWEBFAB/ 2>/dev/null | grep -q ."
 
 
-echo "[LoadBalancer ingress: delivery for a status LB IP (lb-ingress.md)]"
+phase "LoadBalancer ingress: delivery for a status LB IP (lb-ingress.md)"
 # cozyplane consumes status.loadBalancer.ingress as written — here patched by
 # hand, simulating ANY provider (CCM, MetalLB, a human with a console) — and
 # delivers per externalTrafficPolicy: Local at from_uplink, client source
@@ -1220,7 +1242,7 @@ docker rm -f lbcli >/dev/null 2>&1
 # enforced destination-side in to_pod at net 0. Server on $W with a readiness
 # probe (the node-exemption canary); a same-node allowed peer, a cross-node
 # client whose label flips prove label-follows both ways.
-echo "[NetworkPolicy: default-net (network-policy.md)]"
+phase "NetworkPolicy: default-net (network-policy.md)"
 $K create ns nptest >/dev/null
 $K apply -f - >/dev/null <<EOF
 apiVersion: v1
@@ -1514,6 +1536,92 @@ np_refused nptest npcli "http://$NPSRV:8080/" && pass "port outside the endPort 
   || fail "a port outside the endPort range was admitted"
 docker rm -f npext >/dev/null 2>&1
 
+# --- NP entities: nodes / local-pods / local-node (policy-layers.md) ---
+# The node exemption narrowed to the LOCAL node: a REMOTE node's traffic to an
+# isolated pod is now gated, and the `nodes` entity is how a policy readmits it
+# (the apiserver->webhook shape). local-pods admits a co-scheduled net-0 pod.
+phase "NetworkPolicy entities (policy-layers.md)"
+# Start from a clean policy slate: the increment-2 ipBlock policies admit
+# 172.18.0.0/16 — which on kind is the NODE subnet, so they would admit the
+# remote node and mask the narrowed exemption entirely.
+$K -n nptest delete networkpolicy --all >/dev/null 2>&1
+$K apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: nphost1, namespace: nptest}
+spec:
+  nodeName: $W
+  hostNetwork: true
+  containers:
+    - {name: s, image: nicolaka/netshoot, command: [sleep, infinity]}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: nphost2, namespace: nptest}
+spec:
+  nodeName: $W2
+  hostNetwork: true
+  containers:
+    - {name: s, image: nicolaka/netshoot, command: [sleep, infinity]}
+EOF
+$K -n nptest wait --for=condition=Ready pod/nphost1 pod/nphost2 --timeout=120s >/dev/null 2>&1
+
+# npsrv (on $W) ingress-isolated by an ordinary pod-selector policy.
+$K apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: npsrv-ent, namespace: nptest}
+spec:
+  podSelector: {matchLabels: {app: npsrv}}
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {role: allowed}}}]
+      ports: [{port: 8080}]
+EOF
+np_served nptest nphost1 "http://$NPSRV:8080/" && pass "local node still reaches an isolated pod (structural exemption, the kubelet shape)" \
+  || fail "local-node origin gated — the plumbing exemption broke"
+np_refused nptest nphost2 "http://$NPSRV:8080/" && pass "REMOTE node gated by default (exemption narrowed to the local node)" \
+  || fail "remote-node origin is still blanket-exempt"
+$K -n nptest get pod npsrv -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' | grep -q True \
+  && pass "isolated pod stays Ready under the narrowed exemption (probes are local-node)" \
+  || fail "narrowing the exemption broke kubelet probes"
+
+# The `nodes` entity readmits remote-node origin (the apiserver->webhook shape).
+$K apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: npsrv-ent, namespace: nptest}
+spec:
+  podSelector: {matchLabels: {app: npsrv}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {policy.cozyplane.io/entity: nodes}}
+      ports: [{port: 8080}]
+EOF
+np_served nptest nphost2 "http://$NPSRV:8080/" && pass "nodes entity admits the remote node" \
+  || fail "nodes entity did not admit remote-node origin"
+np_refused nptest npcli "http://$NPSRV:8080/" && pass "nodes entity does not leak to pod sources" \
+  || fail "nodes entity admitted an ordinary pod"
+
+# local-pods: npsame is co-scheduled with npsrv on $W; npcli lives on $W2.
+$K apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: npsrv-ent, namespace: nptest}
+spec:
+  podSelector: {matchLabels: {app: npsrv}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {policy.cozyplane.io/entity: local-pods}}
+      ports: [{port: 8080}]
+EOF
+np_served nptest npsame "http://$NPSRV:8080/" && pass "local-pods entity admits a co-scheduled pod" \
+  || fail "local-pods entity did not admit the same-node pod"
+np_refused nptest npcli "http://$NPSRV:8080/" && pass "local-pods entity refuses the cross-node pod (placement, as declared)" \
+  || fail "local-pods entity admitted a pod on another node"
+
 $K delete ns nptest --wait=false >/dev/null 2>&1
 
 # --- Host firewall (docs/host-firewall.md) ---
@@ -1521,7 +1629,7 @@ $K delete ns nptest --wait=false >/dev/null 2>&1
 # TCP/UDP flows: external and pod sources are gated, node sources / ICMP /
 # the overlay / replies stay exempt, and node-originated UDP returns via the
 # hf_ct pins (all three write points exercised below).
-echo "[HostFirewall (host-firewall.md)]"
+phase "HostFirewall (host-firewall.md)"
 WADDRS=$($K get node "$W" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
 WIP4=$(echo "$WADDRS" | tr ' ' '\n' | grep -v : | head -1)
 WIP6=$(echo "$WADDRS" | tr ' ' '\n' | grep : | head -1)
@@ -1546,7 +1654,9 @@ metadata: {name: hfcli, namespace: hftest}
 spec:
   nodeName: $W2
   containers:
-    - {name: s, image: nicolaka/netshoot, command: [sleep, infinity]}
+    - name: s
+      image: nicolaka/netshoot
+      command: [python3, -m, http.server, "8080", --bind, "::"]
 ---
 apiVersion: v1
 kind: Pod
@@ -1556,7 +1666,8 @@ spec:
   containers:
     - name: s
       image: nicolaka/netshoot
-      command: [socat, -T3, "UDP4-LISTEN:5354,reuseaddr,fork", "EXEC:/bin/cat"]
+      command: [sh, -c, "socat -T3 UDP4-LISTEN:5354,reuseaddr,fork EXEC:/bin/cat & exec python3 -m http.server 8080 --bind ::"]
+      readinessProbe: {tcpSocket: {port: 8080}, periodSeconds: 2}
 ---
 apiVersion: v1
 kind: Pod
@@ -1572,6 +1683,7 @@ HFSAME=$($K -n hftest get pod hfsame -o jsonpath='{.status.podIP}')
 docker run -d --rm --name hfext --network kind nicolaka/netshoot sleep 900 >/dev/null 2>&1
 HFEXTIP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' hfext)
 docker exec -d hfext socat -T3 "UDP4-LISTEN:5354,reuseaddr,fork" "EXEC:/bin/cat" >/dev/null 2>&1
+docker exec -d hfext python3 -m http.server 80 >/dev/null 2>&1
 
 hf_ext_served() {
   for _ in $(seq 1 10); do
@@ -1698,15 +1810,78 @@ $K delete hostfirewall hf-e2e hf-e2e-pods >/dev/null
 hf_ext_served && pass "deleting the HostFirewalls reopens the node" \
   || fail "node still isolated after HostFirewall deletion"
 
+# --- Host firewall EGRESS (host-firewall.md, increment 2) ---
+# The node's OWN new flows go default-deny. node->node and node->local-pod stay
+# exempt (kubelet<->apiserver, the agent's own API access, kubelet probes) —
+# that is what makes egress isolation impossible to self-lock-out with.
+phase "HostFirewall egress"
+HFCLIIP=$($K -n hftest get pod hfcli -o jsonpath='{.status.podIP}')
+HFSAMEIP=$($K -n hftest get pod hfsame -o jsonpath='{.status.podIP}')
+np_served hftest hfsrv "http://$HFEXTIP/" && pass "node->external serves before egress isolation" \
+  || fail "node->external unreachable before egress isolation"
+np_served hftest hfsrv "http://$HFCLIIP:8080/" && pass "node->remote-pod serves before egress isolation" \
+  || fail "node->remote-pod unreachable before egress isolation"
+
+$K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: HostFirewall
+metadata: {name: hf-e2e-eg}
+spec:
+  nodeSelector: {matchLabels: {cozyplane-e2e/hf: isolated}}
+  policyTypes: [Egress]
+EOF
+hf_ext_served && pass "an Egress-only object leaves INGRESS open" \
+  || fail "an Egress-only object isolated ingress too"
+np_refused hftest hfsrv "http://$HFEXTIP/" && pass "node->external refused (egress default-deny)" \
+  || fail "node->external still served under egress isolation"
+np_refused hftest hfsrv "http://$HFCLIIP:8080/" && pass "node->remote-pod refused (the from_pod encap gate)" \
+  || fail "node->remote-pod still served under egress isolation"
+
+# The cluster survives its own firewall: all three exemptions, live.
+np_served hftest hfsrv "http://$HFSAMEIP:8080/" && pass "node->LOCAL-pod stays exempt under egress isolation" \
+  || fail "egress isolation gated node->local-pod (kubelet probes are this flow)"
+ready=$($K get node "$W" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+[ "$ready" = "True" ] && pass "node stays Ready under egress isolation (node->node exempt)" \
+  || fail "egress isolation broke kubelet->apiserver (node went NotReady)"
+$K -n hftest get pod hfsame -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' | grep -q True \
+  && pass "kubelet probes still pass on the egress-isolated node" \
+  || fail "egress isolation broke kubelet probes to a local pod"
+apod=$($K -n kube-system get pods -l app=cozyplane-agent --field-selector "spec.nodeName=$W" -o name 2>/dev/null | head -1)
+[ -n "$apod" ] && $K -n kube-system get "$apod" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' | grep -q True \
+  && pass "the agent on the egress-isolated node stays Ready (no self-lockout)" \
+  || fail "egress isolation cut the agent off from the apiserver"
+
+# Allow rules reopen, per destination and port.
+$K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: HostFirewall
+metadata: {name: hf-e2e-eg}
+spec:
+  nodeSelector: {matchLabels: {cozyplane-e2e/hf: isolated}}
+  policyTypes: [Egress]
+  egress:
+    - to: [{cidr: $HFEXTIP/32}]
+      ports: [{protocol: TCP, port: 80}]
+EOF
+np_served hftest hfsrv "http://$HFEXTIP/" && pass "egress cidr+port rule reopens node->external" \
+  || fail "the egress allow rule did not reopen the destination"
+np_refused hftest hfsrv "http://$HFCLIIP:8080/" && pass "the egress allow is scoped (remote pod still refused)" \
+  || fail "an egress /32 allow leaked to other destinations"
+
+$K delete hostfirewall hf-e2e-eg >/dev/null
+np_served hftest hfsrv "http://$HFCLIIP:8080/" && pass "deleting the egress object reopens the node's own traffic" \
+  || fail "node still egress-isolated after deletion"
+
 $K label node "$W" cozyplane-e2e/hf- >/dev/null 2>&1
 docker rm -f hfext >/dev/null 2>&1
 $K delete ns hftest --wait=false >/dev/null 2>&1
 
-echo "[revocation]"
+phase "revocation"
 $K -n team-a delete vpcbinding vpc-a >/dev/null
 sleep 6
 check_fail "a1 severed after its binding is revoked" bash -c "$K -n team-a exec a1 -- ping -c1 -W2 $A2 >/dev/null 2>&1"
 
 echo
+echo "e2e: ${PASSED} passed, $((CHECKS - PASSED)) failed, ${SKIPPED} skipped, in $(( $(date +%s) - START ))s"
 if [ "$FAILED" = "0" ]; then echo "e2e: ALL PASSED"; else echo "e2e: FAILURES"; fi
 exit $FAILED

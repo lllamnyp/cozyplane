@@ -48,6 +48,8 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &sdnv1alpha1.FloatingIPStatusApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("HostFirewall"):
 		return &sdnv1alpha1.HostFirewallApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("HostFirewallEgressRule"):
+		return &sdnv1alpha1.HostFirewallEgressRuleApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("HostFirewallPeer"):
 		return &sdnv1alpha1.HostFirewallPeerApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("HostFirewallPort"):

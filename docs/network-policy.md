@@ -156,12 +156,33 @@ separate policy unions, unlike SG's symmetric-pair admission).
 
 ### Exemptions (upstream conventions)
 
-- **Node-origin traffic bypasses ingress policy** — kubelet probes must reach
-  pods regardless (every implementation exempts the host; the SG world has the
-  NS_MARK/kubelet-exempt precedent). Cross-node node-origin arrives via
-  `node_remotes` and is identifiable the same way.
+- **LOCAL-node-origin traffic bypasses ingress policy** — kubelet probes
+  must reach pods regardless (every implementation exempts the host; the SG
+  world has the NS_MARK/kubelet-exempt precedent). `np_nodes` carries a
+  locality flag; only the pod's own node is unconditionally exempt.
+  **Remote-node sources are gated** once a pod is ingress-isolated
+  (Cilium's host-vs-remote-node split): a pod that receives cross-node
+  node-origin traffic — an admission webhook called by a hostNetwork
+  apiserver, an aggregated API — declares it with the `nodes` entity
+  (below). This is the first narrowing of the address-trust surface
+  (policy-layers.md § trust model).
 - **hostNetwork pods** are node addresses and inherit the node exemption
   (Cilium's default behavior; documented, not configurable initially).
+- **Entities** (`policy-layers.md` § entities): peers upstream cannot
+  express, encoded as a reserved namespaceSelector label
+  (`policy.cozyplane.io/entity: local-node|nodes|local-pods` as the sole
+  matchLabels entry, no podSelector beside it — anything else evaluates as
+  a literal selector). Compiled to reserved source ids: `nodes` admits any
+  cluster node address (probed on an `np_nodes` hit), `local-pods` admits
+  net-0 pods co-scheduled on the subject's node (probed on a net-0 `locals`
+  hit — author-declared placement dependence, allowed by tenet 6 because
+  the AUTHOR names it, enforcement doesn't infer it), `local-node` is the
+  explicit form of the structural local-node exemption (compiled,
+  effectively redundant today, the forward path to a strict mode).
+  `local-pods` also works as an egress `to` peer; `nodes`/`local-node` in
+  egress are refused with a warning — node-destined egress is
+  HostFirewall's (one owner per contract). Reserved ids 2/3/4; real
+  identity hashes are remapped off 0–7.
 - **VPC pods**: NP never gates overlay (VNI ≠ 0) traffic — that is SG
   territory. A VPC pod's fabric IP can appear in `np_ident` like any pod's
   (upstream says policies select pods in the namespace), but the only
@@ -201,7 +222,7 @@ separate policy unions, unlike SG's symmetric-pair admission).
 
    *As built — a verifier war story with a moral.* The first cut put both
    directions in one `np_check` callee and counted `from_pod`'s gate drops
-   via the `count_np_drop` subprogram. dev4's kernel loaded it; kind's 6.8
+   via the `count_np_drop` subprogram. the dev cluster's 6.12 kernel loaded it; kind's 6.8
    verifier refused: *"combined stack size of 2 calls is 544"* —
    `from_pod`(496) plus even a trivial callee frame busts 512, and the
    two-direction callee's spills did the same on `to_pod`(432). The moral:

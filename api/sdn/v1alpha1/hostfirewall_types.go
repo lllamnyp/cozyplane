@@ -31,9 +31,49 @@ type HostFirewallSpec struct {
 	// +optional
 	NodeSelector metav1.LabelSelector `json:"nodeSelector,omitempty"`
 
+	// PolicyTypes selects the directions this object isolates, mirroring
+	// NetworkPolicy: empty defaults to [Ingress], plus Egress when Egress
+	// rules are present. A node selected by an object whose types include
+	// Egress is host-EGRESS isolated: its own new TCP/UDP flows out are
+	// default-deny. node->node and node->local-pod stay exempt regardless
+	// (kubelet↔apiserver, the agent's own API access, kubelet probes —
+	// docs/host-firewall.md).
+	// +optional
+	PolicyTypes []HostFirewallPolicyType `json:"policyTypes,omitempty"`
+
 	// Ingress rules union across all HostFirewalls selecting a node.
 	// +optional
 	Ingress []HostFirewallRule `json:"ingress,omitempty"`
+
+	// Egress rules union across all HostFirewalls selecting a node. `to`
+	// peers are CIDRs, like ingress `from`.
+	// +optional
+	Egress []HostFirewallEgressRule `json:"egress,omitempty"`
+}
+
+// HostFirewallPolicyType is a direction a HostFirewall isolates.
+// +kubebuilder:validation:Enum=Ingress;Egress
+type HostFirewallPolicyType string
+
+const (
+	// HostFirewallPolicyTypeIngress isolates traffic TO the node.
+	HostFirewallPolicyTypeIngress HostFirewallPolicyType = "Ingress"
+	// HostFirewallPolicyTypeEgress isolates traffic FROM the node.
+	HostFirewallPolicyTypeEgress HostFirewallPolicyType = "Egress"
+)
+
+// HostFirewallEgressRule admits node-originated traffic to destinations. An
+// empty To admits any destination; an empty Ports admits every TCP and UDP
+// port.
+type HostFirewallEgressRule struct {
+	// To lists admitted destination ranges. Empty means any destination.
+	// +optional
+	To []HostFirewallPeer `json:"to,omitempty"`
+
+	// Ports narrows the rule to specific destination ports. Empty means
+	// every port, TCP and UDP.
+	// +optional
+	Ports []HostFirewallPort `json:"ports,omitempty"`
 }
 
 // HostFirewallRule admits sources to ports. An empty From admits any source;

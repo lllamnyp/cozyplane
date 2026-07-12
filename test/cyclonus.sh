@@ -4,9 +4,9 @@
 #
 # Two ways to run:
 #   - default: create a kind cluster, install cozyplane, sweep against it.
-#   - against an existing cozyplane cluster (e.g. dev4): pass KCTX/KUBECONFIG
-#     and REUSE=1 to skip bring-up. Heavy sweeps belong on dev4, not the
-#     laptop (a full sweep is ~hundreds of policies x a 9x9 probe matrix).
+#   - REUSE=1 with KCTX/KUBECONFIG: sweep an existing cozyplane cluster. A full
+#     sweep is hundreds of policies x a 9x9 probe matrix, so it wants a real
+#     cluster's headroom.
 #
 # Probe scope (the two knobs that make the signal meaningful):
 #   --server-protocol TCP,UDP  — SCTP is a documented non-goal (we gate only
@@ -14,8 +14,8 @@
 #       touching an isolated pod as "wrong" — noise, not a defect. Drop it
 #       from the servers so the truth table reflects what we actually enforce.
 #   --destination-type pod-ip  — cyclonus hardcodes .svc.cluster.local; on a
-#       cluster whose domain differs (dev4 = cozy.local) every service-name
-#       probe NXDOMAINs. Probe pod IPs directly.
+#       cluster whose domain differs, every service-name probe NXDOMAINs.
+#       Probe pod IPs directly.
 # Excluded test tags (with reasons):
 #   named-port  — not served: identities are label-sets, there is no pod spec
 #                 to resolve a named port against (documented, warned).

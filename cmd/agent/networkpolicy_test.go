@@ -529,3 +529,148 @@ func TestNPCompileEgressFlagAndDefaultTypes(t *testing.T) {
 		t.Fatalf("default policyTypes not derived: flags=%d", w.Flags)
 	}
 }
+
+// entityPeer builds an entity peer: the reserved label as the selector's only
+// matchLabels entry (docs/policy-layers.md § entities).
+func entityPeer(name string) networkingv1.NetworkPolicyPeer {
+	return networkingv1.NetworkPolicyPeer{
+		NamespaceSelector: &metav1.LabelSelector{
+			MatchLabels: map[string]string{npEntityLabel: name},
+		},
+	}
+}
+
+func hasAllowDir(c npCompiled, dst, src uint64, dir uint8, proto uint8, port uint16) bool {
+	for _, a := range c.allows {
+		if a.DstID == dst && a.SrcID == src && a.Dir == dir && a.Proto == proto && a.Port == port {
+			return true
+		}
+	}
+	return false
+}
+
+func TestNPCompileEntities(t *testing.T) {
+	pods := []*corev1.Pod{
+		npPod("prod", "web-1", "10.244.0.10", map[string]string{"app": "web"}),
+	}
+	nss := []*corev1.Namespace{npNS("prod", nil)}
+	nps := []*networkingv1.NetworkPolicy{{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "web"},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{{
+				From: []networkingv1.NetworkPolicyPeer{
+					entityPeer("nodes"),
+					entityPeer("local-pods"),
+					entityPeer("local-node"),
+				},
+				Ports: []networkingv1.NetworkPolicyPort{{Port: ptrIntOrString(8080)}},
+			}},
+		},
+	}}
+
+	c := compileNetworkPolicies(pods, nss, nps)
+	web, ok := identOf(c, "10.244.0.10")
+	if !ok {
+		t.Fatal("no ident row")
+	}
+	for _, want := range []struct {
+		id   uint64
+		name string
+	}{
+		{datapath.NPSrcNodes, "nodes"},
+		{datapath.NPSrcLocalPods, "local-pods"},
+		{datapath.NPSrcLocalNode, "local-node"},
+	} {
+		if !hasAllow(c, web.ID, want.id, 6, 8080) {
+			t.Fatalf("missing %s entity row: %+v", want.name, c.allows)
+		}
+	}
+	if len(c.warnings) != 0 {
+		t.Fatalf("unexpected warnings: %v", c.warnings)
+	}
+	// The reserved ids must not collide with a real identity.
+	if web.ID < datapath.NPFirstRealID {
+		t.Fatalf("identity %d landed in the reserved range", web.ID)
+	}
+}
+
+func TestNPCompileEntityEgressRules(t *testing.T) {
+	pods := []*corev1.Pod{
+		npPod("prod", "cli-1", "10.244.0.11", map[string]string{"role": "cli"}),
+	}
+	nss := []*corev1.Namespace{npNS("prod", nil)}
+	nps := []*networkingv1.NetworkPolicy{{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "cli"},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"role": "cli"}},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
+			Egress: []networkingv1.NetworkPolicyEgressRule{{
+				To: []networkingv1.NetworkPolicyPeer{
+					entityPeer("local-pods"), // legal: a pod destination
+					entityPeer("nodes"),      // refused: HostFirewall's contract
+				},
+				Ports: []networkingv1.NetworkPolicyPort{{Port: ptrIntOrString(9100)}},
+			}},
+		},
+	}}
+
+	c := compileNetworkPolicies(pods, nss, nps)
+	cli, ok := identOf(c, "10.244.0.11")
+	if !ok {
+		t.Fatal("no ident row")
+	}
+	if !hasAllowDir(c, datapath.NPSrcLocalPods, cli.ID, datapath.NPDirEg, 6, 9100) {
+		t.Fatalf("missing local-pods egress row: %+v", c.allows)
+	}
+	if hasAllowDir(c, datapath.NPSrcNodes, cli.ID, datapath.NPDirEg, 6, 9100) {
+		t.Fatal("nodes entity leaked into an egress rule")
+	}
+	if len(c.warnings) != 1 || !strings.Contains(c.warnings[0], "not served as an egress peer") {
+		t.Fatalf("expected one refusal warning, got %v", c.warnings)
+	}
+}
+
+func TestNPCompileEntityLabelOnARealNamespace(t *testing.T) {
+	// A namespace that genuinely carries the reserved label, selected the
+	// ordinary way (with a podSelector beside it): must compile as a literal
+	// namespace selector, NOT as an entity.
+	pods := []*corev1.Pod{
+		npPod("prod", "web-1", "10.244.0.10", map[string]string{"app": "web"}),
+		npPod("infra", "mon-1", "10.244.1.20", map[string]string{"app": "mon"}),
+	}
+	nss := []*corev1.Namespace{
+		npNS("prod", nil),
+		npNS("infra", map[string]string{npEntityLabel: "nodes"}),
+	}
+	nps := []*networkingv1.NetworkPolicy{{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "web"},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{{
+				From: []networkingv1.NetworkPolicyPeer{{
+					NamespaceSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{npEntityLabel: "nodes"},
+					},
+					PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "mon"}},
+				}},
+				Ports: []networkingv1.NetworkPolicyPort{{Port: ptrIntOrString(8080)}},
+			}},
+		},
+	}}
+
+	c := compileNetworkPolicies(pods, nss, nps)
+	web, _ := identOf(c, "10.244.0.10")
+	mon, ok := identOf(c, "10.244.1.20")
+	if !ok {
+		t.Fatal("no mon ident")
+	}
+	if !hasAllow(c, web.ID, mon.ID, 6, 8080) {
+		t.Fatalf("podSelector beside the label must select the real namespace: %+v", c.allows)
+	}
+	if hasAllow(c, web.ID, datapath.NPSrcNodes, 6, 8080) {
+		t.Fatal("a literal namespace selector was mistaken for the nodes entity")
+	}
+}

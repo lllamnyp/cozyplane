@@ -74,6 +74,9 @@ const (
 	// cfgHFEnabled arms host-firewall enforcement: 1 while a HostFirewall
 	// selects this node (set after the rule sync, cleared before the wipe).
 	cfgHFEnabled = uint32(9)
+	// cfgHFEgEnabled arms host-firewall EGRESS: the node's own new flows are
+	// default-deny (node→node and node→local-pod stay exempt).
+	cfgHFEgEnabled = uint32(10)
 )
 
 // ResolverPort is the port the split-horizon resolver binds on the node

@@ -19,6 +19,8 @@ package datapath
 import (
 	"fmt"
 	"net"
+
+	"github.com/cilium/ebpf"
 )
 
 // Host firewall (docs/host-firewall.md). The agent compiles the HostFirewalls
@@ -39,11 +41,22 @@ type HFAllow struct {
 	Allow bool
 }
 
-// SyncHFAllows makes hf_allow exactly `entries` (full-state diff). A v4
-// range lives in NAT64 form (/N -> /(96+N)); the key prefix is the 32 fixed
-// bits (proto+pad+port) plus that. At an identical key an allow from any
-// policy wins (policies union; the np_cidr rule).
+// SyncHFAllows makes hf_allow (ingress) exactly `entries` (full-state diff).
 func (m *Manager) SyncHFAllows(entries []HFAllow) error {
+	return m.syncHFRules(m.objs.HfAllow, entries)
+}
+
+// SyncHFEgressAllows makes hf_eallow (egress) exactly `entries`. Same key
+// shape; the address is the DESTINATION.
+func (m *Manager) SyncHFEgressAllows(entries []HFAllow) error {
+	return m.syncHFRules(m.objs.HfEallow, entries)
+}
+
+// syncHFRules is the shared full-state diff. A v4 range lives in NAT64 form
+// (/N -> /(96+N)); the key prefix is the 32 fixed bits (proto+pad+port) plus
+// that. At an identical key an allow from any policy wins (policies union;
+// the np_cidr rule).
+func (m *Manager) syncHFRules(mp *ebpf.Map, entries []HFAllow) error {
 	want := map[overlayHfAllowKey]uint8{}
 	for _, e := range entries {
 		if e.CIDR == nil {
@@ -77,7 +90,7 @@ func (m *Manager) SyncHFAllows(entries []HFAllow) error {
 		}
 		want[key] = v
 	}
-	return syncMap(m.objs.HfAllow, want)
+	return syncMap(mp, want)
 }
 
 // SyncHFSelf makes hf_self exactly `ips` — the node's own addresses, which
@@ -94,26 +107,39 @@ func (m *Manager) SyncHFSelf(ips []net.IP) error {
 	return syncMap(m.objs.HfSelf, want)
 }
 
-// SetHFEnabled arms (or disarms) host-firewall enforcement. The caller
-// orders this against the rule sync — set after syncing on enable, clear
-// before wiping on disable — so there is no fail-open window.
+// SetHFEnabled arms (or disarms) host-firewall INGRESS enforcement;
+// SetHFEgressEnabled the egress half. The caller orders these against the
+// rule syncs — set after syncing on enable, clear before wiping on disable —
+// so there is no fail-open window.
 func (m *Manager) SetHFEnabled(on bool) error {
-	var v uint32
-	if on {
-		v = 1
-	}
-	return m.objs.Params.Put(cfgHFEnabled, v)
+	return m.objs.Params.Put(cfgHFEnabled, boolToU32(on))
 }
 
-// HFDrops returns the host-firewall drop total (summed across CPUs).
-func (m *Manager) HFDrops() (uint64, error) {
-	var perCPU []uint64
-	if err := m.objs.HfDrops.Lookup(uint32(0), &perCPU); err != nil {
-		return 0, fmt.Errorf("lookup hf_drops: %w", err)
+func (m *Manager) SetHFEgressEnabled(on bool) error {
+	return m.objs.Params.Put(cfgHFEgEnabled, boolToU32(on))
+}
+
+func boolToU32(b bool) uint32 {
+	if b {
+		return 1
 	}
-	var sum uint64
-	for _, v := range perCPU {
-		sum += v
+	return 0
+}
+
+// HFDrops returns the host-firewall drop totals by direction (NPDirIn /
+// NPDirEg), summed across CPUs.
+func (m *Manager) HFDrops() (map[uint8]uint64, error) {
+	out := map[uint8]uint64{}
+	for dir := uint32(0); dir < 2; dir++ {
+		var perCPU []uint64
+		if err := m.objs.HfDrops.Lookup(dir, &perCPU); err != nil {
+			return nil, fmt.Errorf("lookup hf_drops[%d]: %w", dir, err)
+		}
+		var sum uint64
+		for _, v := range perCPU {
+			sum += v
+		}
+		out[uint8(dir)] = sum
 	}
-	return sum, nil
+	return out, nil
 }

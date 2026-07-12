@@ -1533,6 +1533,68 @@ spec:
             description: HostFirewallSpec selects nodes and declares what may reach
               them.
             properties:
+              egress:
+                description: |-
+                  Egress rules union across all HostFirewalls selecting a node. `to`
+                  peers are CIDRs, like ingress `from`.
+                items:
+                  description: |-
+                    HostFirewallEgressRule admits node-originated traffic to destinations. An
+                    empty To admits any destination; an empty Ports admits every TCP and UDP
+                    port.
+                  properties:
+                    ports:
+                      description: |-
+                        Ports narrows the rule to specific destination ports. Empty means
+                        every port, TCP and UDP.
+                      items:
+                        description: HostFirewallPort is a protocol/port an ingress
+                          rule admits.
+                        properties:
+                          endPort:
+                            description: |-
+                              EndPort extends Port to an inclusive range [Port, EndPort]. Ranges
+                              expand to per-port datapath entries and are capped at 64 ports
+                              (docs/host-firewall.md); wider ranges are rejected (fail closed).
+                            format: int32
+                            type: integer
+                          port:
+                            description: |-
+                              Port is the destination port. Zero (or omitted) means every port for
+                              the protocol.
+                            format: int32
+                            type: integer
+                          protocol:
+                            description: Protocol is TCP or UDP.
+                            enum:
+                            - TCP
+                            - UDP
+                            type: string
+                        required:
+                        - protocol
+                        type: object
+                      type: array
+                    to:
+                      description: To lists admitted destination ranges. Empty means
+                        any destination.
+                      items:
+                        description: HostFirewallPeer is an admitted source range.
+                        properties:
+                          cidr:
+                            description: CIDR admits sources within the range (either
+                              family).
+                            type: string
+                          except:
+                            description: Except carves sub-ranges out of CIDR.
+                            items:
+                              type: string
+                            type: array
+                        required:
+                        - cidr
+                        type: object
+                      type: array
+                  type: object
+                type: array
               ingress:
                 description: Ingress rules union across all HostFirewalls selecting
                   a node.
@@ -1645,6 +1707,23 @@ spec:
                     type: object
                 type: object
                 x-kubernetes-map-type: atomic
+              policyTypes:
+                description: |-
+                  PolicyTypes selects the directions this object isolates, mirroring
+                  NetworkPolicy: empty defaults to [Ingress], plus Egress when Egress
+                  rules are present. A node selected by an object whose types include
+                  Egress is host-EGRESS isolated: its own new TCP/UDP flows out are
+                  default-deny. node->node and node->local-pod stay exempt regardless
+                  (kubelet↔apiserver, the agent's own API access, kubelet probes —
+                  docs/host-firewall.md).
+                items:
+                  description: HostFirewallPolicyType is a direction a HostFirewall
+                    isolates.
+                  enum:
+                  - Ingress
+                  - Egress
+                  type: string
+                type: array
             type: object
           status:
             description: HostFirewallStatus is the observed state of a HostFirewall.
