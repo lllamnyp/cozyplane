@@ -67,11 +67,12 @@ trap cleanup EXIT INT TERM HUP
 # apply: never swallow a rejected object. A policy that failed schema validation
 # looks exactly like a policy that failed to enforce, and the whole phase then
 # tests nothing. (`on` is a YAML 1.1 boolean, which is how that bites.)
-# --validate=false: on an install where the bootstrap CRDs and the aggregated
-# APIService both serve sdn.cozystack.io, OpenAPI aggregation for the group
-# fails on duplicated paths, so client-side validation cannot fetch a schema.
-# The server still validates (the registry strategy does the real checks).
-apply() { $K apply --validate=false -f - >/dev/null || { echo "  FATAL: apply rejected"; exit 1; }; }
+# Client-side validation stays ON. It is a load-bearing assertion: it can only
+# work if the group's OpenAPI serves, and the group's OpenAPI can only serve if
+# nothing else publishes paths for it — which is exactly what the API-group
+# split guarantees (docs/api-groups.md). If the tenant kinds ever regain a CRD,
+# every apply here fails with "failed to download openapi" and the suite says so.
+apply() { $K apply -f - >/dev/null || { echo "  FATAL: apply rejected"; exit 1; }; }
 
 # served/refused: poll, because policy programming is eventually consistent.
 served()  { for _ in $(seq 1 10); do $K -n "$NS" exec "$1" -- curl -gs -m3 "$2" >/dev/null 2>&1 && return 0; sleep 2; done; return 1; }
