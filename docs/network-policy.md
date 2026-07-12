@@ -1,8 +1,10 @@
 # NetworkPolicy on the default network (net 0)
 
-Status: **increments 1–2 built** (ingress + egress, selector and ipBlock
-peers with `except`, label-follows, the UDP reply-pin, node exemption —
-e2e 138/138). Increment 3 (conformance, endPort) remains.
+Status: **complete** (increments 1–3): ingress + egress, selector and
+ipBlock peers with `except`, `endPort` ranges, label-follows, the UDP
+reply-pin, node exemption. Repo e2e 140/140; **cyclonus conformance 89/90
+on the dev cluster — the one miss is a named-port case in disguise**
+(a documented non-goal; see "Conformance" below).
 
 The production blocker Cilium's removal left open (roadmap §6): the default
 network has no `NetworkPolicy` enforcement. The decision (2026-07-11) is to
@@ -204,17 +206,42 @@ separate policy unions, unlike SG's symmetric-pair admission).
    scratch. Different kernels explore different verifier states: a load
    that succeeds on one kernel proves nothing about the floor the project
    supports — kind's 6.8 is the gate.
-3. **Conformance + scale** — `endPort` ranges via the `np_allow` port-suffix
-   LPM (above): general for identity-pair rules; for **ipBlock × endPort**
-   the two variable dimensions (address prefix, port prefix) cannot share
-   one LPM, so ranges on ipBlock rules expand per-port up to 64 ports and
-   compile closed (with a warning) beyond — a documented cap, not a silent
-   one. The pinned `np_allow` type change is absorbed by `reconcilePins`
-   (incompatible pin removed on agent restart, re-seeded by the first
-   resync; running pods keep the old program+maps until re-attach, so
-   there is no fail-open window). Then: the cyclonus suite against kind
-   (named ports and SCTP stay out — excluded and documented), and a
-   compiler benchmark for identity-churn scale.
+3. **Conformance + scale** — **BUILT.** `endPort` ranges via the `np_allow`
+   port-suffix LPM (above): general for identity-pair rules; for
+   **ipBlock × endPort** the two variable dimensions (address prefix, port
+   prefix) cannot share one LPM, so ranges on ipBlock rules expand per-port
+   up to 64 ports and compile closed (with a warning) beyond — a documented
+   cap, not a silent one. The pinned `np_allow` type change is absorbed by
+   `reconcilePins` (incompatible pin removed on agent restart, re-seeded by
+   the first resync; running pods keep the old program+maps until
+   re-attach, so there is no fail-open window — observed live on the dev
+   cluster: "recreated incompatible pinned maps: [np_allow]").
+
+   **Conformance (cyclonus, dev cluster, 2026-07-12).** `test/cyclonus.sh`;
+   90 generated cases (defaults minus multi-peer/upstream-e2e/example/
+   namespaces-by-default-label/named-port/sctp, **end-port re-enabled**),
+   TCP/UDP servers, pod-IP destinations. **89/90 passed** — every tag
+   family 100% (direction 78/78, peer-pods 20/20, ipBlock ±except 4/4,
+   ports 34/34 incl. end-port 8/8, protocols 24/24, conflicts 16/16,
+   pathological 2/2, delete/set-label perturbations all green). The single
+   failure, `update-policy`, is a **named port in disguise**: the case's
+   step 2 updates the ingress port to `serve-81-udp`, which we fail-close
+   by design; cyclonus tags the case only `update-policy`, so the
+   named-port exclusion can't catch it. Reproduced in isolation and
+   root-caused to exactly the 4 cells the named-port rule would open.
+   The generic update path is separately proven (a live create-then-update
+   flip enforces in seconds), as is the responder-egress-isolated UDP
+   reply (the widened-pin shape no e2e had covered).
+
+   Harness notes for reruns: cyclonus hardcodes `.svc.cluster.local`
+   (dev cluster domain is `cozy.local`) → `--destination-type pod-ip`;
+   SCTP servers flag every isolated pod's whole row+column (we gate only
+   TCP/UDP) → `--server-protocol TCP,UDP`; its state verifier fatals on
+   stale half-terminated x/y/z namespaces from a previous run.
+
+   **Scale**: `BenchmarkCompileNetworkPolicies` — 5000 pods / 120 shapes /
+   200 policies ≈ **5.9ms per full recompute** (i7-1280P); every watched
+   event costs one recompute, so pod churn is a non-issue.
 
 Non-goals initially: SCTP, named ports (need pod-spec resolution), policy on
 hostNetwork subjects, and the **host firewall** — that is the node-scoped
