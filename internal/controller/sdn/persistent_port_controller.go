@@ -138,20 +138,20 @@ func (r *PersistentPortReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	// The active pod's status.podIP is its fabric IP (cozyplane reports the fabric
-	// IP as the pod IP). It changes per pod; the VPC IP/MAC do not.
+	// The cutover re-points the Port at the active launcher. It no longer copies
+	// the pod's fabric address into the Port: the underlay address lives in the
+	// launcher's own FabricIP object (docs/api-groups.md), so a migration that
+	// changes it updates exactly one object. This used to be the sharpest
+	// instance of the stale-copy bug — the fabric IP churned on every cutover
+	// and the Port carried a duplicate that had to be chased.
 	if port.Spec.Node == active.Spec.NodeName &&
 		port.Spec.NodeIP == nodeIP &&
-		port.Spec.FabricIP == active.Status.PodIP &&
 		port.Labels[sdnv1alpha1.LabelPodUID] == string(active.UID) {
 		return ctrl.Result{}, nil // binding already current
 	}
 
 	port.Spec.Node = active.Spec.NodeName
 	port.Spec.NodeIP = nodeIP
-	if active.Status.PodIP != "" {
-		port.Spec.FabricIP = active.Status.PodIP
-	}
 	port.Spec.PodNamespace = active.Namespace
 	port.Spec.PodName = active.Name
 	if port.Labels == nil {

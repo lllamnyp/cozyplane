@@ -412,7 +412,7 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	} else {
 		factory := sdninformers.NewSharedInformerFactory(sdnClient, 0)
 		watchVPCs(factory, mgr, log)
-		watchPorts(ctx, factory, sdnClient, client, mgr, nodeName, state.NodeIP, log)
+		watchPorts(ctx, factory, localFactory, sdnClient, client, mgr, nodeName, state.NodeIP, log)
 		watchPeerings(ctx, factory, mgr, log)
 		watchGateways(ctx, factory, mgr, nodeName, log)
 		watchFloatingIPs(ctx, factory, mgr, nodeName, log)
@@ -625,7 +625,7 @@ func watchVPCs(factory sdninformers.SharedInformerFactory, mgr *datapath.Manager
 // map as /32 routes to their node's Geneve endpoint, and severs a *local* pod's
 // datapath when its Port is reaped out from under it (revocation). Best-effort,
 // like watchVPCs.
-func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory, sdn sdnclientset.Interface, core kubernetes.Interface, mgr *datapath.Manager, selfName, selfIP string, log *slog.Logger) {
+func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory, localFactory localinformers.SharedInformerFactory, sdn sdnclientset.Interface, core kubernetes.Interface, mgr *datapath.Manager, selfName, selfIP string, log *slog.Logger) {
 	informer := factory.Sdn().V1alpha1().Ports().Informer()
 
 	// Guest-announcement cutover (stage 3): a reconcile loop, keyed on veth
@@ -644,7 +644,7 @@ func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory,
 		// revocation that landed while this agent was down replays here.
 		if port.DeletionTimestamp != nil {
 			if port.Spec.Node == selfName {
-				releaseSeveredPort(ctx, sdn, core, port, log)
+				releaseSeveredPort(ctx, sdn, core, localFactory, port, log)
 			}
 			return
 		}
@@ -752,7 +752,7 @@ func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory,
 			if port.Spec.Node == selfName {
 				// Belt for Ports created before the sever finalizer existed;
 				// finalized Ports were already severed while terminating.
-				severLocalPort(ctx, core, port, log)
+				severLocalPort(ctx, core, localFactory, port, log)
 				return
 			}
 			if err := mgr.DelRemote(net_, hostCIDR(port.Spec.IP)); err != nil {
@@ -864,11 +864,11 @@ func watchGuestAnnouncements(ctx context.Context, ports sdnv1alpha1listers.PortL
 // releaseSeveredPort handles a terminating Port on this node: sever the live
 // pod if the Port was reaped out from under it, then remove the sever
 // finalizer so the deletion completes. Idempotent — re-delivery is harmless.
-func releaseSeveredPort(ctx context.Context, sdn sdnclientset.Interface, core kubernetes.Interface, port *sdnv1alpha1.Port, log *slog.Logger) {
+func releaseSeveredPort(ctx context.Context, sdn sdnclientset.Interface, core kubernetes.Interface, localFactory localinformers.SharedInformerFactory, port *sdnv1alpha1.Port, log *slog.Logger) {
 	if !slices.Contains(port.Finalizers, sdnv1alpha1.FinalizerSever) {
 		return
 	}
-	severLocalPort(ctx, core, port, log)
+	severLocalPort(ctx, core, localFactory, port, log)
 	for range 3 {
 		latest, err := sdn.SdnV1alpha1().Ports().Get(ctx, port.Name, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
@@ -1353,7 +1353,7 @@ func portFromDelete(obj any) *sdnv1alpha1.Port {
 // has already cleaned up. It only severs if the owning pod still exists, is not
 // being deleted, and is the same pod (UID) that claimed the Port — so a stale
 // delete for a name-reused pod can't cut off an unrelated one.
-func severLocalPort(ctx context.Context, core kubernetes.Interface, port *sdnv1alpha1.Port, log *slog.Logger) {
+func severLocalPort(ctx context.Context, core kubernetes.Interface, localFactory localinformers.SharedInformerFactory, port *sdnv1alpha1.Port, log *slog.Logger) {
 	if port.Spec.PodNamespace == "" || port.Spec.PodName == "" {
 		return
 	}
@@ -1371,7 +1371,10 @@ func severLocalPort(ctx context.Context, core kubernetes.Interface, port *sdnv1a
 	if uid := port.Labels[sdnv1alpha1.LabelPodUID]; uid != "" && string(pod.UID) != uid {
 		return // a different pod reused the name; not the one this Port belonged to
 	}
-	severed, err := datapath.SeverLocal(net_, net.ParseIP(port.Spec.IP), port.Spec.FabricIP)
+	// The underlay address comes from the pod's FabricIP claim, not from a copy
+	// on the Port (docs/api-groups.md).
+	fabric := fabricByPodUID(localFactory, port.Labels[sdnv1alpha1.LabelPodUID])
+	severed, err := datapath.SeverLocal(net_, net.ParseIP(port.Spec.IP), fabric)
 	if err != nil {
 		log.Error("sever local port", "port", port.Name, "err", err)
 		return

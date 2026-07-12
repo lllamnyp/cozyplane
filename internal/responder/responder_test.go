@@ -68,7 +68,7 @@ func headless(ns, name, vpcAnno string, ports ...corev1.ServicePort) *corev1.Ser
 func testResolver() *Resolver {
 	st := &fakeState{
 		ports: map[string]*sdnv1alpha1.Port{
-			"10.244.1.5": {Spec: sdnv1alpha1.PortSpec{VPCRef: vpcA, IP: "192.168.0.10", FabricIP: "10.244.1.5"}},
+			"10.244.1.5": {Spec: sdnv1alpha1.PortSpec{VPCRef: vpcA, IP: "192.168.0.10"}},
 		},
 		svcs: map[string]*corev1.Service{
 			"team-a/etcd": headless("team-a", "etcd", "team-a/vpc-a",

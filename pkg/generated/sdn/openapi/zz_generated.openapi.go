@@ -1031,13 +1031,6 @@ func schema_cozyplane_api_sdn_v1alpha1_PortSpec(ref common.ReferenceCallback) co
 							Format:      "",
 						},
 					},
-					"fabricIP": {
-						SchemaProps: spec.SchemaProps{
-							Description: "FabricIP is the pod's status.podIP: a unique address from the node pod CIDR, reachable on the default overlay, that the bridge DNATs to IP.",
-							Type:        []string{"string"},
-							Format:      "",
-						},
-					},
 					"mac": {
 						SchemaProps: spec.SchemaProps{
 							Description: "MAC is the pod interface MAC address.",

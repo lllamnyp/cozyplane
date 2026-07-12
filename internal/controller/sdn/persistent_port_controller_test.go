@@ -128,8 +128,12 @@ func TestCutoverFollowsVMINode(t *testing.T) {
 	if got.Spec.Node != "node-b" {
 		t.Fatalf("port node = %q, want node-b (the VMI's current node)", got.Spec.Node)
 	}
-	if got.Spec.FabricIP != "10.244.1.9" {
-		t.Errorf("fabric IP = %q, want the target launcher's %q", got.Spec.FabricIP, "10.244.1.9")
+	// The Port carries NO underlay address anymore (docs/api-groups.md). It
+	// re-points at the target LAUNCHER; the launcher's own FabricIP claim holds
+	// the address. This used to be the sharpest instance of the stale-copy bug:
+	// the fabric IP churned on every cutover and the Port had to chase it.
+	if got.Spec.PodName != "virt-launcher-vm-dst" {
+		t.Errorf("pod name = %q, want the target launcher's", got.Spec.PodName)
 	}
 	if got.Spec.NodeIP != "10.0.0.2" {
 		t.Errorf("node IP = %q, want node-b's %q", got.Spec.NodeIP, "10.0.0.2")

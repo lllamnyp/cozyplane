@@ -43,10 +43,12 @@ type PortSpec struct {
 	// address configured inside the pod).
 	IP string `json:"ip"`
 
-	// FabricIP is the pod's status.podIP: a unique address from the node pod
-	// CIDR, reachable on the default overlay, that the bridge DNATs to IP.
-	// +optional
-	FabricIP string `json:"fabricIP,omitempty"`
+	// (There is deliberately no fabricIP here. A pod's UNDERLAY address is the
+	// local layer's business — it lives in exactly one place, the FabricIP
+	// object of local.sdn.cozystack.io, and both objects point at the pod
+	// (docs/api-groups.md). Denormalizing a copy into the tenant object invites
+	// the bug it was born to cause: the address churns — a VM migrates, a pod is
+	// re-created — and the stale copy programs the datapath.)
 
 	// MAC is the pod interface MAC address.
 	// +optional

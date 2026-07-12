@@ -177,8 +177,8 @@ func TestClaimIP_FirstAddressAndPortShape(t *testing.T) {
 	if port.Name != "v100.10-10-0-2" {
 		t.Errorf("port name = %q, want v100.10-10-0-2", port.Name)
 	}
-	if port.Spec.IP != "10.10.0.2" || port.Spec.FabricIP != "10.244.0.5" {
-		t.Errorf("port spec ip/fabric = %q/%q", port.Spec.IP, port.Spec.FabricIP)
+	if port.Spec.IP != "10.10.0.2" {
+		t.Errorf("port spec ip = %q", port.Spec.IP)
 	}
 	if port.Spec.VPCRef != (sdnv1alpha1.VPCRef{Namespace: "team-a", Name: "tenant-a"}) {
 		t.Errorf("port vpcRef = %+v", port.Spec.VPCRef)
@@ -222,8 +222,8 @@ func TestClaimIP_IPv6(t *testing.T) {
 		t.Errorf("port name = %q, want v200.fd00-a--2", port.Name)
 	}
 	// The fabric IP stays v4 (from the node pod CIDR underlay) even for a v6 pod.
-	if port.Spec.IP != "fd00:a::2" || port.Spec.FabricIP != "10.244.0.5" {
-		t.Errorf("port spec ip/fabric = %q/%q", port.Spec.IP, port.Spec.FabricIP)
+	if port.Spec.IP != "fd00:a::2" {
+		t.Errorf("port spec ip = %q", port.Spec.IP)
 	}
 }
 

@@ -109,6 +109,37 @@ func watchFabricIPs(ctx context.Context, factory localinformers.SharedInformerFa
 	return nil
 }
 
+// fabricByPodUID resolves a pod's UNDERLAY address from the FabricIP store.
+//
+// This is the join that replaces `Port.spec.fabricIP` (docs/api-groups.md). The
+// address lives in exactly one object; `Port` (tenant identity) and `FabricIP`
+// (underlay claim) both point at the pod, and the pod UID is the key. A churned
+// address — a VM migrates, a pod is re-created — updates one object, and the
+// next resync programs the truth. There is no copy to go stale.
+func fabricByPodUID(factory localinformers.SharedInformerFactory, podUID string) string {
+	if podUID == "" {
+		return ""
+	}
+	for _, obj := range factory.Local().V1alpha1().FabricIPs().Informer().GetStore().List() {
+		fip, ok := obj.(*localv1alpha1.FabricIP)
+		if !ok || fip.Spec.PodUID != podUID {
+			continue
+		}
+		// A dual-stack pod holds one claim per family; the bridge keys on the
+		// v4 fabric handle (the bridges map is v4 today), so prefer it.
+		if ip := net.ParseIP(fip.Spec.Address); ip != nil && ip.To4() != nil {
+			return fip.Spec.Address
+		}
+	}
+	// No v4 claim: fall back to whatever family the pod does hold.
+	for _, obj := range factory.Local().V1alpha1().FabricIPs().Informer().GetStore().List() {
+		if fip, ok := obj.(*localv1alpha1.FabricIP); ok && fip.Spec.PodUID == podUID {
+			return fip.Spec.Address
+		}
+	}
+	return ""
+}
+
 // nodeIPIndex tracks node name -> underlay (Geneve) address, so a FabricIP can
 // be resolved to a tunnel endpoint without a second API read.
 type nodeIPIndex struct {

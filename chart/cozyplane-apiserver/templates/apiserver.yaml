@@ -98,8 +98,28 @@ subjects:
     namespace: {{ $ns }}
 ---
 {{- if not .Values.etcd.operator.enabled }}
-# Built-in single-pod etcd (dev/evaluation; ephemeral by default). Production
-# uses the operator-managed EtcdCluster instead — see templates/etcd-cluster.yaml.
+{{- if .Values.etcd.persistence.enabled }}
+# The single-pod etcd's storage. The aggregated API's objects are cluster state:
+# an emptyDir would lose every VPC, Port and policy the moment the pod moves.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cozyplane-etcd-data
+  namespace: {{ $ns }}
+  labels:
+    {{- include "cozyplane-apiserver.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with .Values.etcd.persistence.storageClassName }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.etcd.persistence.size }}
+---
+{{- end }}
+# Built-in single-pod etcd. Production uses the operator-managed EtcdCluster
+# instead — see templates/etcd-cluster.yaml.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -110,6 +130,10 @@ metadata:
     {{- include "cozyplane-apiserver.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  # Recreate, not RollingUpdate: two etcd pods must never hold the same RWO
+  # volume, and a rolling update would try.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: cozyplane-etcd

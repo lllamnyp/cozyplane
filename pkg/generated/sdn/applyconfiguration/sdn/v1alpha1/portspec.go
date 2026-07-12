@@ -33,9 +33,6 @@ type PortSpecApplyConfiguration struct {
 	// IP is the address allocated to the pod within the VPC CIDR (the tenant
 	// address configured inside the pod).
 	IP *string `json:"ip,omitempty"`
-	// FabricIP is the pod's status.podIP: a unique address from the node pod
-	// CIDR, reachable on the default overlay, that the bridge DNATs to IP.
-	FabricIP *string `json:"fabricIP,omitempty"`
 	// MAC is the pod interface MAC address.
 	MAC *string `json:"mac,omitempty"`
 	// Node is the name of the node hosting the pod.
@@ -69,14 +66,6 @@ func (b *PortSpecApplyConfiguration) WithVPCRef(value *VPCRefApplyConfiguration)
 // If called multiple times, the IP field is set to the value of the last call.
 func (b *PortSpecApplyConfiguration) WithIP(value string) *PortSpecApplyConfiguration {
 	b.IP = &value
-	return b
-}
-
-// WithFabricIP sets the FabricIP field in the declarative configuration to the given value
-// and returns the receiver, so that objects can be built by chaining "With" function invocations.
-// If called multiple times, the FabricIP field is set to the value of the last call.
-func (b *PortSpecApplyConfiguration) WithFabricIP(value string) *PortSpecApplyConfiguration {
-	b.FabricIP = &value
 	return b
 }
 

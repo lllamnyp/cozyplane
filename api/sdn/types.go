@@ -206,7 +206,6 @@ type PortList struct {
 type PortSpec struct {
 	VPCRef       VPCRef
 	IP           string
-	FabricIP     string
 	MAC          string
 	Node         string
 	NodeIP       string

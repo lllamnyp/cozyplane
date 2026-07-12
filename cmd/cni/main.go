@@ -708,9 +708,10 @@ func attachPort(client sdnclientset.Interface, vpc *sdnv1alpha1.VPC, vpcNS strin
 			labelPodUID:       podUID,
 		}
 		spec := sdnv1alpha1.PortSpec{
-			VPCRef:       sdnv1alpha1.VPCRef{Namespace: vpcNS, Name: vpc.Name},
-			IP:           ipStr,
-			FabricIP:     fabricIP,
+			VPCRef: sdnv1alpha1.VPCRef{Namespace: vpcNS, Name: vpc.Name},
+			IP:     ipStr,
+			// No fabricIP: the underlay address is the pod's FabricIP claim,
+			// not a copy on the tenant object (docs/api-groups.md).
 			Node:         state.NodeName,
 			NodeIP:       state.NodeIP,
 			PodNamespace: podNS,
@@ -1018,9 +1019,6 @@ func cmdDel(args *skel.CmdArgs) error {
 				if net_, ok := netFromPortName(p.Name); ok {
 					_ = datapath.DelLocal(net_, net.ParseIP(p.Spec.IP))
 				}
-				if p.Spec.FabricIP != "" {
-					_ = datapath.DelBridge(p.Spec.FabricIP, hostVethNameFor(args.ContainerID))
-				}
 				// A persistent (VM NIC) Port outlives its pod so the VPC IP + MAC
 				// survive pod churn / live migration: never delete it here — the
 				// persistent-Port controller GCs it when the VM is gone.
@@ -1028,6 +1026,21 @@ func cmdDel(args *skel.CmdArgs) error {
 					continue
 				}
 				_ = client.SdnV1alpha1().Ports().Delete(context.TODO(), p.Name, metav1.DeleteOptions{})
+			}
+		}
+	}
+
+	// The bridge is keyed by the pod's underlay address, which lives in its
+	// FabricIP claim(s) — read them BEFORE releasing, since releasing is what
+	// destroys them.
+	if podUID != "" {
+		if lc, e := localClient(); e == nil {
+			if list, e2 := lc.LocalV1alpha1().FabricIPs().List(context.TODO(), metav1.ListOptions{
+				LabelSelector: labelFabricPodUID + "=" + podUID,
+			}); e2 == nil {
+				for i := range list.Items {
+					_ = datapath.DelBridge(list.Items[i].Spec.Address, hostVethNameFor(args.ContainerID))
+				}
 			}
 		}
 	}

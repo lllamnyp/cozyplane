@@ -1051,7 +1051,6 @@ func autoConvert_v1alpha1_PortSpec_To_sdn_PortSpec(in *PortSpec, out *sdn.PortSp
 		return err
 	}
 	out.IP = in.IP
-	out.FabricIP = in.FabricIP
 	out.MAC = in.MAC
 	out.Node = in.Node
 	out.NodeIP = in.NodeIP
@@ -1071,7 +1070,6 @@ func autoConvert_sdn_PortSpec_To_v1alpha1_PortSpec(in *sdn.PortSpec, out *PortSp
 		return err
 	}
 	out.IP = in.IP
-	out.FabricIP = in.FabricIP
 	out.MAC = in.MAC
 	out.Node = in.Node
 	out.NodeIP = in.NodeIP

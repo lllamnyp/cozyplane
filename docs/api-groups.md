@@ -142,7 +142,7 @@ What it costs, and what must change before flipping:
   `ipBlock`) take the **cluster** CIDR instead of a node's slice — simpler, but
   it is a semantic change in anything that hardcodes `Node.spec.podCIDR`.
 
-## `Port.spec.fabricIP` — normalized away
+## `Port.spec.fabricIP` — normalized away (BUILT)
 
 `Port` currently conflates two things: the *tenant identity* of a VPC NIC (VPC
 IP, pinned MAC, the persistence that survives live migration) and the pod's
@@ -156,11 +156,25 @@ either — a reference whose value *is* the address (the `FabricIP` name) would
 re-create the same stale-copy problem under a different field name.
 
 The address lives in exactly one place — the `FabricIP` object — and both
-objects point at the **pod**. The agent joins them on the pod UID: `Port` gives
-`{net, vpcIP, MAC}`, `FabricIP` gives the underlay address, and the pair feeds
-the `bridges` map. Both are already watched, so this is a join in the agent's
-existing resync, not a new watch. A churned address updates one object and the
-next resync programs the truth.
+objects point at the **pod**. Everything that used to read the copy now joins on
+the pod UID:
+
+- the **agent** (severing a revoked Port) resolves the address from the FabricIP
+  store;
+- the **CNI** tears the bridge down from the pod's own claims at DEL (read
+  before releasing — releasing is what destroys them);
+- the **responder** identifies a querying VPC pod from the underlay source of
+  its DNS packet: address → `FabricIP` → pod → `Port`. Two lookups instead of
+  one, and no denormalized address to go stale;
+- the **datapath's restart rebuild** never read the Port at all — it re-derives
+  from the veth alias records — so it needed no change.
+
+**The sharpest instance of the bug this kills:** the persistent-Port controller
+used to *copy the fabric IP into the Port on every live-migration cutover*
+(`port.Spec.FabricIP = active.Status.PodIP`), because the launcher's address
+churns while the VPC IP and MAC do not. That whole sync is deleted. A cutover
+now re-points the Port at the new launcher and nothing else; the launcher's own
+`FabricIP` holds the address.
 
 ## `NodeFabric` — what it would be, and why it waits
 
@@ -206,7 +220,8 @@ say. Revisit then; the group can grow.
 3. Move the tenant kinds to aggregated-only: drop their CRDs from
    `chart/cozyplane`, delete the takeover machinery, make the clients resolve
    the extension group by discovery.
-4. `Port.spec.fabricIP` → removed; the agent joins `Port` and `FabricIP` on the
-   pod. VPC pods stop carrying an underlay address in a tenant object.
+4. **BUILT.** `Port.spec.fabricIP` removed; every reader joins `Port` and
+   `FabricIP` on the pod. VPC pods stop carrying an underlay address in a tenant
+   object, and the migration-cutover copy is deleted.
 5. (Open) the CRD-storage shim for the extension registry — the thing that would
    drop etcd. Its own design.

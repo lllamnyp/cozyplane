@@ -40,15 +40,19 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
+	localv1alpha1 "github.com/lllamnyp/cozyplane/api/localsdn/v1alpha1"
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
 	"github.com/lllamnyp/cozyplane/datapath"
 	"github.com/lllamnyp/cozyplane/internal/responder"
+	localclient "github.com/lllamnyp/cozyplane/pkg/generated/localsdn/clientset/versioned"
+	localinformers "github.com/lllamnyp/cozyplane/pkg/generated/localsdn/informers/externalversions"
 	sdnclient "github.com/lllamnyp/cozyplane/pkg/generated/sdn/clientset/versioned"
 	sdninformers "github.com/lllamnyp/cozyplane/pkg/generated/sdn/informers/externalversions"
 )
 
 const (
-	fabricIPIndex = "fabricIP"
+	fabricIPIndex = "fabricIP" // on FabricIPs: the underlay address
+	podUIDIndex   = "podUID"   // on Ports: the claiming pod
 	podIndex      = "pod"
 	svcIndex      = "service"
 	localVPCIndex = "localVPC"
@@ -99,6 +103,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	local, err := localclient.NewForConfig(cfg)
+	if err != nil {
+		return err
+	}
 	sdn, err := sdnclient.NewForConfig(cfg)
 	if err != nil {
 		return err
@@ -144,12 +152,15 @@ func run() error {
 	}
 	portInf := sdnFactory.Sdn().V1alpha1().Ports().Informer()
 	if err := portInf.AddIndexers(cache.Indexers{
-		fabricIPIndex: func(obj any) ([]string, error) {
+		podUIDIndex: func(obj any) ([]string, error) {
 			p, ok := obj.(*sdnv1alpha1.Port)
-			if !ok || p.Spec.FabricIP == "" {
+			if !ok {
 				return nil, nil
 			}
-			return []string{canonIP(p.Spec.FabricIP)}, nil
+			if uid := p.Labels[sdnv1alpha1.LabelPodUID]; uid != "" {
+				return []string{uid}, nil
+			}
+			return nil, nil
 		},
 		podIndex: func(obj any) ([]string, error) {
 			p, ok := obj.(*sdnv1alpha1.Port)
@@ -181,13 +192,31 @@ func run() error {
 		return err
 	}
 
+	// The querying pod is identified by its UNDERLAY address (the source of the
+	// steered DNS packet), which lives in its FabricIP claim — not on the Port
+	// (docs/api-groups.md). Resolve address -> pod UID -> Port.
+	localFactory := localinformers.NewSharedInformerFactory(local, 0)
+	fipInf := localFactory.Local().V1alpha1().FabricIPs().Informer()
+	if err := fipInf.AddIndexers(cache.Indexers{
+		fabricIPIndex: func(obj any) ([]string, error) {
+			f, ok := obj.(*localv1alpha1.FabricIP)
+			if !ok || f.Spec.Address == "" {
+				return nil, nil
+			}
+			return []string{canonIP(f.Spec.Address)}, nil
+		},
+	}); err != nil {
+		return err
+	}
+
 	sdnFactory.Start(stop)
+	localFactory.Start(stop)
 	kubeFactory.Start(stop)
-	if !cache.WaitForCacheSync(stop, portInf.HasSynced, svcInf.HasSynced, epsInf.HasSynced, peeringInf.HasSynced, svipInf.HasSynced) {
+	if !cache.WaitForCacheSync(stop, portInf.HasSynced, svcInf.HasSynced, epsInf.HasSynced, peeringInf.HasSynced, svipInf.HasSynced, fipInf.HasSynced) {
 		return fmt.Errorf("informer caches did not sync")
 	}
 
-	state := &informerState{ports: portInf.GetIndexer(), svcs: svcInf.GetIndexer(), eps: epsInf.GetIndexer(), peerings: peeringInf.GetIndexer(), svips: svipInf.GetIndexer()}
+	state := &informerState{ports: portInf.GetIndexer(), svcs: svcInf.GetIndexer(), eps: epsInf.GetIndexer(), peerings: peeringInf.GetIndexer(), svips: svipInf.GetIndexer(), fips: fipInf.GetIndexer()}
 	res := &responder.Resolver{Domain: domain, Upstreams: upstreams, State: state}
 
 	var wg sync.WaitGroup
@@ -255,6 +284,7 @@ func upstreamsFromResolvConf(path string) ([]string, error) {
 
 // informerState implements responder.State over the shared informer indexes.
 type informerState struct {
+	fips     cache.Indexer
 	ports    cache.Indexer
 	svcs     cache.Indexer
 	eps      cache.Indexer
@@ -315,8 +345,20 @@ func detectClusterDomain(path string) string {
 	return ""
 }
 
+// PortByFabricIP identifies the querying VPC pod from the underlay source
+// address of its DNS packet: FabricIP (address -> pod) then Port (pod -> VPC
+// identity). Two lookups instead of one, and no denormalized address that can
+// go stale when a pod is re-created or a VM migrates.
 func (s *informerState) PortByFabricIP(ip string) *sdnv1alpha1.Port {
-	objs, err := s.ports.ByIndex(fabricIPIndex, ip)
+	fobjs, err := s.fips.ByIndex(fabricIPIndex, ip)
+	if err != nil || len(fobjs) == 0 {
+		return nil
+	}
+	fip, ok := fobjs[0].(*localv1alpha1.FabricIP)
+	if !ok || fip.Spec.PodUID == "" {
+		return nil
+	}
+	objs, err := s.ports.ByIndex(podUIDIndex, fip.Spec.PodUID)
 	if err != nil || len(objs) == 0 {
 		return nil
 	}
