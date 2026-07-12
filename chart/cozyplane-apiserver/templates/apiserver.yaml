@@ -74,6 +74,13 @@ rules:
   - apiGroups: ["apiregistration.k8s.io"]
     resources: ["apiservices"]
     verbs: ["get", "create", "patch"]
+  # ...and then removes the bootstrap CRDs it superseded. They are shadowed for
+  # routing but NOT for OpenAPI: while they exist, the group's spec fails to
+  # merge (duplicated paths) and `kubectl apply` of any object in it dies with
+  # "failed to download openapi".
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

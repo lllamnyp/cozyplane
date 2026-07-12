@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"syscall"
@@ -46,6 +47,7 @@ import (
 	"golang.org/x/sys/unix"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
@@ -616,6 +618,47 @@ func requireVPCBinding(client sdnclientset.Interface, podNS, vpcNS, vpcName stri
 	return fmt.Errorf("no VPCBinding in namespace %q authorizes attaching to VPC %s/%s (default-deny)", podNS, vpcNS, vpcName)
 }
 
+// rebindPodIdentity re-points a reused persistent Port at the pod binding it
+// now: the identity labels the controller reverse-indexes on, the spec's
+// pod name/namespace, and the pod-labels snapshot. A no-op when nothing moved.
+func rebindPodIdentity(client sdnclientset.Interface, p *sdnv1alpha1.Port, podNS, podName, podUID, podLabels string) error {
+	if p.Labels[sdnv1alpha1.LabelPodNamespace] == podNS &&
+		p.Labels[sdnv1alpha1.LabelPodName] == podName &&
+		p.Labels[sdnv1alpha1.LabelPodUID] == podUID &&
+		(podLabels == "" || p.Annotations[sdnv1alpha1.AnnotationPodLabels] == podLabels) {
+		return nil
+	}
+	patch := map[string]any{
+		"metadata": map[string]any{
+			"labels": map[string]string{
+				sdnv1alpha1.LabelPodNamespace: podNS,
+				sdnv1alpha1.LabelPodName:      podName,
+				sdnv1alpha1.LabelPodUID:       podUID,
+			},
+		},
+		"spec": map[string]any{
+			"podNamespace": podNS,
+			"podName":      podName,
+		},
+	}
+	if podLabels != "" {
+		patch["metadata"].(map[string]any)["annotations"] = map[string]string{
+			sdnv1alpha1.AnnotationPodLabels: podLabels,
+		}
+	}
+	raw, err := json.Marshal(patch)
+	if err != nil {
+		return err
+	}
+	updated, err := client.SdnV1alpha1().Ports().Patch(context.TODO(), p.Name,
+		k8stypes.MergePatchType, raw, metav1.PatchOptions{})
+	if err != nil {
+		return err
+	}
+	*p = *updated
+	return nil
+}
+
 // attachPort obtains the Port realizing a pod's VPC NIC and returns its VPC IP,
 // the pinned MAC (nil for an ordinary pod — the veth keeps its random MAC), and
 // the Port.
@@ -648,6 +691,17 @@ func attachPort(client sdnclientset.Interface, vpc *sdnv1alpha1.VPC, vpcNS strin
 			mac, err := net.ParseMAC(p.Spec.MAC)
 			if err != nil {
 				return nil, nil, nil, false, fmt.Errorf("persistent port %s has invalid MAC %q: %w", p.Name, p.Spec.MAC, err)
+			}
+			// Re-point the Port's pod identity at the pod binding it NOW. The
+			// {IP, MAC} stay pinned — that is the whole point of a persistent
+			// Port — but membership must follow the live launcher, not the
+			// first one that ever claimed it, or a migrated VM's SecurityGroup
+			// membership would freeze at its original labels
+			// (docs/security-groups.md § Membership). Best-effort: a failure
+			// here must not fail the ADD, and the controller still has the
+			// snapshot to fall back on.
+			if err := rebindPodIdentity(client, p, podNS, podName, podUID, podLabels); err != nil {
+				fmt.Fprintf(os.Stderr, "cozyplane: rebind pod identity on %s: %v\n", p.Name, err)
 			}
 			return ip, mac, p, true, nil
 		}

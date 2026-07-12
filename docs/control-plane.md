@@ -17,8 +17,8 @@ needs cert-manager** (serving cert, etcd PKI).
   dedicated etcd. In Cozystack it is a separate component that `dependsOn`
   cert-manager. Installing it creates the explicit APIService for
   `v1alpha1.sdn.cozystack.io`, which **atomically takes over** the group's
-  serving from the CRDs' implicit APIService — the CRDs stay installed, shadowed
-  and inert, and every request from that moment hits the aggregated server.
+  serving from the CRDs' implicit APIService, and every request from that moment
+  hits the aggregated server. **The server then deletes the bootstrap CRDs.**
 
 The takeover is storage-disjoint: objects in the CRD store (kube etcd) are not
 visible through the aggregated server (its own etcd). On a fresh cluster that is
@@ -26,7 +26,28 @@ a non-event — the CRD store is empty when the apiserver lands (tenants come
 later). On a cluster with live CRD-stored objects, export → install → re-apply
 (see the cozyplane-apiserver chart README).
 
-Two mechanics of the takeover, both learned the empirical way:
+Three mechanics of the takeover, all learned the empirical way:
+
+- **The bootstrap CRDs must be REMOVED, not merely shadowed** (corrected
+  2026-07-12 — an earlier version of this doc claimed they could "stay
+  installed, shadowed and inert"). They are shadowed for *routing* only: a CRD
+  goes on publishing its OpenAPI paths after the APIService takes serving over,
+  so the kube-apiserver tries to merge two specs describing the same paths and
+  gives up —
+
+  ```
+  Error in OpenAPI handler: failed to build merge specs: unable to merge:
+  duplicated path /apis/sdn.cozystack.io/v1alpha1/namespaces/{namespace}/vpcs/{name}
+  ```
+
+  The group's schema then never serves, and every `kubectl apply` of one of our
+  objects fails client-side with *"failed to download openapi"* — while core
+  types keep working perfectly, which is exactly why this hid for so long. The
+  apiserver deletes the CRDs itself once its APIService lands
+  (`--remove-bootstrap-crds`, on by default), which is safe precisely because
+  the takeover is storage-disjoint (below). The CNI chart must also stop
+  shipping them (`crds.enabled: false`) wherever the apiserver is installed, or
+  the next `helm upgrade` puts them back.
 
 - **The APIService cannot be a chart manifest.** The kube-apiserver
   auto-registers an APIService for every served CRD group, so in the takeover

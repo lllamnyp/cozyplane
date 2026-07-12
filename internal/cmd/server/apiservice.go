@@ -47,6 +47,14 @@ const (
 	autoManagedLabel = "kube-aggregator.kubernetes.io/automanaged"
 )
 
+// sdnPlurals are the group's resources — the bootstrap CRDs named
+// "<plural>.sdn.cozystack.io". Keep in step with internal/setup/sdn's storage
+// map; a missing entry just leaves one CRD behind (and its OpenAPI collision).
+var sdnPlurals = []string{
+	"vpcs", "vpcbindings", "vpcpeerings", "ports", "externalpools",
+	"floatingips", "servicevips", "securitygroups", "hostfirewalls",
+}
+
 var apiServiceGVR = schema.GroupVersionResource{
 	Group: "apiregistration.k8s.io", Version: "v1", Resource: "apiservices",
 }
@@ -142,4 +150,56 @@ func splitServiceRef(ref string) (ns, name string, err error) {
 		return "", "", fmt.Errorf("expected namespace/name, got %q", ref)
 	}
 	return parts[0], parts[1], nil
+}
+
+// crdGVR is apiextensions' CRD resource — the bootstrap surface this server
+// supersedes.
+var crdGVR = schema.GroupVersionResource{
+	Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions",
+}
+
+// RemoveBootstrapCRDs deletes the CRDs that bootstrapped this server's group,
+// once the aggregated APIService owns it.
+//
+// This is not tidiness — leaving them breaks the group. A CRD keeps publishing
+// its OpenAPI paths after the APIService takes over serving, so the
+// kube-apiserver tries to merge two specs describing the same paths and fails:
+//
+//	Error in OpenAPI handler: failed to build merge specs: unable to merge:
+//	duplicated path /apis/sdn.cozystack.io/v1alpha1/namespaces/{namespace}/vpcs/{name}
+//
+// The group's OpenAPI then never serves, and every `kubectl apply` of one of
+// our objects dies client-side with "failed to download openapi" — while every
+// core type keeps working, which is what made this so easy to miss. The CRDs
+// are shadowed for *routing*, never for OpenAPI.
+//
+// Deleting a CRD deletes the objects in ITS store. That is safe here precisely
+// because the takeover is storage-disjoint (docs/control-plane.md §0): the
+// aggregated server keeps its objects in its own etcd, the CRD store's copies
+// were never migrated, and the documented migration path is export → install →
+// re-apply. Anything still sitting in the CRD store is already invisible —
+// requests have been answered by the aggregated server since the takeover.
+func RemoveBootstrapCRDs(ctx context.Context, cfg *rest.Config, plurals []string) error {
+	dyn, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("dynamic client: %w", err)
+	}
+	c := dyn.Resource(crdGVR)
+	for _, plural := range plurals {
+		name := plural + "." + sdnGroup
+		err := c.Delete(ctx, name, metav1.DeleteOptions{})
+		switch {
+		case apierrors.IsNotFound(err):
+			// The common case once the handoff has happened.
+		case err != nil:
+			// Not fatal: the group still SERVES correctly, only its OpenAPI is
+			// degraded. Say so loudly rather than refusing to start.
+			klog.Warningf("could not remove bootstrap CRD %s: %v — while it exists, "+
+				"OpenAPI for %s cannot merge and `kubectl apply` of its objects will "+
+				"fail client-side validation", name, err, sdnGroup)
+		default:
+			klog.Infof("removed bootstrap CRD %s (superseded by the aggregated APIService)", name)
+		}
+	}
+	return nil
 }

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"slices"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -52,6 +53,7 @@ type SecurityGroupReconciler struct {
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=securitygroups/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=ports,verbs=get;list;watch
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=ports/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 
 func (r *SecurityGroupReconciler) reader() client.Reader {
 	if r.Reader != nil {
@@ -182,13 +184,32 @@ func (r *SecurityGroupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 // PortMembershipReconciler resolves a Port's SecurityGroup membership from the
-// pod labels the CNI stamped on it, writing the group ids into
-// Port.status.groups — the input the agent folds into the datapath membership
-// bitmap. Membership is claim-time: it is (re)computed on Port creation and
-// whenever a SecurityGroup in the Port's VPC changes (its selector or id), but
-// not on later pod-label edits (a v2 refinement).
+// pod's LIVE labels, writing the group ids into Port.status.groups — the input
+// the agent folds into the datapath membership bitmap. Membership FOLLOWS
+// labels (docs/security-groups.md § Membership): it is recomputed on Port
+// creation, on any SecurityGroup change in the Port's VPC, and on the pod's own
+// label edits — the contract NetworkPolicy has always had. The CNI's pod-labels
+// annotation is only the fallback for when the Port has no live pod (a
+// persistent VM Port between launchers; a CRD-mode install with no pod access),
+// so membership holds steady instead of collapsing to "no groups".
 type PortMembershipReconciler struct {
 	client.Client
+}
+
+// podLabelsFor returns the labels to evaluate selectors against: the live pod's
+// if the Port names one that exists, else the claim-time snapshot.
+func (r *PortMembershipReconciler) podLabelsFor(ctx context.Context, port *sdnv1alpha1.Port) map[string]string {
+	ns := port.Labels[sdnv1alpha1.LabelPodNamespace]
+	name := port.Labels[sdnv1alpha1.LabelPodName]
+	if ns != "" && name != "" {
+		var pod corev1.Pod
+		if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &pod); err == nil {
+			if pod.DeletionTimestamp == nil {
+				return pod.Labels
+			}
+		}
+	}
+	return decodePodLabels(port.Annotations[sdnv1alpha1.AnnotationPodLabels])
 }
 
 func (r *PortMembershipReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -202,7 +223,7 @@ func (r *PortMembershipReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, nil
 	}
 
-	podLabels := decodePodLabels(port.Annotations[sdnv1alpha1.AnnotationPodLabels])
+	podLabels := r.podLabelsFor(ctx, &port)
 
 	// Evaluate every SecurityGroup in the Port's VPC (owner namespace + name).
 	var groups sdnv1alpha1.SecurityGroupList
@@ -261,10 +282,34 @@ func (r *PortMembershipReconciler) mapSGToPorts(ctx context.Context, obj client.
 	return reqs
 }
 
+// mapPodToPorts re-enqueues the Port(s) a pod owns when the pod changes — the
+// label-follows trigger. The CNI stamps pod-namespace/pod-name on every Port it
+// creates, so the reverse index is a plain list filter (Ports are cluster-scoped
+// and few per node; a field index is the optimization if this ever shows up).
+func (r *PortMembershipReconciler) mapPodToPorts(ctx context.Context, obj client.Object) []ctrl.Request {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return nil
+	}
+	var ports sdnv1alpha1.PortList
+	if err := r.List(ctx, &ports, client.MatchingLabels{
+		sdnv1alpha1.LabelPodNamespace: pod.Namespace,
+		sdnv1alpha1.LabelPodName:      pod.Name,
+	}); err != nil {
+		return nil
+	}
+	var reqs []ctrl.Request
+	for i := range ports.Items {
+		reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{Name: ports.Items[i].Name}})
+	}
+	return reqs
+}
+
 func (r *PortMembershipReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&sdnv1alpha1.Port{}).
 		Watches(&sdnv1alpha1.SecurityGroup{}, handler.EnqueueRequestsFromMapFunc(r.mapSGToPorts)).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.mapPodToPorts)).
 		Named("portmembership").
 		Complete(r)
 }

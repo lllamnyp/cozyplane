@@ -85,7 +85,12 @@ exportPolicy:
 # API server (custom validation, subresources — the design target) is the
 # SEPARATE chart/cozyplane-apiserver, which installs later (it needs
 # cert-manager) and atomically takes over the group's serving from these CRDs
-# via its explicit APIService; the CRDs stay installed, shadowed and inert.
-# Disable only to keep the group entirely unserved until that chart installs.
+# via its explicit APIService — and then DELETES these CRDs, because a CRD keeps
+# publishing OpenAPI paths for a group it no longer serves, and the resulting
+# merge collision breaks `kubectl apply` for every object in the group.
+#
+# Set this to false wherever cozyplane-apiserver is installed: otherwise a
+# `helm upgrade` of this chart re-creates the CRDs the apiserver removed, and
+# the group's OpenAPI breaks again until the apiserver restarts.
 crds:
   enabled: true

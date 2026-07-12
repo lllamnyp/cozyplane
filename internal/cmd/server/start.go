@@ -74,6 +74,10 @@ type CozyplaneServerOptions struct {
 	// done here and not in a chart manifest.
 	EnsureAPIServiceService     string
 	EnsureAPIServiceCAInjection string
+	// RemoveBootstrapCRDs deletes the CRDs that bootstrapped the group once the
+	// APIService takeover lands. On by default: leaving them installed breaks
+	// OpenAPI for the whole group (RemoveBootstrapCRDs explains how).
+	RemoveBootstrapCRDs bool
 }
 
 // NewCozyplaneServerOptions returns a new CozyplaneServerOptions.
@@ -88,6 +92,7 @@ func NewCozyplaneServerOptions(out, errOut io.Writer) *CozyplaneServerOptions {
 		StdOut:                   out,
 		StdErr:                   errOut,
 		ServeSDN:                 true,
+		RemoveBootstrapCRDs:      true,
 	}
 
 	return o
@@ -140,6 +145,10 @@ func NewCommandStartCozyplaneServer(ctx context.Context, defaults *CozyplaneServ
 	flags.BoolVar(&o.ServeSDN, "serve-sdn", o.ServeSDN, "Serve the sdn.cozystack.io API group from this server.")
 	flags.StringVar(&o.EnsureAPIServiceService, "ensure-apiservice-service", o.EnsureAPIServiceService,
 		"namespace/name of this server's Service; when set, register (or take over from CRD autoregistration) the group's APIService pointing at it.")
+	flags.BoolVar(&o.RemoveBootstrapCRDs, "remove-bootstrap-crds", o.RemoveBootstrapCRDs,
+		"After taking the group over, delete the CRDs that bootstrapped it. Leaving them "+
+			"installed makes OpenAPI for the group fail to merge (duplicated paths), which "+
+			"breaks client-side validation for every object in it.")
 	flags.StringVar(&o.EnsureAPIServiceCAInjection, "ensure-apiservice-ca-injection", o.EnsureAPIServiceCAInjection,
 		"namespace/certificate for the cert-manager.io/inject-ca-from annotation on the ensured APIService.")
 
@@ -239,8 +248,19 @@ func (o CozyplaneServerOptions) RunCozyplaneServer(ctx context.Context) error {
 			return fmt.Errorf("--ensure-apiservice-service: %w", err)
 		}
 		clientConfig := config.GenericConfig.ClientConfig
+		removeCRDs := o.RemoveBootstrapCRDs
 		server.GenericAPIServer.AddPostStartHookOrDie("ensure-apiservice", func(hookCtx genericapiserver.PostStartHookContext) error {
-			return EnsureAPIService(hookCtx, clientConfig, svcNS, svcName, o.EnsureAPIServiceCAInjection)
+			if err := EnsureAPIService(hookCtx, clientConfig, svcNS, svcName, o.EnsureAPIServiceCAInjection); err != nil {
+				return err
+			}
+			if !removeCRDs {
+				return nil
+			}
+			// The handoff is only complete once the bootstrap CRDs are gone:
+			// they keep publishing OpenAPI paths for a group we now serve, and
+			// the merge collision kills the group's schema (see
+			// RemoveBootstrapCRDs).
+			return RemoveBootstrapCRDs(hookCtx, clientConfig, sdnPlurals)
 		})
 	}
 

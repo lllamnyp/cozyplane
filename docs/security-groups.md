@@ -9,8 +9,8 @@
 cluster. This is the first increment of `design.md` §7 ("Network identity &
 security groups"). The remaining §7 surface (egress, peered-group references,
 FQDN and specific-CIDR sources, the Geneve identity TLV) is v2 — the v1 shape is
-chosen so those are additive, never a reshape. What v1 does **not** yet do is
-called out inline as "v2".
+chosen so those are additive, never a reshape. What is not built yet is called
+out inline. **Label-follows membership is built** (see "Membership").
 
 ## What §7 commits us to
 
@@ -77,19 +77,33 @@ Semantics, deliberately AWS-shaped:
 
 ## Membership: how a pod lands in a group
 
-The CNI already stamps every VPC pod's identity onto its `Port` (pod
-namespace/name/UID labels). Membership derives from **pod labels at ADD time**:
-the plugin copies the pod's labels into a dedicated annotation on the Port
-(`sdn.cozystack.io/pod-labels`), and the **controller** evaluates every
+The CNI stamps every VPC pod's identity onto its `Port` (pod
+namespace/name/UID labels) and snapshots the pod's labels into an annotation
+(`sdn.cozystack.io/pod-labels`). The **controller** evaluates every
 `SecurityGroup.podSelector` against them, writing the resolved membership into
 `Port.status.groups` (small integers, allocated per VPC — the wire identity).
 
-Two consequences to be explicit about:
+**Membership follows live labels (v2, built).** The controller resolves a
+Port's pod (from the identity labels the CNI stamped) and evaluates selectors
+against the pod's **current** labels, re-running on every pod update — the same
+contract NetworkPolicy has had from day one, and the asymmetry between the two
+layers is now gone. A `kubectl label` moves a running pod between groups within
+a reconcile; no pod restart.
 
-- **Label changes after ADD do not move a running pod between groups** in v1.
-  Membership is claim-time, like the IP. (A controller re-evaluation on pod
-  label updates is a v2 refinement; it needs a pods watch keyed to Ports, which
-  the persistent-port machinery already half-built.) (Review Q3.)
+- The **annotation snapshot is the fallback**, not the source of truth: it is
+  used only when the Port's pod is not (yet, or no longer) present. That keeps
+  a persistent VM Port's membership stable across the window where the Port
+  outlives its launcher pod (live migration) instead of flapping to "no groups"
+  — and it keeps the CRD-mode install working when the controller cannot see
+  pods.
+- The CNI **refreshes both the identity labels and the snapshot when it
+  re-binds a persistent Port** to a new launcher pod, so a migrated VM's
+  membership follows its *current* pod rather than the first one that ever
+  claimed the Port.
+- Enforcement is still destination-side and placement-independent; only the
+  *input* to membership changed. A pod losing its group loses admission on its
+  next new flow (established TCP is not torn down — the SYN-gate has no
+  conntrack to revoke; the same is true of NetworkPolicy).
 - The **numeric group id** is allocated by the controller per VPC. id 0 = "no
   groups, legacy allow"; ids **1..62** are real groups; id **63 is reserved**
   as the north-south "world" pseudo-group (v2). Membership is a `u64` bitmap in
@@ -160,11 +174,13 @@ identities must cross a trust boundary (peered VPCs, v2).
 - **`SecurityGroupReconciler`**: per-VPC id allocation (live-read, ids 1..62,
   deterministic duplicate repair) → `status.id`/`phase`.
 - **`PortMembershipReconciler`**: evaluates every SecurityGroup's `podSelector`
-  in the Port's VPC against the pod-labels the CNI stamped (annotation
-  `sdn.cozystack.io/pod-labels`, a claim-time snapshot) → `Port.status.groups`.
-  Re-runs when a Port is created or any SecurityGroup in its VPC changes; **not**
-  on later pod-label edits (v2 — a Ports-keyed pods watch, which the
-  persistent-port machinery already half-built).
+  in the Port's VPC against the Port's pod's **live labels** (falling back to
+  the `sdn.cozystack.io/pod-labels` snapshot when the pod is absent) →
+  `Port.status.groups`. Re-runs when a Port is created, when any SecurityGroup
+  in its VPC changes, and **when the pod's labels change** (a Pod watch mapped
+  to Ports through the stamped `pod-namespace`/`pod-name` labels). The agent
+  needs no change: any `status.groups` edit is a Port update, which its existing
+  resync already folds into `sg_members`.
 - The **agent** compiles SecurityGroups directly into `sg_rules` (it does not
   read a controller-compiled form).
 - **AuthZ**: the VPC owner manages groups — the object is namespaced in the VPC

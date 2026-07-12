@@ -57,7 +57,11 @@ trap cleanup EXIT
 # apply: never swallow a rejected object. A policy that failed schema validation
 # looks exactly like a policy that failed to enforce, and the whole phase then
 # tests nothing. (`on` is a YAML 1.1 boolean, which is how that bites.)
-apply() { $K apply -f - >/dev/null || { echo "  FATAL: apply rejected"; exit 1; }; }
+# --validate=false: on an install where the bootstrap CRDs and the aggregated
+# APIService both serve sdn.cozystack.io, OpenAPI aggregation for the group
+# fails on duplicated paths, so client-side validation cannot fetch a schema.
+# The server still validates (the registry strategy does the real checks).
+apply() { $K apply --validate=false -f - >/dev/null || { echo "  FATAL: apply rejected"; exit 1; }; }
 
 # served/refused: poll, because policy programming is eventually consistent.
 served()  { for _ in $(seq 1 10); do $K -n "$NS" exec "$1" -- curl -gs -m3 "$2" >/dev/null 2>&1 && return 0; sleep 2; done; return 1; }
@@ -313,6 +317,89 @@ $K delete hostfirewall pol-e2e-eg >/dev/null
 $K label node "$W" "${HFLABEL}-" >/dev/null 2>&1
 served host1 "http://$CLI:8080/" && pass "deleting the egress object reopens the node's own traffic" \
   || fail "the node stayed egress-isolated after deletion"
+
+# ===========================================================================
+phase "SecurityGroup: label-follows membership"
+# Membership must track a pod's LIVE labels, not the snapshot taken when its
+# Port was claimed — the contract NetworkPolicy has always had.
+apply <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: VPC
+metadata: {name: sgvpc, namespace: $NS}
+spec: {cidrs: ["10.77.0.0/24"]}
+EOF
+apply <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sgweb
+  namespace: $NS
+  labels: {role: web}
+  annotations: {sdn.cozystack.io/vpc: sgvpc}
+spec:
+  nodeName: $W
+  containers:
+    - name: s
+      image: nicolaka/netshoot
+      command: [python3, -m, http.server, "8080", --bind, "::"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sgcli
+  namespace: $NS
+  labels: {role: client}
+  annotations: {sdn.cozystack.io/vpc: sgvpc}
+spec:
+  nodeName: $W2
+  containers:
+    - {name: s, image: nicolaka/netshoot, command: [sleep, infinity]}
+EOF
+if ! $K -n "$NS" wait --for=condition=Ready pod/sgweb pod/sgcli --timeout=180s >/dev/null 2>&1; then
+  skip "SecurityGroup phase (VPC pods did not become Ready)"
+else
+  vpcip() { $K get ports -o jsonpath="{range .items[*]}{.spec.podName}{' '}{.spec.ip}{'\n'}{end}" | awk -v p="$1" '$1==p{print $2}'; }
+  groups() { $K get ports -o jsonpath="{range .items[*]}{.spec.podName}{'='}{.status.groups}{'\n'}{end}" | awk -F= -v p="$1" '$1==p{print $2}'; }
+  SGWEB=$(vpcip sgweb)
+  apply <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: SecurityGroup
+metadata: {name: web, namespace: $NS}
+spec:
+  vpcRef: {name: sgvpc}
+  podSelector: {matchLabels: {role: web}}
+  ingress: [{from: {group: client}, ports: [{protocol: TCP, port: 8080}]}]
+---
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: SecurityGroup
+metadata: {name: client, namespace: $NS}
+spec:
+  vpcRef: {name: sgvpc}
+  podSelector: {matchLabels: {role: client}}
+  egress: [{to: {group: web}, ports: [{protocol: TCP, port: 8080}]}]
+EOF
+  # Wait for membership to resolve at all.
+  for _ in $(seq 1 20); do [ "$(groups sgweb)" != "" ] && [ "$(groups sgweb)" != "[]" ] && break; sleep 2; done
+  served sgcli "http://$SGWEB:8080/" && pass "grouped client reaches web (membership resolved from labels)" \
+    || fail "the SG rules did not admit the grouped client"
+
+  # THE POINT: relabel a RUNNING pod out of its group. v1 froze membership at
+  # claim time, so this changed nothing; it must now take effect.
+  $K -n "$NS" label pod sgcli role=bystander --overwrite >/dev/null
+  refused sgcli "http://$SGWEB:8080/" && pass "relabelled pod LOSES membership on a live pod (label-follows)" \
+    || fail "membership did not follow the label change (still admitted)"
+  for _ in $(seq 1 15); do [ "$(groups sgcli)" = "[]" ] || [ "$(groups sgcli)" = "" ] && break; sleep 2; done
+  g=$(groups sgcli)
+  { [ "$g" = "[]" ] || [ -z "$g" ]; } && pass "Port.status.groups emptied for the relabelled pod" \
+    || fail "Port.status.groups still holds a group after the relabel (got '$g')"
+
+  # And back: membership is not a one-way door.
+  $K -n "$NS" label pod sgcli role=client --overwrite >/dev/null
+  served sgcli "http://$SGWEB:8080/" && pass "relabelling back RE-JOINS the group (label-follows both ways)" \
+    || fail "membership did not follow the label back into the group"
+
+  $K -n "$NS" delete securitygroup web client >/dev/null 2>&1
+fi
 
 echo
 echo "policy-e2e: ${PASSED} passed, $((CHECKS - PASSED)) failed, ${SKIPPED} skipped, in $(( $(date +%s) - START ))s"
