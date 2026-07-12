@@ -4,12 +4,35 @@ How the operator comes alive. Companion to `design.md` (architecture). Group:
 `sdn.cozystack.io`, version `v1alpha1`, served by the **cozyplane aggregated API
 server** — with a CRD serving of the same group as the **bootstrap surface**.
 
-> **Superseded in design by [api-groups.md](api-groups.md)** (2026-07-12): one
-> group served by two mechanisms cannot work — the shadowed CRDs keep publishing
-> OpenAPI paths and the group's schema stops merging. The plan is two groups,
-> one CRD-served and one aggregated. This section describes what is built today.
+## 0. Two groups, two owners — and no takeover
 
-## 0. Two serving modes, one group — and the takeover
+**Rewritten 2026-07-12** ([api-groups.md](api-groups.md) is the design). The old
+model — one group bootstrapped as CRDs and then *taken over* by the aggregated
+apiserver — is gone, along with all of its machinery. It could not work: a CRD
+keeps publishing its OpenAPI paths after an APIService takes the group over, the
+two specs collide on duplicated paths, the group's schema stops serving, and
+`kubectl apply` fails for every object in the group while core types keep
+working.
+
+The split is by concern, not by serving mechanism:
+
+- **`local.sdn.cozystack.io`** — CRDs, shipped with the CNI. Underlay IPAM
+  (`FabricIP`). Its dependency floor is the kube API and nothing else, because
+  everything above it — cert-manager, etcd, cozyplane's own apiserver — runs as
+  default-network pods and therefore needs this layer first.
+- **`sdn.cozystack.io`** — the aggregated apiserver, only, never CRDs. `VPC`,
+  `VPCBinding`, `VPCPeering`, `Port`, `SecurityGroup`, `HostFirewall`,
+  `ServiceVIP`, `FloatingIP`, `ExternalPool`.
+
+Disjoint kinds, so disjoint paths, so the collision cannot occur. What this
+deleted: APIService adoption, the `automanaged`-label fight with the CRD
+autoregistration controller, the CRD-delete grant, and the ordering constraint
+between the two charts. The server still registers its own APIService at
+startup — but that is now a plain create, because nothing else creates one.
+
+The old text follows for the record.
+
+## 0b. (Historical) Two serving modes, one group — and the takeover
 
 The group has two servers, packaged as two charts, because of a deploy-time
 truth: **the CNI must install before cert-manager, and the aggregated apiserver

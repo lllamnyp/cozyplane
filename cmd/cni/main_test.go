@@ -18,6 +18,7 @@ package main
 
 import (
 	"net"
+	"slices"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,46 +29,69 @@ import (
 	sdnfake "github.com/lllamnyp/cozyplane/pkg/generated/sdn/clientset/versioned/fake"
 )
 
-func TestNodeCIDRFor(t *testing.T) {
+func TestPoolFor(t *testing.T) {
 	const (
-		v4 = "10.244.1.0/24"
-		v6 = "fd00:10:244:1::/64"
+		v4        = "10.244.1.0/24"
+		v6        = "fd00:10:244:1::/64"
+		clusterV4 = "10.244.0.0/16"
+		clusterV6 = "fd00:10:244::/56"
 	)
-	tests := []struct {
-		name    string
-		cidrs   []string
-		single  string
-		wantV6  bool
-		expect  string
-		wantErr bool
-	}{
-		{name: "v4 vpc, dual-stack node", cidrs: []string{v4, v6}, wantV6: false, expect: v4},
-		{name: "v6 vpc, dual-stack node", cidrs: []string{v4, v6}, wantV6: true, expect: v6},
-		{name: "v4 vpc, v4-only node", cidrs: []string{v4}, wantV6: false, expect: v4},
-		// The decoupling: a v6 VPC on a v4-only node falls back to the v4 fabric
-		// CIDR instead of erroring — east-west VPC traffic keys on the VPC IP.
-		{name: "v6 vpc, v4-only node falls back", cidrs: []string{v4}, wantV6: true, expect: v4},
-		{name: "v4 vpc, v6-only node falls back", cidrs: []string{v6}, wantV6: false, expect: v6},
-		{name: "single PodCIDR fallback field", single: v4, wantV6: true, expect: v4},
-		{name: "no CIDRs at all errors", wantErr: true},
+	// The flat pool wins when the agent published one: a pod's address is drawn
+	// from the whole cluster range, not from this node's slice of it.
+	state := &datapath.AgentState{
+		PodCIDR:         v4,
+		PodCIDRs:        []string{v4, v6},
+		ClusterPodCIDRs: []string{clusterV4, clusterV6},
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			state := &datapath.AgentState{PodCIDR: tc.single, PodCIDRs: tc.cidrs}
-			got, err := nodeCIDRFor(state, tc.wantV6)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("expected error, got %q", got)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if got != tc.expect {
-				t.Fatalf("got %q, want %q", got, tc.expect)
-			}
-		})
+	if got := poolFor(state); !slices.Equal(got, []string{clusterV4, clusterV6}) {
+		t.Fatalf("flat pool: got %v", got)
+	}
+	// Without one, fall back to the node's slice (pre-flat behaviour).
+	state = &datapath.AgentState{PodCIDR: v4, PodCIDRs: []string{v4, v6}}
+	if got := poolFor(state); !slices.Equal(got, []string{v4, v6}) {
+		t.Fatalf("node-slice fallback: got %v", got)
+	}
+	state = &datapath.AgentState{PodCIDR: v4}
+	if got := poolFor(state); !slices.Equal(got, []string{v4}) {
+		t.Fatalf("single-CIDR fallback: got %v", got)
+	}
+}
+
+func TestPoolOfFamily(t *testing.T) {
+	const (
+		v4 = "10.244.0.0/16"
+		v6 = "fd00:10:244::/56"
+	)
+	if got := poolOfFamily([]string{v4, v6}, false); !slices.Equal(got, []string{v4}) {
+		t.Fatalf("v4 wanted: got %v", got)
+	}
+	if got := poolOfFamily([]string{v4, v6}, true); !slices.Equal(got, []string{v6}) {
+		t.Fatalf("v6 wanted: got %v", got)
+	}
+	// The decoupling stands: a v6 VPC on a v4-only cluster still gets a fabric
+	// handle — east-west VPC traffic keys on the VPC IP, not the fabric IP.
+	if got := poolOfFamily([]string{v4}, true); !slices.Equal(got, []string{v4}) {
+		t.Fatalf("v6 VPC on a v4-only cluster must fall back: got %v", got)
+	}
+}
+
+func TestClaimWalkIsAddressable(t *testing.T) {
+	// addOffset must carry across octets, and must not overflow on a v6 pool
+	// whose span (2^72 for a /56) does not fit a uint64.
+	base := net.ParseIP("10.244.0.0")
+	if got := addOffset(base, 258).String(); got != "10.244.1.2" {
+		t.Fatalf("carry across octets: got %s", got)
+	}
+	v6 := net.ParseIP("fd00:10:244::")
+	if got := addOffset(v6, 1).String(); got != "fd00:10:244::1" {
+		t.Fatalf("v6 offset: got %s", got)
+	}
+	_, ipnet, _ := net.ParseCIDR("10.244.0.0/16")
+	if !isReserved(ipnet, net.ParseIP("10.244.0.0")) || !isReserved(ipnet, net.ParseIP("10.244.0.1")) {
+		t.Fatal("network address and the .1 gateway must stay out of the pool")
+	}
+	if isReserved(ipnet, net.ParseIP("10.244.0.2")) {
+		t.Fatal("first usable address must be allocatable")
 	}
 }
 

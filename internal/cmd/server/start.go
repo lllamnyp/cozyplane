@@ -74,9 +74,13 @@ type CozyplaneServerOptions struct {
 	// done here and not in a chart manifest.
 	EnsureAPIServiceService     string
 	EnsureAPIServiceCAInjection string
-	// RemoveBootstrapCRDs deletes the CRDs that bootstrapped the group once the
-	// APIService takeover lands. On by default: leaving them installed breaks
-	// OpenAPI for the whole group (RemoveBootstrapCRDs explains how).
+	// EnsureAPIServiceInsecureSkipTLS registers the APIService with
+	// insecureSkipTLSVerify — for installs where the server self-signs its
+	// serving cert (dev, CI). Production injects a CA instead.
+	EnsureAPIServiceInsecureSkipTLS bool
+	// RemoveBootstrapCRDs deletes leftover CRDs for this group. Since the
+	// API-group split the group has none; this only cleans up clusters
+	// installed before it (docs/api-groups.md).
 	RemoveBootstrapCRDs bool
 }
 
@@ -145,6 +149,8 @@ func NewCommandStartCozyplaneServer(ctx context.Context, defaults *CozyplaneServ
 	flags.BoolVar(&o.ServeSDN, "serve-sdn", o.ServeSDN, "Serve the sdn.cozystack.io API group from this server.")
 	flags.StringVar(&o.EnsureAPIServiceService, "ensure-apiservice-service", o.EnsureAPIServiceService,
 		"namespace/name of this server's Service; when set, register (or take over from CRD autoregistration) the group's APIService pointing at it.")
+	flags.BoolVar(&o.EnsureAPIServiceInsecureSkipTLS, "ensure-apiservice-insecure-skip-tls-verify", o.EnsureAPIServiceInsecureSkipTLS,
+		"Register the APIService with insecureSkipTLSVerify (the server self-signs its serving cert; dev/CI only).")
 	flags.BoolVar(&o.RemoveBootstrapCRDs, "remove-bootstrap-crds", o.RemoveBootstrapCRDs,
 		"After taking the group over, delete the CRDs that bootstrapped it. Leaving them "+
 			"installed makes OpenAPI for the group fail to merge (duplicated paths), which "+
@@ -250,7 +256,7 @@ func (o CozyplaneServerOptions) RunCozyplaneServer(ctx context.Context) error {
 		clientConfig := config.GenericConfig.ClientConfig
 		removeCRDs := o.RemoveBootstrapCRDs
 		server.GenericAPIServer.AddPostStartHookOrDie("ensure-apiservice", func(hookCtx genericapiserver.PostStartHookContext) error {
-			if err := EnsureAPIService(hookCtx, clientConfig, svcNS, svcName, o.EnsureAPIServiceCAInjection); err != nil {
+			if err := EnsureAPIService(hookCtx, clientConfig, svcNS, svcName, o.EnsureAPIServiceCAInjection, o.EnsureAPIServiceInsecureSkipTLS); err != nil {
 				return err
 			}
 			if !removeCRDs {

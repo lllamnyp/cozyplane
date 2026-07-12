@@ -96,44 +96,6 @@ func cidrIsV6(cidr string) (bool, error) {
 	return isV6(ip), nil
 }
 
-// nodeCIDRFor returns a node pod CIDR for the pod's fabric IP (from
-// AgentState.PodCIDRs, falling back to the single PodCIDR). It prefers the
-// requested family — a v6 VPC pod ideally draws a v6 fabric IP so north-south
-// (fabric-IP DNAT) stays same-family — but the fabric IP is only the underlay
-// identity: same-node bridge delivery and node-originated ingress. East-west VPC
-// traffic rides the Geneve overlay keyed on the VPC IP (family-independent), so
-// when the node has no pod CIDR of the VPC's family (e.g. a v6 VPC on a v4-only
-// cluster) we fall back to whatever family the node offers. Pod-to-pod within the
-// VPC still works; only north-south *to* the VPC IP via the fabric IP is
-// unavailable across families (a v4→v6 DNAT can't exist).
-func nodeCIDRFor(state *datapath.AgentState, wantV6 bool) (string, error) {
-	cidrs := state.PodCIDRs
-	if len(cidrs) == 0 {
-		cidrs = []string{state.PodCIDR}
-	}
-	var fallback string
-	for _, c := range cidrs {
-		v6, err := cidrIsV6(c)
-		if err != nil {
-			continue
-		}
-		if v6 == wantV6 {
-			return c, nil // preferred: fabric family matches the VPC family
-		}
-		if fallback == "" {
-			fallback = c
-		}
-	}
-	if fallback != "" {
-		return fallback, nil // cross-family underlay; east-west still delivers
-	}
-	fam := "IPv4"
-	if wantV6 {
-		fam = "IPv6"
-	}
-	return "", fmt.Errorf("node has no pod CIDR at all for the fabric IP (wanted %s)", fam)
-}
-
 // hostMask returns the host-route mask for ip's family (/32 or /128).
 func hostMask(ip net.IP) net.IPMask {
 	if isV6(ip) {
@@ -287,14 +249,11 @@ func addDefault(args *skel.CmdArgs, conf *NetConf) (result *current.Result, err 
 		return nil, err
 	}
 
-	// Dual-stack: one address per pool (a v4 and, dual-stack, a v6). The claim
-	// is a FabricIP object — atomic by name, GC-able by the controller — not a
-	// reservation in host-local's node-local file store (docs/api-groups.md).
-	cidrs := state.PodCIDRs
-	if len(cidrs) == 0 {
-		cidrs = []string{state.PodCIDR}
-	}
-	podIPs, err := claimFabricIPs(lc, cidrs, state.NodeName, podNS, podName, podUID)
+	// Dual-stack: one address per pool (a v4 and, dual-stack, a v6), drawn from
+	// the FLAT cluster-wide pool — a pod's address has nothing to do with which
+	// node it landed on. The claim is a FabricIP object: atomic by name,
+	// GC-able by the controller (docs/api-groups.md).
+	podIPs, err := claimFabricIPs(lc, poolFor(state), state.NodeName, podNS, podName, podUID)
 	if err != nil {
 		return nil, err
 	}
@@ -370,22 +329,19 @@ func addVPC(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, p
 	// FabricIP exactly like a default-network pod's — the underlay address is
 	// the LOCAL layer's business, not the tenant plane's (docs/api-groups.md).
 	// Prefer the VPC IP's family (a dual-stack node gives a v6 VPC a v6 fabric
-	// IP); nodeCIDRFor falls back to whichever family the node has, since the
+	// IP); poolOfFamily falls back to whichever family the cluster has, since the
 	// fabric IP is only the underlay handle — east-west VPC traffic keys on the
 	// VPC IP.
 	wantV6, err := cidrIsV6(vpc.Spec.CIDRs[0])
 	if err != nil {
 		return fmt.Errorf("vpc CIDR: %w", err)
 	}
-	fabricCIDR, err := nodeCIDRFor(state, wantV6)
-	if err != nil {
-		return err
-	}
 	lc, err := localClient()
 	if err != nil {
 		return err
 	}
-	fabricIPs, err := claimFabricIPs(lc, []string{fabricCIDR}, state.NodeName, podNS, podName, podUID)
+	fabricIPs, err := claimFabricIPs(lc, poolOfFamily(poolFor(state), wantV6),
+		state.NodeName, podNS, podName, podUID)
 	if err != nil {
 		return err
 	}

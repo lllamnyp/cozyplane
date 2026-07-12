@@ -39,12 +39,6 @@ const (
 	sdnGroup       = "sdn.cozystack.io"
 	sdnVersion     = "v1alpha1"
 	apiServiceName = sdnVersion + "." + sdnGroup
-
-	// The label the kube-apiserver's CRD autoregistration controller stamps on
-	// APIServices it manages. While it is present, that controller reconciles
-	// the object back to local (CRD) serving — removing it is what makes the
-	// takeover stick.
-	autoManagedLabel = "kube-aggregator.kubernetes.io/automanaged"
 )
 
 // sdnPlurals are the group's resources — the bootstrap CRDs named
@@ -68,7 +62,7 @@ var apiServiceGVR = schema.GroupVersionResource{
 // from reconciling the object back to local serving. caInjection, when set
 // ("namespace/certificate"), lets cert-manager's cainjector maintain the
 // caBundle, exactly as the manifest flow did.
-func EnsureAPIService(ctx context.Context, cfg *rest.Config, svcNamespace, svcName, caInjection string) error {
+func EnsureAPIService(ctx context.Context, cfg *rest.Config, svcNamespace, svcName, caInjection string, insecureSkipTLS bool) error {
 	dyn, err := dynamic.NewForConfig(cfg)
 	if err != nil {
 		return fmt.Errorf("dynamic client: %w", err)
@@ -86,6 +80,11 @@ func EnsureAPIService(ctx context.Context, cfg *rest.Config, svcNamespace, svcNa
 			"port":      int64(443),
 		},
 	}
+	if insecureSkipTLS {
+		// The server self-signed its serving cert (dev/CI: no cert-manager), so
+		// the aggregator has no CA to pin. Production installs inject one.
+		spec["insecureSkipTLSVerify"] = true
+	}
 	annotations := map[string]any{}
 	if caInjection != "" {
 		annotations["cert-manager.io/inject-ca-from"] = caInjection
@@ -93,7 +92,7 @@ func EnsureAPIService(ctx context.Context, cfg *rest.Config, svcNamespace, svcNa
 
 	// Retry across startup races (RBAC propagation, transient apiserver blips).
 	return wait.PollUntilContextTimeout(ctx, 2*time.Second, 60*time.Second, true, func(ctx context.Context) (bool, error) {
-		existing, err := c.Get(ctx, apiServiceName, metav1.GetOptions{})
+		_, err := c.Get(ctx, apiServiceName, metav1.GetOptions{})
 		switch {
 		case apierrors.IsNotFound(err):
 			obj := &unstructured.Unstructured{Object: map[string]any{
@@ -116,12 +115,12 @@ func EnsureAPIService(ctx context.Context, cfg *rest.Config, svcNamespace, svcNa
 			return false, nil
 		}
 
-		// Exists (ours from a previous run, or the CRD autoregistration's):
-		// merge-patch the desired spec in and strip the automanaged label so the
-		// autoregistration controller stops fighting for it.
+		// Exists from a previous run of ours: merge-patch the desired spec in.
+		// (Nothing else creates this object anymore. The group has no CRDs, so
+		// the kube-apiserver's CRD autoregistration never sees it — the whole
+		// takeover dance, and the label fight it needed, is gone.)
 		patch := map[string]any{
 			"metadata": map[string]any{
-				"labels":      map[string]any{autoManagedLabel: nil},
 				"annotations": annotations,
 			},
 			"spec": spec,
@@ -134,11 +133,7 @@ func EnsureAPIService(ctx context.Context, cfg *rest.Config, svcNamespace, svcNa
 			klog.Warningf("patch APIService %s: %v (retrying)", apiServiceName, err)
 			return false, nil
 		}
-		if _, wasAuto := existing.GetLabels()[autoManagedLabel]; wasAuto {
-			klog.Infof("took over APIService %s from CRD autoregistration -> %s/%s", apiServiceName, svcNamespace, svcName)
-		} else {
-			klog.V(2).Infof("APIService %s ensured -> %s/%s", apiServiceName, svcNamespace, svcName)
-		}
+		klog.V(2).Infof("APIService %s ensured -> %s/%s", apiServiceName, svcNamespace, svcName)
 		return true, nil
 	})
 }
@@ -158,10 +153,14 @@ var crdGVR = schema.GroupVersionResource{
 	Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions",
 }
 
-// RemoveBootstrapCRDs deletes the CRDs that bootstrapped this server's group,
-// once the aggregated APIService owns it.
+// RemoveBootstrapCRDs deletes CRDs for this server's group.
 //
-// This is not tidiness — leaving them breaks the group. A CRD keeps publishing
+// Since the API-group split (docs/api-groups.md) the tenant kinds have no CRDs
+// at all — the group is aggregated-only, so nothing here should exist. This
+// stays as the cleanup for a cluster installed BEFORE the split, where the old
+// single-group CRDs are still present and still poisoning the group's OpenAPI.
+//
+// Leaving them breaks the group. A CRD keeps publishing
 // its OpenAPI paths after the APIService takes over serving, so the
 // kube-apiserver tries to merge two specs describing the same paths and fails:
 //

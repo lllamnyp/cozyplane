@@ -1,0 +1,175 @@
+# The aggregated apiserver, in its plain form: no cert-manager, no etcd
+# operator. This is what the kind e2e and a dev cluster install.
+#
+# It exists because the tenant kinds (VPC, Port, SecurityGroup, HostFirewall, …)
+# are served ONLY by the aggregated server now — never by CRDs
+# (docs/api-groups.md). One group served by two mechanisms makes the
+# kube-apiserver's OpenAPI merge collide on duplicated paths, which silently
+# breaks `kubectl apply` for everything in the group. So the tests must run the
+# real server, which has the pleasant side effect that they test what ships.
+#
+# Two dev-only simplifications versus chart/cozyplane-apiserver:
+#   - the server self-signs its serving cert (no --tls-cert-file), and the
+#     APIService is registered with insecureSkipTLSVerify — no cert-manager.
+#   - etcd is a single ephemeral pod — no operator, no PVC.
+# Neither is fit for production; the chart is.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cozyplane-apiserver
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cozyplane-apiserver:system:auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: cozyplane-apiserver
+    namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cozyplane-apiserver-auth-reader
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+  - kind: ServiceAccount
+    name: cozyplane-apiserver
+    namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cozyplane-apiserver
+rules:
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingwebhookconfigurations", "mutatingwebhookconfigurations"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["flowcontrol.apiserver.k8s.io"]
+    resources: ["flowschemas", "prioritylevelconfigurations"]
+    verbs: ["get", "list", "watch"]
+  # The server registers its own APIService at startup. With the tenant kinds no
+  # longer CRD-served, nothing auto-registers one for the group, so this is a
+  # plain create — no takeover, no fight with the CRD autoregistration
+  # controller.
+  - apiGroups: ["apiregistration.k8s.io"]
+    resources: ["apiservices"]
+    verbs: ["get", "create", "patch"]
+  # Authorization checks (the `peer` verb on VPCs) go through SubjectAccessReview.
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews", "localsubjectaccessreviews"]
+    verbs: ["create"]
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cozyplane-apiserver
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cozyplane-apiserver
+subjects:
+  - kind: ServiceAccount
+    name: cozyplane-apiserver
+    namespace: kube-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cozyplane-etcd
+  namespace: kube-system
+  labels: {app: cozyplane-etcd}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: cozyplane-etcd}
+  template:
+    metadata:
+      labels: {app: cozyplane-etcd}
+    spec:
+      containers:
+        - name: etcd
+          image: registry.k8s.io/etcd:3.5.16-0
+          command:
+            - etcd
+            - --data-dir=/var/run/etcd/default.etcd
+            - --listen-client-urls=http://0.0.0.0:2379
+            - --advertise-client-urls=http://cozyplane-etcd.kube-system.svc:2379
+          ports:
+            - {containerPort: 2379, name: client}
+          volumeMounts:
+            - {name: data, mountPath: /var/run/etcd}
+      volumes:
+        - {name: data, emptyDir: {}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cozyplane-etcd
+  namespace: kube-system
+spec:
+  selector: {app: cozyplane-etcd}
+  ports:
+    - {port: 2379, targetPort: 2379, name: client}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cozyplane-apiserver
+  namespace: kube-system
+  labels: {app: cozyplane-apiserver}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: cozyplane-apiserver}
+  template:
+    metadata:
+      labels: {app: cozyplane-apiserver}
+    spec:
+      serviceAccountName: cozyplane-apiserver
+      containers:
+        - name: apiserver
+          image: ghcr.io/lllamnyp/cozyplane:dev
+          command: ["/cozyplane-apiserver"]
+          args:
+            - --serve-sdn
+            # Self-registration: create the APIService pointing at our Service.
+            # insecure-skip-tls-verify because we self-sign (dev only).
+            - --ensure-apiservice-service=kube-system/cozyplane-apiserver
+            - --ensure-apiservice-insecure-skip-tls-verify
+            - --etcd-servers=http://cozyplane-etcd.kube-system.svc:2379
+            - --secure-port=6443
+            - --audit-log-path=-
+          ports:
+            - {containerPort: 6443, name: https}
+          livenessProbe:
+            httpGet: {path: /livez, port: 6443, scheme: HTTPS}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /readyz, port: 6443, scheme: HTTPS}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cozyplane-apiserver
+  namespace: kube-system
+spec:
+  selector: {app: cozyplane-apiserver}
+  ports:
+    - {port: 443, targetPort: 6443, name: https}

@@ -256,7 +256,10 @@ struct {
 	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
 	__type(key, struct lpm_key);
 	__type(value, __u32);
-	__uint(max_entries, 4096);
+	// Sized for PODS, not nodes: with a flat pool the default network keys
+	// remotes per pod (docs/api-groups.md), so 4096 would have been a cluster-
+	// wide pod cap, not a node cap.
+	__uint(max_entries, 131072);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } remotes SEC(".maps");

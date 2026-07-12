@@ -1,6 +1,6 @@
 # Two API groups: `local.sdn.cozystack.io` and `sdn.cozystack.io`
 
-Status: **design, reviewed 2026-07-12 — decisions taken, ready to build.**
+Status: **BUILT 2026-07-12** (increments 1-3). `FabricIP` replaces host-local, the pool is flat, and the tenant kinds are aggregated-only.
 Supersedes the single-group "bootstrap CRDs then take the group over" model in
 [control-plane.md](control-plane.md) §0.
 

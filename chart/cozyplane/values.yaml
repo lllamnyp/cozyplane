@@ -80,17 +80,16 @@ controller:
 exportPolicy:
   enabled: true
 
-# The CRD serving of sdn.cozystack.io — the bootstrap surface: tenancy works
-# from the moment the CNI lands, with no cert-manager in sight. The aggregated
-# API server (custom validation, subresources — the design target) is the
-# SEPARATE chart/cozyplane-apiserver, which installs later (it needs
-# cert-manager) and atomically takes over the group's serving from these CRDs
-# via its explicit APIService — and then DELETES these CRDs, because a CRD keeps
-# publishing OpenAPI paths for a group it no longer serves, and the resulting
-# merge collision breaks `kubectl apply` for every object in the group.
+# CRDs for the LOCAL group (local.sdn.cozystack.io): underlay IPAM (FabricIP).
+# This is the layer beneath everything — it must work before cert-manager,
+# before etcd, and before cozyplane's own aggregated apiserver, all of which run
+# as default-network pods.
 #
-# Set this to false wherever cozyplane-apiserver is installed: otherwise a
-# `helm upgrade` of this chart re-creates the CRDs the apiserver removed, and
-# the group's OpenAPI breaks again until the apiserver restarts.
+# The tenant kinds (VPC, Port, SecurityGroup, HostFirewall, ...) are NOT CRDs.
+# They are served only by chart/cozyplane-apiserver: a group served by both a
+# CRD and an APIService makes the kube-apiserver's OpenAPI merge collide, and
+# `kubectl apply` then fails for every object in the group (docs/api-groups.md).
+#
+# Disable only if you install these CRDs out-of-band.
 crds:
   enabled: true

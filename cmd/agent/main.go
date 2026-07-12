@@ -51,8 +51,11 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
+	localv1alpha1 "github.com/lllamnyp/cozyplane/api/localsdn/v1alpha1"
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
 	"github.com/lllamnyp/cozyplane/datapath"
+	localclientset "github.com/lllamnyp/cozyplane/pkg/generated/localsdn/clientset/versioned"
+	localinformers "github.com/lllamnyp/cozyplane/pkg/generated/localsdn/informers/externalversions"
 	sdnclientset "github.com/lllamnyp/cozyplane/pkg/generated/sdn/clientset/versioned"
 	sdninformers "github.com/lllamnyp/cozyplane/pkg/generated/sdn/informers/externalversions"
 	sdnv1alpha1informers "github.com/lllamnyp/cozyplane/pkg/generated/sdn/informers/externalversions/sdn/v1alpha1"
@@ -355,9 +358,43 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	// instead of emitting a pod-sourced frame the underlay may drop.
 	advertiseNodeAddrs(ctx, client, nodeName, log)
 
-	if err := watchNodes(ctx, client, mgr, nodeName, log); err != nil {
+	// The local layer (docs/api-groups.md): FabricIP claims are the flat pool's
+	// delivery table — one remotes entry per pod, keyed by address. This is the
+	// default network's forwarding state, so it is FATAL, like watchNodes: a
+	// node that cannot learn where pods live must not serve.
+	lc, err := localclientset.NewForConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("local sdn client: %w", err)
+	}
+	localFactory := localinformers.NewSharedInformerFactory(lc, 0)
+	nodeIPs := newNodeIPIndex()
+
+	// A node's tunnel endpoint may arrive after the FabricIPs that reference it
+	// (informer ordering is not ours to choose), so a node event re-drives the
+	// fabric handlers rather than leaving those pods unreachable.
+	fabricResync := func() {
+		for _, obj := range localFactory.Local().V1alpha1().FabricIPs().Informer().GetStore().List() {
+			fip, ok := obj.(*localv1alpha1.FabricIP)
+			if !ok || fip.Spec.Node == nodeName || fip.Spec.Node == "" {
+				continue
+			}
+			node := nodeIPs.get(fip.Spec.Node)
+			if node == nil {
+				continue
+			}
+			if err := mgr.SetRemote(0, hostCIDR(fip.Spec.Address), node); err != nil {
+				log.Error("set remote (node resync)", "addr", fip.Spec.Address, "err", err)
+			}
+		}
+	}
+
+	if err := watchNodes(ctx, client, mgr, nodeName, nodeIPs, fabricResync, log); err != nil {
 		return err
 	}
+	if err := watchFabricIPs(ctx, localFactory, mgr, nodeIPs.get, nodeName, log); err != nil {
+		return err
+	}
+	fabricResync() // nodes are known now; catch FabricIPs seen before their node
 
 	// Default-net NetworkPolicy (docs/network-policy.md): compile upstream
 	// NetworkPolicies into the pinned NP maps. Fatal on failure like
@@ -441,7 +478,8 @@ func nodeAddresses(node *corev1.Node) []net.IP { return npNodeAddresses(node) }
 // watchNodes starts a Node informer that mirrors every other node's pod CIDR
 // into the remotes map, and every other node's addresses into node_remotes. It
 // blocks until the cache is synced.
-func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.Manager, selfName string, log *slog.Logger) error {
+func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.Manager, selfName string,
+	nodeIPs *nodeIPIndex, fabricResync func(), log *slog.Logger) error {
 	factory := informers.NewSharedInformerFactory(client, 0)
 	nodeInformer := factory.Core().V1().Nodes().Informer()
 
@@ -455,17 +493,12 @@ func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.
 			log.Warn("node has no InternalIP", "node", node.Name)
 			return
 		}
-		// Node pod CIDRs are the default network (scope 0). On a dual-stack node
-		// there are two (a v4 and a v6); the Geneve endpoint stays the node's v4
-		// IP for both (the underlay is v4). Overlay/fabric delivery of a v6 pod IP
-		// then resolves the node just like a v4 one.
-		for _, cidr := range nodePodCIDRs(node) {
-			if err := mgr.SetRemote(0, cidr, net.ParseIP(ip)); err != nil {
-				log.Error("set remote", "node", node.Name, "cidr", cidr, "err", err)
-				continue
-			}
-			log.Info("remote set", "node", node.Name, "podCIDR", cidr, "nodeIP", ip)
-		}
+		// The pool is FLAT (docs/api-groups.md): a pod's address says nothing
+		// about which node holds it, so there is no per-node CIDR to program.
+		// Delivery keys on the address — watchFabricIPs writes one remotes entry
+		// per pod. All this watch owes it is the node -> tunnel-endpoint index.
+		nodeIPs.set(node)
+		fabricResync()
 		// Map the node's own addresses to its Geneve endpoint, so a pod's reply to
 		// this node is encapsulated over the overlay (never emitted pod-sourced).
 		geneveIP := net.ParseIP(ip)
@@ -483,11 +516,6 @@ func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.
 			node, ok := obj.(*corev1.Node)
 			if !ok || node.Name == selfName || node.Spec.PodCIDR == "" {
 				return
-			}
-			for _, cidr := range nodePodCIDRs(node) {
-				if err := mgr.DelRemote(0, cidr); err != nil {
-					log.Error("del remote", "node", node.Name, "cidr", cidr, "err", err)
-				}
 			}
 			for _, addr := range nodeAddresses(node) {
 				if err := mgr.DelNodeRemote(addr); err != nil {

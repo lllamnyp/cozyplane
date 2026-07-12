@@ -52,6 +52,13 @@ if [ "${REUSE:-0}" != "1" ]; then
 
   echo "== installing cozyplane =="
   $K apply -f "$ROOT/config/crd/" >/dev/null
+  # The tenant kinds are served ONLY by the aggregated apiserver now — they have
+  # no CRDs (docs/api-groups.md) — so the suite runs the real server. It
+  # self-signs and uses a single ephemeral etcd (deploy/apiserver.yaml), so this
+  # needs neither cert-manager nor the etcd operator.
+  sed "s#ghcr.io/lllamnyp/cozyplane:dev#${IMAGE}#g" "$ROOT/deploy/apiserver.yaml" | $K apply -f - >/dev/null
+  $K -n kube-system rollout status deploy/cozyplane-apiserver --timeout=180s || exit 1
+  for _ in $(seq 1 30); do $K get vpcs.sdn.cozystack.io >/dev/null 2>&1 && break; sleep 2; done
   for f in agent controller authz; do
     sed "s#ghcr.io/lllamnyp/cozyplane:dev#${IMAGE}#g" "$ROOT/deploy/$f.yaml" | $K apply -f - >/dev/null
   done
