@@ -15,7 +15,7 @@ set -uo pipefail
 
 CLUSTER="${CLUSTER:-cozyplane-e2e}"
 IMAGE="${IMAGE:-ghcr.io/lllamnyp/cozyplane:e2e}"
-KCTX="kind-${CLUSTER}"
+KCTX="${KCTX:-kind-${CLUSTER}}"
 K="kubectl --context ${KCTX}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FAILED=0
@@ -129,7 +129,24 @@ if [ "${REUSE:-0}" != "1" ]; then
   $K -n kube-system rollout status deploy/cozyplane-controller --timeout=120s || exit 1
 fi
 
-W="${CLUSTER}-worker"; W2="${CLUSTER}-worker2"
+# Nodes: the kind naming when we made the cluster, else the first two Ready
+# nodes of whatever cluster we were pointed at.
+if [ "${REUSE:-0}" = "1" ]; then
+  mapfile -t _NODES < <($K get nodes -o jsonpath='{range .items[?(@.status.conditions[-1].status=="True")]}{.metadata.name}{"\n"}{end}')
+  W="${_NODES[0]:-}"; W2="${_NODES[1]:-}"
+  [ -n "$W" ] && [ -n "$W2" ] || { echo "need two Ready nodes"; exit 1; }
+else
+  W="${CLUSTER}-worker"; W2="${CLUSTER}-worker2"
+fi
+
+# EXT: can we run "external" clients and inspect nodes with docker? True only on
+# a kind cluster, whose nodes ARE docker containers on a docker network. On a
+# real cluster there is no such network and the nodes are not containers, so
+# every check built on one is skipped rather than failed — it is testing the
+# harness's reach, not the datapath.
+if docker inspect "$W" >/dev/null 2>&1; then EXT=1; else EXT=0; fi
+ext() { [ "$EXT" = "1" ]; }
+echo "nodes: $W / $W2 (external-client checks: $([ "$EXT" = 1 ] && echo enabled || echo SKIPPED — not a kind cluster))"
 echo "== fixtures =="
 $K create ns team-a >/dev/null 2>&1; $K create ns team-b >/dev/null 2>&1
 # Two VPCs with the SAME CIDR (overlap), plus a disjoint one for peering.
