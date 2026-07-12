@@ -52,8 +52,17 @@ kind: ClusterRole
 metadata:
   name: cozyplane-apiserver
 rules:
+  # NamespaceLifecycle admission needs these.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+  # All four: the admission informers must sync or /readyz stays 500 forever.
   - apiGroups: ["admissionregistration.k8s.io"]
-    resources: ["validatingwebhookconfigurations", "mutatingwebhookconfigurations"]
+    resources:
+      - "validatingwebhookconfigurations"
+      - "mutatingwebhookconfigurations"
+      - "validatingadmissionpolicies"
+      - "validatingadmissionpolicybindings"
     verbs: ["get", "list", "watch"]
   - apiGroups: ["flowcontrol.apiserver.k8s.io"]
     resources: ["flowschemas", "prioritylevelconfigurations"]
@@ -143,7 +152,7 @@ spec:
       containers:
         - name: apiserver
           image: ghcr.io/lllamnyp/cozyplane:dev
-          command: ["/cozyplane-apiserver"]
+          command: ["/usr/local/bin/cozyplane-apiserver"]
           args:
             - --serve-sdn
             # Self-registration: create the APIService pointing at our Service.

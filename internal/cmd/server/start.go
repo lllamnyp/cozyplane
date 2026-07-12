@@ -78,9 +78,11 @@ type CozyplaneServerOptions struct {
 	// insecureSkipTLSVerify — for installs where the server self-signs its
 	// serving cert (dev, CI). Production injects a CA instead.
 	EnsureAPIServiceInsecureSkipTLS bool
-	// RemoveBootstrapCRDs deletes leftover CRDs for this group. Since the
-	// API-group split the group has none; this only cleans up clusters
-	// installed before it (docs/api-groups.md).
+	// RemoveBootstrapCRDs deletes leftover CRDs for this group. OFF by default:
+	// since the API-group split the group HAS no CRDs, so there is nothing to
+	// remove and enabling it only demands a cluster-wide CRD-delete grant. Turn
+	// it on once, with that grant, to clean a cluster installed BEFORE the split
+	// (docs/api-groups.md).
 	RemoveBootstrapCRDs bool
 }
 
@@ -96,7 +98,7 @@ func NewCozyplaneServerOptions(out, errOut io.Writer) *CozyplaneServerOptions {
 		StdOut:                   out,
 		StdErr:                   errOut,
 		ServeSDN:                 true,
-		RemoveBootstrapCRDs:      true,
+		RemoveBootstrapCRDs:      false,
 	}
 
 	return o
