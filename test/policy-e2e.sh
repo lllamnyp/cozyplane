@@ -344,6 +344,13 @@ apiVersion: sdn.cozystack.io/v1alpha1
 kind: VPC
 metadata: {name: sgvpc, namespace: $NS}
 spec: {cidrs: ["10.77.0.0/24"]}
+---
+# VPC attachment is default-deny: a VPCBinding is the grant, even in the VPC's
+# own namespace.
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: VPCBinding
+metadata: {name: sgvpc, namespace: $NS}
+spec: {vpcRef: {namespace: $NS, name: sgvpc}}
 EOF
 apply <<EOF
 apiVersion: v1
