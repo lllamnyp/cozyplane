@@ -53,10 +53,12 @@ needs storage (Linstor), and Linstor needs the CNI. Two mechanisms break it:
   as **CRDs** from the moment it lands (no cert-manager), so tenancy never
   waits. The aggregated apiserver is a **separate component**
   (`cozystack.cozyplane-apiserver`, chart `cozyplane-apiserver`) that
-  `dependsOn` cert-manager and etcd-operator; when it installs, its explicit
-  `APIService` **atomically takes over** the group's serving from the CRDs
-  (they stay installed, shadowed). On a fresh cluster the CRD store is empty at
-  takeover — tenants come later — so nothing migrates.
+  `dependsOn` cert-manager and etcd-operator. **There is no takeover**
+  (2026-07-12, [api-groups.md](api-groups.md)): the tenant group
+  `sdn.cozystack.io` has no CRDs at all, so the apiserver simply registers its
+  `APIService` and serves. The CNI chart ships only the *local* group's CRDs
+  (`local.sdn.cozystack.io` — underlay IPAM), which the apiserver never touches.
+  The two charts are independent installs with no ordering between them.
 - **Memory-backed etcd.** The apiserver's etcd is
   `etcd-operator.cozystack.io/v1alpha2` with `storage.medium: Memory` — no PVC,
   no wait on storage.
@@ -144,8 +146,8 @@ spec:
 
 Apply it and watch as in the tutorial's step 2.3. Expect this order to settle:
 cozyplane agent Ready → cozyplane-kpr Ready (socket-LB attached) → cert-manager
-→ cozyplane-apiserver Ready (memory etcd; the APIService takes over the group
-from the bootstrap CRDs) → the rest of the system bundle.
+→ cozyplane-apiserver Ready (memory etcd; it registers the APIService for
+`sdn.cozystack.io`, which no CRD serves) → the rest of the system bundle.
 
 ### 3. Storage / networking / finalize
 
