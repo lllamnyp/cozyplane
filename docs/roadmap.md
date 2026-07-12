@@ -128,6 +128,7 @@ install installs nothing — [#10](../../issues/10)'s endgame.
 ## 8. CI & testing
 
 - [x] CI: unit tests, lint, build-drift, image release, datapath e2e
+- [x] **Cluster-agnostic suites** — `test/policy-e2e.sh` (NetworkPolicy incl. entities, HostFirewall ingress+egress, SecurityGroup label-follows) and `test/vpc-e2e.sh` (VPC attach with Port/FabricIP as separate objects, east-west, isolation, **overlapping CIDRs proven by identity** — the same address resolves to a different pod in each VPC, the dual-address bridge, peering, split-horizon DNS, SG, revocation). Both take `KCTX=` and run on a real cluster; `test/e2e.sh` stays kind-only because its "external" clients are containers on kind's docker network
 - [x] eBPF bindings check (static bpftool, libbpf-dev)
 - [x] Cross-compiled release image
 - [x] e2e coverage for the IPv6 north-south paths (cross-node pinned — this caught the missing ip6tables FORWARD ACCEPT)
