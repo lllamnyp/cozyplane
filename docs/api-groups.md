@@ -89,6 +89,59 @@ whose claiming pod is gone. The fabric side simply never had an object to reap.
   through the API — which it already talks to on every ADD anyway, to read the
   pod.
 
+## The pool is FLAT — no per-node podCIDR carve-out
+
+`FabricIP` allocates from **one cluster-wide pool**, not from a slice of it
+handed to each node. This is a consequence of the claim being atomic
+cluster-wide (name uniqueness in the API), and it is worth stating explicitly
+because the Flannel-style carve-out is so idiomatic that its absence looks like
+an oversight.
+
+**The datapath already works this way everywhere else.** `remotes` is a 128-bit
+LPM keyed address → node:
+
+- VPC networks feed it **one entry per pod** (`hostCIDR(port.Spec.IP)`), from a
+  pool with no node carve-out at all. Flat, already.
+- The default network feeds it the node's `spec.podCIDR` — one aggregated entry
+  per node.
+
+The carve-out on net 0 is not a design decision; it is what `host-local`
+requires, because a file-based allocator can only be safe within a range it owns
+exclusively on that node. Replace it with a cluster-wide atomic claim and the
+reason evaporates.
+
+**The one real argument for per-node ranges is route aggregation** — if pods are
+reachable by *native routing*, one route per node scales and one route per pod
+does not (and BGP/cloud route tables want the aggregate). cozyplane does not
+route natively: it Geneve-encapsulates and demuxes by map lookup, so aggregation
+buys nothing. If a native-routing mode is ever wanted, that is the decision that
+brings node ranges back — nothing else.
+
+What flat buys:
+
+- **No per-node exhaustion.** A /24 per node caps a node at 254 pods no matter
+  how empty the cluster is; the mask is chosen up front and the fragmentation is
+  permanent.
+- **A pod's underlay address can survive a node move.** Live migration preserves
+  a VM's VPC IP and MAC today, but its fabric IP comes from the node's slice, so
+  it necessarily churns at cutover. From a flat pool it need not.
+- `nodeCIDRFor` and every dependence on `Node.spec.podCIDR` disappear
+  (kube-controller-manager may keep allocating it; nothing of ours reads it).
+
+What it costs, and what must change before flipping:
+
+- **Churn.** Every pod create/delete becomes a `remotes` write on *every* node,
+  where today only node joins move it. This is Cilium's endpoint-propagation
+  cost, and the agent already does exactly this for VPC `Port`s — but net-0 pod
+  density is far higher, so the watch/update path must be event-scoped (the
+  `svc_vips` workqueue shape), not a full rebuild per event.
+- **`remotes` is sized `max_entries = 4096`.** Aggregated that is 4096 *nodes*;
+  per-pod it is 4096 *pods*. It must grow (65k+) before the default network goes
+  flat, or a busy cluster silently fails to program remotes.
+- Rules that name "the pod range" (a `HostFirewall` admitting the pod CIDR, an
+  `ipBlock`) take the **cluster** CIDR instead of a node's slice — simpler, but
+  it is a semantic change in anything that hardcodes `Node.spec.podCIDR`.
+
 ## `Port.spec.fabricIP` — normalized away
 
 `Port` currently conflates two things: the *tenant identity* of a VPC NIC (VPC
@@ -144,11 +197,16 @@ say. Revisit then; the group can grow.
 
 1. `local.sdn.cozystack.io` + `FabricIP`: types, CRD, controller GC, CNI claims
    through it, agent watches it. Default network only — no `Port` change yet, so
-   nothing regresses.
-2. Move the tenant kinds to aggregated-only: drop their CRDs from
+   nothing regresses. Ship it still allocating from the node's slice, so the
+   claim path is proven before the pool changes shape.
+2. **Go flat**: allocate from the cluster pool, feed `remotes` per pod at net 0,
+   grow the map, event-scope the updates, drop `nodeCIDRFor`. This is the step
+   that removes per-node exhaustion and lets an underlay address survive a node
+   move.
+3. Move the tenant kinds to aggregated-only: drop their CRDs from
    `chart/cozyplane`, delete the takeover machinery, make the clients resolve
    the extension group by discovery.
-3. `Port.spec.fabricIP` → removed; the agent joins `Port` and `FabricIP` on the
+4. `Port.spec.fabricIP` → removed; the agent joins `Port` and `FabricIP` on the
    pod. VPC pods stop carrying an underlay address in a tenant object.
-4. (Open) the CRD-storage shim for the extension registry — the thing that would
+5. (Open) the CRD-storage shim for the extension registry — the thing that would
    drop etcd. Its own design.
