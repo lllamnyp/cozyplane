@@ -223,5 +223,9 @@ say. Revisit then; the group can grow.
 4. **BUILT.** `Port.spec.fabricIP` removed; every reader joins `Port` and
    `FabricIP` on the pod. VPC pods stop carrying an underlay address in a tenant
    object, and the migration-cutover copy is deleted.
-5. (Open) the CRD-storage shim for the extension registry — the thing that would
-   drop etcd. Its own design.
+5. (Open) the CRD-storage shim for the extension registry. Its motivation was
+   dropping the etcd dependency — but with storage classes in place the built-in
+   etcd now defaults to a **PVC**, so that dependency is durable rather than
+   painful. The shim is no longer forced; revisit if etcd's operational cost
+   bites again. (The group naming still leaves the door open: CRs the shim
+   persisted would live in `local.sdn.cozystack.io`.)
