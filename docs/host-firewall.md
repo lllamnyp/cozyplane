@@ -1,6 +1,8 @@
 # Host firewall
 
-Status: **increment 1 built** (design 2026-07-12). The node-scoped sibling of
+Status: **increment 1 complete** (design + build 2026-07-12; e2e 160/160;
+dev-cluster-validated live — a control-plane node isolated behind the
+apiserver LB, monitoring scrapes gated and counted, per-CIDR reopen). The node-scoped sibling of
 default-net NetworkPolicy ([network-policy.md](network-policy.md)): gates
 traffic addressed to **the node itself** — the one delivery target the other
 two policy layers deliberately leave alone (NetworkPolicy gates net-0 pods,
