@@ -4,6 +4,11 @@ How the operator comes alive. Companion to `design.md` (architecture). Group:
 `sdn.cozystack.io`, version `v1alpha1`, served by the **cozyplane aggregated API
 server** — with a CRD serving of the same group as the **bootstrap surface**.
 
+> **Superseded in design by [api-groups.md](api-groups.md)** (2026-07-12): one
+> group served by two mechanisms cannot work — the shadowed CRDs keep publishing
+> OpenAPI paths and the group's schema stops merging. The plan is two groups,
+> one CRD-served and one aggregated. This section describes what is built today.
+
 ## 0. Two serving modes, one group — and the takeover
 
 The group has two servers, packaged as two charts, because of a deploy-time
