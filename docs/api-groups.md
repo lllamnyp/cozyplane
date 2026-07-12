@@ -1,137 +1,134 @@
-# Two API groups: one CRD-local, one aggregated
+# Two API groups, split by concern: the fabric plane and the tenant plane
 
-Status: **design, awaiting review.** Supersedes the single-group "bootstrap
-CRDs then take the group over" model in [control-plane.md](control-plane.md) §0.
+Status: **design, awaiting review.** Supersedes the single-group "bootstrap CRDs
+then take the group over" model in [control-plane.md](control-plane.md) §0.
 
-## The forcing bug
+## Why two groups
 
-A CRD does not stop existing when an APIService takes its group over. It is
-shadowed for *routing* — every request goes to the aggregated server — but it
-keeps publishing its OpenAPI paths. The kube-apiserver then tries to merge two
-specs that describe the same paths, and gives up:
+The forcing bug is that **one group cannot be served by two mechanisms**. A CRD
+does not stop existing when an APIService takes its group over: it is shadowed
+for *routing*, but it keeps publishing its OpenAPI paths, so the kube-apiserver
+tries to merge two specs describing the same paths and gives up —
 
 ```
 Error in OpenAPI handler: failed to build merge specs: unable to merge:
 duplicated path /apis/sdn.cozystack.io/v1alpha1/namespaces/{namespace}/vpcs/{name}
 ```
 
-The group's schema never serves. Every `kubectl apply` of a cozyplane object
-dies client-side with *"failed to download openapi"*, while every core type
-keeps working — which is exactly why this went unnoticed from the chart split
-until 2026-07-12.
+— the group's schema never serves, and every `kubectl apply` of a cozyplane
+object dies client-side with *"failed to download openapi"* while core types
+keep working. (Latent since the chart split; found 2026-07-12.)
 
-The single-group model can only *police* this: whoever installs second must
-delete what the other installed. That is a race with Helm (a `helm upgrade` of
-the CNI chart re-creates the CRDs the apiserver deleted), it needs the
-apiserver to hold cluster-wide CRD **delete** rights, and it is one forgotten
-`crds.enabled: true` away from a broken cluster API. **The collision is
-structural, so the fix should be structural: never let two servers own the same
-group.**
+But the *interesting* reason for two groups is not that bug. It is that
+cozyplane already has **two layers with different dependency floors**, and has
+been pretending they are one:
+
+- **The fabric plane** — a pod gets an underlay address and a working default
+  network. This must come up with nothing but a CNI. No cert-manager, no etcd,
+  no extension apiserver. Everything else in the cluster — including
+  cozyplane's *own* apiserver and its etcd — is a default-network pod, so this
+  layer is strictly beneath them.
+- **The tenant plane** — VPCs, Ports, peerings, security groups, host
+  firewalls, service VIPs, floating IPs. Rich API surface: server-side
+  allocation, custom validation, cross-kind claims, subresources. It can demand
+  the full stack, because nothing depends on it to boot.
+
+Splitting the group along that seam is the structural fix. The two groups hold
+**disjoint kinds**, so their paths are disjoint, so the merge collision cannot
+occur — and unlike a scaffold-twin design there is nothing duplicated, nothing
+generated twice, and nothing to keep in sync.
 
 ## The model
 
-Two groups, same kinds, same schemas, different owners:
+| Group | Served by | Holds | Dependency floor |
+|-------|-----------|-------|------------------|
+| **`fabric.cozystack.io`** | CustomResourceDefinitions, shipped with the CNI chart | the underlay: fabric IP claims, node fabric state | the kube API and nothing else |
+| **`sdn.cozystack.io`** | the aggregated apiserver, only — never CRDs | `VPC`, `VPCBinding`, `VPCPeering`, `Port`, `SecurityGroup`, `HostFirewall`, `ServiceVIP`, `FloatingIP`, `ExternalPool` | apiserver + etcd + certs |
 
-| Group | Served by | For |
-|-------|-----------|-----|
-| **`sdn.cozystack.io`** | the aggregated apiserver, only | the real API: tenants, operators, all new surface, custom validation, subresources, server-side allocation |
-| **`crd.sdn.cozystack.io`** | CustomResourceDefinitions, only | the scaffold: installs with no apiserver (dev clusters, the kind e2e, a CNI-only deployment), and the bootstrap window before an aggregated server exists |
+`config/crd/` contains only `fabric.cozystack.io` definitions. The tenant group
+has no CRD anywhere, ever. The takeover machinery — APIService adoption,
+stripping the `automanaged` label, deleting CRDs, the cluster-wide CRD-delete
+grant — is **deleted, not fixed**.
 
-Neither group is ever served by the other mechanism. `config/crd/` only ever
-contains `*.crd.sdn.cozystack.io` definitions; the aggregated group has no CRDs
-at all, anywhere, ever. Both may therefore be installed at once — their paths
-are disjoint, so OpenAPI merges cleanly — and the takeover machinery
-(APIService adoption, stripping the `automanaged` label, deleting CRDs) is
-**deleted, not fixed**.
+## What lives in the fabric group
 
-The names say what they are: the unqualified group is the product; the
-`crd.`-prefixed one is visibly the scaffold, so nobody ships a tenant-facing
-manifest against it by accident.
+Today the fabric plane has no API at all: the CNI shells out to the `host-local`
+IPAM plugin, which keeps a file store per node. That works, but it is the one
+piece of allocation state in the system that is invisible, un-GC-able, and
+leaks on an unclean DEL — the classic host-local failure. And a VPC pod's
+fabric address is recorded in `Port.spec.fabricIP`, which means the *underlay*
+address of a pod is owned by a *tenant-plane* object that requires the whole
+aggregated stack to exist.
 
-## Which group does a client talk to?
+Proposed:
 
-All the clients are ours (CNI plugin, agent, controller). They resolve the
-group **once at startup, by discovery**: if `sdn.cozystack.io` is served (an
-APIService for it exists and is Available), use it; otherwise fall back to
-`crd.sdn.cozystack.io`; if neither is served, the default network still works
-(the agent's VPC watches are already best-effort) and VPC attachment fails
-closed.
+- **`FabricIP`** (cluster-scoped) — one object per allocated underlay address,
+  `metadata.name` *being* the address. The claim is atomic by name uniqueness,
+  exactly the trick `Port` already uses for VPC IPs, and it replaces the
+  host-local file store. Spec: the node, the pod reference, the family. The
+  controller/agent GC an object whose pod is gone, so a leaked address is
+  visible (`kubectl get fabricips`) and reclaimable instead of silently wedging
+  a node's range.
+- **`NodeFabric`** (cluster-scoped, one per node) — the node's pod CIDRs, its
+  addresses (today a `cozyplane.io/node-addresses` annotation on `Node`), MTU,
+  Geneve port. This is state the agent already publishes by other means; giving
+  it a kind makes the fabric plane self-describing rather than smeared across
+  annotations and `/run/cozyplane/agent.json`.
 
-That keeps mode selection out of flags and out of the charts — a cluster's mode
-is a fact about what is installed, and the clients read it.
+**`Port` then stops conflating two things.** It keeps what it is actually for —
+the tenant identity of a VPC NIC: the VPC IP, the pinned MAC, the persistence
+that survives live migration — and *references* the `FabricIP` rather than
+owning the address. A VPC pod needs both objects, which is honest: it is a
+tenant workload, so it depends on the tenant plane by definition.
 
-## Codegen: one source of truth, two groups
+## Consequences that make this worth doing
 
-The types are written once, in `api/sdn/v1alpha1` (group `sdn.cozystack.io`).
-The CRD twin `api/sdncrd/v1alpha1` is **generated** from it — the same files
-with the package and `+groupName` marker rewritten — by a `make generate` step,
-never hand-edited. `controller-gen` then emits the CRD YAML from the twin, so
-`config/crd/` is the CRD group by construction. CI's build-drift check catches
-any divergence, exactly as it does for deepcopy and the eBPF object.
+- **The default network has no dependency on cozyplane's own API server.** It
+  never really did; now the object model says so. A cluster whose aggregated
+  apiserver is broken keeps scheduling and networking system pods — including
+  the ones that would fix the apiserver.
+- **Fabric IPAM becomes visible and reclaimable.** Losing the host-local file
+  store removes a whole class of "the node ran out of IPs and nobody knows why".
+- **The two charts stop being ordered.** `chart/cozyplane` (CNI + the fabric
+  CRDs) and `chart/cozyplane-apiserver` (the tenant plane) are independent
+  installs with no takeover between them and no `crds.enabled` foot-gun.
+- **CRD mode disappears as a *mode*.** It was never a mode; it was the fabric
+  layer wearing the tenant layer's clothes. There is no "CRD-served VPC"
+  anymore — if you want VPCs, you install the apiserver.
 
-Each group gets its own generated clientset/informers/listers (codegen is
-per-group). The clients talk to a small interface — `pkg/sdnapi` — with two
-backing implementations, so the resolver is the only place that knows which
-group is live.
+## What it costs
 
-**Alternative considered:** serve the CRD group through the dynamic client and
-unstructured objects, avoiding a second clientset entirely. Rejected for now:
-the agent's watch paths are typed informers, and unstructured conversion at
-every event trades a build-time cost for a runtime one, in the datapath's
-control loop.
-
-## Migration
-
-Objects do not move between groups by themselves, and they never did — the
-current takeover is already storage-disjoint (the CRD store and the aggregated
-etcd are different stores; the documented path is export → install → re-apply).
-Two groups make that honest rather than magical:
-
-```sh
-kubectl get vpcs.crd.sdn.cozystack.io -A -o yaml \
-  | sed 's#crd\.sdn\.cozystack\.io#sdn.cozystack.io#' \
-  | kubectl apply -f -
-```
-
-The `--remove-bootstrap-crds` flag built on 2026-07-12 keeps exactly one job:
-cleaning the **old single-group CRDs** off a cluster that predates this split
-(dev clusters, and anything installed before it). It is the migration tool, not
-part of the steady state.
-
-## What this costs
-
-- **A tenant-facing `apiVersion` depends on the install mode.** A manifest for a
-  CRD-only cluster says `crd.sdn.cozystack.io/v1alpha1`. This is a real wart. It
-  is mitigated by the naming (the scaffold is visibly the scaffold) and by the
-  fact that anything real runs aggregated. Docs and examples target the
-  aggregated group; the e2e, which runs CRD mode, derives the group at runtime.
-- **Two clientsets** in the binary. Mechanical, generated, drift-checked.
-- **The e2e and demo scripts must not hardcode the group.** They resolve it the
-  same way the clients do (one `kubectl api-resources` lookup at the top).
-
-## What it buys
-
-- The OpenAPI collision cannot happen — not "is prevented", cannot happen.
-- No takeover code: no APIService adoption, no `automanaged` label fight, no
-  cluster-wide CRD-delete grant to the apiserver, no Helm race over who owns the
-  CRDs, no ordering constraint between the two charts.
-- A CRD-only install and an aggregated install are now genuinely independent
-  products, which is what they always were in practice.
+- **The kind e2e must run the aggregated apiserver** to exercise VPCs, security
+  groups, and the rest, where today it gets them from CRDs. The apiserver
+  already has a single-pod etcd fallback (roadmap §1), and it can self-sign its
+  serving cert, so this is bring-up work, not a new dependency on cert-manager.
+  Cost is real; it is also the thing that makes the e2e test what actually
+  ships.
+- **A migration for existing clusters** (the dev cluster, and anything installed
+  before this): fabric addresses currently live in host-local files and in
+  `Port.spec.fabricIP`; tenant objects currently live in CRD storage on
+  CRD-mode clusters. The `--remove-bootstrap-crds` flag built on 2026-07-12
+  becomes the tool for the second half — it cleans the old single-group CRDs off
+  a pre-split cluster — and the agent can adopt existing fabric addresses into
+  `FabricIP` objects on first start (it already rebuilds local state from veth
+  alias records, so the inputs are there).
+- **`Port` changes shape** (it gives up `spec.fabricIP` for a reference). That is
+  an API break, taken now while the API has one real consumer.
 
 ## Open questions (for review)
 
-1. **Group name for the scaffold.** `crd.sdn.cozystack.io` (proposed) vs
-   `local.sdn.cozystack.io` vs `bootstrap.sdn.cozystack.io`. The first says
-   *how it is served*, which is the thing that actually distinguishes it.
-2. **Does the scaffold need the whole kind set?** It could carry only what a
-   CNI-only install can use (`VPC`, `Port`, `VPCBinding`, `SecurityGroup`) and
-   omit the kinds that only make sense with server-side allocation
-   (`ServiceVIP`, `FloatingIP`, `ExternalPool`, `HostFirewall`). Smaller
-   surface, but two divergent kind sets to keep straight. Proposal: keep them
-   identical — the generator makes it free, and "the scaffold is the same API,
-   served differently" is a simpler sentence than any subset rule.
-3. **Do we keep CRD mode at all?** The alternative is to delete it: the
-   aggregated server becomes the only way to serve the group, and the kind e2e
-   installs it. That removes the wart in (1) entirely, at the cost of making
-   every dev cluster deploy cert-manager + etcd. Worth a decision now rather
-   than carrying two modes forever.
+1. **Group name.** `fabric.cozystack.io` says what it is. Alternatives:
+   `underlay.cozystack.io`, `node.cozystack.io`. Naming it for the *concern*
+   (not for "local" or "CRD") is what keeps this from reading as a scaffold.
+2. **Does `NodeFabric` earn its place in v1**, or does the fabric group start
+   with `FabricIP` alone and leave node state in annotations until it hurts?
+   Smaller first step; the group can grow.
+3. **Does `FabricIP` replace host-local now, or later?** The group split and the
+   OpenAPI fix do not *require* it — the fabric group could start empty-ish and
+   the collision is already solved by moving the tenant kinds to
+   aggregated-only. But an empty fabric group is a strange thing to ship, and
+   the host-local leak is a real bug we would be walking past.
+4. **`Port.spec.fabricIP` → reference, or keep it denormalized** for the agent's
+   convenience (it currently reads one object to program the bridge)? A
+   reference is cleaner; denormalizing is one fewer join in the datapath's hot
+   reconcile path.
