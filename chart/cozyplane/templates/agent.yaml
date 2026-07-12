@@ -58,6 +58,11 @@ rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["securitygroups"]
     verbs: ["get", "list", "watch"]
+  # FabricIPs: the CNI plugin claims and releases underlay addresses through
+  # this SA (the agent writes its kubeconfig), and the agent watches them.
+  - apiGroups: ["local.sdn.cozystack.io"]
+    resources: ["fabricips"]
+    verbs: ["get", "list", "watch", "create", "delete"]
   # HostFirewalls: the agent compiles the objects selecting its node into the
   # hf_allow map and arms enforcement (docs/host-firewall.md).
   - apiGroups: ["sdn.cozystack.io"]

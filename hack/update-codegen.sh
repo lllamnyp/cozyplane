@@ -34,7 +34,7 @@ THIS_PKG="github.com/lllamnyp/cozyplane"
 if [[ -n ${API_GROUPS+x} ]]; then
     read -r -a API_GROUPS <<<"$API_GROUPS"
 else
-    API_GROUPS=("sdn")
+    API_GROUPS=("sdn" "localsdn")
 fi
 
 # Generate helper code (deepcopy, defaulter, conversion).
@@ -59,6 +59,11 @@ done
 
 # Generate OpenAPI and client code for each API group.
 for api_group in "${API_GROUPS[@]}"; do
+    # OpenAPI definitions are only consumed by the aggregated apiserver. A
+    # CRD-served group (localsdn) publishes its schema from the CRD itself.
+    if [[ "${api_group}" == "localsdn" ]]; then
+        echo "Skipping OpenAPI for CRD-served API group: ${api_group}"
+    else
     echo "Generating OpenAPI for API group: ${api_group}"
     set +o errexit
     kube::codegen::gen_openapi \
@@ -69,6 +74,7 @@ for api_group in "${API_GROUPS[@]}"; do
         --boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
         "${SCRIPT_ROOT}/api/${api_group}" || echo "Warning: OpenAPI generation had issues for ${api_group}, continuing..."
     set -o errexit
+    fi
 
     echo "Generating client code for API group: ${api_group}"
     kube::codegen::gen_client \

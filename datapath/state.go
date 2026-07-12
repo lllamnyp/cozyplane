@@ -34,9 +34,19 @@ type AgentState struct {
 	// On a dual-stack node it is the IPv4 CIDR; see PodCIDRs for both families.
 	PodCIDR string `json:"podCIDR"`
 	// PodCIDRs is this node's pod CIDRs across families (dual-stack: a v4 and a
-	// v6 entry). A v6 VPC pod draws its fabric IP from the v6 entry. Empty falls
-	// back to PodCIDR (single-stack).
+	// v6 entry). Empty falls back to PodCIDR (single-stack).
+	//
+	// DEPRECATED as an allocation source: the pool is FLAT (docs/api-groups.md).
+	// A node's slice is a Flannel-era artifact of file-based IPAM, which can
+	// only be safe inside a range it exclusively owns; a FabricIP claim is
+	// atomic cluster-wide, so there is nothing left to carve. Kept only as the
+	// fallback pool when ClusterPodCIDRs is unset, and to pick a FAMILY.
 	PodCIDRs []string `json:"podCIDRs,omitempty"`
+	// ClusterPodCIDRs is the flat, cluster-wide pool every pod address is drawn
+	// from — one entry per family. With it set, a pod's address has nothing to
+	// do with which node it landed on, so a node cannot exhaust while the
+	// cluster has room, and an address can follow a pod across a node move.
+	ClusterPodCIDRs []string `json:"clusterPodCIDRs,omitempty"`
 	// MTU is the pod MTU (underlay MTU minus Geneve overhead).
 	MTU int `json:"mtu"`
 	// Namespace is the agent's own (system) namespace. Gateway-attach

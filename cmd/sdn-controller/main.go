@@ -32,7 +32,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
+	localv1alpha1 "github.com/lllamnyp/cozyplane/api/localsdn/v1alpha1"
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
+	localsdnctrl "github.com/lllamnyp/cozyplane/internal/controller/localsdn"
 	sdncontroller "github.com/lllamnyp/cozyplane/internal/controller/sdn"
 )
 
@@ -44,6 +46,7 @@ var (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(sdnv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(localv1alpha1.AddToScheme(scheme))
 }
 
 func main() {
@@ -223,6 +226,16 @@ func main() {
 	}
 
 	setupLog.Info("starting sdn-controller")
+
+	// The local layer's GC: reclaim underlay addresses whose pod is gone
+	// (docs/api-groups.md). It reconciles a CRD-served kind, so it works on a
+	// cluster with no aggregated apiserver at all.
+	if err := (&localsdnctrl.FabricIPReconciler{
+		Client: mgr.GetClient(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "FabricIP")
+		os.Exit(1)
+	}
 
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")

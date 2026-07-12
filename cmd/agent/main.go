@@ -241,13 +241,19 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	if len(podCIDRs) == 0 {
 		podCIDRs = []string{podCIDR}
 	}
+	// The FLAT pool (docs/api-groups.md): every pod address is drawn from the
+	// cluster-wide supernet, not from this node's slice of it. --cluster-cidr
+	// already carries it (it is the masquerade supernet), so there is nothing
+	// new to configure. Unset, the CNI falls back to the node's slice, which is
+	// the pre-flat behaviour.
 	state := &datapath.AgentState{
-		NodeName:  nodeName,
-		NodeIP:    internalIP(self),
-		PodCIDR:   podCIDR,
-		PodCIDRs:  podCIDRs,
-		MTU:       mtu,
-		Namespace: os.Getenv("AGENT_NAMESPACE"), // gates gateway-attach to the system namespace
+		NodeName:        nodeName,
+		NodeIP:          internalIP(self),
+		PodCIDR:         podCIDR,
+		PodCIDRs:        podCIDRs,
+		ClusterPodCIDRs: splitCIDRs(clusterCIDR),
+		MTU:             mtu,
+		Namespace:       os.Getenv("AGENT_NAMESPACE"), // gates gateway-attach to the system namespace
 	}
 	if err := state.Save(); err != nil {
 		return fmt.Errorf("publish agent state: %w", err)

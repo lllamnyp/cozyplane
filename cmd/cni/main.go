@@ -41,7 +41,6 @@ import (
 	current "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/cni/pkg/version"
 	"github.com/containernetworking/plugins/pkg/ip"
-	"github.com/containernetworking/plugins/pkg/ipam"
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -62,7 +61,6 @@ const (
 	// gwVethName is the gateway pod's second interface, carrying the VPC's
 	// reserved .1 address (gateway-attach).
 	gwVethName = "eth1"
-	ipamPlugin = "host-local"
 )
 
 // Annotation and label keys come from the API package so the CNI (writer) and
@@ -280,47 +278,53 @@ func addDefault(args *skel.CmdArgs, conf *NetConf) (result *current.Result, err 
 		mtu = state.MTU
 	}
 
-	// Dual-stack: allocate from every node pod CIDR (a v4 and, on a dual-stack
-	// node, a v6), so a default pod gets an address per family.
+	podNS, podName, podUID, err := podIdentity(args)
+	if err != nil {
+		return nil, err
+	}
+	lc, err := localClient()
+	if err != nil {
+		return nil, err
+	}
+
+	// Dual-stack: one address per pool (a v4 and, dual-stack, a v6). The claim
+	// is a FabricIP object — atomic by name, GC-able by the controller — not a
+	// reservation in host-local's node-local file store (docs/api-groups.md).
 	cidrs := state.PodCIDRs
 	if len(cidrs) == 0 {
 		cidrs = []string{state.PodCIDR}
 	}
-	ipamData, err := ipamStdin(args.StdinData, cidrs...)
+	podIPs, err := claimFabricIPs(lc, cidrs, state.NodeName, podNS, podName, podUID)
 	if err != nil {
 		return nil, err
-	}
-	r, err := ipam.ExecAdd(ipamPlugin, ipamData)
-	if err != nil {
-		return nil, fmt.Errorf("ipam add: %w", err)
 	}
 	defer func() {
 		if err != nil {
-			_ = ipam.ExecDel(ipamPlugin, ipamData)
+			releaseFabricIPs(lc, podUID)
 		}
 	}()
-
-	ipamResult, err := current.NewResultFromResult(r)
-	if err != nil {
-		return nil, err
-	}
-	if len(ipamResult.IPs) == 0 {
-		return nil, fmt.Errorf("ipam returned no addresses")
-	}
-	podIPs := make([]net.IP, 0, len(ipamResult.IPs))
-	for _, ipc := range ipamResult.IPs {
-		podIPs = append(podIPs, ipc.Address.IP)
-	}
 
 	result, _, err = setupVeth(args, conf.CNIVersion, podIPs, nil, mtu, 0)
 	if err != nil {
 		return nil, err
 	}
-	result.IPs = ipamResult.IPs
-	for i := range result.IPs {
-		result.IPs[i].Interface = current.Int(0)
+	result.IPs = make([]*current.IPConfig, 0, len(podIPs))
+	for _, ip := range podIPs {
+		result.IPs = append(result.IPs, &current.IPConfig{
+			Address:   *hostIPNet(ip),
+			Interface: current.Int(0),
+		})
 	}
 	return result, nil
+}
+
+// hostIPNet is the /32 (or /128) form of an address — a pod's fabric address is
+// a host route on the node, never a subnet, now that the pool is not carved up.
+func hostIPNet(ip net.IP) *net.IPNet {
+	if v4 := ip.To4(); v4 != nil {
+		return &net.IPNet{IP: v4, Mask: net.CIDRMask(32, 32)}
+	}
+	return &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
 }
 
 // addVPC attaches the pod to a VPC using the dual-address bridge: the pod's
@@ -362,11 +366,13 @@ func addVPC(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, p
 		mtu = state.MTU
 	}
 
-	// Fabric IP (status.podIP): host-local from the node pod CIDR, unique and
-	// reachable on the default overlay. Prefer the VPC IP's family (so a dual-stack
-	// node gives a v6 VPC a v6 fabric IP), but nodeCIDRFor falls back to the node's
-	// available family when the VPC's is absent — the fabric IP is only the underlay
-	// identity; east-west VPC traffic keys on the VPC IP, not the fabric IP.
+	// Fabric IP (status.podIP): the pod's underlay identity, claimed as a
+	// FabricIP exactly like a default-network pod's — the underlay address is
+	// the LOCAL layer's business, not the tenant plane's (docs/api-groups.md).
+	// Prefer the VPC IP's family (a dual-stack node gives a v6 VPC a v6 fabric
+	// IP); nodeCIDRFor falls back to whichever family the node has, since the
+	// fabric IP is only the underlay handle — east-west VPC traffic keys on the
+	// VPC IP.
 	wantV6, err := cidrIsV6(vpc.Spec.CIDRs[0])
 	if err != nil {
 		return fmt.Errorf("vpc CIDR: %w", err)
@@ -375,27 +381,20 @@ func addVPC(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, p
 	if err != nil {
 		return err
 	}
-	ipamData, err := ipamStdin(args.StdinData, fabricCIDR)
+	lc, err := localClient()
 	if err != nil {
 		return err
 	}
-	r, err := ipam.ExecAdd(ipamPlugin, ipamData)
+	fabricIPs, err := claimFabricIPs(lc, []string{fabricCIDR}, state.NodeName, podNS, podName, podUID)
 	if err != nil {
-		return fmt.Errorf("fabric ipam add: %w", err)
+		return err
 	}
 	defer func() {
 		if err != nil {
-			_ = ipam.ExecDel(ipamPlugin, ipamData)
+			releaseFabricIPs(lc, podUID)
 		}
 	}()
-	fabricRes, err := current.NewResultFromResult(r)
-	if err != nil {
-		return err
-	}
-	if len(fabricRes.IPs) == 0 {
-		return fmt.Errorf("fabric ipam returned no addresses")
-	}
-	fabricIP := fabricRes.IPs[0].Address.IP
+	fabricIP := fabricIPs[0]
 
 	// VPC IP + MAC: bind the VM's persistent Port (survives migration) or claim a
 	// fresh one. bound => the Port pre-existed; never delete it on our error.
@@ -850,25 +849,6 @@ func setupVeth(args *skel.CmdArgs, cniVersion string, podIPs []net.IP, pinnedMAC
 	}, podMAC, nil
 }
 
-// ipamStdin rewrites the plugin config so host-local allocates from the node pod
-// CIDR(s). Passing both a v4 and a v6 CIDR makes host-local return one address
-// per family (dual-stack): each CIDR is its own range set.
-func ipamStdin(stdin []byte, podCIDRs ...string) ([]byte, error) {
-	var raw map[string]interface{}
-	if err := json.Unmarshal(stdin, &raw); err != nil {
-		return nil, err
-	}
-	ranges := make([][]map[string]string, 0, len(podCIDRs))
-	for _, c := range podCIDRs {
-		ranges = append(ranges, []map[string]string{{"subnet": c}})
-	}
-	raw["ipam"] = map[string]interface{}{
-		"type":   ipamPlugin,
-		"ranges": ranges,
-	}
-	return json.Marshal(raw)
-}
-
 // configurePodIface sets the pod's eth0 address, brings it up, and installs the
 // link-local default route. Runs inside the pod netns. When pinnedMAC is set (a
 // VM NIC), it is applied to eth0 so the MAC survives migration — KubeVirt's
@@ -1064,13 +1044,6 @@ func cmdDel(args *skel.CmdArgs) error {
 	}
 
 	podNS, podName, podUID, _ := podIdentity(args)
-	var podCIDRs []string
-	if state, e := datapath.LoadAgentState(); e == nil {
-		podCIDRs = state.PodCIDRs
-		if len(podCIDRs) == 0 && state.PodCIDR != "" {
-			podCIDRs = []string{state.PodCIDR}
-		}
-	}
 
 	// Release a VPC Port if this pod had one. Prefer the pod UID (unique, never
 	// reused) so a stale DEL can't delete a newer pod's Port that reuses a name.
@@ -1103,11 +1076,15 @@ func cmdDel(args *skel.CmdArgs) error {
 		}
 	}
 
-	// Release default-network IPAM (no-op for VPC pods, which use no host-local).
-	// Both families are released — the ADD allocated one address per node CIDR.
-	if len(podCIDRs) != 0 {
-		if ipamData, e := ipamStdin(args.StdinData, podCIDRs...); e == nil {
-			_ = ipam.ExecDel(ipamPlugin, ipamData)
+	// Release the underlay claim(s). Best-effort by design: if this DEL never
+	// runs (the node died, kubelet was down when the pod went away), the
+	// controller's GC reaps the FabricIP once the pod is gone. That is the whole
+	// reason the address is an object and not a line in host-local's file store,
+	// where a missed DEL leaked the address permanently (docs/api-groups.md).
+	// Keyed on pod UID, so a reused pod name cannot reap the new pod's address.
+	if podUID != "" {
+		if lc, e := localClient(); e == nil {
+			releaseFabricIPs(lc, podUID)
 		}
 	}
 
