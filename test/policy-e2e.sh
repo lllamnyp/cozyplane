@@ -54,6 +54,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# apply: never swallow a rejected object. A policy that failed schema validation
+# looks exactly like a policy that failed to enforce, and the whole phase then
+# tests nothing. (`on` is a YAML 1.1 boolean, which is how that bites.)
+apply() { $K apply -f - >/dev/null || { echo "  FATAL: apply rejected"; exit 1; }; }
+
 # served/refused: poll, because policy programming is eventually consistent.
 served()  { for _ in $(seq 1 10); do $K -n "$NS" exec "$1" -- curl -gs -m3 "$2" >/dev/null 2>&1 && return 0; sleep 2; done; return 1; }
 refused() { for _ in $(seq 1 10); do $K -n "$NS" exec "$1" -- curl -gs -m3 "$2" >/dev/null 2>&1 || return 0; sleep 2; done; return 1; }
@@ -143,7 +148,7 @@ phase "NetworkPolicy: baseline + isolation"
 served cli "http://$SRV:8080/" && pass "srv serves the cross-node client before any policy" \
   || fail "srv unreachable before any policy"
 
-$K apply -f - >/dev/null <<EOF
+apply <<EOF
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata: {name: srv-ingress, namespace: $NS}
@@ -169,7 +174,7 @@ served host1 "http://$SRV:8080/" && pass "LOCAL node reaches the isolated pod (s
 refused host2 "http://$SRV:8080/" && pass "REMOTE node is gated (the exemption narrowed to the local node)" \
   || fail "remote-node origin is still blanket-exempt"
 
-$K apply -f - >/dev/null <<EOF
+apply <<EOF
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata: {name: srv-ingress, namespace: $NS}
@@ -186,7 +191,7 @@ served host2 "http://$SRV:8080/" && pass "the nodes entity readmits remote-node 
 refused cli "http://$SRV:8080/" && pass "the nodes entity does not leak to pod sources" \
   || fail "the nodes entity admitted an ordinary pod"
 
-$K apply -f - >/dev/null <<EOF
+apply <<EOF
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata: {name: srv-ingress, namespace: $NS}
@@ -206,14 +211,14 @@ $K -n "$NS" delete networkpolicy --all >/dev/null
 
 # ===========================================================================
 phase "HostFirewall ingress"
-$K label node "$W" "$HFLABEL=on" --overwrite >/dev/null
+$K label node "$W" "$HFLABEL=active" --overwrite >/dev/null
 served cli "http://$WIP4:10250/" >/dev/null 2>&1 # warm the path; kubelet 401s but connects
-$K apply -f - >/dev/null <<EOF
+apply <<EOF
 apiVersion: sdn.cozystack.io/v1alpha1
 kind: HostFirewall
 metadata: {name: pol-e2e-in, labels: {$HFLABEL: owned}}
 spec:
-  nodeSelector: {matchLabels: {$HFLABEL: on}}
+  nodeSelector: {matchLabels: {$HFLABEL: active}}
 EOF
 refused cli "http://$WIP4:9411/metrics" && pass "cross-node pod->node refused (from_overlay gate)" \
   || fail "cross-node pod->node still served while isolated"
@@ -237,12 +242,12 @@ $K -n "$NS" exec host1 -- nslookup -timeout=3 kubernetes.default >/dev/null 2>&1
   && pass "hostNetwork cluster DNS works while isolated (the node->pod UDP pin)" \
   || fail "hostNetwork cluster DNS broke while isolated"
 
-$K apply -f - >/dev/null <<EOF
+apply <<EOF
 apiVersion: sdn.cozystack.io/v1alpha1
 kind: HostFirewall
 metadata: {name: pol-e2e-in, labels: {$HFLABEL: owned}}
 spec:
-  nodeSelector: {matchLabels: {$HFLABEL: on}}
+  nodeSelector: {matchLabels: {$HFLABEL: active}}
   ingress:
     - from: [{cidr: $PODCIDR}]
       ports: [{protocol: TCP, port: 9411, endPort: 9413}]
@@ -259,12 +264,12 @@ served cli "http://$WIP4:9411/metrics" && pass "deleting the HostFirewall reopen
 phase "HostFirewall egress"
 served host1 "http://$CLI:8080/" && pass "node->remote-pod serves before egress isolation" \
   || fail "node->remote-pod unreachable before egress isolation"
-$K apply -f - >/dev/null <<EOF
+apply <<EOF
 apiVersion: sdn.cozystack.io/v1alpha1
 kind: HostFirewall
 metadata: {name: pol-e2e-eg, labels: {$HFLABEL: owned}}
 spec:
-  nodeSelector: {matchLabels: {$HFLABEL: on}}
+  nodeSelector: {matchLabels: {$HFLABEL: active}}
   policyTypes: [Egress]
 EOF
 served cli "http://$WIP4:9411/metrics" && pass "an Egress-only object leaves INGRESS open" \
@@ -291,12 +296,12 @@ else
   skip "agent readiness (agent pod not found)"
 fi
 
-$K apply -f - >/dev/null <<EOF
+apply <<EOF
 apiVersion: sdn.cozystack.io/v1alpha1
 kind: HostFirewall
 metadata: {name: pol-e2e-eg, labels: {$HFLABEL: owned}}
 spec:
-  nodeSelector: {matchLabels: {$HFLABEL: on}}
+  nodeSelector: {matchLabels: {$HFLABEL: active}}
   policyTypes: [Egress]
   egress:
     - to: [{cidr: $CLI/32}]
