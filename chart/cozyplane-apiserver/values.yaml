@@ -1,7 +1,7 @@
 # Container image (shared with the cozyplane chart — the apiserver binary lives
 # in the same image). Digest-pinned (no floating tag); update on each published
 # build.
-image: ghcr.io/lllamnyp/cozyplane@sha256:05f8c8935c05f9090b9d0aef6e9d8b2281a294a55e9c13da34d65fdffc0fc1b7
+image: ghcr.io/lllamnyp/cozyplane@sha256:c3858ecc3d590b05de81599f65bf2ed1ecd4708f41f6be80244ddd566b303101
 imagePullPolicy: IfNotPresent
 imagePullSecrets: []
 
@@ -23,6 +23,11 @@ etcd:
     enabled: false
     replicas: 3
     size: 4Gi
+    # persistent: PVC-backed (durable) vs tmpfs. The aggregated API's objects
+    # are cluster state; a memory-backed etcd loses all of them on a
+    # full-cluster restart, which is what a node reboot is. Requires a storage
+    # layer, so the component must be sequenced after it.
+    persistent: true
     # StorageClass for the members' PVCs ("" = cluster default).
     storageClass: ""
   # Built-in single-pod etcd (dev/evaluation only).
