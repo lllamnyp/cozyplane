@@ -23,6 +23,13 @@ KCTX="${KCTX:?set KCTX (e.g. admin@dev, or kind-czp-foo)}"
 K="kubectl --context ${KCTX}"
 NS="${NS:-pol-e2e}"
 HFLABEL="cozyplane.io/pol-e2e"
+# Every HostFirewall this suite creates carries this rule. The nodes under test
+# may be control-plane nodes, and host-ingress isolation would otherwise drop
+# external clients to the apiserver — including the kubectl running this script.
+# The checks all target other ports, so the guard costs the suite nothing.
+APIGUARD='  ingress:
+    - from: [{cidr: 0.0.0.0/0}, {cidr: "::/0"}]
+      ports: [{protocol: TCP, port: 6443}]'
 
 FAILED=0
 CHECKS=0
@@ -52,7 +59,10 @@ cleanup() {
     $K delete ns "$NS" --wait=false >/dev/null 2>&1
   fi
 }
-trap cleanup EXIT
+# EXIT alone is not enough: bash does not run an EXIT trap when it is killed by
+# a signal, so a `pkill` of this suite would leave the node isolated — and on an
+# all-control-plane cluster that locks the API out from anywhere but a node.
+trap cleanup EXIT INT TERM HUP
 
 # apply: never swallow a rejected object. A policy that failed schema validation
 # looks exactly like a policy that failed to enforce, and the whole phase then
@@ -223,6 +233,7 @@ kind: HostFirewall
 metadata: {name: pol-e2e-in, labels: {$HFLABEL: owned}}
 spec:
   nodeSelector: {matchLabels: {$HFLABEL: active}}
+$APIGUARD
 EOF
 refused cli "http://$WIP4:9411/metrics" && pass "cross-node pod->node refused (from_overlay gate)" \
   || fail "cross-node pod->node still served while isolated"
@@ -253,6 +264,8 @@ metadata: {name: pol-e2e-in, labels: {$HFLABEL: owned}}
 spec:
   nodeSelector: {matchLabels: {$HFLABEL: active}}
   ingress:
+    - from: [{cidr: 0.0.0.0/0}, {cidr: "::/0"}]
+      ports: [{protocol: TCP, port: 6443}]
     - from: [{cidr: $PODCIDR}]
       ports: [{protocol: TCP, port: 9411, endPort: 9413}]
 EOF
