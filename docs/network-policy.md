@@ -1,5 +1,9 @@
 # NetworkPolicy on the default network (net 0)
 
+> One of three policy layers; flow ownership across
+> NetworkPolicy/SecurityGroup/HostFirewall is recorded in
+> [policy-layers.md](policy-layers.md).
+
 Status: **complete** (increments 1–3): ingress + egress, selector and
 ipBlock peers with `except`, `endPort` ranges, label-follows, the UDP
 reply-pin, node exemption. Repo e2e 140/140; **cyclonus conformance 89/90

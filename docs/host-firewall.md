@@ -1,5 +1,8 @@
 # Host firewall
 
+> One of three policy layers; flow ownership and the node-origin trust
+> model are recorded in [policy-layers.md](policy-layers.md).
+
 Status: **increment 1 complete** (design + build 2026-07-12; e2e 160/160;
 dev-cluster-validated live — a control-plane node isolated behind the
 apiserver LB, monitoring scrapes gated and counted, per-CIDR reopen). The node-scoped sibling of
@@ -13,12 +16,16 @@ SecurityGroups gate VPC ports; both exempt node-destined traffic).
 Removing Cilium (and with it any host-endpoint policy) left every node
 service reachable by anything that can route to a node address:
 
-- **Tenant workloads.** A net-0 pod — and, more importantly for Cozystack, a
-  **tenant VM guest** on the default network — can dial kubelet (10250), the
-  Talos API (50000/50001), node-exporter, or any hostNetwork service on any
-  node. NetworkPolicy cannot express this: its subjects are pods, and its
-  node-destined egress is exempt by design (the deviation recorded in
-  network-policy.md explicitly deferred to this document).
+- **Default-network workloads.** A net-0 pod — or a **VM guest** on the
+  default network — can dial kubelet (10250), the Talos API (50000/50001),
+  node-exporter, or any hostNetwork service on any node. Net 0 is
+  *semi-privileged*, not tenant land (true tenants live in VPCs and cannot
+  address nodes at all — [policy-layers.md](policy-layers.md) § trust
+  zones), but semi-privileged is exactly the zone that needs a firewall:
+  it can reach the hosts and is only somewhat trusted. NetworkPolicy
+  cannot express this gating: its subjects are pods, and its node-destined
+  egress is exempt by design (the deviation recorded in network-policy.md
+  explicitly deferred to this document).
 - **External clients.** Whatever the perimeter (cloud security lists, ToR
   ACLs) chooses not to block arrives at the uplink and goes straight to the
   host stack.

@@ -1,5 +1,9 @@
 # Security groups — intra-VPC policy
 
+> One of three policy layers; which layer owns which flow (and why a
+> SecurityGroup can never break kubelet probes) is recorded in
+> [policy-layers.md](policy-layers.md).
+
 **Status: v1 implemented and dev-cluster-validated (2026-07-06).** East-west
 (intra-VPC, group-to-group) ingress enforcement is built and validated on a real
 cluster. This is the first increment of `design.md` §7 ("Network identity &
