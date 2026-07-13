@@ -147,19 +147,38 @@ func (r *FloatingIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 // resolvePool returns the ExternalPool this FloatingIP allocates from: the one
 // named in spec.poolRef, or — when unset — the single pool if exactly one
 // exists. Returns nil when the reference is missing or the default is ambiguous.
+// resolvePool returns the ExternalPool this FloatingIP draws from — the pool of
+// its VPC's GATEWAY (docs/north-south.md § increment 3).
+//
+// A floating IP is an EIP: an address on the VPC's boundary, associated with a
+// Port. So it comes out of the boundary's pool, and a VPC with no gateway gets no
+// external address at all — which is tenet 7 ("nothing crosses by default") read
+// from the other side, and it makes the `attach` verb on the pool govern EVERY
+// address a tenant can wear, not just its NAT identity.
+//
+// spec.poolRef still wins when set, for the case of a pool an operator granted
+// directly; but the gateway is the answer when it is not.
 func (r *FloatingIPReconciler) resolvePool(ctx context.Context, fip *sdnv1alpha1.FloatingIP) *sdnv1alpha1.ExternalPool {
-	if name := fip.Spec.PoolRef.Name; name != "" {
-		pool := &sdnv1alpha1.ExternalPool{}
-		if err := r.Get(ctx, types.NamespacedName{Name: name}, pool); err != nil {
+	name := fip.Spec.PoolRef.Name
+	if name == "" {
+		var gws sdnv1alpha1.VPCGatewayList
+		if err := r.List(ctx, &gws, client.InNamespace(fip.Namespace)); err != nil {
 			return nil
 		}
-		return pool
+		gw := sdnv1alpha1.EffectiveGateway(gws.Items, fip.Spec.VPCRef.Name)
+		if gw == nil {
+			return nil // no boundary: no address
+		}
+		name = gw.Spec.PoolRef.Name
 	}
-	var list sdnv1alpha1.ExternalPoolList
-	if err := r.List(ctx, &list); err != nil || len(list.Items) != 1 {
+	if name == "" {
 		return nil
 	}
-	return &list.Items[0]
+	pool := &sdnv1alpha1.ExternalPool{}
+	if err := r.Get(ctx, types.NamespacedName{Name: name}, pool); err != nil {
+		return nil
+	}
+	return pool
 }
 
 // ensureAddress returns the address bound to this FloatingIP, allocating one if
@@ -335,6 +354,7 @@ func (r *FloatingIPReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&sdnv1alpha1.Port{}, handler.EnqueueRequestsFromMapFunc(r.mapPortToFloatingIPs)).
 		Watches(&sdnv1alpha1.ExternalPool{}, handler.EnqueueRequestsFromMapFunc(r.mapPoolToFloatingIPs)).
 		Watches(&sdnv1alpha1.FloatingIP{}, handler.EnqueueRequestsFromMapFunc(r.mapToPendingFloatingIPs)).
+		Watches(&sdnv1alpha1.VPCGateway{}, handler.EnqueueRequestsFromMapFunc(r.mapGatewayToFloatingIPs)).
 		Named("floatingip").
 		Complete(r)
 }
@@ -399,4 +419,24 @@ func (r *FloatingIPReconciler) mapToPendingFloatingIPs(ctx context.Context, obj 
 		}
 	}
 	return reqs
+}
+
+// mapGatewayToFloatingIPs re-drives a VPC's floating addresses when its boundary
+// changes: the gateway is where their pool comes from.
+func (r *FloatingIPReconciler) mapGatewayToFloatingIPs(ctx context.Context, obj client.Object) []ctrl.Request {
+	gw, ok := obj.(*sdnv1alpha1.VPCGateway)
+	if !ok {
+		return nil
+	}
+	var list sdnv1alpha1.FloatingIPList
+	if err := r.List(ctx, &list, client.InNamespace(gw.Namespace)); err != nil {
+		return nil
+	}
+	var out []ctrl.Request
+	for i := range list.Items {
+		if list.Items[i].Spec.VPCRef.Name == gw.Spec.VPCRef.Name {
+			out = append(out, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(&list.Items[i])})
+		}
+	}
+	return out
 }

@@ -18,21 +18,24 @@ limitations under the License.
 
 package v1alpha1
 
-import (
-	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
-)
-
 // ExternalPoolSpecApplyConfiguration represents a declarative configuration of the ExternalPoolSpec type for use
 // with apply.
 //
+// Cozyplane does not ANNOUNCE a pool's addresses — it delivers them
+// (docs/north-south.md, tenet 3). Making the fabric hand an address to a node is
+// the platform's job: a CCM assigning it to a VNIC, MetalLB, a static route, or
+// an address configured on a node. Because from_uplink runs at tc ingress, ahead
+// of the kernel's routing decision, delivery works however that was arranged and
+// to whichever node the address lands on.
+//
+// The `advertisement: L2 | BGP` field that used to be here was dead code, and it
+// stayed dead: a CNI has no business holding routing sessions with the fabric, and
+// the L2 responder it implied was MetalLB reimplemented inside one.
 // ExternalPoolSpec is the specification of a pool of externally-routable
 // addresses that FloatingIPs are allocated from.
 type ExternalPoolSpecApplyConfiguration struct {
 	// CIDRs are the address ranges the pool hands out.
 	CIDRs []string `json:"cidrs,omitempty"`
-	// Advertisement is how in-use addresses are announced to the physical
-	// network. Empty selects the controller default (L2).
-	Advertisement *sdnv1alpha1.ExternalPoolAdvertisement `json:"advertisement,omitempty"`
 }
 
 // ExternalPoolSpecApplyConfiguration constructs a declarative configuration of the ExternalPoolSpec type for use with
@@ -48,13 +51,5 @@ func (b *ExternalPoolSpecApplyConfiguration) WithCIDRs(values ...string) *Extern
 	for i := range values {
 		b.CIDRs = append(b.CIDRs, values[i])
 	}
-	return b
-}
-
-// WithAdvertisement sets the Advertisement field in the declarative configuration to the given value
-// and returns the receiver, so that objects can be built by chaining "With" function invocations.
-// If called multiple times, the Advertisement field is set to the value of the last call.
-func (b *ExternalPoolSpecApplyConfiguration) WithAdvertisement(value sdnv1alpha1.ExternalPoolAdvertisement) *ExternalPoolSpecApplyConfiguration {
-	b.Advertisement = &value
 	return b
 }

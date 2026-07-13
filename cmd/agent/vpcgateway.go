@@ -62,11 +62,6 @@ func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFa
 			log.Error("list vpcs", "err", err)
 			return
 		}
-		allPools, err := pools.Lister().List(labels.Everything())
-		if err != nil {
-			log.Error("list externalpools", "err", err)
-			return
-		}
 		desired := desiredVPCIngress(allGWs, allVPCs)
 
 		// The VPC's egress identity, and this node's slice of its port space.
@@ -113,25 +108,17 @@ func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFa
 					log.Error("set nat owner", "addr", addr, "shard", i, "err", err)
 				}
 			}
-			// Something has to ATTRACT the address, or the replies land nowhere.
-			// Until attraction leaves the CNI entirely (docs/north-south.md, tenet
-			// 3 — increment 3), a VPC's NAT address rides the same L2 announcement
-			// and the same rendezvous election as a floating IP.
-			mine := announcerForAddr(addr, nodes, allPools) == selfName
-			if mine {
-				if err := mgr.SetAnnounce(addr); err != nil {
-					log.Error("announce nat address", "addr", addr, "err", err)
-				}
-			} else if err := mgr.DelAnnounce(addr); err != nil {
-				log.Error("stop announcing nat address", "addr", addr, "err", err)
-			}
+			// Nothing here ATTRACTS the address (docs/north-south.md, tenet 3):
+			// the platform must make the fabric hand it to a node — a CCM, a
+			// static route, an address configured on a node. Whichever node it
+			// lands on, from_uplink un-NATs the reply or forwards it to the node
+			// whose shard owns the flow, so delivery does not care.
 			if curNAT[vni] != addr {
-				log.Info("VPC egresses as its own address", "vni", vni, "nat", addr, "announced_here", mine)
+				log.Info("VPC egresses as its own address", "vni", vni, "nat", addr)
 			}
 		}
 		for vni, addr := range curNAT {
 			if _, ok := wantNAT[vni]; !ok {
-				_ = mgr.DelAnnounce(addr)
 				if err := mgr.DelVPCNAT(vni, addr); err != nil {
 					log.Error("del vpc nat", "vni", vni, "err", err)
 					continue
@@ -236,20 +223,4 @@ func indexOf(names []string, self string) int {
 		}
 	}
 	return -1
-}
-
-// announcerForAddr elects the node that advertises a bare address (a VPC's NAT
-// identity) — the same rendezvous hash over the nodes that can serve its pool as
-// a floating IP uses, minus the "fall back to the target's node" case: a NAT
-// address has no target pod. Nothing eligible means nobody announces it, and the
-// address is dark rather than black-holed on a node that cannot serve its L2.
-func announcerForAddr(pub string, nodes *nodePoolIndex, pools []*sdnv1alpha1.ExternalPool) string {
-	eligible := nodes.serving(poolOf(pub, pools))
-	best, bestScore := "", uint64(0)
-	for _, n := range eligible {
-		if s := rendezvous(n, pub); best == "" || s > bestScore || (s == bestScore && n < best) {
-			best, bestScore = n, s
-		}
-	}
-	return best
 }

@@ -290,19 +290,6 @@ type Port struct {
 	Status PortStatus
 }
 
-// ExternalPoolAdvertisement is how a pool's addresses are announced to the
-// physical network.
-type ExternalPoolAdvertisement string
-
-const (
-	// ExternalPoolAdvertisementL2 announces each in-use address with gratuitous
-	// ARP/NDP from the node currently anchoring it.
-	ExternalPoolAdvertisementL2 ExternalPoolAdvertisement = "L2"
-	// ExternalPoolAdvertisementBGP announces addresses over BGP (not yet
-	// implemented; reserved).
-	ExternalPoolAdvertisementBGP ExternalPoolAdvertisement = "BGP"
-)
-
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // ExternalPoolList is a list of ExternalPool objects.
@@ -318,10 +305,6 @@ type ExternalPoolList struct {
 type ExternalPoolSpec struct {
 	// CIDRs are the address ranges the pool hands out.
 	CIDRs []string
-
-	// Advertisement is how in-use addresses are announced to the physical
-	// network. Empty selects the controller default (L2).
-	Advertisement ExternalPoolAdvertisement
 }
 
 // ExternalPoolStatus is the observed state of an ExternalPool.

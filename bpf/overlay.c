@@ -494,30 +494,6 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } vpc_ingress SEC(".maps");
 
-// float_announce: public IP -> 1, present ONLY on the node elected to advertise
-// that address (docs/floating-ha.md). It is the sole gate on the ARP/NDP
-// responders, and it is what separates *attraction* from *delivery*: the
-// `floating` map above says where a public address leads, this map says whether
-// THIS node is the one that pulls it off the wire. The election is a pure
-// function of cluster state (a rendezvous hash over the nodes that can serve the
-// pool's link), so there is no lease and no leader — an agent simply programs
-// this map for the addresses it won. Before, "programming the map was the
-// advertisement", which welded the announcement to the pod's location and made a
-// migrating VM's public address depend on one gratuitous ARP landing.
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, struct addr128);
-	__type(value, __u8);
-	__uint(max_entries, 4096);
-	// NO_PREALLOC: a cluster holds tens of floating addresses, not thousands, and
-	// this map is written only from userspace. Preallocating charged the agent's
-	// memory cgroup for entries that will never exist — and the agent runs close
-	// enough to its limit (the LRU conntrack/service maps preallocate ~100MB+)
-	// that a few needless megabytes decide whether it starts or is OOM-killed.
-	__uint(map_flags, BPF_F_NO_PREALLOC);
-	__uint(pinning, LIBBPF_PIN_BY_NAME);
-} float_announce SEC(".maps");
-
 // internal holds the cluster-internal CIDRs (pod/service/node networks) at scope
 // 0. A floating pod egresses straight out the uplink, bypassing the VPC gateway
 // that would otherwise enforce the tenant->system boundary — so from_pod drops
@@ -1841,17 +1817,6 @@ static __always_inline __u32 cfg(__u32 idx)
 	return v ? *v : 0;
 }
 
-// responder_mac returns the MAC the floating ARP/NDP responders answer with on
-// the interface the request arrived on: the floating uplink's own MAC when the
-// request came in there, the default uplink's otherwise.
-static __always_inline struct cozy_mac *responder_mac(struct __sk_buff *skb)
-{
-	__u32 zero = 0;
-	__u32 fidx = cfg(CFG_FLOAT_IFINDEX);
-	if (fidx && skb->ifindex == fidx)
-		return bpf_map_lookup_elem(&float_uplink_mac, &zero);
-	return bpf_map_lookup_elem(&uplink_mac, &zero);
-}
 
 // A fully-specified scoped LPM lookup: 32 scope bits + 128 address bits.
 #define LPM_FULL 160
@@ -1907,13 +1872,6 @@ static __always_inline struct bridge_ep *float_of(struct addr128 pub)
 	return bpf_map_lookup_elem(&floating, &pub);
 }
 
-// announces returns true when this node is the elected announcer for a public
-// address — the one gate on the ARP/NDP responders. It replaces the old "do I
-// host the target pod" test, which is now a separate question entirely.
-static __always_inline int announces(struct addr128 pub)
-{
-	return bpf_map_lookup_elem(&float_announce, &pub) != NULL;
-}
 
 static __always_inline struct addr128 *floating_egress_of(__u32 net, struct addr128 vpc_ip)
 {
@@ -3496,96 +3454,6 @@ static __always_inline int floating_egress_snat6(struct __sk_buff *skb, struct p
 	// The EIP door, outbound — v6 twin (docs/north-south.md).
 	count_ns(net, skb->len, NS_EIP, 0);
 	return bpf_redirect_neigh(uplink, NULL, 0, 0);
-}
-
-// floating_ndp answers a Neighbor Solicitation for a floating v6 address this
-// node was elected to announce, with a solicited+override Neighbor Advertisement
-// carrying the uplink MAC — the NDP twin of floating_arp (the L2 advertisement
-// that pulls inbound traffic to this node; the pod it is destined for may live
-// anywhere). The NS is rewritten to the NA in place and sent back out the
-// uplink; the ICMPv6 checksum is updated incrementally for every changed
-// field, pseudo-header included. DAD probes (unspecified source) are left
-// unanswered: cozyplane owns the address authoritatively, and answering DAD
-// would need the all-nodes multicast path instead.
-static __always_inline int floating_ndp(struct __sk_buff *skb)
-{
-	void *data = (void *)(long)skb->data;
-	void *data_end = (void *)(long)skb->data_end;
-	struct ethhdr *eth = data;
-	if ((void *)(eth + 1) > data_end || eth->h_proto != bpf_htons(ETH_P_IPV6))
-		return FLOAT_MISS;
-	struct ipv6hdr *ip6 = (void *)(eth + 1);
-	if ((void *)(ip6 + 1) > data_end || ip6->nexthdr != IPPROTO_ICMPV6)
-		return FLOAT_MISS;
-	if (data + NDP_TARGET_OFF + 16 > data_end)
-		return FLOAT_MISS;
-	__u8 *icmp = data + L4_OFF6;
-	if (icmp[0] != ICMP6_NEIGH_SOLICIT)
-		return FLOAT_MISS;
-
-	struct addr128 target, req, zero = {};
-	__builtin_memcpy(target.b, data + NDP_TARGET_OFF, 16);
-	__builtin_memcpy(req.b, &ip6->saddr, 16);
-	if (addr128_eq(&req, &zero))
-		return FLOAT_MISS; // DAD probe; not answered (see above)
-
-	if (!announces(target))
-		return FLOAT_MISS; // not the elected announcer for this address
-	struct cozy_mac *node = responder_mac(skb);
-	if (!node)
-		return FLOAT_MISS;
-
-	// Incremental ICMPv6 checksum over every change: the pseudo-header (src
-	// becomes the target, dst becomes the requester) and the payload (type,
-	// flags, option type when present).
-	__u16 csum = 0;
-	bpf_skb_load_bytes(skb, ICMP6_CSUM_OFF, &csum, 2);
-	struct addr128 dst128;
-	__builtin_memcpy(dst128.b, &ip6->daddr, 16);
-	csum = csum_upd128(csum, &req, &target);   // pseudo src: requester -> target
-	csum = csum_upd128(csum, &dst128, &req);   // pseudo dst: sol-node mcast -> requester
-	__u16 otc = bpf_htons(ICMP6_NEIGH_SOLICIT << 8);
-	__u16 ntc = bpf_htons(ICMP6_NEIGH_ADVERT << 8);
-	csum = csum_upd16(csum, otc, ntc);         // type/code word
-	__u32 oflags = 0;
-	bpf_skb_load_bytes(skb, NDP_FLAGS_OFF, &oflags, 4);
-	__u32 nflags = bpf_htonl(0x60000000);      // Solicited | Override
-	csum = csum_upd32(csum, oflags, nflags);
-
-	__u8 req_mac[6];
-	__builtin_memcpy(req_mac, eth->h_source, 6);
-	__u8 have_opt = (void *)(data + NDP_OPT_OFF + 8) <= data_end;
-	if (have_opt) {
-		// Source link-layer option -> target link-layer option with our MAC.
-		__u16 oopt = 0, nopt;
-		bpf_skb_load_bytes(skb, NDP_OPT_OFF, &oopt, 2);
-		__u8 nb[2] = {2, 1};
-		__builtin_memcpy(&nopt, nb, 2);
-		csum = csum_upd16(csum, oopt, nopt);
-		__u16 om[3], nm[3];
-		bpf_skb_load_bytes(skb, NDP_OPT_MAC_OFF, om, 6);
-		__builtin_memcpy(nm, node->addr, 6);
-#pragma unroll
-		for (int i = 0; i < 3; i++)
-			csum = csum_upd16(csum, om[i], nm[i]);
-		bpf_skb_store_bytes(skb, NDP_OPT_OFF, nb, 2, 0);
-		bpf_skb_store_bytes(skb, NDP_OPT_MAC_OFF, node->addr, 6, 0);
-	}
-
-	__u8 na = ICMP6_NEIGH_ADVERT;
-	bpf_skb_store_bytes(skb, L4_OFF6, &na, 1, 0);
-	bpf_skb_store_bytes(skb, NDP_FLAGS_OFF, &nflags, 4, 0);
-	bpf_skb_store_bytes(skb, IP6_SADDR_OFF, target.b, 16, 0);
-	bpf_skb_store_bytes(skb, IP6_DADDR_OFF, req.b, 16, 0);
-	bpf_skb_store_bytes(skb, ICMP6_CSUM_OFF, &csum, 2, 0);
-
-	// Ethernet: back to the requester, from the node.
-	__u8 nmac[6];
-	__builtin_memcpy(nmac, node->addr, 6);
-	bpf_skb_store_bytes(skb, 0, req_mac, 6, 0);
-	bpf_skb_store_bytes(skb, 6, nmac, 6, 0);
-
-	return bpf_redirect(skb->ifindex, 0); // back out the uplink to the requester
 }
 
 static __always_inline struct addr128 *masq_node6(void)
@@ -5423,73 +5291,26 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 	return TC_ACT_OK;
 }
 
-// floating_arp answers ARP for a floating IP this node was ELECTED to announce
-// (float_announce) — not, as before, for one whose target pod happens to be
-// local. That is the whole of the attraction/delivery split: the announcer pulls
-// the address off the wire, and the packet then finds the pod wherever it lives.
-// Advertisement still needs no host-side /32 and no proxy_arp. An ARP request
-// for such an IP is rewritten in place into a reply — sender = this node's uplink
-// MAC + the floating IP, target = the requester — and reflected back out the
-// uplink. Returns a TC action when handled, or FLOAT_MISS to let the caller fall
-// through (not an ARP request for an address we announce).
-static __always_inline int floating_arp(struct __sk_buff *skb)
-{
-	void *data = (void *)(long)skb->data;
-	void *data_end = (void *)(long)skb->data_end;
-	struct ethhdr *eth = data;
-	if ((void *)(eth + 1) > data_end)
-		return FLOAT_MISS;
-	struct arp_eth *arp = (void *)(eth + 1);
-	if ((void *)(arp + 1) > data_end)
-		return FLOAT_MISS;
-	if (arp->op != bpf_htons(ARPOP_REQUEST))
-		return FLOAT_MISS;
-
-	// ARP is v4-only (v6 floating IPs advertise via NDP, a later phase).
-	struct addr128 tip128;
-	v4_to_128(&tip128, arp->tip);
-	if (!announces(tip128))
-		return FLOAT_MISS; // not the elected announcer for this address
-
-	struct cozy_mac *node = responder_mac(skb);
-	if (!node)
-		return FLOAT_MISS;
-
-	__u8 req_mac[6];
-	__builtin_memcpy(req_mac, arp->sha, 6);
-	__be32 req_ip = arp->sip;
-	__be32 fip = arp->tip;
-
-	arp->op = bpf_htons(ARPOP_REPLY);
-	__builtin_memcpy(arp->sha, node->addr, 6);
-	arp->sip = fip;
-	__builtin_memcpy(arp->tha, req_mac, 6);
-	arp->tip = req_ip;
-	__builtin_memcpy(eth->h_dest, req_mac, 6);
-	__builtin_memcpy(eth->h_source, node->addr, 6);
-
-	return bpf_redirect(skb->ifindex, 0); // back out the uplink to the requester
-}
-
 // cozyplane_from_uplink: attached at the node uplink's ingress. It is the only
-// entry point for off-cluster ingress, and it also advertises the floating IPs
-// this node was elected to announce (floating_arp / floating_ndp). A packet
-// destined to a floating IP is redirected into the target pod's veth when that
-// pod is local, and encapsulated to the pod's node when it is not — attraction
-// and delivery are separate decisions (docs/floating-ha.md). to_pod's
-// floating_forward does the public->VPC DNAT (source-preserving) at the far end
-// either way. Everything else — overlay traffic, node traffic — is left to the
-// kernel untouched, at the cost of one hash lookup.
+// entry point for off-cluster ingress, and it DELIVERS — it does not attract.
+//
+// Cozyplane no longer announces anything (docs/north-south.md, tenet 3): making
+// the fabric hand an external address to some node is the platform's job — a CCM
+// assigning it to a VNIC, MetalLB, a static route, an address configured on a
+// node. What used to be here (an ARP/NDP responder and a gratuitous-ARP emitter,
+// elected per address) was MetalLB's L2 mode reimplemented inside a CNI.
+//
+// Because this hook sits at tc ingress — BEFORE the kernel's routing decision —
+// delivery works however the address was attracted, and to whichever node. A
+// packet for a floating IP is redirected into the target pod's veth when the pod
+// is local and encapsulated to the pod's node when it is not; a reply to a VPC's
+// NAT address is un-NAT'd here or forwarded to the node holding the flow. to_pod
+// does the public->VPC DNAT (source-preserving) at the far end either way.
+// Everything else — overlay traffic, node traffic — is left to the kernel
+// untouched, at the cost of one hash lookup.
 SEC("tc")
 int cozyplane_from_uplink(struct __sk_buff *skb)
 {
-	int arp = floating_arp(skb);
-	if (arp != FLOAT_MISS)
-		return arp;
-	int ndp = floating_ndp(skb);
-	if (ndp != FLOAT_MISS)
-		return ndp;
-
 	struct iphdr *ip;
 	if (parse_ipv4(skb, &ip) < 0) {
 		// v6 inbound to a floating address: deliver to the local pod like the

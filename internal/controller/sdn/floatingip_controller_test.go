@@ -60,12 +60,47 @@ func floatingIP(ns, name, vpc, target string) *sdnv1alpha1.FloatingIP {
 	}
 }
 
+// fipClient builds the fixture set — and gives every VPC in it a BOUNDARY.
+//
+// A floating IP is an EIP now: it draws from its VPC's gateway's pool, so a VPC
+// with no gateway gets no external address at all (docs/north-south.md § increment
+// 3). That is the point of the re-parenting — the `attach` verb on the pool governs
+// every address a tenant can wear, not just its NAT identity — and it means each
+// FloatingIP fixture needs a gateway to be reachable at all.
 func fipClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
+
+	var poolName string
+	seen := map[string]bool{}
+	for _, o := range objs {
+		if p, ok := o.(*sdnv1alpha1.ExternalPool); ok && poolName == "" {
+			poolName = p.Name
+		}
+	}
+	all := append([]client.Object{}, objs...)
+	for _, o := range objs {
+		f, ok := o.(*sdnv1alpha1.FloatingIP)
+		if !ok {
+			continue
+		}
+		key := f.Namespace + "/" + f.Spec.VPCRef.Name
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		all = append(all, &sdnv1alpha1.VPCGateway{
+			ObjectMeta: metav1.ObjectMeta{Name: "door-" + f.Spec.VPCRef.Name, Namespace: f.Namespace},
+			Spec: sdnv1alpha1.VPCGatewaySpec{
+				VPCRef:  sdnv1alpha1.LocalVPCRef{Name: f.Spec.VPCRef.Name},
+				PoolRef: sdnv1alpha1.ExternalPoolRef{Name: poolName},
+			},
+		})
+	}
+
 	return fake.NewClientBuilder().
 		WithScheme(testScheme(t)).
-		WithObjects(objs...).
-		WithStatusSubresource(&sdnv1alpha1.FloatingIP{}, &sdnv1alpha1.ExternalPool{}).
+		WithObjects(all...).
+		WithStatusSubresource(&sdnv1alpha1.FloatingIP{}, &sdnv1alpha1.ExternalPool{}, &sdnv1alpha1.VPCGateway{}).
 		Build()
 }
 

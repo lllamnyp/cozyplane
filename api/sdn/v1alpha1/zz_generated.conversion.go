@@ -676,7 +676,6 @@ func Convert_sdn_ExternalPoolRef_To_v1alpha1_ExternalPoolRef(in *sdn.ExternalPoo
 
 func autoConvert_v1alpha1_ExternalPoolSpec_To_sdn_ExternalPoolSpec(in *ExternalPoolSpec, out *sdn.ExternalPoolSpec, s conversion.Scope) error {
 	out.CIDRs = *(*[]string)(unsafe.Pointer(&in.CIDRs))
-	out.Advertisement = sdn.ExternalPoolAdvertisement(in.Advertisement)
 	return nil
 }
 
@@ -687,7 +686,6 @@ func Convert_v1alpha1_ExternalPoolSpec_To_sdn_ExternalPoolSpec(in *ExternalPoolS
 
 func autoConvert_sdn_ExternalPoolSpec_To_v1alpha1_ExternalPoolSpec(in *sdn.ExternalPoolSpec, out *ExternalPoolSpec, s conversion.Scope) error {
 	out.CIDRs = *(*[]string)(unsafe.Pointer(&in.CIDRs))
-	out.Advertisement = ExternalPoolAdvertisement(in.Advertisement)
 	return nil
 }
 

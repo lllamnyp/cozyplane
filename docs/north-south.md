@@ -121,16 +121,16 @@ platform rather than announced by us.
 cozyplane delivers it to the backends, including VPC backends, gated and counted at
 the boundary rather than waved through.
 
-## 4. What this retires
+## 4. What this retired (all done)
 
-- **The floating-IP announcement layer.** `float_announce`, `floating_arp`,
-  `floating_ndp`, `AnnounceAddress`, and the announcer election — a MetalLB L2
-  implementation living inside a CNI. Tenet 3 deletes all of it.
-- **The per-VPC gateway pod**, replaced by eBPF SNAT with a per-VPC identity.
-- **`ExternalPool.spec.advertisement`** (`L2 | BGP`) — presently dead code, read by
-  nothing. Under tenet 3 it never becomes live. Delete the field.
-- **`FloatingIP` as a top-level, self-sufficient object** — it becomes an EIP under
-  a gateway.
+- **The floating-IP announcement layer** — `float_announce`, `floating_arp`,
+  `floating_ndp`, `AnnounceAddress`, the announcer election: a MetalLB L2
+  implementation living inside a CNI. Deleted (increment 3).
+- **The per-VPC gateway pod** — replaced by eBPF SNAT with a per-VPC identity
+  (increment 2). With it went the last netns firewall in the tree.
+- **`ExternalPool.spec.advertisement`** (`L2 | BGP`) — dead code that stayed dead.
+- **`FloatingIP` as a top-level, self-sufficient object** — it is an EIP under a
+  gateway (increment 3).
 
 ## 5. What survives from the floating-HA work
 
@@ -328,7 +328,26 @@ Not a commitment; the order the pieces actually depend on each other.
    sanctioned internal door). The split-horizon resolver (`dns_steer` + the per-node
    responder) already serves VPC pods, so that door is probably vestigial — confirm
    before deleting it, or tenant DNS breaks with the pod.
-3. **EIP re-parented onto the gateway**; delete the announcement layer, and with it
-   `ExternalPool.spec.advertisement`.
+3. **EIP re-parented onto the gateway; the announcement layer deleted — DONE
+   2026-07-14.** Gone: `float_announce`, `floating_arp`, `floating_ndp`,
+   `responder_mac`, `AnnounceAddress` (and its GARP/NA emitters), the announcer
+   election and its rendezvous hash, the node pool-eligibility annotation, the
+   `--floating-ha` flag, and `ExternalPool.spec.advertisement`. Cozyplane attracts
+   nothing.
+
+   **Something else must.** Because `from_uplink` sits at tc ingress — ahead of the
+   kernel's routing decision — delivery works however the address was attracted and
+   to whichever node it lands on: the pod is found through `floating` (or `nat_of`)
+   and reached over the overlay if it lives elsewhere. So the platform arranges
+   attraction: a CCM assigning the address to a VNIC, MetalLB, a static route, or
+   simply **an address configured on a node** (which is what the e2e now does — it
+   is what a CCM would do, and the kernel never sees the packet because tc ingress
+   claims it first).
+
+   **A FloatingIP is now an EIP under the gateway**: it draws from its VPC's
+   gateway's pool, so a VPC with no boundary gets no external address at all. The
+   `attach` verb on the pool therefore governs *every* address a tenant can wear,
+   not just its NAT identity — and every external address a VPC uses crosses, and is
+   counted at, one boundary. Tenet 2, finally true.
 4. **LoadBalancer ingress into a VPC crosses the boundary** — admitted and counted,
    not waved through.

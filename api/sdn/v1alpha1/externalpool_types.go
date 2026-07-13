@@ -20,19 +20,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// ExternalPoolAdvertisement is how a pool's addresses are announced to the
-// physical network.
-// +kubebuilder:validation:Enum=L2;BGP
-type ExternalPoolAdvertisement string
-
-const (
-	// ExternalPoolAdvertisementL2 announces each in-use address with gratuitous
-	// ARP/NDP from the node currently anchoring it.
-	ExternalPoolAdvertisementL2 ExternalPoolAdvertisement = "L2"
-	// ExternalPoolAdvertisementBGP announces addresses over BGP (not yet
-	// implemented; reserved).
-	ExternalPoolAdvertisementBGP ExternalPoolAdvertisement = "BGP"
-)
+// Cozyplane does not ANNOUNCE a pool's addresses — it delivers them
+// (docs/north-south.md, tenet 3). Making the fabric hand an address to a node is
+// the platform's job: a CCM assigning it to a VNIC, MetalLB, a static route, or
+// an address configured on a node. Because from_uplink runs at tc ingress, ahead
+// of the kernel's routing decision, delivery works however that was arranged and
+// to whichever node the address lands on.
+//
+// The `advertisement: L2 | BGP` field that used to be here was dead code, and it
+// stayed dead: a CNI has no business holding routing sessions with the fabric, and
+// the L2 responder it implied was MetalLB reimplemented inside one.
 
 // ExternalPoolSpec is the specification of a pool of externally-routable
 // addresses that FloatingIPs are allocated from.
@@ -40,11 +37,6 @@ type ExternalPoolSpec struct {
 	// CIDRs are the address ranges the pool hands out.
 	// +optional
 	CIDRs []string `json:"cidrs,omitempty"`
-
-	// Advertisement is how in-use addresses are announced to the physical
-	// network. Empty selects the controller default (L2).
-	// +optional
-	Advertisement ExternalPoolAdvertisement `json:"advertisement,omitempty"`
 }
 
 // ExternalPoolStatus is the observed state of an ExternalPool.

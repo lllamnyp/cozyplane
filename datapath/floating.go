@@ -120,27 +120,6 @@ func (m *Manager) EnsureFloatingUplink(publicIP string) error {
 	return nil
 }
 
-// PoolServable reports whether this node can put a frame on the L2 that carries
-// `publicIP` — i.e. whether it is a candidate to ANNOUNCE addresses from that
-// pool (docs/floating-ha.md). The FIB is the authority, as it is in
-// EnsureFloatingUplink: on-link (no gateway) means the address's fabric is
-// directly attached, whether that is a dedicated VLAN or the default uplink's own
-// subnet. A routed pool is on-link nowhere, so no node is electable and the
-// announcement falls back to the target pod's node — an L2 announcement for a
-// routed address would be pointless anyway.
-func (m *Manager) PoolServable(publicIP string) (bool, error) {
-	ip := net.ParseIP(publicIP)
-	if ip == nil {
-		return false, fmt.Errorf("invalid address %q", publicIP)
-	}
-	routes, err := netlink.RouteGet(ip)
-	if err != nil || len(routes) == 0 {
-		return false, fmt.Errorf("route lookup for %s: %w", publicIP, err)
-	}
-	r := routes[0]
-	return r.Gw == nil && r.LinkIndex != 0, nil
-}
-
 // SetFloating records the 1:1 mapping in both directions: floating[publicIP] =
 // {net, VPC IP} for inbound DNAT, and floating_egress[{net, VPC IP}] = publicIP
 // for the pod's outbound SNAT. net is the target pod's network id (its VNI). No
@@ -238,50 +217,10 @@ func (m *Manager) Floatings() (map[string]bool, error) {
 	return out, it.Err()
 }
 
-// SetAnnounce makes this node the advertiser for a public address: from_uplink's
-// ARP/NDP responders answer for exactly the addresses in float_announce. It is
-// the *only* thing that pulls the address to this node, and it is deliberately
-// independent of where the target pod runs — see docs/floating-ha.md. Exactly one
-// node in the cluster should hold a given address (ARP resolves to one MAC), and
-// the agents agree on which without coordinating, by hashing.
-func (m *Manager) SetAnnounce(publicIP string) error {
-	pub, err := addr128Str(publicIP)
-	if err != nil {
-		return fmt.Errorf("public IP: %w", err)
-	}
-	var one uint8 = 1
-	if err := m.objs.FloatAnnounce.Put(&pub, one); err != nil {
-		return fmt.Errorf("announce %s: %w", publicIP, err)
-	}
-	return nil
-}
-
-// DelAnnounce stops advertising a public address from this node (idempotent).
-func (m *Manager) DelAnnounce(publicIP string) error {
-	pub, err := addr128Str(publicIP)
-	if err != nil {
-		return fmt.Errorf("public IP: %w", err)
-	}
-	if err := m.objs.FloatAnnounce.Delete(&pub); err != nil && !isNotExist(err) {
-		return fmt.Errorf("del announce %s: %w", publicIP, err)
-	}
-	return nil
-}
-
-// Announcements returns the public IPs this node currently advertises, so the
-// agent can diff its election result against the pinned map (which outlives it).
-func (m *Manager) Announcements() (map[string]bool, error) {
-	out := map[string]bool{}
-	var key overlayAddr128
-	var v uint8
-	it := m.objs.FloatAnnounce.Iterate()
-	for it.Next(&key, &v) {
-		out[addr128ToIP(key).String()] = true
-	}
-	return out, it.Err()
-}
-
-// Advertisement is not a host-side operation: from_uplink answers ARP for the
-// floating IPs in float_announce (see floating_arp in bpf/overlay.c) — no /32,
-// no proxy_arp. Programming float_announce is the advertisement; programming
-// `floating` only says where the address leads, and every node does that.
+// Cozyplane does not ATTRACT a floating address — it delivers one
+// (docs/north-south.md, tenet 3). Something else must make the fabric hand the
+// address to a node: a CCM assigning it to a VNIC, MetalLB, a static route, an
+// address configured on a node. Because from_uplink sits at tc ingress, ahead of
+// the kernel's routing decision, delivery works however that was arranged and to
+// whichever node the address lands on — the pod is found through `floating` and
+// reached over the overlay if it lives elsewhere.

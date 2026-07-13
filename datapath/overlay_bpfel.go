@@ -325,7 +325,6 @@ const (
 	overlayMapDnsCt                 = "dns_ct"
 	overlayMapDnsIps                = "dns_ips"
 	overlayMapFabricOf              = "fabric_of"
-	overlayMapFloatAnnounce         = "float_announce"
 	overlayMapFloatNet              = "float_net"
 	overlayMapFloatUplinkMac        = "float_uplink_mac"
 	overlayMapFloating              = "floating"
@@ -444,7 +443,6 @@ type overlayMapSpecs struct {
 	DnsCt          *ebpf.MapSpec `ebpf:"dns_ct"`
 	DnsIps         *ebpf.MapSpec `ebpf:"dns_ips"`
 	FabricOf       *ebpf.MapSpec `ebpf:"fabric_of"`
-	FloatAnnounce  *ebpf.MapSpec `ebpf:"float_announce"`
 	FloatNet       *ebpf.MapSpec `ebpf:"float_net"`
 	FloatUplinkMac *ebpf.MapSpec `ebpf:"float_uplink_mac"`
 	Floating       *ebpf.MapSpec `ebpf:"floating"`
@@ -525,7 +523,6 @@ type overlayMaps struct {
 	DnsCt          *ebpf.Map `ebpf:"dns_ct"`
 	DnsIps         *ebpf.Map `ebpf:"dns_ips"`
 	FabricOf       *ebpf.Map `ebpf:"fabric_of"`
-	FloatAnnounce  *ebpf.Map `ebpf:"float_announce"`
 	FloatNet       *ebpf.Map `ebpf:"float_net"`
 	FloatUplinkMac *ebpf.Map `ebpf:"float_uplink_mac"`
 	Floating       *ebpf.Map `ebpf:"floating"`
@@ -582,7 +579,6 @@ func (m *overlayMaps) Close() error {
 		m.DnsCt,
 		m.DnsIps,
 		m.FabricOf,
-		m.FloatAnnounce,
 		m.FloatNet,
 		m.FloatUplinkMac,
 		m.Floating,

@@ -283,13 +283,6 @@ func schema_cozyplane_api_sdn_v1alpha1_ExternalPoolSpec(ref common.ReferenceCall
 							},
 						},
 					},
-					"advertisement": {
-						SchemaProps: spec.SchemaProps{
-							Description: "Advertisement is how in-use addresses are announced to the physical network. Empty selects the controller default (L2).",
-							Type:        []string{"string"},
-							Format:      "",
-						},
-					},
 				},
 			},
 		},
