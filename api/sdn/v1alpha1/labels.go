@@ -33,6 +33,25 @@ const (
 	// VPC has spec.egress.natGateway enabled.
 	AnnotationGatewayFor = "sdn.cozystack.io/gateway-for"
 
+	// AnnotationVPCIP and AnnotationVPCMAC are stamped BY the CNI ONTO the pod: the
+	// VPC address and MAC it just allocated. They are how a tenant learns its own
+	// network identity (docs/multitenancy.md R1).
+	//
+	// Without them a tenant cannot discover its own address at all. `status.podIP`
+	// is the FABRIC IP — the underlay handle the platform routes and kubelet probes
+	// — not the address the pod's own interface carries and not the address anything
+	// inside the VPC uses. The real identity lives on the cluster-scoped Port, which
+	// a tenant may never read (R2), so it would be invisible.
+	//
+	// They are a CACHE, never a source of truth: the Port is authoritative, nothing
+	// reads these back, and their lifetime is exactly the claim's — the pod dies and
+	// they die with it. That is deliberate. A namespaced object COPYING the address
+	// would be the stale-copy bug rebuilt (we deleted Port.spec.fabricIP for exactly
+	// that reason); an annotation on the object the address belongs to cannot drift
+	// away from its owner.
+	AnnotationVPCIP  = "sdn.cozystack.io/vpc-ip"
+	AnnotationVPCMAC = "sdn.cozystack.io/vpc-mac"
+
 	// LabelVPC is the referenced VPC's name.
 	LabelVPC = "sdn.cozystack.io/vpc"
 	// LabelVPCNamespace is the referenced VPC's (owner) namespace.

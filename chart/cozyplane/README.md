@@ -61,5 +61,6 @@ most likely to set:
   revocation, and maintains VPCPeering status.
 - The `sdn.cozystack.io` API: `vpcs`, `vpcbindings`, `vpcpeerings`, `ports` — as
   CRDs (the aggregated server is [cozyplane-apiserver](../cozyplane-apiserver)).
-- RBAC for both components, the `cozyplane-vpc-owner` sample role, and the export
+- RBAC for both components, the aggregated tenant roles (`cozyplane-tenant-edit` /
+  `-view`, docs/multitenancy.md), and the export
   ValidatingAdmissionPolicy.

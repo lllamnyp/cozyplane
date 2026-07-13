@@ -371,6 +371,15 @@ func addVPC(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, p
 		return err
 	}
 
+	// R1 (docs/multitenancy.md): stamp the workload with the identity we just gave
+	// it. A tenant cannot read the Port (it is cluster-scoped, and no tenant role
+	// may ever include a cluster-scoped read), and status.podIP is the FABRIC IP —
+	// so without this the tenant cannot discover its own VPC address at all.
+	//
+	// Best-effort: it is a convenience projection, not datapath state. If it fails
+	// the pod still works; it just cannot tell you its own address.
+	stampVPCIdentity(podNS, podName, vpcIP, podMAC)
+
 	// Bridge: route the (unique) fabric IP to this veth and publish the
 	// fabric -> {net, VPC IP} mapping; the eBPF datapath does the NAT. Both
 	// families are handled — the v6 fabric bridge (bridge_forward6/reverse6)
@@ -1160,4 +1169,26 @@ func nextIP(ip net.IP) net.IP {
 		}
 	}
 	return out
+}
+
+// stampVPCIdentity writes the pod's own VPC address and MAC onto the pod
+// (docs/multitenancy.md R1) — the one place a tenant can read them.
+//
+// It is deliberately a pod annotation and not a namespaced object mirroring the
+// Port: a second object holding a copy of the address is the stale-copy bug we
+// removed when Port.spec.fabricIP was normalized away. An annotation on the pod
+// cannot outlive, or drift from, the claim it describes.
+func stampVPCIdentity(podNS, podName string, vpcIP net.IP, mac net.HardwareAddr) {
+	if podNS == "" || podName == "" || vpcIP == nil {
+		return
+	}
+	core, err := coreClient()
+	if err != nil {
+		return // best-effort: the pod works, it just cannot name its own address
+	}
+	patch := fmt.Appendf(nil, `{"metadata":{"annotations":{%q:%q,%q:%q}}}`,
+		sdnv1alpha1.AnnotationVPCIP, vpcIP.String(),
+		sdnv1alpha1.AnnotationVPCMAC, mac.String())
+	_, _ = core.CoreV1().Pods(podNS).Patch(context.TODO(), podName,
+		k8stypes.MergePatchType, patch, metav1.PatchOptions{})
 }
