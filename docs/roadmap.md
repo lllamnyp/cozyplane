@@ -13,6 +13,64 @@ they're discovered rather than leaving them only in issues.
 
 ---
 
+## Immediate roadmap — what's genuinely open
+
+The sections below are the full ledger, and most of it is ticked. This is the
+short list: what is actually left, in rough priority order. Revised 2026-07-13,
+once the network-security arc closed (all three policy layers built, SG v2 tail
+done).
+
+**Features**
+
+1. **Multi-tenancy model** — the API is single-tenant today. The load-bearing
+   architectural gap, and the one thing standing between cozyplane and its own
+   stated purpose; everything else here is refinement (§1).
+2. **Floating-IP HA beyond L2** — a BGP speaker, or multi-node HA. Today the
+   address is L2-announced from the target pod's node alone (§3).
+3. **Per-VPC metadata endpoint + guest autoconfiguration** — design drafted in
+   [vm-provisioning.md](vm-provisioning.md), awaiting review (§3).
+4. **Site-to-site VPN** ([#6](../../issues/6)) and **cross-family v4↔v6
+   translation** ([#9](../../issues/9)) — design drafts exist; neither is urgent
+   (§3, §4).
+5. **SecurityGroup v2 leftovers**, all low priority: ICMP rules; peer-existence
+   validation for peer refs; and **a real connection table to replace the TCP
+   SYN-gate** — that last one is shared with NetworkPolicy and HostFirewall, so it
+   wants solving once for all three layers rather than three times. FQDN egress is
+   **rejected**: it needs a DNS-snooping engine, which is out of scope (§3).
+
+**Hardening**
+
+6. **Node-origin path-trust** — all three policy layers still recognise node
+   origin by *source address* (`np_nodes` / `hf_self` / `NS_MARK`-absence). The v6
+   masquerade-laundering bug proved the class is exploitable; the fix is to trust
+   the *channel* (host→veth same-node, `node_remotes` overlay cross-node,
+   TLV-authenticatable) instead. Cheap first step: per-layer
+   `*_node_exempt_total` counters, so the exemption is at least visible.
+   **Net-0 RPF for NetworkPolicy identity** is the same one-lookup shape as the
+   `from_pod` RPF SG v2 shipped — the natural follow-on (§6).
+7. **NP egress vs VPC-pod fabric IPs** — a decision, not a build: either drop VPC
+   pods from `np_ident` (fabric IPs become `ipBlock` territory) or document the
+   corner as intended (§6).
+
+**Test gaps**
+
+8. **VM-migration e2e** — none exists, anywhere; and the cutover path changed when
+   `Port.spec.fabricIP` was normalized away (the controller's fabric-IP copy was
+   deleted). Real-cluster hand-validation is the only coverage (§5, §8).
+9. **`test/e2e.sh` has not run since the API-group split** — it is the only
+   coverage for *external* floating-IP and LoadBalancer ingress, and by
+   construction it cannot run on a real cluster (its "external" clients are
+   containers on kind's docker network). Two honest options: give a real test
+   cluster a genuine off-cluster client, or accept kind-in-CI for exactly those
+   phases (§8).
+
+**Deferred by decision** — not gaps; recorded so they aren't re-litigated: the
+CRD-storage shim (§7 — no longer forced, now the built-in etcd is PVC-backed);
+`NodeFabric` (it would restate `Node` and fix nothing); name-based addressing
+(§3 — judgement pending on what the split-horizon resolver already gives).
+
+---
+
 ## 1. Foundation & control plane
 
 - [x] Object model: `VPC`, `Port`, `VPCBinding`, `VPCPeering`, `ExternalPool`, `FloatingIP`
@@ -50,7 +108,7 @@ they're discovered rather than leaving them only in issues.
 - [x] Gate `VPCPeering` creation on a `peer` virtual verb on the local VPC — strategy-enforced in aggregated mode (which also closed the `export` gap there: admission never sees aggregated resources), VAP twin for CRD mode — [#1](../../issues/1)
 - [ ] Floating-IP advertisement beyond L2: BGP speaker / multi-node HA (today the address is L2-announced from the target pod's node only, GARP/NA on move)
 - [ ] Site-to-site VPN: authorized-forwarder role + per-VPC route table — [#6](../../issues/6)
-- [ ] Network policy / security groups within a VPC — **v1 + peered-group refs + north-south (world) done** ([security-groups.md](security-groups.md)): east-west group-to-group ingress, destination-side eBPF (`sg_members`/`sg_rules`, TCP SYN-gate, per-VPC id allocation, membership from stamped pod labels); **peered-VPC group refs** (`from: {group, vpc}`) authoritative via a Geneve identity TLV; **north-south `from: {cidr}`** (AWS-strict default-deny, kubelet exempt by NS_MARK path; all-addresses via SG_WORLD, specific ranges via an `sg_cidr` LPM); **east-west egress** (`egress: {to: {group, vpc}}`, symmetric default-deny, `sg_egress` mirror enforced beside ingress in to_pod + the TLV path); **north-south/external egress** (`egress: {to: {cidr}}`, source-side default-deny at `from_pod`'s gateway path via a loop-free `ns_egress_ok` + `sg_egress_cidr` LPM — plus the off-VPC-transit fix so the pod→gateway hop isn't re-gated as east-west, which had silently broken all grouped-pod TCP/UDP north-south egress) — all dev-cluster-validated. **label-follows membership DONE 2026-07-12** (live pod labels, not the claim-time snapshot; the snapshot survives as the fallback for a Port with no live pod, so a persistent VM Port holds membership steady between launchers — dev-cluster-validated: relabel a running pod out of its group and back). **v2 tail DONE 2026-07-13:** `from_pod` source-IP RPF (anti-spoof — a pod can no longer forge a co-VPC neighbour's address to borrow its groups; the fix closes it on every path, since the cross-node TLV's srcmap was itself computed from the spoofable source; dev-cluster-validated by delivery-capture), overlapping north-south CIDR union across groups ([#11](../../issues/11), compiler `unionContaining`, unit-tested), and floating-pod egress gating (`ns_egress_ok` now covers the floating path too). Still outstanding (lower priority): FQDN egress (**rejected** — a DNS-snooping engine is out of scope), [#11](../../issues/11)
+- [ ] Network policy / security groups within a VPC — **v1 + peered-group refs + north-south (world) done** ([security-groups.md](security-groups.md)): east-west group-to-group ingress, destination-side eBPF (`sg_members`/`sg_rules`, TCP SYN-gate, per-VPC id allocation, membership from stamped pod labels); **peered-VPC group refs** (`from: {group, vpc}`) authoritative via a Geneve identity TLV; **north-south `from: {cidr}`** (AWS-strict default-deny, kubelet exempt by NS_MARK path; all-addresses via SG_WORLD, specific ranges via an `sg_cidr` LPM); **east-west egress** (`egress: {to: {group, vpc}}`, symmetric default-deny, `sg_egress` mirror enforced beside ingress in to_pod + the TLV path); **north-south/external egress** (`egress: {to: {cidr}}`, source-side default-deny at `from_pod`'s gateway path via a loop-free `ns_egress_ok` + `sg_egress_cidr` LPM — plus the off-VPC-transit fix so the pod→gateway hop isn't re-gated as east-west, which had silently broken all grouped-pod TCP/UDP north-south egress) — all dev-cluster-validated. **label-follows membership DONE 2026-07-12** (live pod labels, not the claim-time snapshot; the snapshot survives as the fallback for a Port with no live pod, so a persistent VM Port holds membership steady between launchers — dev-cluster-validated: relabel a running pod out of its group and back). **v2 tail DONE 2026-07-13:** `from_pod` source-IP RPF (anti-spoof — a pod can no longer forge a co-VPC neighbour's address to borrow its groups; the fix closes it on every path, since the cross-node TLV's srcmap was itself computed from the spoofable source; dev-cluster-validated by delivery-capture), overlapping north-south CIDR union across groups ([#11](../../issues/11), compiler `unionContaining`, unit-tested), and floating-pod egress gating (`ns_egress_ok` now covers the floating path too). Still outstanding (lower priority): ICMP rules, peer-existence validation for peer refs, and a real connection table to replace the TCP SYN-gate (shared with NetworkPolicy and HostFirewall — solve once for all three, not three times). FQDN egress is **rejected** — a DNS-snooping engine is out of scope
 - [ ] Per-VPC metadata endpoint + guest autoconfiguration — **design draft: [vm-provisioning.md](vm-provisioning.md)** (awaiting review; also closes #8)
 - [x] Services in a VPC: per-VPC service VIPs + split-horizon DNS + net-scoped service NAT — **design: [services-in-vpc.md](services-in-vpc.md)** (reviewed; prioritized ahead of the KPR work)
   - [x] Increment 1 — split-horizon resolver: DNS steering in the datapath (`dns_steer`/`dns_return` + the `dns_ct` socket-LB coexistence twist), per-node responder, annotation-gated headless answers as VPC IPs, authoritative NXDOMAIN for the rest of the cluster domain, upstream forwarding (e2e-covered; validated on the dev cluster under Talos + Cilium KPR)
