@@ -3235,12 +3235,16 @@ static __always_inline int vpc_nat_reverse(struct __sk_buff *skb, struct pkt *p)
 		nat_icmp_id(skb, gw_port, rv->client_port);
 	else
 		nat_port(skb, proto, L4_DPORT_OFF, gw_port, rv->client_port);
-	// This is the REPLY to a flow the pod itself opened — the SecurityGroup egress
-	// gate already ran at the SNAT, and there is a ct_rev entry to prove the flow
-	// exists. Without saying so, to_pod sees an unsolicited packet from an external
-	// address and applies its ingress gate, which drops it: the reply would be
-	// un-NAT'd correctly and then thrown away on the pod's own doorstep.
-	skb->mark |= SG_OK;
+	// This IS gateway-forwarded ingress — the VPC's gateway, now in eBPF — and it
+	// has to say so, or to_pod throws the reply away on the pod's own doorstep.
+	// Two gates there care: the isolation check refuses srcnet==0 -> dstnet!=0
+	// except for GW_MARK, and the SG ingress gate re-judges anything unmarked. The
+	// reply is neither unsolicited nor unjudged: the pod opened the flow, the SG
+	// EGRESS gate ran at the SNAT, and ct_rev proves it.
+	//
+	// ASSIGNED, not OR'd: the isolation escape tests `skb->mark == GW_MARK` for
+	// exact equality, so an extra bit is as good as no mark at all.
+	skb->mark = GW_MARK;
 	count_ns(net, skb->len, NS_GW, 1);
 	return deliver_local(skb, l);
 }
