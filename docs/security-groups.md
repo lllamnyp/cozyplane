@@ -393,13 +393,15 @@ non-floating traffic — those paths return earlier).
   after the world check. Validated: an exact `/32`, a covering `/24`, and
   non-matching ranges all resolve correctly.
 
-  *Limitation ([#11](../../issues/11)):* LPM returns the **longest** matching
-  prefix only, so overlapping CIDR rules from *different* groups on the same
-  `{net, proto, port}` don't union — a client covered by both a `/16` (group A)
-  and a `/24` (group B) resolves to the `/24`'s bitmap alone, so a pod in group A
-  only is wrongly denied. Non-overlapping rules, identical CIDRs across groups
-  (unioned in the value bitmap), and a pod in a single group (the common case)
-  are exact; a true union would need a per-group LPM or a prefix-walk.
+  **Overlapping-CIDR union ([#11](../../issues/11)) — FIXED.** LPM returns only
+  the longest-matching prefix, so a `/24` from group B would shadow a covering
+  `/16` from group A, and a pod in group A alone was wrongly denied a client both
+  rules should admit. The map can't express "match all covering prefixes" in one
+  lookup, so the union is precomputed in the compiler (`unionContaining`): each
+  entry's bitmap gains the groups of every rule in the same `{net, proto, port}`
+  tier whose CIDR **contains** it. The longest-match entry then carries the union
+  of every rule covering its range — the `np_cidr` allow-propagation discipline,
+  applied to group bitmaps. Same-family, same-tier only; O(n²) per tier, n tiny.
 
 ## v2: egress rules (built + dev-cluster-validated)
 
@@ -529,10 +531,52 @@ east-west egress check — grouped TCP/UDP north-south egress was fully broken (
 ICMP, never gated, worked). East-west enforcement is unchanged by the fix (an
 in-VPC destination is still gated: `client`→`web` needs both directions).
 
+## v2: `from_pod` source-IP RPF (anti-spoof) — BUILT
+
+The load-bearing gap. SecurityGroup **membership is keyed on the source
+address**: `sg_members[{net, src_ip}] -> group bitmap`. So a pod that forges a
+co-VPC neighbour's IP inherits that neighbour's groups — every ingress rule that
+admits them, and (via `sg_egress`) every north-south `to: {cidr}` allowance they
+hold. The address *is* the credential, and it was unauthenticated.
+
+The Geneve TLV does **not** close this, contrary to how "stage B, authoritative"
+reads at first glance. The TLV is anti-spoof against a *forwarder* forging the
+option in flight (a pod can't write Geneve options) — but the source node
+computes the stamped `srcmap` as `sg_members[{srcnet, p.src}]`, from the
+spoofable `p.src`. Forge the source IP and the source node stamps the *victim's*
+groups into the "authoritative" option. So the hole is not same-node-only; it is
+every path. RPF at `from_pod` is the one fix for all of them.
+
+**The check.** Every local pod's veth registers its `{net, VPC IP}` in `locals`
+(dual-stack: one entry per family), all pointing at that veth's ifindex. So the
+source's honesty is a single lookup: `local_of(srcnet, p.src)` must return an
+endpoint whose `ifindex` is the veth the packet actually arrived on. A forged
+co-VPC address resolves to a *different* veth (or, for a remote/nonexistent
+address, to nothing) — ifindex mismatch, drop. Placement-independent by
+construction: the same-node path is now exactly as trustworthy as the wire, and
+even the cross-node encap no longer stamps a forged `srcmap`, because the packet
+never reaches the encap.
+
+Scope and exemptions:
+- **VPC pods only** (`srcnet != 0`). Gateway legs (`is_gw`) are exempt: they
+  legitimately forward off-VPC traffic whose source is not a local pod. The
+  default network (net 0) has the identical mechanism for NetworkPolicy
+  (`np_ident` keyed on the address); RPF there is a follow-up, tracked
+  separately — it is the same one-lookup shape.
+- Runs before DNS steering / isolation / the encap, so a spoofed packet is
+  dropped at its origin veth and never influences any downstream identity
+  decision.
+- **Stack:** `from_pod` hosts no BPF-to-BPF callee (496-byte frame, the 544
+  lesson). The `local_of` probe is inline (its `local_key` shares the frame slot
+  the hook's other `local_of`/`sg_members` keys already use), and the drop is
+  counted inline against `sg_drops[srcnet]` — the existing per-VPC counter,
+  since a spoof is a security-group drop. A dedicated metric can split later.
+
 ## v2 backlog (remaining)
 
-Floating-pod egress gating; FQDN sources;
-label-change-follows membership; ICMP rules; a real conntrack to replace the TCP
-SYN-gate; `from_pod` source-IP RPF (authoritative source group + general
-anti-spoof); peer-existence validation for peer refs;
-[#11](../../issues/11) (overlapping north-south cidr union).
+FQDN sources (rejected — a DNS-snooping engine is out of scope); ICMP rules; a
+real conntrack to replace the TCP SYN-gate (shared with NetworkPolicy and the
+host firewall — solve once, not three times); peer-existence validation for peer
+refs; net-0 RPF for NetworkPolicy identity (same shape as above).
+See also: floating-pod egress gating (below), [#11](../../issues/11)
+(overlapping north-south cidr union, below).

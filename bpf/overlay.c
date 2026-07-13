@@ -2790,6 +2790,13 @@ static __always_inline int floating_egress_snat(struct __sk_buff *skb, struct ip
 		return FLOAT_MISS;
 	if (is_internal(dst128))
 		return FLOAT_MISS; // internal: let the gateway proxy DNS / deny the rest
+	// SecurityGroup egress applies to a floating pod's off-VPC traffic too
+	// (docs/security-groups.md § floating egress): a grouped floating pod is
+	// gated by its to:{cidr} rules, exactly like a gateway'd pod — closing the
+	// gap where floating egress returned before the isolation block's gate.
+	// Ungrouped pods, replies (SYN-gated) and ICMP pass inside ns_egress_ok.
+	if (!ns_egress_ok(skb, net, 0, proto, src128, dst128))
+		return TC_ACT_SHOT;
 	// Floating egress leaves by the floating uplink (the link that carries the
 	// public range) — only there is the public source a valid address for the
 	// wire. Falls back to the default uplink when they are the same link.
@@ -3083,6 +3090,9 @@ static __always_inline int floating_egress_snat6(struct __sk_buff *skb, struct p
 		return FLOAT_MISS;
 	if (is_internal(p->dst))
 		return FLOAT_MISS;
+	// SG egress gates a floating pod's off-VPC traffic (the v4 twin's rationale).
+	if (!ns_egress_ok(skb, net, 1, proto, p->src, p->dst))
+		return TC_ACT_SHOT;
 	// Same floating-uplink selection as the v4 path. No explicit v6 next-hop
 	// yet (CFG_FLOAT_NH is a v4 cell): on a distinct floating uplink, v6
 	// off-subnet egress still resolves via the FIB — revisit with v6 floating.
@@ -4296,6 +4306,27 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	// veth answers, never overlay-deliver it or subject it to isolation.
 	if (p.is_v6 && v6_link_scoped(&p.dst))
 		return TC_ACT_OK;
+
+	// Source-address RPF (docs/security-groups.md § anti-spoof). A VPC pod's
+	// SecurityGroup identity is keyed on its source IP (sg_members[{net,src}]),
+	// so a pod forging a co-VPC neighbour's address would inherit that
+	// neighbour's groups — on every path, since the cross-node TLV's srcmap is
+	// itself computed from this (spoofable) p.src. Authenticate it here, at the
+	// origin veth: the source must own the address it claims — locals[{srcnet,
+	// p.src}] must resolve to THIS veth. A forged co-VPC IP maps to a different
+	// veth (or nothing); drop it before it can influence any downstream
+	// identity decision. Gateway legs are exempt (they forward off-VPC sources).
+	// Inline, no callee (from_pod's 496-byte frame; the 544 lesson); the drop
+	// counts against the per-VPC sg_drops counter.
+	if (srcnet && !is_gw) {
+		struct endpoint *self = local_of(srcnet, p.src);
+		if (!self || self->ifindex != ifindex) {
+			__u64 *d = bpf_map_lookup_elem(&sg_drops, &srcnet);
+			if (d)
+				(*d)++;
+			return TC_ACT_SHOT;
+		}
+	}
 
 	// The destination's network, resolved within the source's scope: its own
 	// CIDR or a peer's. Overlapping CIDRs in other VPCs are invisible here.

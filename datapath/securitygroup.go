@@ -87,9 +87,60 @@ type SGCidr struct {
 // CIDR is encoded in the datapath's NAT64 form (client addresses are v4_to_128),
 // so its /N becomes /(96+N) in the 128-bit client space; the map key prefix is
 // the 64 fixed bits (net+port+proto) plus that client prefix.
+// cidrGroup is one north-south CIDR rule for containment analysis: a scope
+// (net for ingress, src_net for egress), the {proto, port} tier, the range, and
+// the source groups the rule admits.
+type cidrGroup struct {
+	scope  uint32
+	proto  uint8
+	port   uint16
+	cidr   *net.IPNet
+	groups uint64
+}
+
+// unionContaining fixes #11: the sg_cidr LPM returns exactly ONE entry (the
+// longest match), so a narrower prefix from an unrelated group SHADOWS a broader
+// one, and rules that should union do not. The map cannot express "match all
+// covering prefixes" in one lookup, so the union is precomputed here: each
+// entry's bitmap gains the groups of every rule in the same {scope, proto, port}
+// tier whose CIDR CONTAINS it. The longest-match entry then carries the union of
+// every rule covering its range. O(n^2) per tier, n tiny.
+func unionContaining(items []cidrGroup) []uint64 {
+	out := make([]uint64, len(items))
+	for i := range items {
+		e := items[i]
+		if e.cidr == nil {
+			continue
+		}
+		eOnes, _ := e.cidr.Mask.Size()
+		acc := e.groups
+		for j := range items {
+			if j == i {
+				continue
+			}
+			f := items[j]
+			if f.cidr == nil || f.scope != e.scope || f.proto != e.proto || f.port != e.port {
+				continue
+			}
+			fOnes, _ := f.cidr.Mask.Size()
+			// f contains e iff f is no more specific and e's network sits in f.
+			if fOnes <= eOnes && f.cidr.Contains(e.cidr.IP) {
+				acc |= f.groups
+			}
+		}
+		out[i] = acc
+	}
+	return out
+}
+
 func (m *Manager) SyncSGCidr(entries []SGCidr) error {
+	items := make([]cidrGroup, len(entries))
+	for i, e := range entries {
+		items[i] = cidrGroup{scope: e.Net, proto: e.Proto, port: e.Port, cidr: e.CIDR, groups: e.AllowedGroups}
+	}
+	groups := unionContaining(items)
 	want := map[overlaySgCidrKey]uint64{}
-	for _, e := range entries {
+	for i, e := range entries {
 		if e.CIDR == nil {
 			continue
 		}
@@ -113,7 +164,7 @@ func (m *Manager) SyncSGCidr(entries []SGCidr) error {
 			Proto:     uint16(e.Proto),
 			Client:    a,
 		}
-		want[key] |= e.AllowedGroups
+		want[key] |= groups[i]
 	}
 	return syncMap(m.objs.SgCidr, want)
 }
@@ -132,8 +183,13 @@ type SGEgressCidr struct {
 // SyncSGEgressCidr makes the sg_egress_cidr LPM map exactly `entries` (full-state
 // diff), the egress twin of SyncSGCidr keyed by source net + destination CIDR.
 func (m *Manager) SyncSGEgressCidr(entries []SGEgressCidr) error {
+	items := make([]cidrGroup, len(entries))
+	for i, e := range entries {
+		items[i] = cidrGroup{scope: e.SrcNet, proto: e.Proto, port: e.Port, cidr: e.CIDR, groups: e.AllowedGroups}
+	}
+	groups := unionContaining(items)
 	want := map[overlaySgEgressCidrKey]uint64{}
-	for _, e := range entries {
+	for i, e := range entries {
 		if e.CIDR == nil {
 			continue
 		}
@@ -157,7 +213,7 @@ func (m *Manager) SyncSGEgressCidr(entries []SGEgressCidr) error {
 			Proto:     uint16(e.Proto),
 			Dest:      a,
 		}
-		want[key] |= e.AllowedGroups
+		want[key] |= groups[i]
 	}
 	return syncMap(m.objs.SgEgressCidr, want)
 }
