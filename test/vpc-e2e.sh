@@ -264,27 +264,30 @@ phase "anti-spoof: from_pod RPF drops a forged source"
 # gets no reply anyway (it went to the forged address), so we CAPTURE on the
 # destination and confirm the forged SYN never arrives — with a non-spoofed SYN
 # as the positive control that the capture works.
-# Needs raw sockets (hping3) and tcpdump; netshoot has both. Skip if absent.
-if ! $K -n "$NS" exec a2 -- sh -c 'command -v hping3 && command -v tcpdump' >/dev/null 2>&1; then
-  skip "RPF (hping3/tcpdump not in the image)"
+# Needs raw sockets (nping) and tcpdump; netshoot has both. Skip if absent.
+if ! $K -n "$NS" exec a2 -- sh -c 'command -v nping && command -v tcpdump' >/dev/null 2>&1; then
+  skip "RPF (nping/tcpdump not in the image)"
 else
   # A forged source in the VPC CIDR that a2 does NOT own (a1's neighbour range).
   SPOOF="10.90.0.240"
-  cap() { # <filter-src> -> "1" if a SYN to :8080 from that src reached a1
+  cap() { # <filter-src>: prints the count of SYNs to :8080 from that src that reached a1
     $K -n "$NS" exec a1 -- sh -c \
-      "timeout 6 tcpdump -ni any -c1 'tcp[tcpflags] & tcp-syn != 0 and dst port 8080 and src host $1' >/tmp/c 2>/dev/null; grep -c 'seq' /tmp/c 2>/dev/null || echo 0"
+      "timeout 6 tcpdump -lni any -c1 \"tcp[tcpflags] \& tcp-syn != 0 and dst port 8080 and src host $1\" 2>/dev/null | grep -c flags"
   }
-  # Positive control: a2's OWN source must arrive (proves the capture path works).
-  ( sleep 1; $K -n "$NS" exec a2 -- hping3 -c 2 -S -p 8080 "$A1" >/dev/null 2>&1 ) &
-  got=$(cap "$A2")
-  wait
-  [ "${got:-0}" -ge 1 ] && pass "positive control: a2's genuine SYN reaches a1 (capture works)" \
-    || fail "capture positive control failed — a2's real SYN did not arrive (got '$got')"
-  # The spoof: a2 sends a SYN with a forged co-VPC source. RPF must drop it at
-  # a2's from_pod, so a1 never sees it.
-  ( sleep 1; $K -n "$NS" exec a2 -- hping3 -c 2 -S -p 8080 -a "$SPOOF" "$A1" >/dev/null 2>&1 ) &
-  got=$(cap "$SPOOF")
-  wait
+  fire() { # <src-ip> — a spoofed (or genuine) SYN from a2 to a1:8080
+    $K -n "$NS" exec a2 -- nping --tcp -c 3 -p 8080 --flags syn -S "$1" --rate 3 "$A1" >/dev/null 2>&1
+  }
+  # Positive control: a2's OWN source must arrive (proves the capture path works
+  # AND that a genuine SYN from a2 is delivered, i.e. RPF admits the honest one).
+  ( sleep 1; fire "$A2" ) &
+  got=$(cap "$A2"); wait
+  [ "${got:-0}" -ge 1 ] && pass "positive control: a2's genuine SYN reaches a1 (RPF admits the honest source)" \
+    || fail "positive control failed — a2's real SYN did not arrive (got '$got')"
+  # The spoof: a2 forges a co-VPC source it does not own. RPF must drop it at
+  # a2's own from_pod, so a1 never sees it — decisive because delivery, not a
+  # reply, is what is observed (a spoofed packet forfeits its reply regardless).
+  ( sleep 1; fire "$SPOOF" ) &
+  got=$(cap "$SPOOF"); wait
   [ "${got:-0}" -eq 0 ] && pass "a forged co-VPC source is dropped at the origin veth (RPF); a1 never sees it" \
     || fail "SPOOFED packet reached a1 — RPF did not drop it (got '$got')"
 fi
