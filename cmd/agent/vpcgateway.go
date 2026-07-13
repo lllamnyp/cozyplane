@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net"
 	"sync"
 
 	"k8s.io/apimachinery/pkg/labels"
@@ -41,7 +42,7 @@ import (
 // Recompute-and-diff against the pinned map, like every other watcher here: the
 // map outlives the agent, so a gateway deleted while it was down must be pruned.
 func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFactory, mgr *datapath.Manager,
-	nodes *nodePoolIndex, nodeIPs *nodeIPIndex, selfName string, log *slog.Logger) {
+	nodes *nodePoolIndex, nodeIPs *nodeIPIndex, selfName, selfIP string, log *slog.Logger) {
 	gws := factory.Sdn().V1alpha1().VPCGateways()
 	vpcs := factory.Sdn().V1alpha1().VPCs()
 	pools := factory.Sdn().V1alpha1().ExternalPools()
@@ -80,14 +81,14 @@ func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFa
 			log.Error("read vpc_nat map", "err", err)
 			return
 		}
-		for net, addr := range wantNAT {
+		for vni, addr := range wantNAT {
 			if selfShard >= 0 {
 				base, span, ok := datapath.NATShardFor(selfShard)
 				if !ok {
 					log.Warn("more nodes than NAT port shards; this node cannot NAT",
 						"node", selfName, "index", selfShard, "shards", datapath.NATShards)
-				} else if err := mgr.SetVPCNAT(net, addr, base, span); err != nil {
-					log.Error("set vpc nat", "vni", net, "addr", addr, "err", err)
+				} else if err := mgr.SetVPCNAT(vni, addr, base, span); err != nil {
+					log.Error("set vpc nat", "vni", vni, "addr", addr, "err", err)
 					continue
 				}
 			}
@@ -95,7 +96,16 @@ func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFa
 				if i >= datapath.NATShards {
 					break
 				}
+				// nodeIPIndex holds only the OTHER nodes — it exists to feed
+				// `remotes`, and watchNodes skips self. But the shard table must
+				// name every node INCLUDING this one, or the reverse lookup misses
+				// on exactly the node that holds the flow: the reply falls through
+				// to the kernel, which ARPs for an address the node itself
+				// announces. (It did. That is how this was found.)
 				ip := nodeIPs.get(n)
+				if n == selfName {
+					ip = net.ParseIP(selfIP)
+				}
 				if ip == nil {
 					continue
 				}
@@ -115,21 +125,21 @@ func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFa
 			} else if err := mgr.DelAnnounce(addr); err != nil {
 				log.Error("stop announcing nat address", "addr", addr, "err", err)
 			}
-			if curNAT[net] != addr {
-				log.Info("VPC egresses as its own address", "vni", net, "nat", addr, "announced_here", mine)
+			if curNAT[vni] != addr {
+				log.Info("VPC egresses as its own address", "vni", vni, "nat", addr, "announced_here", mine)
 			}
 		}
-		for net, addr := range curNAT {
-			if _, ok := wantNAT[net]; !ok {
+		for vni, addr := range curNAT {
+			if _, ok := wantNAT[vni]; !ok {
 				_ = mgr.DelAnnounce(addr)
-				if err := mgr.DelVPCNAT(net, addr); err != nil {
-					log.Error("del vpc nat", "vni", net, "err", err)
+				if err := mgr.DelVPCNAT(vni, addr); err != nil {
+					log.Error("del vpc nat", "vni", vni, "err", err)
 					continue
 				}
 				for i := range datapath.NATShards {
 					_ = mgr.DelNATOwner(addr, uint16(i))
 				}
-				log.Info("VPC lost its egress identity", "vni", net, "nat", addr)
+				log.Info("VPC lost its egress identity", "vni", vni, "nat", addr)
 			}
 		}
 
