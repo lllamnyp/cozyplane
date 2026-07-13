@@ -52,6 +52,15 @@ kind: ClusterRole
 metadata:
   name: cozyplane-apiserver
 rules:
+  # ResourceQuota admission (docs/multitenancy.md R5): this server enforces
+  # count/<resource>.sdn.cozystack.io itself — the kube-apiserver's quota cannot see
+  # an aggregated API's kinds. Reads the tenant's quotas, writes usage to status.
+  - apiGroups: [""]
+    resources: ["resourcequotas"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["resourcequotas/status"]
+    verbs: ["get", "update", "patch"]
   # NamespaceLifecycle admission needs these.
   - apiGroups: [""]
     resources: ["namespaces"]

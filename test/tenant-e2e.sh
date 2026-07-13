@@ -159,6 +159,68 @@ echo "  the Port's truth:             $TRUE_IP"
   && pass "R1 is served through the pod the tenant already owns — R2 stays intact" \
   || fail "R1 required widening the tenant's reads"
 
+# ---------------------------------------------------------------------------
+phase "R5: a tenant cannot exhaust what it does not own"
+# The ceiling is a plain Kubernetes ResourceQuota — no new kind, no new
+# vocabulary. The kube-apiserver's quota admission cannot see an aggregated API's
+# kinds, so cozyplane's own apiserver enforces count/<resource>.sdn.cozystack.io
+# through the quota Evaluator interface.
+apply <<EOF
+apiVersion: v1
+kind: ResourceQuota
+metadata: {name: network, namespace: $A}
+spec:
+  hard:
+    count/vpcs.sdn.cozystack.io: "2"
+    count/floatingips.sdn.cozystack.io: "1"
+EOF
+sleep 3
+
+# The VPC created earlier for R1 counts as 1. One more fits; the third must not.
+apply <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: VPC
+metadata: {name: vb, namespace: $A}
+spec: {cidrs: ["10.91.0.0/24"]}
+EOF
+pass "a tenant may create VPCs up to its quota (2)"
+
+ERR=$($K -n "$A" create -f - 2>&1 <<EOF || true
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: VPC
+metadata: {name: vc, namespace: $A}
+spec: {cidrs: ["10.92.0.0/24"]}
+EOF
+)
+echo "$ERR" | grep -qi "exceeded quota" \
+  && pass "the VPC over the ceiling is REFUSED by ResourceQuota (the VNI keyspace is bounded)" \
+  || fail "a tenant exceeded its VPC quota (got: $(echo "$ERR" | head -1))"
+
+# The quota's usage is observed and written back, like any other quota.
+USED=$($K -n "$A" get resourcequota network -o jsonpath='{.status.used.count/vpcs\.sdn\.cozystack\.io}' 2>/dev/null)
+[ "$USED" = "2" ] \
+  && pass "the quota's status reports observed usage (used=$USED) — it is a real quota, not a gate" \
+  || fail "quota usage not reported (got '$USED')"
+
+# And the pool: an EIP is an address out of a scarce, operator-granted pool.
+# `attach` was a BINARY grant — hold it, drain the pool. Now it has a ceiling.
+apply <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: FloatingIP
+metadata: {name: eip1, namespace: $A}
+spec: {vpcRef: {name: va}, target: "10.90.0.99"}
+EOF
+ERR=$($K -n "$A" create -f - 2>&1 <<EOF || true
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: FloatingIP
+metadata: {name: eip2, namespace: $A}
+spec: {vpcRef: {name: va}, target: "10.90.0.98"}
+EOF
+)
+echo "$ERR" | grep -qi "exceeded quota" \
+  && pass "a tenant cannot drain a pool it was granted 'attach' on (EIPs are bounded)" \
+  || fail "a tenant exceeded its EIP quota (got: $(echo "$ERR" | head -1))"
+
 echo
 echo "tenant-e2e: ${PASSED} passed, $((CHECKS - PASSED)) failed"
 [ "$FAILED" = "0" ] && echo "tenant-e2e: ALL PASSED" || echo "tenant-e2e: FAILURES"

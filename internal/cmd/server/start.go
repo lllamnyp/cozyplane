@@ -32,6 +32,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apiserver/pkg/admission"
+	"k8s.io/apiserver/pkg/admission/initializer"
+	"k8s.io/apiserver/pkg/admission/plugin/resourcequota"
+	quotav1 "k8s.io/apiserver/pkg/quota/v1"
 	"k8s.io/apiserver/pkg/endpoints/openapi"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	genericoptions "k8s.io/apiserver/pkg/server/options"
@@ -196,8 +199,29 @@ func (o *CozyplaneServerOptions) Config() (*apiserver.Config, error) {
 		return nil, fmt.Errorf("error creating self-signed certificates: %w", err)
 	}
 
-	o.RecommendedOptions.ExtraAdmissionInitializers = func(*genericapiserver.RecommendedConfig) ([]admission.PluginInitializer, error) {
-		return []admission.PluginInitializer{}, nil
+	// The ceiling (docs/multitenancy.md R5). Isolation without a ceiling is not
+	// tenancy — nothing bounded a tenant's VPCs (and so its VNIs), the addresses it
+	// drew from a pool it was granted, or its SecurityGroups.
+	//
+	// The object for this already exists and it is not one of ours: Kubernetes'
+	// ResourceQuota, with the `count/<resource>.<group>` idiom. What was missing is
+	// that the kube-apiserver's quota admission cannot see an aggregated API's
+	// kinds — so THIS server enforces it, which is what the quota Evaluator
+	// interface exists for. An operator writes `count/vpcs.sdn.cozystack.io: "3"`
+	// and a tenant's fourth VPC is refused by the same machinery, with the same
+	// error, as its eleventh ConfigMap.
+	resourcequota.Register(o.RecommendedOptions.Admission.Plugins)
+	o.RecommendedOptions.Admission.RecommendedPluginOrder = append(
+		o.RecommendedOptions.Admission.RecommendedPluginOrder, resourcequota.PluginName)
+
+	o.RecommendedOptions.ExtraAdmissionInitializers = func(c *genericapiserver.RecommendedConfig) ([]admission.PluginInitializer, error) {
+		// No stock initializer supplies the quota Configuration — the evaluators are
+		// necessarily ours, because the resources are.
+		quotaConfig, err := sdnsetup.NewQuotaConfiguration(c.LoopbackClientConfig)
+		if err != nil {
+			return nil, err
+		}
+		return []admission.PluginInitializer{quotaInitializer{config: quotaConfig}}, nil
 	}
 
 	serverConfig := genericapiserver.NewRecommendedConfig(apiserver.Codecs)
@@ -313,5 +337,18 @@ func restFriendlyDefinitionName(defNamer *openapi.DefinitionNamer) func(string) 
 		_, ext := defNamer.GetDefinitionName(friendly)
 
 		return friendly, ext
+	}
+}
+
+// quotaInitializer hands the ResourceQuota admission plugin the evaluators for
+// this server's kinds. The stock initializers cover clients, informers and the
+// authorizer; the quota Configuration is the one thing only we can provide.
+type quotaInitializer struct {
+	config quotav1.Configuration
+}
+
+func (i quotaInitializer) Initialize(plugin admission.Interface) {
+	if w, ok := plugin.(initializer.WantsQuotaConfiguration); ok {
+		w.SetQuotaConfiguration(i.config)
 	}
 }
