@@ -220,11 +220,39 @@ because the only tenant-relevant read that exists today is a cluster-scoped one.
    cluster-scoped. Inert under a RoleBinding, but it documented the intent, and one
    ClusterRoleBinding would have handed every tenant every other tenant's pod names,
    addresses, MACs and placement.
-2. **R5 — the ceiling.** A quota, enforced in the aggregated registry's create
-   path — the same place `export`/`peer`/`attach` are already enforced, because it
-   is the same kind of question ("may you?") asked of a different resource. Bound
-   VPCs, pool addresses per namespace, ServiceVIPs, Ports. Roll the per-VPC
-   counters up per tenant while we are there: R7 already produces the numbers.
+2. **R5 — the ceiling — DONE 2026-07-14** (`test/tenant-e2e.sh` 23/23 on the dev
+   cluster). And it needed **no new kind**: the object already exists, and it is
+   Kubernetes' own. `ResourceQuota`, with the `count/<resource>.<group>` idiom:
+
+   ```yaml
+   kind: ResourceQuota
+   spec:
+     hard:
+       count/vpcs.sdn.cozystack.io:        "3"
+       count/floatingips.sdn.cozystack.io: "8"
+   ```
+
+   What was missing is that the **kube-apiserver's quota admission cannot see an
+   aggregated API's kinds** — so cozyplane's own apiserver enforces it, which is
+   precisely what the quota **`Evaluator`** interface exists for. One object-count
+   evaluator per tenant-created kind, the stock `ResourceQuota` plugin registered
+   into this server's admission chain, and a `PluginInitializer` supplying the
+   Configuration (no stock initializer can — the evaluators are necessarily ours).
+
+   A tenant's fourth VPC is refused by the same machinery, with the same error, as
+   its eleventh ConfigMap. And it is a real quota, not a gate: observed usage is
+   written back to `status.used`.
+
+   **Usage is counted by LISTing through the loopback client, not a shared
+   informer.** kube-apiserver trades exactness for cheapness there; staleness in a
+   quota means over-admission. Creates here are rare — a tenant makes a VPC, not a
+   VPC per request — so we buy exactness at a price nobody pays.
+
+   **Deliberately not quota'd:** `Port` (one per pod — pods are *already* the unit
+   Kubernetes quotas) and `ServiceVIP` (one per attached Service — `count/services`
+   already bounds it). A tenant creates neither; it creates the pod or the Service
+   that causes them. A ceiling on those would be a second, weaker spelling of a
+   limit that already binds.
 3. **R8 — decide.** Cozystack composition. A decision, not a build.
 
 ## What is already done (do not rebuild)
