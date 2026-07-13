@@ -199,12 +199,27 @@ is a real cost and a real decision — so it is the open question, not a default
 it is a safety property. You cannot grant a tenant *any* role until R2 holds,
 because the only tenant-relevant read that exists today is a cluster-scoped one.
 
-1. **R1 + R2 together.** Stamp the workload with its own identity (Option C). Then
-   define the tenant role: create/read/update/delete `VPC`, `VPCBinding`,
-   `VPCGateway`, `SecurityGroup`, `FloatingIP`, `VPCPeering` **in its own
-   namespace**, and *no cluster-scoped read at all*. The testable property is
-   sharp: **a tenant, holding the full tenant role, can discover nothing about any
-   other tenant.** That is one e2e.
+1. **R1 + R2 together — DONE 2026-07-14** (`test/tenant-e2e.sh`, 19/19 on the dev
+   cluster). The CNI stamps the pod with the address and MAC it allocated
+   (`sdn.cozystack.io/vpc-ip` / `-mac`); the aggregated `cozyplane-tenant-edit` /
+   `-view` roles carry only namespaced kinds and aggregate into the built-in
+   admin/edit/view. R2 holds structurally: a RoleBinding grants no access to a
+   cluster-scoped resource, so `list ports` is unreachable from a tenant role.
+
+   The run says it better than prose can:
+
+   ```
+   status.podIP (the FABRIC ip): 10.244.176.237
+   annotated VPC ip / mac:       10.90.0.2 / 22:bc:74:2a:51:a3
+   the Port's truth:             10.90.0.2
+   ```
+
+   The tenant's real address is 10.90.0.2; Kubernetes was showing it a different
+   address on a different network. And a **loaded gun** was removed on the way: the
+   sample `cozyplane-vpc-owner` role granted `get/list/watch` on **ports** —
+   cluster-scoped. Inert under a RoleBinding, but it documented the intent, and one
+   ClusterRoleBinding would have handed every tenant every other tenant's pod names,
+   addresses, MACs and placement.
 2. **R5 — the ceiling.** A quota, enforced in the aggregated registry's create
    path — the same place `export`/`peer`/`attach` are already enforced, because it
    is the same kind of question ("may you?") asked of a different resource. Bound
