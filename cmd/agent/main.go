@@ -2080,6 +2080,33 @@ func serveMetrics(ctx context.Context, mgr *datapath.Manager, vpcs sdnv1alpha1in
 			}
 		}
 
+		// North-south metering (docs/north-south.md, #2): every crossing of a
+		// VPC's boundary, attributed to the door it went through. This is the
+		// number that was missing — a tenant could pull terabytes out through a
+		// floating address or a LoadBalancer Service and nothing recorded it. The
+		// `door` label is the point: it says which of the three mechanisms carried
+		// the traffic, which is what makes the case for consolidating them.
+		for _, m := range []struct {
+			name, help string
+			pick       func(datapath.VPCCounter, int, int) uint64
+		}{
+			{"cozyplane_vpc_ns_bytes_total", "Bytes crossing a VPC's north-south boundary",
+				func(c datapath.VPCCounter, d, in int) uint64 { return c.NSBytes[d][in] }},
+			{"cozyplane_vpc_ns_packets_total", "Packets crossing a VPC's north-south boundary",
+				func(c datapath.VPCCounter, d, in int) uint64 { return c.NSPackets[d][in] }},
+		} {
+			fmt.Fprintf(&b, "# HELP %s %s (this node), by the door it used.\n# TYPE %s counter\n", m.name, m.help, m.name)
+			for net, c := range counters {
+				id := names[net]
+				for door, doorName := range datapath.NSDoorNames {
+					for in, dir := range []string{"out", "in"} {
+						fmt.Fprintf(&b, "%s{vni=\"%d\",vpc_namespace=%q,vpc=%q,node=%q,door=%q,direction=%q} %d\n",
+							m.name, net, id[0], id[1], nodeName, doorName, dir, m.pick(c, door, in))
+					}
+				}
+			}
+		}
+
 		// Security-group policy drops (#7), same per-VPC labeling.
 		if drops, err := mgr.SGDrops(); err == nil {
 			fmt.Fprintf(&b, "# HELP cozyplane_sg_drops_total Packets dropped by security-group policy (this node).\n# TYPE cozyplane_sg_drops_total counter\n")

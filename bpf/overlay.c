@@ -619,16 +619,34 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } migrate_fwd SEC(".maps");
 
-// vpc_counters meters east-west traffic per VPC (net), a metering/billing
-// foundation (#2). PERCPU so the hooks never contend — the agent sums across
-// CPUs when it reads. tx counts a VPC pod's egress (from_pod), rx its ingress
-// on the main delivery path (to_pod); north-south (gateway/floating) metering
-// is a later increment. The default network (net 0) is never metered.
+// vpc_counters meters traffic per VPC (net), the metering/billing foundation
+// (#2). PERCPU so the hooks never contend — the agent sums across CPUs when it
+// reads. tx/rx count EAST-WEST (from_pod egress / to_pod ingress); ns_* count
+// every crossing of the VPC's NORTH-SOUTH boundary, split by the door it went
+// through (docs/north-south.md).
+//
+// The north-south half exists because the boundary was, until now, unaccounted:
+// a tenant could pull terabytes out through a floating address or a LoadBalancer
+// Service and cozyplane could not say that it happened. In a real cloud that
+// traffic crosses your IGW or NAT gateway and lands on your bill. Counting it is
+// not a reporting feature — it is the test of whether the boundary is real
+// (north-south.md, tenet 6: if a path cannot be counted, it is not a sanctioned
+// path). The default network (net 0) is never metered: it is the platform's, not
+// a tenant's.
+#define NS_GW  0 // the VPC's egress gateway
+#define NS_EIP 1 // a floating address: 1:1, and the only egress today that
+                 // carries an identity the TENANT owns rather than the node's
+#define NS_LB  2 // LoadBalancer/NodePort ingress landing on a VPC backend —
+                 // the door that rides the platform's stack all the way in
+#define NS_MECH_MAX 3
+
 struct vpc_counter {
 	__u64 tx_packets;
 	__u64 tx_bytes;
 	__u64 rx_packets;
 	__u64 rx_bytes;
+	__u64 ns_packets[NS_MECH_MAX][2]; // [door][in]
+	__u64 ns_bytes[NS_MECH_MAX][2];
 };
 
 struct {
@@ -666,6 +684,30 @@ static __attribute__((noinline)) void count_dir(__u32 net, __u32 len, int rx)
 		c->tx_packets++;
 		c->tx_bytes += len;
 	}
+}
+
+// count_ns meters one crossing of a VPC's north-south boundary, attributed to the
+// door it went through. Unlike count_dir this is __always_inline, and it has to
+// be: every door's EGRESS leaves through from_pod, which hosts no BPF-to-BPF
+// callee at all (its frame is already ~496 of the 512-byte combined-stack limit —
+// the very reason count_dir lives in to_pod and east-west is metered there). That
+// constraint is why north-south went unmetered for so long; the way past it is to
+// inline, on the narrow terminal paths only, so the verifier's path exploration
+// stays cheap.
+//
+// mech/in are compile-time constants at every call site, so the indexing folds
+// away; the bounds check costs nothing and keeps the verifier happy if it ever
+// doesn't. Like count_dir, the entry is never created here — the agent pre-seeds
+// one per VPC net.
+static __always_inline void count_ns(__u32 net, __u32 len, int mech, int in)
+{
+	if (!net || mech < 0 || mech >= NS_MECH_MAX || in < 0 || in > 1)
+		return;
+	struct vpc_counter *c = bpf_map_lookup_elem(&vpc_counters, &net);
+	if (!c)
+		return;
+	c->ns_packets[mech][in]++;
+	c->ns_bytes[mech][in] += len;
 }
 
 // Security groups (intra-VPC policy, #7). Enforcement is destination-side, in
@@ -2790,6 +2832,8 @@ static __always_inline int floating_forward(struct __sk_buff *skb, struct iphdr 
 		}
 	}
 	nat_addr(skb, proto, IP_DADDR_OFF, ip->daddr, vpc);
+	// The EIP door, inbound (docs/north-south.md).
+	count_ns(net, skb->len, NS_EIP, 1);
 	return TC_ACT_OK; // delivered to the pod, the real client still its source
 }
 
@@ -2852,6 +2896,9 @@ static __always_inline int floating_egress_snat(struct __sk_buff *skb, struct ip
 		}
 	}
 	nat_addr(skb, proto, IP_SADDR_OFF, osrc, pub);
+	// The EIP door, outbound: the packet is now leaving the VPC as the tenant's
+	// own public address (docs/north-south.md).
+	count_ns(net, skb->len, NS_EIP, 0);
 	// Pick the neighbour for the redirect. ON the floating subnet the
 	// destination is its own neighbour (the FIB's on-link route resolves it);
 	// OFF it the agent-supplied virtual router is — the FIB would route via
@@ -3104,6 +3151,8 @@ static __always_inline int floating_forward6(struct __sk_buff *skb, struct pkt *
 		}
 	}
 	nat_addr6(skb, proto, IP6_DADDR_OFF, &p->dst, &vpc_ip);
+	// The EIP door, inbound — v6 twin (docs/north-south.md).
+	count_ns(net, skb->len, NS_EIP, 1);
 	return TC_ACT_OK;
 }
 
@@ -3143,6 +3192,8 @@ static __always_inline int floating_egress_snat6(struct __sk_buff *skb, struct p
 		}
 	}
 	nat_addr6(skb, proto, IP6_SADDR_OFF, &p->src, &pub);
+	// The EIP door, outbound — v6 twin (docs/north-south.md).
+	count_ns(net, skb->len, NS_EIP, 0);
 	return bpf_redirect_neigh(uplink, NULL, 0, 0);
 }
 
@@ -3597,7 +3648,7 @@ static __always_inline int svc_hairpin_reverse(struct __sk_buff *skb, struct pkt
 // path.
 #define LB_MISS -1
 
-static __always_inline int lb_return(struct __sk_buff *skb, struct pkt *p)
+static __always_inline int lb_return(struct __sk_buff *skb, struct pkt *p, __u32 srcnet)
 {
 	if (p->proto != IPPROTO_TCP && p->proto != IPPROTO_UDP)
 		return LB_MISS;
@@ -3616,6 +3667,11 @@ static __always_inline int lb_return(struct __sk_buff *skb, struct pkt *p)
 	struct svc_rev_val *rv = bpf_map_lookup_elem(&svc_rev, &rk);
 	if (!rv || !rv->lb)
 		return LB_MISS;
+	// The LoadBalancer door, outbound: a VPC backend answering an external
+	// client as the LB frontend. srcnet is 0 for a default-network backend, and
+	// count_ns ignores net 0 — that traffic is the platform's, not a tenant's
+	// (docs/north-south.md).
+	count_ns(srcnet, skb->len, NS_LB, 0);
 
 	__u32 uplink = cfg(CFG_FLOAT_IFINDEX);
 	if (!uplink)
@@ -3802,6 +3858,14 @@ int cozyplane_lb_ingress(struct __sk_buff *skb)
 			count_sg_drop(be->net);
 			return TC_ACT_SHOT;
 		}
+		// The LoadBalancer door, inbound: a Service frontend the PLATFORM
+		// attracted, delivered by the platform's uplink hook, landing on a
+		// TENANT's pod — the crossing that today rides the platform's stack all
+		// the way in without the VPC being involved (docs/north-south.md §1).
+		// Counted here and only here: this node attracted the packet, and every
+		// LB packet for a VPC backend passes this program exactly once, whether
+		// the backend turns out to be local or is DSR'd onward.
+		count_ns(be->net, skb->len, NS_LB, 1);
 		l = local_of(be->net, be->vpc_ip);
 	} else {
 		s->dst = s->backend;
@@ -4381,7 +4445,7 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	// attachment only, external destinations only (!dstnet); costs one LRU
 	// miss on other off-net egress.
 	if (!is_gw && !dstnet && ifindex != cfg(CFG_UPLINK_IFINDEX)) {
-		int lr = lb_return(skb, &p);
+		int lr = lb_return(skb, &p, srcnet);
 		if (lr != LB_MISS)
 			return lr;
 	}
@@ -4546,6 +4610,12 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 		struct gw_entry *g = bpf_map_lookup_elem(&gateways, &srcnet);
 		if (!g)
 			return TC_ACT_SHOT; // closed island: no gateway for this VPC
+		// The gateway door, outbound: this is the VPC's traffic leaving through
+		// its own gateway, and the one crossing that is *declared* rather than
+		// incidental. Counted here, at the branch, rather than at the gateway pod
+		// — where it would already wear the platform's identity, not the tenant's
+		// (docs/north-south.md §1).
+		count_ns(srcnet, skb->len, NS_GW, 0);
 		if (!g->node_ip) {
 			struct endpoint *gl = local_of(srcnet, g->gw_ip);
 			if (!gl)
@@ -4556,6 +4626,13 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 		// from_overlay there hands the packet to the gateway's veth.
 		return encap(skb, srcnet, g->node_ip, 0);
 	}
+
+	// The gateway door, inbound: the gateway pod handing traffic back to a tenant
+	// in its own VPC — the return half of everything counted above (and the DNS
+	// the gateway proxies). It is east-west by address, but it is the boundary by
+	// meaning: every byte here came from, or is going to, outside the VPC.
+	if (is_gw && srcnet && dstnet == srcnet)
+		count_ns(srcnet, skb->len, NS_GW, 1);
 
 	// ServiceVIP DNAT. VPC ServiceVIPs (net != 0) for VPC pods; and — once
 	// kube-proxy is gone (KPR increment 3) — default-network (net 0) ClusterIPs

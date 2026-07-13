@@ -184,9 +184,41 @@ not be in a CNI.
 
 Not a commitment; the order the pieces actually depend on each other.
 
-0. **Meter the existing doors.** Before changing anything, count what crosses.
-   It is the cheapest possible proof that the three-door problem is real, and the
-   counters survive every later change.
+0. **Meter the existing doors — DONE 2026-07-13.** Before changing anything, count
+   what crosses. `vpc_counters` gained `ns_packets[door][in]` / `ns_bytes[door][in]`,
+   and the agent serves `cozyplane_vpc_ns_{bytes,packets}_total{vni,vpc,node,door,direction}`.
+   Every door is counted at the point where the packet demonstrably crosses:
+
+   | door | out | in |
+   |------|-----|-----|
+   | gateway | `from_pod`, at the branch that hands the packet to the VPC's gateway | `from_pod`, the gateway pod handing traffic back into its own VPC |
+   | eip | `floating_egress_snat` (v4+v6), after the SNAT to the tenant's address | `floating_forward` (v4+v6), after the DNAT to the pod |
+   | loadbalancer | `lb_return`, a VPC backend answering as the frontend | `lb_ingress`, where the backend resolves to a VPC pod |
+
+   **The constraint that had kept north-south unmetered:** every door's *egress*
+   leaves through `from_pod`, which hosts **no BPF-to-BPF callee at all** (its frame
+   is ~496 of the 512-byte combined-stack limit — the very reason `count_dir` lives
+   in `to_pod`). So `count_ns` is `__always_inline`, placed only on the narrow
+   terminal paths, keeping the verifier's path exploration cheap. It loads on both
+   6.8 and 6.12.
+
+   Dev-cluster measurement, one VPC, each door driven in turn (bytes):
+
+   ```
+   door          out        in
+   gateway       4555      6070
+   eip           4734      3771
+   loadbalancer   290       560
+   ```
+
+   **A finding from driving it:** an *in-cluster* client (a hostNetwork pod) dialling
+   a VPC pod's LoadBalancer IP never crosses the LB door at all — cozyplane-kpr's
+   socket-LB rewrites its `connect()` straight to the backend, so the packet never
+   reaches `from_uplink`. It takes the fabric bridge instead. Only a genuinely
+   external client crosses the LB door, which is the right semantics — but it means
+   the door's traffic can only be exercised with a socket-LB-bypassing raw SYN, and
+   that anyone reasoning about "who can reach a VPC pod" must remember the socket-LB
+   shortcut exists.
 1. **`VPCGateway`: the boundary object.** Declared policy + NAT identity + counters,
    enforced in the existing hooks. No datapath rewrite yet.
 2. **NAT gateway in eBPF, per-VPC identity.** Retire the gateway pod.

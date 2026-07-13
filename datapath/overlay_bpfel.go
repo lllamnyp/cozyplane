@@ -296,6 +296,8 @@ type overlayVpcCounter struct {
 	TxBytes   uint64
 	RxPackets uint64
 	RxBytes   uint64
+	NsPackets [3][2]uint64
+	NsBytes   [3][2]uint64
 }
 
 // Names of all BPF objects in the ELF.

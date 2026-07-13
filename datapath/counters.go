@@ -22,14 +22,42 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-// VPCCounter is the per-VPC traffic tally read from the datapath (#2): tx is a
-// VPC pod's egress, rx its east-west ingress. North-south (gateway/floating)
-// is not metered yet.
+// NS doors — the ways a tenant's traffic can cross the VPC's north-south
+// boundary (docs/north-south.md). Must match the NS_* constants in bpf/overlay.c.
+const (
+	NSGateway = 0 // out through the VPC's egress gateway (and back)
+	NSEIP     = 1 // a floating address: 1:1, the tenant's own identity
+	NSLB      = 2 // LoadBalancer/NodePort ingress landing on a VPC backend
+	nsDoors   = 3
+)
+
+// NSDoorNames labels the doors for metrics; index by the NS* constants.
+var NSDoorNames = [nsDoors]string{"gateway", "eip", "loadbalancer"}
+
+// VPCCounter is the per-VPC traffic tally read from the datapath (#2).
+//
+// Tx/Rx are EAST-WEST (a VPC pod's egress / its ingress). NSPackets and NSBytes
+// count every crossing of the VPC's north-south boundary, split by the door it
+// went through and by direction ([door][in]) — which is the thing that was
+// missing: a tenant could pull terabytes out through a floating address or a
+// LoadBalancer Service and cozyplane could not say it happened.
 type VPCCounter struct {
 	TxPackets uint64
 	TxBytes   uint64
 	RxPackets uint64
 	RxBytes   uint64
+	NSPackets [nsDoors][2]uint64
+	NSBytes   [nsDoors][2]uint64
+}
+
+// NorthSouthBytes totals every byte this VPC pushed across its boundary, in both
+// directions and through every door — the number the three-door problem is about.
+func (c VPCCounter) NorthSouthBytes() uint64 {
+	var t uint64
+	for door := range c.NSBytes {
+		t += c.NSBytes[door][0] + c.NSBytes[door][1]
+	}
+	return t
 }
 
 // EnsureVPCCounter creates a zeroed vpc_counters entry for a net if absent.
@@ -70,6 +98,12 @@ func (m *Manager) VPCCounters() (map[uint32]VPCCounter, error) {
 			c.TxBytes += per[i].TxBytes
 			c.RxPackets += per[i].RxPackets
 			c.RxBytes += per[i].RxBytes
+			for door := 0; door < nsDoors; door++ {
+				for in := 0; in < 2; in++ {
+					c.NSPackets[door][in] += per[i].NsPackets[door][in]
+					c.NSBytes[door][in] += per[i].NsBytes[door][in]
+				}
+			}
 		}
 		out[net] = c
 	}
