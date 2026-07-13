@@ -513,12 +513,15 @@ may egress there (v4 in NAT64 form, like `sg_cidr`); `0.0.0.0/0` is just a `/0`
 entry, so no pseudo-group is needed. No group-loop, so `from_pod`'s budget is
 safe.
 
-**v1 scope:** the check gates the **gateway** path. A *floating* pod's egress
-(`floating_egress_snat`, which returns before the gateway path) is not yet gated
-— a documented follow-up, since floating egress is a distinct deliberate surface.
-The `from_pod` source is `p.src` (the pod's claimed address); a co-VPC pod could
-spoof a same-VPC IP to borrow its egress groups — the same intra-VPC RPF gap
-noted for ingress, closed by the same future `from_pod` RPF.
+**Coverage (both closed in the v2 tail).** The gate now covers **both** egress
+paths: the gateway path (in the isolation block) and the **floating** path —
+`floating_egress_snat`/`_snat6` call `ns_egress_ok` right after confirming the
+pod is floating and the destination external, before the SNAT. A grouped
+floating pod is gated by its `to: {cidr}` rules exactly like a gateway'd one;
+ungrouped pods, replies (SYN-gated) and ICMP pass. And the source-spoofing gap —
+a co-VPC pod forging a same-VPC IP to borrow egress groups — is closed by
+**`from_pod` RPF** (§ anti-spoof, above): the forged packet is dropped at its
+origin veth before either egress gate ever sees it.
 
 **Validated on the dev cluster (2026-07-07).** A grouped `client` pod's off-VPC egress to a
 node IP (`10.4.100.13:6443`, reached through the vpc-a NAT gateway) is
