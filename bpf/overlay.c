@@ -3235,6 +3235,12 @@ static __always_inline int vpc_nat_reverse(struct __sk_buff *skb, struct pkt *p)
 		nat_icmp_id(skb, gw_port, rv->client_port);
 	else
 		nat_port(skb, proto, L4_DPORT_OFF, gw_port, rv->client_port);
+	// This is the REPLY to a flow the pod itself opened — the SecurityGroup egress
+	// gate already ran at the SNAT, and there is a ct_rev entry to prove the flow
+	// exists. Without saying so, to_pod sees an unsolicited packet from an external
+	// address and applies its ingress gate, which drops it: the reply would be
+	// un-NAT'd correctly and then thrown away on the pod's own doorstep.
+	skb->mark |= SG_OK;
 	count_ns(net, skb->len, NS_GW, 1);
 	return deliver_local(skb, l);
 }
