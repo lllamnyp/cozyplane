@@ -91,6 +91,14 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if gw == nil || !gw.Spec.NAT.Enabled {
 		return ctrl.Result{}, r.deleteGateways(ctx, vpc.Namespace, vpc.Name)
 	}
+	// A gateway with a NAT identity is realized in eBPF — SNAT at the pod's own
+	// veth, straight out the uplink (docs/north-south.md § increment 2). No pod, no
+	// hairpin, no per-VPC single point of failure, and the tenant's traffic wears
+	// its own address instead of the node's. The pod remains only for a gateway
+	// with no pool to draw an identity from, and goes away with it.
+	if gw.Status.NATAddress != "" {
+		return ctrl.Result{}, r.deleteGateways(ctx, vpc.Namespace, vpc.Name)
+	}
 	if vpc.Status.VNI == 0 {
 		return ctrl.Result{}, nil // requeued by the VPC status update
 	}

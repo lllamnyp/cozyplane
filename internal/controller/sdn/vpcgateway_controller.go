@@ -86,7 +86,22 @@ func (r *VPCGatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 	exclusive := conflict == ""
 
-	status := sdnv1alpha1.VPCGatewayStatus{Phase: sdnv1alpha1.VPCGatewayPhasePending}
+	// The VPC's egress identity: an address of its OWN, from its own pool. Without
+	// one, its traffic is SNATed to the node's address and the tenant is
+	// indistinguishable from the platform on the wire (docs/north-south.md, tenet 8).
+	natAddr := ""
+	if exclusive && poolOK && gw.Spec.NAT.Enabled && gw.Spec.PoolRef.Name != "" {
+		a, err := r.ensureNATAddress(ctx, gw)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		natAddr = a
+	}
+
+	status := sdnv1alpha1.VPCGatewayStatus{
+		Phase:      sdnv1alpha1.VPCGatewayPhasePending,
+		NATAddress: natAddr,
+	}
 	setGWCondition(&status, sdnv1alpha1.VPCGatewayConditionVPCResolved, vpcOK,
 		"VPCResolved", "spec.vpcRef names a VPC in this namespace")
 	setGWCondition(&status, sdnv1alpha1.VPCGatewayConditionPoolResolved, poolOK,
@@ -142,6 +157,46 @@ func (r *VPCGatewayReconciler) conflictingGateway(ctx context.Context, gw *sdnv1
 		}
 	}
 	return "", nil
+}
+
+// ensureNATAddress allocates (and keeps) the VPC's egress address from its pool.
+// FloatingIPs draw from the same pools, so both allocators must see each other's
+// claims — a VPC must never egress as an address some pod is also floating on.
+func (r *VPCGatewayReconciler) ensureNATAddress(ctx context.Context, gw *sdnv1alpha1.VPCGateway) (string, error) {
+	pool := &sdnv1alpha1.ExternalPool{}
+	if err := r.Get(ctx, types.NamespacedName{Name: gw.Spec.PoolRef.Name}, pool); err != nil {
+		return "", nil
+	}
+
+	used := map[string]bool{}
+	var fips sdnv1alpha1.FloatingIPList
+	if err := r.List(ctx, &fips); err != nil {
+		return "", fmt.Errorf("list floatingips: %w", err)
+	}
+	for i := range fips.Items {
+		if a := fips.Items[i].Status.Address; a != "" {
+			used[a] = true
+		}
+	}
+	var gws sdnv1alpha1.VPCGatewayList
+	if err := r.List(ctx, &gws); err != nil {
+		return "", fmt.Errorf("list vpcgateways: %w", err)
+	}
+	for i := range gws.Items {
+		g := &gws.Items[i]
+		if g.Namespace == gw.Namespace && g.Name == gw.Name {
+			continue
+		}
+		if a := g.Status.NATAddress; a != "" {
+			used[a] = true
+		}
+	}
+
+	// Sticky: a VPC's egress identity should not move under its live flows.
+	if cur := gw.Status.NATAddress; cur != "" && addrInCIDRs(pool.Spec.CIDRs, cur) && !used[cur] {
+		return cur, nil
+	}
+	return firstFreeAddress(pool.Spec.CIDRs, used), nil
 }
 
 func setGWCondition(status *sdnv1alpha1.VPCGatewayStatus, condType string, ok bool, reason, msg string) {

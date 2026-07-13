@@ -131,6 +131,21 @@ func (n *nodePoolIndex) serving(pool string) []string {
 	return out
 }
 
+// sortedNames is the node order the NAT port shards are cut from. Sorted, so every
+// agent derives the same partition without coordinating. A node joining or leaving
+// reshuffles the shards and breaks live NAT flows — acceptable, and recorded in
+// docs/north-south.md.
+func (n *nodePoolIndex) sortedNames() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	out := make([]string, 0, len(n.nodes))
+	for name := range n.nodes {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func samePools(a, b map[string]bool) bool {
 	if len(a) != len(b) {
 		return false

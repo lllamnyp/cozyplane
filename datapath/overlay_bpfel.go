@@ -130,6 +130,13 @@ type overlayLpmKey struct {
 	Addr      overlayAddr128
 }
 
+type overlayNatShardKey struct {
+	_     structs.HostLayout
+	Ip    overlayAddr128
+	Shard uint16
+	Pad   uint16
+}
+
 type overlayNpAllowKey struct {
 	_         structs.HostLayout
 	Prefixlen uint32
@@ -301,6 +308,13 @@ type overlayVpcCounter struct {
 	NsDenied  [3]uint64
 }
 
+type overlayVpcNat struct {
+	_        structs.HostLayout
+	Ip       overlayAddr128
+	PortBase uint32
+	PortSpan uint32
+}
+
 // Names of all BPF objects in the ELF.
 //
 // Used for safe lookups in a Collection or CollectionSpec.
@@ -329,6 +343,8 @@ const (
 	overlayMapLocals                = "locals"
 	overlayMapMasqSrcs              = "masq_srcs"
 	overlayMapMigrateFwd            = "migrate_fwd"
+	overlayMapNatOf                 = "nat_of"
+	overlayMapNatOwner              = "nat_owner"
 	overlayMapNetworks              = "networks"
 	overlayMapNodeIp6               = "node_ip6"
 	overlayMapNodeRemotes           = "node_remotes"
@@ -355,6 +371,7 @@ const (
 	overlayMapUplinkMac             = "uplink_mac"
 	overlayMapVpcCounters           = "vpc_counters"
 	overlayMapVpcIngress            = "vpc_ingress"
+	overlayMapVpcNat                = "vpc_nat"
 	overlayProgCozyplaneFromOverlay = "cozyplane_from_overlay"
 	overlayProgCozyplaneFromPod     = "cozyplane_from_pod"
 	overlayProgCozyplaneFromUplink  = "cozyplane_from_uplink"
@@ -445,6 +462,8 @@ type overlayMapSpecs struct {
 	Locals         *ebpf.MapSpec `ebpf:"locals"`
 	MasqSrcs       *ebpf.MapSpec `ebpf:"masq_srcs"`
 	MigrateFwd     *ebpf.MapSpec `ebpf:"migrate_fwd"`
+	NatOf          *ebpf.MapSpec `ebpf:"nat_of"`
+	NatOwner       *ebpf.MapSpec `ebpf:"nat_owner"`
 	Networks       *ebpf.MapSpec `ebpf:"networks"`
 	NodeIp6        *ebpf.MapSpec `ebpf:"node_ip6"`
 	NodeRemotes    *ebpf.MapSpec `ebpf:"node_remotes"`
@@ -471,6 +490,7 @@ type overlayMapSpecs struct {
 	UplinkMac      *ebpf.MapSpec `ebpf:"uplink_mac"`
 	VpcCounters    *ebpf.MapSpec `ebpf:"vpc_counters"`
 	VpcIngress     *ebpf.MapSpec `ebpf:"vpc_ingress"`
+	VpcNat         *ebpf.MapSpec `ebpf:"vpc_nat"`
 }
 
 // overlayVariableSpecs contains global variables before they are loaded into the kernel.
@@ -523,6 +543,8 @@ type overlayMaps struct {
 	Locals         *ebpf.Map `ebpf:"locals"`
 	MasqSrcs       *ebpf.Map `ebpf:"masq_srcs"`
 	MigrateFwd     *ebpf.Map `ebpf:"migrate_fwd"`
+	NatOf          *ebpf.Map `ebpf:"nat_of"`
+	NatOwner       *ebpf.Map `ebpf:"nat_owner"`
 	Networks       *ebpf.Map `ebpf:"networks"`
 	NodeIp6        *ebpf.Map `ebpf:"node_ip6"`
 	NodeRemotes    *ebpf.Map `ebpf:"node_remotes"`
@@ -549,6 +571,7 @@ type overlayMaps struct {
 	UplinkMac      *ebpf.Map `ebpf:"uplink_mac"`
 	VpcCounters    *ebpf.Map `ebpf:"vpc_counters"`
 	VpcIngress     *ebpf.Map `ebpf:"vpc_ingress"`
+	VpcNat         *ebpf.Map `ebpf:"vpc_nat"`
 }
 
 func (m *overlayMaps) Close() error {
@@ -577,6 +600,8 @@ func (m *overlayMaps) Close() error {
 		m.Locals,
 		m.MasqSrcs,
 		m.MigrateFwd,
+		m.NatOf,
+		m.NatOwner,
 		m.Networks,
 		m.NodeIp6,
 		m.NodeRemotes,
@@ -603,6 +628,7 @@ func (m *overlayMaps) Close() error {
 		m.UplinkMac,
 		m.VpcCounters,
 		m.VpcIngress,
+		m.VpcNat,
 	)
 }
 

@@ -250,6 +250,63 @@ Not a commitment; the order the pieces actually depend on each other.
    door; egress still launders into the node's address until increment 2. Better to
    sequence that honestly than to ship a field the datapath ignores.
 2. **NAT gateway in eBPF, per-VPC identity.** Retire the gateway pod.
+
+   **Why the gateway pod exists at all** — worth stating, because it dictates the
+   design. `masq_snat` (the cluster-egress masquerade) identifies a default-network
+   pod by its *address* (`is_masq_src`), at the uplink. **That is impossible for a
+   VPC**: tenant CIDRs overlap by design, so a source address at the uplink names no
+   one. The tenant is knowable only at the **pod's veth**, where `ports[ifindex]`
+   gives the net. The gateway pod is, in essence, a place to stand where identity is
+   still known. Take it away and the SNAT has to happen at the veth.
+
+   Which forces the real question: **the connection state then lives on the pod's
+   node, but the reply comes back to whichever node attracts the NAT address.**
+   Three ways out:
+
+   - **Elect one egress node per VPC** and steer the VPC's egress to it (Cilium's
+     egress-gateway shape). Simple, and the reply lands where the state is — but it
+     is a *hop*, and tenet 1 says the gateway is a boundary, not a hop. It would
+     re-introduce the hairpin and the per-VPC single point of failure we are
+     retiring. **Rejected by our own tenet.**
+   - **One NAT address per (VPC, node)**: replies land naturally on the right node,
+     no demux. Costs N addresses per VPC — too expensive for a pool.
+   - **One address per VPC, port ranges partitioned per node** (chosen). Each node
+     SNATs its own pods to the VPC's single address, drawing ports from *its own*
+     shard. The attractor demuxes a reply by port → owning node and forwards it over
+     the overlay; the owning node reverses from its own `ct_rev`. Egress stays
+     distributed (DVR), the VPC keeps one identity, and the boundary stays a
+     boundary. Cost: the shard map, and a node-set change reshuffles ranges and
+     breaks live flows — acceptable, and recorded.
+
+   **Datapath**, reusing what exists rather than inventing:
+
+   - `vpc_nat`: `net -> {nat_ip, port_base, port_span}` — *this node's* shard.
+   - `nat_owner`: `{nat_ip, shard} -> node_ip` — for the attractor's demux.
+   - `nat_of`: `nat_ip -> net` — so the attractor knows the tenant.
+   - **Egress** (`from_pod`, pod veth, `srcnet && !dstnet`, after the EIP path
+     misses): drop cluster-internal (`is_internal` — the tenant→system boundary the
+     gateway's netns firewall enforced today), apply `ns_egress_ok` (the SG gate,
+     exactly as the gateway path does), then allocate a port from this node's shard
+     and SNAT with the **same `ct_fwd`/`ct_rev` machinery `masq_snat` already uses**
+     — it is the same problem with `net` set and a per-VPC address instead of the
+     node's. Keys go in **per-CPU scratch**, not on the stack: `from_pod` is at ~496
+     of its 512-byte budget.
+   - **Reply** (`from_uplink`): `nat_of(dst)` gives the tenant; the port's shard
+     gives the owning node. Local → reverse from `ct_rev` and deliver. Remote →
+     Geneve to that node, where a probe in `from_overlay`'s VPC branch reverses and
+     delivers — the same shape as the floating probe.
+
+   **What this buys:** a VPC's traffic finally leaves the cluster wearing *its own*
+   address (tenet 8 — today it is SNATed to the gateway pod's fabric IP and then
+   re-SNATed by the cluster masquerade to the **node's**, so tenants are
+   indistinguishable from the platform on the wire), and `poolRef` and the `attach`
+   verb become load-bearing rather than decorative. It also deletes the last netns
+   firewall in the tree.
+
+   **To verify first:** the gateway pod also proxies cluster DNS on `:53` (the one
+   sanctioned internal door). The split-horizon resolver (`dns_steer` + the per-node
+   responder) already serves VPC pods, so that door is probably vestigial — confirm
+   before deleting it, or tenant DNS breaks with the pod.
 3. **EIP re-parented onto the gateway**; delete the announcement layer, and with it
    `ExternalPool.spec.advertisement`.
 4. **LoadBalancer ingress into a VPC crosses the boundary** — admitted and counted,

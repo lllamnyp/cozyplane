@@ -96,6 +96,14 @@ type VPCGatewaySpec struct {
 
 // VPCGatewayStatus is the observed state of a VPCGateway.
 type VPCGatewayStatus struct {
+	// NATAddress is the address this VPC's egress wears on the wire — allocated
+	// from spec.poolRef, and the tenant's OWN identity. Without it a VPC's traffic
+	// is SNATed to the node's address and is indistinguishable from the platform's
+	// (docs/north-south.md, tenet 8). Empty means no NAT identity: the VPC has no
+	// pool, and its egress falls back to the legacy gateway pod.
+	// +optional
+	NATAddress string `json:"natAddress,omitempty"`
+
 	// Phase is the lifecycle phase.
 	// +optional
 	Phase VPCGatewayPhase `json:"phase,omitempty"`
@@ -112,6 +120,7 @@ type VPCGatewayStatus struct {
 // +kubebuilder:printcolumn:name="VPC",type=string,JSONPath=`.spec.vpcRef.name`
 // +kubebuilder:printcolumn:name="Pool",type=string,JSONPath=`.spec.poolRef.name`
 // +kubebuilder:printcolumn:name="NAT",type=boolean,JSONPath=`.spec.nat.enabled`
+// +kubebuilder:printcolumn:name="NATAddress",type=string,JSONPath=`.status.natAddress`
 // +kubebuilder:printcolumn:name="LB",type=boolean,JSONPath=`.spec.ingress.loadBalancer`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`

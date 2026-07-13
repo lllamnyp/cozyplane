@@ -28,6 +28,12 @@ import (
 //
 // VPCGatewayStatus is the observed state of a VPCGateway.
 type VPCGatewayStatusApplyConfiguration struct {
+	// NATAddress is the address this VPC's egress wears on the wire — allocated
+	// from spec.poolRef, and the tenant's OWN identity. Without it a VPC's traffic
+	// is SNATed to the node's address and is indistinguishable from the platform's
+	// (docs/north-south.md, tenet 8). Empty means no NAT identity: the VPC has no
+	// pool, and its egress falls back to the legacy gateway pod.
+	NATAddress *string `json:"natAddress,omitempty"`
 	// Phase is the lifecycle phase.
 	Phase *sdnv1alpha1.VPCGatewayPhase `json:"phase,omitempty"`
 	// Conditions is the detailed state.
@@ -38,6 +44,14 @@ type VPCGatewayStatusApplyConfiguration struct {
 // apply.
 func VPCGatewayStatus() *VPCGatewayStatusApplyConfiguration {
 	return &VPCGatewayStatusApplyConfiguration{}
+}
+
+// WithNATAddress sets the NATAddress field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the NATAddress field is set to the value of the last call.
+func (b *VPCGatewayStatusApplyConfiguration) WithNATAddress(value string) *VPCGatewayStatusApplyConfiguration {
+	b.NATAddress = &value
+	return b
 }
 
 // WithPhase sets the Phase field in the declarative configuration to the given value

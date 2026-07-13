@@ -203,6 +203,17 @@ func (r *FloatingIPReconciler) usedAddresses(ctx context.Context, self *sdnv1alp
 			used[f.Status.Address] = true
 		}
 	}
+	// A VPC's NAT identity comes out of the SAME pools (docs/north-south.md), so a
+	// floating address must not be handed an address a gateway already egresses as.
+	var gws sdnv1alpha1.VPCGatewayList
+	if err := r.List(ctx, &gws); err != nil {
+		return nil, fmt.Errorf("list vpcgateways: %w", err)
+	}
+	for i := range gws.Items {
+		if a := gws.Items[i].Status.NATAddress; a != "" {
+			used[a] = true
+		}
+	}
 	return used, nil
 }
 

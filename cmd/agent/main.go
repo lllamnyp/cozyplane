@@ -419,7 +419,7 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	} else {
 		factory := sdninformers.NewSharedInformerFactory(sdnClient, 0)
 		watchVPCs(factory, mgr, log)
-		watchVPCGateways(ctx, factory, mgr, log)
+		watchVPCGateways(ctx, factory, mgr, nodePools, nodeIPs, nodeName, log)
 		watchPorts(ctx, factory, localFactory, sdnClient, client, mgr, nodeName, state.NodeIP, log)
 		watchPeerings(ctx, factory, mgr, log)
 		watchGateways(ctx, factory, mgr, nodeName, log)

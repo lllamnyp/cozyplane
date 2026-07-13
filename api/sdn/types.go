@@ -89,6 +89,8 @@ type VPCGatewaySpec struct {
 
 // VPCGatewayStatus is the observed state of a VPCGateway.
 type VPCGatewayStatus struct {
+	// NATAddress is the VPC's own egress identity, allocated from its pool.
+	NATAddress string
 	Phase      VPCGatewayPhase
 	Conditions []metav1.Condition
 }

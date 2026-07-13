@@ -2187,6 +2187,13 @@ func schema_cozyplane_api_sdn_v1alpha1_VPCGatewayStatus(ref common.ReferenceCall
 				Description: "VPCGatewayStatus is the observed state of a VPCGateway.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
+					"natAddress": {
+						SchemaProps: spec.SchemaProps{
+							Description: "NATAddress is the address this VPC's egress wears on the wire — allocated from spec.poolRef, and the tenant's OWN identity. Without it a VPC's traffic is SNATed to the node's address and is indistinguishable from the platform's (docs/north-south.md, tenet 8). Empty means no NAT identity: the VPC has no pool, and its egress falls back to the legacy gateway pod.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
 					"phase": {
 						SchemaProps: spec.SchemaProps{
 							Description: "Phase is the lifecycle phase.",

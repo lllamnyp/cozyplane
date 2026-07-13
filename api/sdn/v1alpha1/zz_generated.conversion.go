@@ -1807,6 +1807,7 @@ func Convert_sdn_VPCGatewaySpec_To_v1alpha1_VPCGatewaySpec(in *sdn.VPCGatewaySpe
 }
 
 func autoConvert_v1alpha1_VPCGatewayStatus_To_sdn_VPCGatewayStatus(in *VPCGatewayStatus, out *sdn.VPCGatewayStatus, s conversion.Scope) error {
+	out.NATAddress = in.NATAddress
 	out.Phase = sdn.VPCGatewayPhase(in.Phase)
 	out.Conditions = *(*[]v1.Condition)(unsafe.Pointer(&in.Conditions))
 	return nil
@@ -1818,6 +1819,7 @@ func Convert_v1alpha1_VPCGatewayStatus_To_sdn_VPCGatewayStatus(in *VPCGatewaySta
 }
 
 func autoConvert_sdn_VPCGatewayStatus_To_v1alpha1_VPCGatewayStatus(in *sdn.VPCGatewayStatus, out *VPCGatewayStatus, s conversion.Scope) error {
+	out.NATAddress = in.NATAddress
 	out.Phase = VPCGatewayPhase(in.Phase)
 	out.Conditions = *(*[]v1.Condition)(unsafe.Pointer(&in.Conditions))
 	return nil

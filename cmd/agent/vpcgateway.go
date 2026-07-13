@@ -40,9 +40,11 @@ import (
 //
 // Recompute-and-diff against the pinned map, like every other watcher here: the
 // map outlives the agent, so a gateway deleted while it was down must be pruned.
-func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFactory, mgr *datapath.Manager, log *slog.Logger) {
+func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFactory, mgr *datapath.Manager,
+	nodes *nodePoolIndex, nodeIPs *nodeIPIndex, selfName string, log *slog.Logger) {
 	gws := factory.Sdn().V1alpha1().VPCGateways()
 	vpcs := factory.Sdn().V1alpha1().VPCs()
+	pools := factory.Sdn().V1alpha1().ExternalPools()
 
 	var mu sync.Mutex
 	resync := func() {
@@ -59,7 +61,77 @@ func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFa
 			log.Error("list vpcs", "err", err)
 			return
 		}
+		allPools, err := pools.Lister().List(labels.Everything())
+		if err != nil {
+			log.Error("list externalpools", "err", err)
+			return
+		}
 		desired := desiredVPCIngress(allGWs, allVPCs)
+
+		// The VPC's egress identity, and this node's slice of its port space.
+		// Every node programs the WHOLE shard table: any node may be the one the
+		// fabric hands a reply to, and it must know which node's connection table
+		// holds the flow (docs/north-south.md § increment 2).
+		wantNAT := desiredVPCNAT(allGWs, allVPCs)
+		order := nodes.sortedNames()
+		selfShard := indexOf(order, selfName)
+		curNAT, err := mgr.VPCNATs()
+		if err != nil {
+			log.Error("read vpc_nat map", "err", err)
+			return
+		}
+		for net, addr := range wantNAT {
+			if selfShard >= 0 {
+				base, span, ok := datapath.NATShardFor(selfShard)
+				if !ok {
+					log.Warn("more nodes than NAT port shards; this node cannot NAT",
+						"node", selfName, "index", selfShard, "shards", datapath.NATShards)
+				} else if err := mgr.SetVPCNAT(net, addr, base, span); err != nil {
+					log.Error("set vpc nat", "vni", net, "addr", addr, "err", err)
+					continue
+				}
+			}
+			for i, n := range order {
+				if i >= datapath.NATShards {
+					break
+				}
+				ip := nodeIPs.get(n)
+				if ip == nil {
+					continue
+				}
+				if err := mgr.SetNATOwner(addr, uint16(i), ip); err != nil {
+					log.Error("set nat owner", "addr", addr, "shard", i, "err", err)
+				}
+			}
+			// Something has to ATTRACT the address, or the replies land nowhere.
+			// Until attraction leaves the CNI entirely (docs/north-south.md, tenet
+			// 3 — increment 3), a VPC's NAT address rides the same L2 announcement
+			// and the same rendezvous election as a floating IP.
+			mine := announcerForAddr(addr, nodes, allPools) == selfName
+			if mine {
+				if err := mgr.SetAnnounce(addr); err != nil {
+					log.Error("announce nat address", "addr", addr, "err", err)
+				}
+			} else if err := mgr.DelAnnounce(addr); err != nil {
+				log.Error("stop announcing nat address", "addr", addr, "err", err)
+			}
+			if curNAT[net] != addr {
+				log.Info("VPC egresses as its own address", "vni", net, "nat", addr, "announced_here", mine)
+			}
+		}
+		for net, addr := range curNAT {
+			if _, ok := wantNAT[net]; !ok {
+				_ = mgr.DelAnnounce(addr)
+				if err := mgr.DelVPCNAT(net, addr); err != nil {
+					log.Error("del vpc nat", "vni", net, "err", err)
+					continue
+				}
+				for i := range datapath.NATShards {
+					_ = mgr.DelNATOwner(addr, uint16(i))
+				}
+				log.Info("VPC lost its egress identity", "vni", net, "nat", addr)
+			}
+		}
 
 		current, err := mgr.VPCIngresses()
 		if err != nil {
@@ -92,11 +164,15 @@ func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFa
 		DeleteFunc: func(any) { resync() },
 	}
 	_, _ = gws.Informer().AddEventHandler(onAny)
+	_, _ = pools.Informer().AddEventHandler(onAny)
+	// The node set decides both the port shards and the announcer.
+	nodes.onChange(resync)
 	// VPCs too: the gate is keyed by VNI, which the VPC's status carries.
 	_, _ = vpcs.Informer().AddEventHandler(onAny)
 
 	go func() {
-		if cache.WaitForCacheSync(ctx.Done(), gws.Informer().HasSynced, vpcs.Informer().HasSynced) {
+		if cache.WaitForCacheSync(ctx.Done(), gws.Informer().HasSynced, vpcs.Informer().HasSynced,
+			pools.Informer().HasSynced) {
 			resync()
 		}
 	}()
@@ -121,4 +197,49 @@ func desiredVPCIngress(gws []*sdnv1alpha1.VPCGateway, vpcs []*sdnv1alpha1.VPC) m
 		}
 	}
 	return out
+}
+
+// desiredVPCNAT is the set of VNIs with an allocated egress identity, keyed to the
+// address their traffic wears on the wire. A VPC's boundary is its OLDEST gateway.
+func desiredVPCNAT(gws []*sdnv1alpha1.VPCGateway, vpcs []*sdnv1alpha1.VPC) map[uint32]string {
+	byNS := map[string][]sdnv1alpha1.VPCGateway{}
+	for _, g := range gws {
+		byNS[g.Namespace] = append(byNS[g.Namespace], *g)
+	}
+	out := map[uint32]string{}
+	for _, vpc := range vpcs {
+		if vpc.Status.VNI == 0 {
+			continue
+		}
+		gw := sdnv1alpha1.EffectiveGateway(byNS[vpc.Namespace], vpc.Name)
+		if gw != nil && gw.Spec.NAT.Enabled && gw.Status.NATAddress != "" {
+			out[uint32(vpc.Status.VNI)] = gw.Status.NATAddress
+		}
+	}
+	return out
+}
+
+func indexOf(names []string, self string) int {
+	for i, n := range names {
+		if n == self {
+			return i
+		}
+	}
+	return -1
+}
+
+// announcerForAddr elects the node that advertises a bare address (a VPC's NAT
+// identity) — the same rendezvous hash over the nodes that can serve its pool as
+// a floating IP uses, minus the "fall back to the target's node" case: a NAT
+// address has no target pod. Nothing eligible means nobody announces it, and the
+// address is dark rather than black-holed on a node that cannot serve its L2.
+func announcerForAddr(pub string, nodes *nodePoolIndex, pools []*sdnv1alpha1.ExternalPool) string {
+	eligible := nodes.serving(poolOf(pub, pools))
+	best, bestScore := "", uint64(0)
+	for _, n := range eligible {
+		if s := rendezvous(n, pub); best == "" || s > bestScore || (s == bestScore && n < best) {
+			best, bestScore = n, s
+		}
+	}
+	return best
 }
