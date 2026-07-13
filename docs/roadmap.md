@@ -22,9 +22,15 @@ done).
 
 **Features**
 
-1. **Multi-tenancy model** — the API is single-tenant today. The load-bearing
-   architectural gap, and the one thing standing between cozyplane and its own
-   stated purpose; everything else here is refinement (§1).
+1. **Multi-tenancy model** — **[multitenancy.md](multitenancy.md)**: the rules,
+   each justified or dropped. The *datapath* has been multi-tenant since early on;
+   what is missing is a tenant in the **API** — no role a tenant could hold, no
+   surface shaped for one, no ceiling on what one consumes. Three gaps: a tenant
+   cannot learn **its own** address (`status.podIP` is the fabric IP; the VPC
+   address lives only on the cluster-scoped `Port`); a tenant role is unsafe to
+   grant at all until reads are namespaced (one `list ports` leaks every tenant's
+   pods, addresses, MACs and placement); and nothing bounds a tenant's consumption
+   of VNIs, pool addresses or ServiceVIPs (§1)
 2. **North-south: one boundary** — **[north-south.md](north-south.md)**, the arc
    that replaces "floating-IP HA beyond L2". Cozyplane grew **three** independent
    ways for a tenant to cross between a VPC and the outside (the gateway pod, the
@@ -90,7 +96,8 @@ CRD-storage shim (§7 — no longer forced, now the built-in etcd is PVC-backed)
   - [x] Stage 1 — cutover follows `VMI.status.nodeName` (phase-explicit, degrades to the pod label without KubeVirt; dev-cluster-validated with a real migration)
   - [x] Stage 2 — source→target forward during the migration window (`migrate_fwd` map + `from_overlay` re-encap; 15 s grace; closes the cross-node cutover gap; OVN's `requested-chassis=src,target`)
   - [x] Stage 3 — guest-announcement cutover: `AF_PACKET` listener on the staged target veth flips `spec.node` on the guest's gratuitous ARP / unsolicited NA (OVN's `activation-strategy=rarp`); VMI-watch is the fallback
-- [ ] Observability subresource(s) (e.g. `/ports`) — **parked** (original motivation not recalled; revisit if an operator need appears)
+- [ ] ~~Observability subresource(s) (e.g. `/ports`)~~ — **the motivation was multi-tenancy, and it is now recorded**: `Port` is cluster-scoped (the IPAM claim is atomic *because* the name is globally unique), so a tenant can never be granted a read on it. But the tenant-facing requirement it was meant to serve — "list the ports of my VPC" — is **dropped** on reflection: it is address-thinking, and tenet 4 says identity, not addresses. What a tenant actually cannot do is learn **its own** address, which the CNI can stamp on the pod. See [multitenancy.md](multitenancy.md) R1/R3
+- [ ] **Multi-tenancy: a tenant persona, a projection, a ceiling** — [multitenancy.md](multitenancy.md). R1 (a tenant can learn its own workload's VPC address/MAC — today `status.podIP` is the *fabric* IP and the real identity is invisible), R2 (a tenant enumerates nothing it does not own — no cluster-scoped read may ever appear in a tenant role), R5 (a quota: nothing bounds VPCs/VNIs, pool addresses, or ServiceVIPs, and `attach` is a binary grant with no ceiling). R1+R2 must land **together** — a tenant role cannot be granted safely before reads are namespaced
 - [x] Agent token rotation: the plugin kubeconfig references a host-visible tokenFile the agent refreshes as kubelet rotates the projected SA token (the embedded-once copy only worked via the API server's expired-token grace)
 - [ ] Multi-tenancy model (the API is single-tenant today) — `design.md`
 
