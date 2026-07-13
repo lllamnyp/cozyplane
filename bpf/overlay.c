@@ -405,6 +405,25 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } floating_egress SEC(".maps");
 
+// vpc_ingress: net (VNI) -> 1, present only for a VPC whose gateway admits
+// LoadBalancer ingress (docs/north-south.md, tenet 7 — "nothing crosses by
+// default"). Absent means a Service type=LoadBalancer must NOT be able to open a
+// door into that tenant's VPC, however it was created and by whom.
+//
+// This is the one place the boundary is fail-closed rather than merely observed:
+// before it, a Service in ANY namespace naming a VPC pod as its backend got a
+// free ride — the platform attracted it, the platform's uplink hook delivered it,
+// and the tenant's own networking was never consulted. Now the VPC's gateway has
+// to say yes. (It admits the traffic to the boundary; the destination's
+// SecurityGroups still decide which pods and ports answer.)
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u32); // net (VNI)
+	__type(value, __u8);
+	__uint(max_entries, 4096);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} vpc_ingress SEC(".maps");
+
 // float_announce: public IP -> 1, present ONLY on the node elected to advertise
 // that address (docs/floating-ha.md). It is the sole gate on the ARP/NDP
 // responders, and it is what separates *attraction* from *delivery*: the
@@ -647,6 +666,12 @@ struct vpc_counter {
 	__u64 rx_bytes;
 	__u64 ns_packets[NS_MECH_MAX][2]; // [door][in]
 	__u64 ns_bytes[NS_MECH_MAX][2];
+	// Packets REFUSED at the boundary, per door. Kept apart from the crossing
+	// counters on purpose: a refused packet did not cross, so folding it into the
+	// byte meter would corrupt the one number the boundary exists to produce. It
+	// still has to be visible — "the tenant's LoadBalancer does not work" is
+	// answered by this counter being non-zero.
+	__u64 ns_denied[NS_MECH_MAX];
 };
 
 struct {
@@ -708,6 +733,17 @@ static __always_inline void count_ns(__u32 net, __u32 len, int mech, int in)
 		return;
 	c->ns_packets[mech][in]++;
 	c->ns_bytes[mech][in] += len;
+}
+
+// count_ns_denied records a packet the boundary REFUSED, per door.
+static __always_inline void count_ns_denied(__u32 net, int mech)
+{
+	if (!net || mech < 0 || mech >= NS_MECH_MAX)
+		return;
+	struct vpc_counter *c = bpf_map_lookup_elem(&vpc_counters, &net);
+	if (!c)
+		return;
+	c->ns_denied[mech]++;
 }
 
 // Security groups (intra-VPC policy, #7). Enforcement is destination-side, in
@@ -3854,6 +3890,13 @@ int cozyplane_lb_ingress(struct __sk_buff *skb)
 	int remote = 0;
 	if (be) {
 		s->dst = be->vpc_ip;
+		// Tenet 7: ingress into a VPC is something the VPC's own boundary admits.
+		// No gateway with ingress.loadBalancer, no door — whoever created the
+		// Service (docs/north-south.md).
+		if (!bpf_map_lookup_elem(&vpc_ingress, &be->net)) {
+			count_ns_denied(be->net, NS_LB);
+			return TC_ACT_SHOT;
+		}
 		if (!ns_sg_admit(be->net, be->vpc_ip, s->fk.client, p.proto, tport)) {
 			count_sg_drop(be->net);
 			return TC_ACT_SHOT;

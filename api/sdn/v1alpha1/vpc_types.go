@@ -42,22 +42,11 @@ type VPCSpec struct {
 	// controller default.
 	// +optional
 	MTU int32 `json:"mtu,omitempty"`
-
-	// Egress configures how workloads in this VPC reach destinations outside
-	// it. Absent means no egress: the VPC is a closed island for outbound
-	// traffic (inbound north-south via the fabric IP still works).
-	// +optional
-	Egress *VPCEgress `json:"egress,omitempty"`
 }
 
-// VPCEgress is the egress configuration of a VPC.
-type VPCEgress struct {
-	// NATGateway runs a per-VPC gateway pod that forwards off-VPC traffic to
-	// the outside world (masqueraded to the gateway's address) and to cluster
-	// DNS; other cluster-internal destinations stay denied.
-	// +optional
-	NATGateway bool `json:"natGateway,omitempty"`
-}
+// A VPC's way OUT (and in) is not declared here: it is a VPCGateway, which is a
+// separate object because opening a door onto an ExternalPool is the operator's
+// grant, not the tenant's to take (docs/north-south.md).
 
 // VPCStatus is the observed state of a VPC.
 type VPCStatus struct {

@@ -30,6 +30,7 @@ import (
 	servicevipstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/servicevip"
 	vpcstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/vpc"
 	vpcbindingstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/vpcbinding"
+	vpcgatewaystorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/vpcgateway"
 	vpcpeeringstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/vpcpeering"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -61,6 +62,10 @@ func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOpt
 	apiGroupInfo := genericapiserver.NewDefaultAPIGroupInfo(sdn.GroupName, scheme, metav1.ParameterCodec, codec)
 
 	vpcREST, vpcStatusREST, err := vpcstorage.NewREST(scheme, restOptionsGetter)
+	if err != nil {
+		panic(err)
+	}
+	vpcGatewayREST, vpcGatewayStatusREST, err := vpcgatewaystorage.NewREST(scheme, restOptionsGetter, auth)
 	if err != nil {
 		panic(err)
 	}
@@ -105,6 +110,8 @@ func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOpt
 	v1alpha1storage["ports"] = portREST
 	v1alpha1storage["ports/status"] = portStatusREST
 	v1alpha1storage["vpcbindings"] = defaultregistry.RESTInPeace(vpcbindingstorage.NewREST(scheme, restOptionsGetter, auth))
+	v1alpha1storage["vpcgateways"] = vpcGatewayREST
+	v1alpha1storage["vpcgateways/status"] = vpcGatewayStatusREST
 	v1alpha1storage["vpcpeerings"] = vpcPeeringREST
 	v1alpha1storage["vpcpeerings/status"] = vpcPeeringStatusREST
 	v1alpha1storage["externalpools"] = externalPoolREST

@@ -36,6 +36,7 @@ type SdnV1alpha1Interface interface {
 	ServiceVIPsGetter
 	VPCsGetter
 	VPCBindingsGetter
+	VPCGatewaysGetter
 	VPCPeeringsGetter
 }
 
@@ -74,6 +75,10 @@ func (c *SdnV1alpha1Client) VPCs(namespace string) VPCInterface {
 
 func (c *SdnV1alpha1Client) VPCBindings(namespace string) VPCBindingInterface {
 	return newVPCBindings(c, namespace)
+}
+
+func (c *SdnV1alpha1Client) VPCGateways(namespace string) VPCGatewayInterface {
+	return newVPCGateways(c, namespace)
 }
 
 func (c *SdnV1alpha1Client) VPCPeerings(namespace string) VPCPeeringInterface {

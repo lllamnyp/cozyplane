@@ -48,6 +48,11 @@ type VPCCounter struct {
 	RxBytes   uint64
 	NSPackets [nsDoors][2]uint64
 	NSBytes   [nsDoors][2]uint64
+	// NSDenied counts packets the boundary REFUSED, per door. Deliberately not
+	// folded into the crossing counters: a refused packet did not cross, and the
+	// byte meter must stay clean. It still has to be visible — "my LoadBalancer
+	// doesn't reach the VPC" is answered by this being non-zero.
+	NSDenied [nsDoors]uint64
 }
 
 // NorthSouthBytes totals every byte this VPC pushed across its boundary, in both
@@ -99,6 +104,7 @@ func (m *Manager) VPCCounters() (map[uint32]VPCCounter, error) {
 			c.RxPackets += per[i].RxPackets
 			c.RxBytes += per[i].RxBytes
 			for door := 0; door < nsDoors; door++ {
+				c.NSDenied[door] += per[i].NsDenied[door]
 				for in := 0; in < 2; in++ {
 					c.NSPackets[door][in] += per[i].NsPackets[door][in]
 					c.NSBytes[door][in] += per[i].NsBytes[door][in]
@@ -111,4 +117,38 @@ func (m *Manager) VPCCounters() (map[uint32]VPCCounter, error) {
 		return nil, fmt.Errorf("iterate vpc_counters: %w", err)
 	}
 	return out, nil
+}
+
+// SetVPCIngress opens a VPC to LoadBalancer ingress; DelVPCIngress closes it.
+// Absent means closed — a Service type=LoadBalancer cannot open a door into a
+// tenant's VPC unless that VPC's gateway admits it (docs/north-south.md, tenet 7).
+func (m *Manager) SetVPCIngress(net uint32) error {
+	if net == 0 {
+		return nil // the default network is the platform's, not a tenant's
+	}
+	var one uint8 = 1
+	if err := m.objs.VpcIngress.Put(net, one); err != nil {
+		return fmt.Errorf("open vpc ingress for net %d: %w", net, err)
+	}
+	return nil
+}
+
+func (m *Manager) DelVPCIngress(net uint32) error {
+	if err := m.objs.VpcIngress.Delete(net); err != nil && !isNotExist(err) {
+		return fmt.Errorf("close vpc ingress for net %d: %w", net, err)
+	}
+	return nil
+}
+
+// VPCIngresses returns the nets currently admitting LoadBalancer ingress, so the
+// agent can diff its desired set against the pinned map (which outlives it).
+func (m *Manager) VPCIngresses() (map[uint32]bool, error) {
+	out := map[uint32]bool{}
+	var net uint32
+	var v uint8
+	it := m.objs.VpcIngress.Iterate()
+	for it.Next(&net, &v) {
+		out[net] = true
+	}
+	return out, it.Err()
 }

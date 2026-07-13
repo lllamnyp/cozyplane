@@ -44,15 +44,24 @@ func gatewayScheme(t *testing.T) *runtime.Scheme {
 }
 
 func egressVPC(ns, name string, vni int32, egress bool) *sdnv1alpha1.VPC {
-	vpc := &sdnv1alpha1.VPC{
+	return &sdnv1alpha1.VPC{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 		Spec:       sdnv1alpha1.VPCSpec{CIDRs: []string{"10.10.0.0/24"}},
 		Status:     sdnv1alpha1.VPCStatus{VNI: vni},
 	}
-	if egress {
-		vpc.Spec.Egress = &sdnv1alpha1.VPCEgress{NATGateway: true}
+}
+
+// natGateway is the VPC's door: a separate object now, because opening one is the
+// operator's grant and not a bool a tenant flips on its own VPC
+// (docs/north-south.md).
+func natGateway(ns, name, vpcName string) *sdnv1alpha1.VPCGateway {
+	return &sdnv1alpha1.VPCGateway{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: sdnv1alpha1.VPCGatewaySpec{
+			VPCRef: sdnv1alpha1.LocalVPCRef{Name: vpcName},
+			NAT:    sdnv1alpha1.VPCGatewayNAT{Enabled: true},
+		},
 	}
-	return vpc
 }
 
 func gatewayReconciler(c client.Client) *GatewayReconciler {
@@ -69,7 +78,7 @@ func gatewayReconciler(c client.Client) *GatewayReconciler {
 
 func TestGatewayDeploymentCreated(t *testing.T) {
 	scheme := gatewayScheme(t)
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(egressVPC("team-a", "vpc-a", 100, true)).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(egressVPC("team-a", "vpc-a", 100, true), natGateway("team-a", "door", "vpc-a")).Build()
 	r := gatewayReconciler(c)
 
 	key := types.NamespacedName{Namespace: "team-a", Name: "vpc-a"}
@@ -95,7 +104,7 @@ func TestGatewayDeploymentCreated(t *testing.T) {
 
 func TestGatewayNotCreatedWithoutOptIn(t *testing.T) {
 	scheme := gatewayScheme(t)
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(egressVPC("team-a", "vpc-a", 100, false)).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(egressVPC("team-a", "vpc-a", 100, false)).Build() // no VPCGateway: no door
 	r := gatewayReconciler(c)
 
 	key := types.NamespacedName{Namespace: "team-a", Name: "vpc-a"}
@@ -116,7 +125,8 @@ func TestGatewayNotCreatedWithoutOptIn(t *testing.T) {
 func TestGatewayDeletedOnDisableAndVPCDeletion(t *testing.T) {
 	scheme := gatewayScheme(t)
 	vpc := egressVPC("team-a", "vpc-a", 100, true)
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(vpc).Build()
+	gw := natGateway("team-a", "door", "vpc-a")
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(vpc, gw).Build()
 	r := gatewayReconciler(c)
 	ctx := context.Background()
 	key := types.NamespacedName{Namespace: "team-a", Name: "vpc-a"}
@@ -125,10 +135,10 @@ func TestGatewayDeletedOnDisableAndVPCDeletion(t *testing.T) {
 		t.Fatalf("reconcile: %v", err)
 	}
 
-	// Disable egress.
-	vpc.Spec.Egress = nil
-	if err := c.Update(ctx, vpc); err != nil {
-		t.Fatalf("update vpc: %v", err)
+	// Close the door.
+	gw.Spec.NAT.Enabled = false
+	if err := c.Update(ctx, gw); err != nil {
+		t.Fatalf("update vpcgateway: %v", err)
 	}
 	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -138,10 +148,10 @@ func TestGatewayDeletedOnDisableAndVPCDeletion(t *testing.T) {
 		t.Errorf("deployment should be deleted when egress is disabled, got %v", err)
 	}
 
-	// Re-enable, then delete the VPC entirely.
-	vpc.Spec.Egress = &sdnv1alpha1.VPCEgress{NATGateway: true}
-	if err := c.Update(ctx, vpc); err != nil {
-		t.Fatalf("update vpc: %v", err)
+	// Re-open, then delete the VPC entirely.
+	gw.Spec.NAT.Enabled = true
+	if err := c.Update(ctx, gw); err != nil {
+		t.Fatalf("update vpcgateway: %v", err)
 	}
 	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -187,7 +197,7 @@ func TestSeveredGatewayPodIsRecreated(t *testing.T) {
 	}
 
 	c := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(vpc, readyPod("gw-healthy"), readyPod("gw-severed"), gwPort).Build()
+		WithObjects(vpc, natGateway("team-a", "door", "vpc-a"), readyPod("gw-healthy"), readyPod("gw-severed"), gwPort).Build()
 	r := gatewayReconciler(c)
 
 	key := types.NamespacedName{Namespace: "team-a", Name: "vpc-a"}
@@ -207,7 +217,7 @@ func TestSeveredGatewayPodIsRecreated(t *testing.T) {
 
 func TestGatewayWaitsForVNI(t *testing.T) {
 	scheme := gatewayScheme(t)
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(egressVPC("team-a", "vpc-a", 0, true)).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(egressVPC("team-a", "vpc-a", 0, true), natGateway("team-a", "door", "vpc-a")).Build()
 	r := gatewayReconciler(c)
 
 	key := types.NamespacedName{Namespace: "team-a", Name: "vpc-a"}

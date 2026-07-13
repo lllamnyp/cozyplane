@@ -195,6 +195,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := (&sdncontroller.VPCGatewayReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "VPCGateway")
+		os.Exit(1)
+	}
+
 	if gatewayImage != "" {
 		if gatewayNamespace == "" {
 			setupLog.Error(nil, "--gateway-namespace (or POD_NAMESPACE) is required with --gateway-image")

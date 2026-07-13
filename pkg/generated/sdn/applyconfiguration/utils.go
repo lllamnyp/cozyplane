@@ -102,8 +102,16 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &sdnv1alpha1.VPCBindingApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPCBindingSpec"):
 		return &sdnv1alpha1.VPCBindingSpecApplyConfiguration{}
-	case v1alpha1.SchemeGroupVersion.WithKind("VPCEgress"):
-		return &sdnv1alpha1.VPCEgressApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPCGateway"):
+		return &sdnv1alpha1.VPCGatewayApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPCGatewayIngress"):
+		return &sdnv1alpha1.VPCGatewayIngressApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPCGatewayNAT"):
+		return &sdnv1alpha1.VPCGatewayNATApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPCGatewaySpec"):
+		return &sdnv1alpha1.VPCGatewaySpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPCGatewayStatus"):
+		return &sdnv1alpha1.VPCGatewayStatusApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPCPeering"):
 		return &sdnv1alpha1.VPCPeeringApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPCPeeringSpec"):

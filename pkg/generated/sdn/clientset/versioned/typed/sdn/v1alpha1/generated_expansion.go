@@ -34,4 +34,6 @@ type VPCExpansion interface{}
 
 type VPCBindingExpansion interface{}
 
+type VPCGatewayExpansion interface{}
+
 type VPCPeeringExpansion interface{}

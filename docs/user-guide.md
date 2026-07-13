@@ -24,7 +24,7 @@ where it's headed.
   VPC pod via its fabric IP (north-south). A VPC pod itself cannot initiate to
   anything outside its VPC — the default network, the node, other VPCs, the
   internet are all dropped — unless the owner opens a path: a `VPCPeering` to
-  another VPC, or `spec.egress.natGateway` for internet + DNS via a per-VPC
+  another VPC, or a `VPCGateway` for internet + DNS via a per-VPC
   gateway.
 - **Tenancy.** The VPC owner controls who may use it: a `VPCBinding` is created
   by someone holding both `create vpcbindings` in the consumer namespace and the
@@ -267,17 +267,29 @@ Notes:
 - Peering only makes traffic *admissible* between the two VPCs; it grants no
   rights on the peer VPC itself (no attach, no export).
 
-## Open a path to the outside (egress gateway)
+## Open a path to the outside (the VPC's gateway)
 
-By default a VPC is a **closed island** for outbound traffic. The owner opts
-into egress on the VPC:
+By default a VPC is a **closed island**: no way out, and no way in. Its
+north-south boundary is a separate object — a `VPCGateway`
+([docs/north-south.md](north-south.md)) — because opening a door onto an
+`ExternalPool` is the *operator's* grant, not something a tenant takes by
+flipping a field on a VPC it owns:
 
 ```yaml
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: VPCGateway
+metadata: {name: door, namespace: team-a}
 spec:
-  cidrs: ["10.10.0.0/24"]
-  egress:
-    natGateway: true
+  vpcRef: {name: vpc-a}
+  poolRef: {name: public}      # requires the "attach" verb on the pool
+  nat:
+    enabled: true              # outbound for pods with no floating address
+  ingress:
+    loadBalancer: false        # may a Service type=LB land on this VPC's pods?
 ```
+
+A VPC has **exactly one** boundary (the oldest gateway wins), and everything
+that crosses it is counted per VPC and per door — `cozyplane_vpc_ns_bytes_total`.
 
 The controller spawns a per-VPC **gateway pod** in the system namespace — a
 default-network pod with a second leg carrying the VPC's reserved `.1`
@@ -297,8 +309,16 @@ kubectl exec app-1 -- nslookup example.com       # resolves (via the gateway)
 kubectl exec app-1 -- wget -qO- http://<any-cluster-pod-ip>   # still blocked
 ```
 
-Deleting `spec.egress` (or the VPC) tears the gateway down and the VPC closes
-again. The gateway needs the chart's `egress.*` values (cluster pod/service
+Setting `nat.enabled: false` (or deleting the VPCGateway, or the VPC) tears the
+gateway down and the VPC closes again.
+
+**Ingress is closed by default too.** A `Service` of type `LoadBalancer` whose
+backends are VPC pods is *refused* unless this VPC's gateway sets
+`ingress.loadBalancer: true` — whoever created the Service, and in whatever
+namespace. Without it the platform would attract the address, deliver it, and
+hand it to a tenant's pod with the tenant's own networking never consulted.
+Refusals are counted (`cozyplane_vpc_ns_denied_total`), so "my LoadBalancer
+doesn't reach the VPC" has an answer. The gateway needs the chart's `egress.*` values (cluster pod/service
 CIDRs, cluster DNS IP) to know what to deny — set `egress.internalCIDRs` to
 also cover your node/management networks.
 

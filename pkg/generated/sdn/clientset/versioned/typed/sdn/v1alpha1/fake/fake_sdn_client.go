@@ -60,6 +60,10 @@ func (c *FakeSdnV1alpha1) VPCBindings(namespace string) v1alpha1.VPCBindingInter
 	return newFakeVPCBindings(c, namespace)
 }
 
+func (c *FakeSdnV1alpha1) VPCGateways(namespace string) v1alpha1.VPCGatewayInterface {
+	return newFakeVPCGateways(c, namespace)
+}
+
 func (c *FakeSdnV1alpha1) VPCPeerings(namespace string) v1alpha1.VPCPeeringInterface {
 	return newFakeVPCPeerings(c, namespace)
 }

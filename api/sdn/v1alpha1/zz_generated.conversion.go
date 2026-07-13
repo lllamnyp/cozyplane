@@ -457,13 +457,63 @@ func RegisterConversions(s *runtime.Scheme) error {
 	}); err != nil {
 		return err
 	}
-	if err := s.AddGeneratedConversionFunc((*VPCEgress)(nil), (*sdn.VPCEgress)(nil), func(a, b interface{}, scope conversion.Scope) error {
-		return Convert_v1alpha1_VPCEgress_To_sdn_VPCEgress(a.(*VPCEgress), b.(*sdn.VPCEgress), scope)
+	if err := s.AddGeneratedConversionFunc((*VPCGateway)(nil), (*sdn.VPCGateway)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_VPCGateway_To_sdn_VPCGateway(a.(*VPCGateway), b.(*sdn.VPCGateway), scope)
 	}); err != nil {
 		return err
 	}
-	if err := s.AddGeneratedConversionFunc((*sdn.VPCEgress)(nil), (*VPCEgress)(nil), func(a, b interface{}, scope conversion.Scope) error {
-		return Convert_sdn_VPCEgress_To_v1alpha1_VPCEgress(a.(*sdn.VPCEgress), b.(*VPCEgress), scope)
+	if err := s.AddGeneratedConversionFunc((*sdn.VPCGateway)(nil), (*VPCGateway)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_VPCGateway_To_v1alpha1_VPCGateway(a.(*sdn.VPCGateway), b.(*VPCGateway), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*VPCGatewayIngress)(nil), (*sdn.VPCGatewayIngress)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_VPCGatewayIngress_To_sdn_VPCGatewayIngress(a.(*VPCGatewayIngress), b.(*sdn.VPCGatewayIngress), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.VPCGatewayIngress)(nil), (*VPCGatewayIngress)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_VPCGatewayIngress_To_v1alpha1_VPCGatewayIngress(a.(*sdn.VPCGatewayIngress), b.(*VPCGatewayIngress), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*VPCGatewayList)(nil), (*sdn.VPCGatewayList)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_VPCGatewayList_To_sdn_VPCGatewayList(a.(*VPCGatewayList), b.(*sdn.VPCGatewayList), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.VPCGatewayList)(nil), (*VPCGatewayList)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_VPCGatewayList_To_v1alpha1_VPCGatewayList(a.(*sdn.VPCGatewayList), b.(*VPCGatewayList), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*VPCGatewayNAT)(nil), (*sdn.VPCGatewayNAT)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_VPCGatewayNAT_To_sdn_VPCGatewayNAT(a.(*VPCGatewayNAT), b.(*sdn.VPCGatewayNAT), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.VPCGatewayNAT)(nil), (*VPCGatewayNAT)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_VPCGatewayNAT_To_v1alpha1_VPCGatewayNAT(a.(*sdn.VPCGatewayNAT), b.(*VPCGatewayNAT), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*VPCGatewaySpec)(nil), (*sdn.VPCGatewaySpec)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_VPCGatewaySpec_To_sdn_VPCGatewaySpec(a.(*VPCGatewaySpec), b.(*sdn.VPCGatewaySpec), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.VPCGatewaySpec)(nil), (*VPCGatewaySpec)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_VPCGatewaySpec_To_v1alpha1_VPCGatewaySpec(a.(*sdn.VPCGatewaySpec), b.(*VPCGatewaySpec), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*VPCGatewayStatus)(nil), (*sdn.VPCGatewayStatus)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_VPCGatewayStatus_To_sdn_VPCGatewayStatus(a.(*VPCGatewayStatus), b.(*sdn.VPCGatewayStatus), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.VPCGatewayStatus)(nil), (*VPCGatewayStatus)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_VPCGatewayStatus_To_v1alpha1_VPCGatewayStatus(a.(*sdn.VPCGatewayStatus), b.(*VPCGatewayStatus), scope)
 	}); err != nil {
 		return err
 	}
@@ -1620,24 +1670,162 @@ func Convert_sdn_VPCBindingSpec_To_v1alpha1_VPCBindingSpec(in *sdn.VPCBindingSpe
 	return autoConvert_sdn_VPCBindingSpec_To_v1alpha1_VPCBindingSpec(in, out, s)
 }
 
-func autoConvert_v1alpha1_VPCEgress_To_sdn_VPCEgress(in *VPCEgress, out *sdn.VPCEgress, s conversion.Scope) error {
-	out.NATGateway = in.NATGateway
+func autoConvert_v1alpha1_VPCGateway_To_sdn_VPCGateway(in *VPCGateway, out *sdn.VPCGateway, s conversion.Scope) error {
+	out.ObjectMeta = in.ObjectMeta
+	if err := Convert_v1alpha1_VPCGatewaySpec_To_sdn_VPCGatewaySpec(&in.Spec, &out.Spec, s); err != nil {
+		return err
+	}
+	if err := Convert_v1alpha1_VPCGatewayStatus_To_sdn_VPCGatewayStatus(&in.Status, &out.Status, s); err != nil {
+		return err
+	}
 	return nil
 }
 
-// Convert_v1alpha1_VPCEgress_To_sdn_VPCEgress is an autogenerated conversion function.
-func Convert_v1alpha1_VPCEgress_To_sdn_VPCEgress(in *VPCEgress, out *sdn.VPCEgress, s conversion.Scope) error {
-	return autoConvert_v1alpha1_VPCEgress_To_sdn_VPCEgress(in, out, s)
+// Convert_v1alpha1_VPCGateway_To_sdn_VPCGateway is an autogenerated conversion function.
+func Convert_v1alpha1_VPCGateway_To_sdn_VPCGateway(in *VPCGateway, out *sdn.VPCGateway, s conversion.Scope) error {
+	return autoConvert_v1alpha1_VPCGateway_To_sdn_VPCGateway(in, out, s)
 }
 
-func autoConvert_sdn_VPCEgress_To_v1alpha1_VPCEgress(in *sdn.VPCEgress, out *VPCEgress, s conversion.Scope) error {
-	out.NATGateway = in.NATGateway
+func autoConvert_sdn_VPCGateway_To_v1alpha1_VPCGateway(in *sdn.VPCGateway, out *VPCGateway, s conversion.Scope) error {
+	out.ObjectMeta = in.ObjectMeta
+	if err := Convert_sdn_VPCGatewaySpec_To_v1alpha1_VPCGatewaySpec(&in.Spec, &out.Spec, s); err != nil {
+		return err
+	}
+	if err := Convert_sdn_VPCGatewayStatus_To_v1alpha1_VPCGatewayStatus(&in.Status, &out.Status, s); err != nil {
+		return err
+	}
 	return nil
 }
 
-// Convert_sdn_VPCEgress_To_v1alpha1_VPCEgress is an autogenerated conversion function.
-func Convert_sdn_VPCEgress_To_v1alpha1_VPCEgress(in *sdn.VPCEgress, out *VPCEgress, s conversion.Scope) error {
-	return autoConvert_sdn_VPCEgress_To_v1alpha1_VPCEgress(in, out, s)
+// Convert_sdn_VPCGateway_To_v1alpha1_VPCGateway is an autogenerated conversion function.
+func Convert_sdn_VPCGateway_To_v1alpha1_VPCGateway(in *sdn.VPCGateway, out *VPCGateway, s conversion.Scope) error {
+	return autoConvert_sdn_VPCGateway_To_v1alpha1_VPCGateway(in, out, s)
+}
+
+func autoConvert_v1alpha1_VPCGatewayIngress_To_sdn_VPCGatewayIngress(in *VPCGatewayIngress, out *sdn.VPCGatewayIngress, s conversion.Scope) error {
+	out.LoadBalancer = in.LoadBalancer
+	return nil
+}
+
+// Convert_v1alpha1_VPCGatewayIngress_To_sdn_VPCGatewayIngress is an autogenerated conversion function.
+func Convert_v1alpha1_VPCGatewayIngress_To_sdn_VPCGatewayIngress(in *VPCGatewayIngress, out *sdn.VPCGatewayIngress, s conversion.Scope) error {
+	return autoConvert_v1alpha1_VPCGatewayIngress_To_sdn_VPCGatewayIngress(in, out, s)
+}
+
+func autoConvert_sdn_VPCGatewayIngress_To_v1alpha1_VPCGatewayIngress(in *sdn.VPCGatewayIngress, out *VPCGatewayIngress, s conversion.Scope) error {
+	out.LoadBalancer = in.LoadBalancer
+	return nil
+}
+
+// Convert_sdn_VPCGatewayIngress_To_v1alpha1_VPCGatewayIngress is an autogenerated conversion function.
+func Convert_sdn_VPCGatewayIngress_To_v1alpha1_VPCGatewayIngress(in *sdn.VPCGatewayIngress, out *VPCGatewayIngress, s conversion.Scope) error {
+	return autoConvert_sdn_VPCGatewayIngress_To_v1alpha1_VPCGatewayIngress(in, out, s)
+}
+
+func autoConvert_v1alpha1_VPCGatewayList_To_sdn_VPCGatewayList(in *VPCGatewayList, out *sdn.VPCGatewayList, s conversion.Scope) error {
+	out.ListMeta = in.ListMeta
+	out.Items = *(*[]sdn.VPCGateway)(unsafe.Pointer(&in.Items))
+	return nil
+}
+
+// Convert_v1alpha1_VPCGatewayList_To_sdn_VPCGatewayList is an autogenerated conversion function.
+func Convert_v1alpha1_VPCGatewayList_To_sdn_VPCGatewayList(in *VPCGatewayList, out *sdn.VPCGatewayList, s conversion.Scope) error {
+	return autoConvert_v1alpha1_VPCGatewayList_To_sdn_VPCGatewayList(in, out, s)
+}
+
+func autoConvert_sdn_VPCGatewayList_To_v1alpha1_VPCGatewayList(in *sdn.VPCGatewayList, out *VPCGatewayList, s conversion.Scope) error {
+	out.ListMeta = in.ListMeta
+	out.Items = *(*[]VPCGateway)(unsafe.Pointer(&in.Items))
+	return nil
+}
+
+// Convert_sdn_VPCGatewayList_To_v1alpha1_VPCGatewayList is an autogenerated conversion function.
+func Convert_sdn_VPCGatewayList_To_v1alpha1_VPCGatewayList(in *sdn.VPCGatewayList, out *VPCGatewayList, s conversion.Scope) error {
+	return autoConvert_sdn_VPCGatewayList_To_v1alpha1_VPCGatewayList(in, out, s)
+}
+
+func autoConvert_v1alpha1_VPCGatewayNAT_To_sdn_VPCGatewayNAT(in *VPCGatewayNAT, out *sdn.VPCGatewayNAT, s conversion.Scope) error {
+	out.Enabled = in.Enabled
+	return nil
+}
+
+// Convert_v1alpha1_VPCGatewayNAT_To_sdn_VPCGatewayNAT is an autogenerated conversion function.
+func Convert_v1alpha1_VPCGatewayNAT_To_sdn_VPCGatewayNAT(in *VPCGatewayNAT, out *sdn.VPCGatewayNAT, s conversion.Scope) error {
+	return autoConvert_v1alpha1_VPCGatewayNAT_To_sdn_VPCGatewayNAT(in, out, s)
+}
+
+func autoConvert_sdn_VPCGatewayNAT_To_v1alpha1_VPCGatewayNAT(in *sdn.VPCGatewayNAT, out *VPCGatewayNAT, s conversion.Scope) error {
+	out.Enabled = in.Enabled
+	return nil
+}
+
+// Convert_sdn_VPCGatewayNAT_To_v1alpha1_VPCGatewayNAT is an autogenerated conversion function.
+func Convert_sdn_VPCGatewayNAT_To_v1alpha1_VPCGatewayNAT(in *sdn.VPCGatewayNAT, out *VPCGatewayNAT, s conversion.Scope) error {
+	return autoConvert_sdn_VPCGatewayNAT_To_v1alpha1_VPCGatewayNAT(in, out, s)
+}
+
+func autoConvert_v1alpha1_VPCGatewaySpec_To_sdn_VPCGatewaySpec(in *VPCGatewaySpec, out *sdn.VPCGatewaySpec, s conversion.Scope) error {
+	if err := Convert_v1alpha1_LocalVPCRef_To_sdn_LocalVPCRef(&in.VPCRef, &out.VPCRef, s); err != nil {
+		return err
+	}
+	if err := Convert_v1alpha1_ExternalPoolRef_To_sdn_ExternalPoolRef(&in.PoolRef, &out.PoolRef, s); err != nil {
+		return err
+	}
+	if err := Convert_v1alpha1_VPCGatewayNAT_To_sdn_VPCGatewayNAT(&in.NAT, &out.NAT, s); err != nil {
+		return err
+	}
+	if err := Convert_v1alpha1_VPCGatewayIngress_To_sdn_VPCGatewayIngress(&in.Ingress, &out.Ingress, s); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Convert_v1alpha1_VPCGatewaySpec_To_sdn_VPCGatewaySpec is an autogenerated conversion function.
+func Convert_v1alpha1_VPCGatewaySpec_To_sdn_VPCGatewaySpec(in *VPCGatewaySpec, out *sdn.VPCGatewaySpec, s conversion.Scope) error {
+	return autoConvert_v1alpha1_VPCGatewaySpec_To_sdn_VPCGatewaySpec(in, out, s)
+}
+
+func autoConvert_sdn_VPCGatewaySpec_To_v1alpha1_VPCGatewaySpec(in *sdn.VPCGatewaySpec, out *VPCGatewaySpec, s conversion.Scope) error {
+	if err := Convert_sdn_LocalVPCRef_To_v1alpha1_LocalVPCRef(&in.VPCRef, &out.VPCRef, s); err != nil {
+		return err
+	}
+	if err := Convert_sdn_ExternalPoolRef_To_v1alpha1_ExternalPoolRef(&in.PoolRef, &out.PoolRef, s); err != nil {
+		return err
+	}
+	if err := Convert_sdn_VPCGatewayNAT_To_v1alpha1_VPCGatewayNAT(&in.NAT, &out.NAT, s); err != nil {
+		return err
+	}
+	if err := Convert_sdn_VPCGatewayIngress_To_v1alpha1_VPCGatewayIngress(&in.Ingress, &out.Ingress, s); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Convert_sdn_VPCGatewaySpec_To_v1alpha1_VPCGatewaySpec is an autogenerated conversion function.
+func Convert_sdn_VPCGatewaySpec_To_v1alpha1_VPCGatewaySpec(in *sdn.VPCGatewaySpec, out *VPCGatewaySpec, s conversion.Scope) error {
+	return autoConvert_sdn_VPCGatewaySpec_To_v1alpha1_VPCGatewaySpec(in, out, s)
+}
+
+func autoConvert_v1alpha1_VPCGatewayStatus_To_sdn_VPCGatewayStatus(in *VPCGatewayStatus, out *sdn.VPCGatewayStatus, s conversion.Scope) error {
+	out.Phase = sdn.VPCGatewayPhase(in.Phase)
+	out.Conditions = *(*[]v1.Condition)(unsafe.Pointer(&in.Conditions))
+	return nil
+}
+
+// Convert_v1alpha1_VPCGatewayStatus_To_sdn_VPCGatewayStatus is an autogenerated conversion function.
+func Convert_v1alpha1_VPCGatewayStatus_To_sdn_VPCGatewayStatus(in *VPCGatewayStatus, out *sdn.VPCGatewayStatus, s conversion.Scope) error {
+	return autoConvert_v1alpha1_VPCGatewayStatus_To_sdn_VPCGatewayStatus(in, out, s)
+}
+
+func autoConvert_sdn_VPCGatewayStatus_To_v1alpha1_VPCGatewayStatus(in *sdn.VPCGatewayStatus, out *VPCGatewayStatus, s conversion.Scope) error {
+	out.Phase = VPCGatewayPhase(in.Phase)
+	out.Conditions = *(*[]v1.Condition)(unsafe.Pointer(&in.Conditions))
+	return nil
+}
+
+// Convert_sdn_VPCGatewayStatus_To_v1alpha1_VPCGatewayStatus is an autogenerated conversion function.
+func Convert_sdn_VPCGatewayStatus_To_v1alpha1_VPCGatewayStatus(in *sdn.VPCGatewayStatus, out *VPCGatewayStatus, s conversion.Scope) error {
+	return autoConvert_sdn_VPCGatewayStatus_To_v1alpha1_VPCGatewayStatus(in, out, s)
 }
 
 func autoConvert_v1alpha1_VPCList_To_sdn_VPCList(in *VPCList, out *sdn.VPCList, s conversion.Scope) error {
@@ -1795,7 +1983,6 @@ func Convert_sdn_VPCRef_To_v1alpha1_VPCRef(in *sdn.VPCRef, out *VPCRef, s conver
 func autoConvert_v1alpha1_VPCSpec_To_sdn_VPCSpec(in *VPCSpec, out *sdn.VPCSpec, s conversion.Scope) error {
 	out.CIDRs = *(*[]string)(unsafe.Pointer(&in.CIDRs))
 	out.MTU = in.MTU
-	out.Egress = (*sdn.VPCEgress)(unsafe.Pointer(in.Egress))
 	return nil
 }
 
@@ -1807,7 +1994,6 @@ func Convert_v1alpha1_VPCSpec_To_sdn_VPCSpec(in *VPCSpec, out *sdn.VPCSpec, s co
 func autoConvert_sdn_VPCSpec_To_v1alpha1_VPCSpec(in *sdn.VPCSpec, out *VPCSpec, s conversion.Scope) error {
 	out.CIDRs = *(*[]string)(unsafe.Pointer(&in.CIDRs))
 	out.MTU = in.MTU
-	out.Egress = (*VPCEgress)(unsafe.Pointer(in.Egress))
 	return nil
 }
 

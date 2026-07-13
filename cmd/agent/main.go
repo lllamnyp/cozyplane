@@ -419,6 +419,7 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	} else {
 		factory := sdninformers.NewSharedInformerFactory(sdnClient, 0)
 		watchVPCs(factory, mgr, log)
+		watchVPCGateways(ctx, factory, mgr, log)
 		watchPorts(ctx, factory, localFactory, sdnClient, client, mgr, nodeName, state.NodeIP, log)
 		watchPeerings(ctx, factory, mgr, log)
 		watchGateways(ctx, factory, mgr, nodeName, log)
@@ -2104,6 +2105,18 @@ func serveMetrics(ctx context.Context, mgr *datapath.Manager, vpcs sdnv1alpha1in
 							m.name, net, id[0], id[1], nodeName, doorName, dir, m.pick(c, door, in))
 					}
 				}
+			}
+		}
+
+		// Refused at the boundary — kept out of the byte meter above (a refused
+		// packet did not cross), but an operator debugging "my LoadBalancer never
+		// reaches the VPC" needs exactly this number.
+		fmt.Fprintf(&b, "# HELP cozyplane_vpc_ns_denied_total Packets refused at a VPC's north-south boundary (this node).\n# TYPE cozyplane_vpc_ns_denied_total counter\n")
+		for net, c := range counters {
+			id := names[net]
+			for door, doorName := range datapath.NSDoorNames {
+				fmt.Fprintf(&b, "cozyplane_vpc_ns_denied_total{vni=\"%d\",vpc_namespace=%q,vpc=%q,node=%q,door=%q} %d\n",
+					net, id[0], id[1], nodeName, doorName, c.NSDenied[door])
 			}
 		}
 

@@ -52,6 +52,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&VPCBinding{},
 		&VPCBindingList{},
 		&VPCPeering{},
+		&VPCGateway{},
+		&VPCGatewayList{},
 		&VPCPeeringList{},
 		&Port{},
 		&PortList{},

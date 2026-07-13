@@ -50,18 +50,68 @@ type VPCSpec struct {
 	// MTU is the MTU advertised to ports in this VPC. Zero selects the
 	// controller default.
 	MTU int32
-
-	// Egress configures how workloads in this VPC reach destinations outside
-	// it. Nil means no egress: the VPC is a closed island for outbound traffic.
-	Egress *VPCEgress
 }
 
-// VPCEgress is the egress configuration of a VPC.
-type VPCEgress struct {
-	// NATGateway runs a per-VPC gateway that forwards off-VPC traffic
-	// (masqueraded) to the outside world and cluster DNS, while everything
-	// else internal stays denied.
-	NATGateway bool
+// VPCGatewayPhase is the lifecycle phase of a VPCGateway.
+type VPCGatewayPhase string
+
+const (
+	VPCGatewayPhasePending VPCGatewayPhase = "Pending"
+	VPCGatewayPhaseReady   VPCGatewayPhase = "Ready"
+)
+
+// Condition types surfaced in VPCGateway status.
+const (
+	VPCGatewayConditionVPCResolved  = "VPCResolved"
+	VPCGatewayConditionPoolResolved = "PoolResolved"
+	VPCGatewayConditionExclusive    = "Exclusive"
+)
+
+// VPCGatewayNAT configures many-to-one egress for pods with no address of their own.
+type VPCGatewayNAT struct {
+	Enabled bool
+}
+
+// VPCGatewayIngress configures what may enter the VPC from outside.
+type VPCGatewayIngress struct {
+	// LoadBalancer admits Service type=LoadBalancer traffic onto this VPC's pods;
+	// false by default (docs/north-south.md, tenet 7).
+	LoadBalancer bool
+}
+
+// VPCGatewaySpec declares a VPC's north-south boundary.
+type VPCGatewaySpec struct {
+	VPCRef  LocalVPCRef
+	PoolRef ExternalPoolRef
+	NAT     VPCGatewayNAT
+	Ingress VPCGatewayIngress
+}
+
+// VPCGatewayStatus is the observed state of a VPCGateway.
+type VPCGatewayStatus struct {
+	Phase      VPCGatewayPhase
+	Conditions []metav1.Condition
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// VPCGateway is a VPC's north-south boundary — the one place its traffic to and
+// from the outside is declared, permitted and counted (docs/north-south.md).
+type VPCGateway struct {
+	metav1.TypeMeta
+	metav1.ObjectMeta
+
+	Spec   VPCGatewaySpec
+	Status VPCGatewayStatus
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// VPCGatewayList contains a list of VPCGateway.
+type VPCGatewayList struct {
+	metav1.TypeMeta
+	metav1.ListMeta
+	Items []VPCGateway
 }
 
 // VPCStatus is the observed state of a VPC.

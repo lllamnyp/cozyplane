@@ -45,7 +45,7 @@ const (
 // "<plural>.sdn.cozystack.io". Keep in step with internal/setup/sdn's storage
 // map; a missing entry just leaves one CRD behind (and its OpenAPI collision).
 var sdnPlurals = []string{
-	"vpcs", "vpcbindings", "vpcpeerings", "ports", "externalpools",
+	"vpcs", "vpcbindings", "vpcpeerings", "vpcgateways", "ports", "externalpools",
 	"floatingips", "servicevips", "securitygroups", "hostfirewalls",
 }
 

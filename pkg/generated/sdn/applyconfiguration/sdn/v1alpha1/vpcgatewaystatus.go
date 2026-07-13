@@ -23,41 +23,27 @@ import (
 	v1 "k8s.io/client-go/applyconfigurations/meta/v1"
 )
 
-// VPCStatusApplyConfiguration represents a declarative configuration of the VPCStatus type for use
+// VPCGatewayStatusApplyConfiguration represents a declarative configuration of the VPCGatewayStatus type for use
 // with apply.
 //
-// A VPC's way OUT (and in) is not declared here: it is a VPCGateway, which is a
-// separate object because opening a door onto an ExternalPool is the operator's
-// grant, not the tenant's to take (docs/north-south.md).
-// VPCStatus is the observed state of a VPC.
-type VPCStatusApplyConfiguration struct {
-	// VNI is the overlay network identifier allocated to this VPC by the
-	// controller. Zero means unallocated.
-	VNI *int32 `json:"vni,omitempty"`
-	// Phase is the current lifecycle phase of the VPC.
-	Phase *sdnv1alpha1.VPCPhase `json:"phase,omitempty"`
-	// Conditions represent the latest available observations.
+// VPCGatewayStatus is the observed state of a VPCGateway.
+type VPCGatewayStatusApplyConfiguration struct {
+	// Phase is the lifecycle phase.
+	Phase *sdnv1alpha1.VPCGatewayPhase `json:"phase,omitempty"`
+	// Conditions is the detailed state.
 	Conditions []v1.ConditionApplyConfiguration `json:"conditions,omitempty"`
 }
 
-// VPCStatusApplyConfiguration constructs a declarative configuration of the VPCStatus type for use with
+// VPCGatewayStatusApplyConfiguration constructs a declarative configuration of the VPCGatewayStatus type for use with
 // apply.
-func VPCStatus() *VPCStatusApplyConfiguration {
-	return &VPCStatusApplyConfiguration{}
-}
-
-// WithVNI sets the VNI field in the declarative configuration to the given value
-// and returns the receiver, so that objects can be built by chaining "With" function invocations.
-// If called multiple times, the VNI field is set to the value of the last call.
-func (b *VPCStatusApplyConfiguration) WithVNI(value int32) *VPCStatusApplyConfiguration {
-	b.VNI = &value
-	return b
+func VPCGatewayStatus() *VPCGatewayStatusApplyConfiguration {
+	return &VPCGatewayStatusApplyConfiguration{}
 }
 
 // WithPhase sets the Phase field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the Phase field is set to the value of the last call.
-func (b *VPCStatusApplyConfiguration) WithPhase(value sdnv1alpha1.VPCPhase) *VPCStatusApplyConfiguration {
+func (b *VPCGatewayStatusApplyConfiguration) WithPhase(value sdnv1alpha1.VPCGatewayPhase) *VPCGatewayStatusApplyConfiguration {
 	b.Phase = &value
 	return b
 }
@@ -65,7 +51,7 @@ func (b *VPCStatusApplyConfiguration) WithPhase(value sdnv1alpha1.VPCPhase) *VPC
 // WithConditions adds the given value to the Conditions field in the declarative configuration
 // and returns the receiver, so that objects can be build by chaining "With" function invocations.
 // If called multiple times, values provided by each call will be appended to the Conditions field.
-func (b *VPCStatusApplyConfiguration) WithConditions(values ...*v1.ConditionApplyConfiguration) *VPCStatusApplyConfiguration {
+func (b *VPCGatewayStatusApplyConfiguration) WithConditions(values ...*v1.ConditionApplyConfiguration) *VPCGatewayStatusApplyConfiguration {
 	for i := range values {
 		if values[i] == nil {
 			panic("nil value passed to WithConditions")

@@ -12,8 +12,15 @@ note "but packets leave a VPC only through a door the tenant asked for."
 echo
 read -r -p "        [press Enter to open the door: one flag on the VPC]" || true
 
-kubectl -n "$RED_NS" patch vpc "$RED_VPC" --type=merge -p '{"spec":{"egress":{"natGateway":true}}}' >/dev/null
-note "patched: spec.egress.natGateway=true — the controller now spawns a gateway pod"
+kubectl apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: VPCGateway
+metadata: {name: door, namespace: $RED_NS}
+spec:
+  vpcRef: {name: $RED_VPC}
+  nat: {enabled: true}
+EOF
+note "created a VPCGateway — the VPC's door, and the controller now spawns a gateway pod"
 
 GWNS=""; GWPOD=""
 for _ in $(seq 40); do

@@ -430,8 +430,17 @@ func addGatewayLeg(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, pod
 	if err != nil {
 		return fmt.Errorf("get vpc %s/%s: %w", vpcNS, vpcName, err)
 	}
-	if vpc.Spec.Egress == nil || !vpc.Spec.Egress.NATGateway {
-		return fmt.Errorf("vpc %s/%s has no egress gateway enabled (spec.egress.natGateway)", vpcNS, vpcName)
+	// The VPC's owner must have opened a door: a VPCGateway naming this VPC, with
+	// NAT enabled. Not a field on the VPC any more — opening one onto an
+	// ExternalPool is the operator's grant (docs/north-south.md). The VPC's
+	// boundary is its OLDEST gateway; a second one realizes nothing.
+	gws, err := client.SdnV1alpha1().VPCGateways(vpcNS).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list vpcgateways in %s: %w", vpcNS, err)
+	}
+	gw := sdnv1alpha1.EffectiveGateway(gws.Items, vpcName)
+	if gw == nil || !gw.Spec.NAT.Enabled {
+		return fmt.Errorf("vpc %s/%s has no gateway with NAT enabled (create a VPCGateway)", vpcNS, vpcName)
 	}
 	if vpc.Status.VNI == 0 {
 		return fmt.Errorf("vpc %s/%s is not ready (no VNI assigned yet)", vpcNS, vpcName)

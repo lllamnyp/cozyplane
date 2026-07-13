@@ -40,6 +40,8 @@ type Interface interface {
 	VPCs() VPCInformer
 	// VPCBindings returns a VPCBindingInformer.
 	VPCBindings() VPCBindingInformer
+	// VPCGateways returns a VPCGatewayInformer.
+	VPCGateways() VPCGatewayInformer
 	// VPCPeerings returns a VPCPeeringInformer.
 	VPCPeerings() VPCPeeringInformer
 }
@@ -93,6 +95,11 @@ func (v *version) VPCs() VPCInformer {
 // VPCBindings returns a VPCBindingInformer.
 func (v *version) VPCBindings() VPCBindingInformer {
 	return &vPCBindingInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// VPCGateways returns a VPCGatewayInformer.
+func (v *version) VPCGateways() VPCGatewayInformer {
+	return &vPCGatewayInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
 // VPCPeerings returns a VPCPeeringInformer.

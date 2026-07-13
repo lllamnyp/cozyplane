@@ -26,6 +26,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -78,7 +79,16 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, fmt.Errorf("fetch VPC: %w", err)
 	}
 
-	if vpc.Spec.Egress == nil || !vpc.Spec.Egress.NATGateway {
+	// The door is a VPCGateway now, not a field on the VPC: opening one onto an
+	// ExternalPool is the operator's grant, and a tenant must not be able to give
+	// itself internet by flipping a bool on an object it owns (docs/north-south.md).
+	// The VPC's boundary is its OLDEST gateway; a second one realizes nothing.
+	var gws sdnv1alpha1.VPCGatewayList
+	if err := r.List(ctx, &gws, client.InNamespace(vpc.Namespace)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("list VPCGateways: %w", err)
+	}
+	gw := sdnv1alpha1.EffectiveGateway(gws.Items, vpc.Name)
+	if gw == nil || !gw.Spec.NAT.Enabled {
 		return ctrl.Result{}, r.deleteGateways(ctx, vpc.Namespace, vpc.Name)
 	}
 	if vpc.Status.VNI == 0 {
@@ -235,6 +245,7 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&sdnv1alpha1.VPC{}).
 		Watches(&appsv1.Deployment{}, handler.EnqueueRequestsFromMapFunc(r.mapDeploymentToVPC)).
 		Watches(&sdnv1alpha1.Port{}, handler.EnqueueRequestsFromMapFunc(r.mapGatewayPortToVPC)).
+		Watches(&sdnv1alpha1.VPCGateway{}, handler.EnqueueRequestsFromMapFunc(r.mapVPCGatewayToVPC)).
 		Named("gateway").
 		Complete(r)
 }
@@ -262,4 +273,15 @@ func (r *GatewayReconciler) mapDeploymentToVPC(ctx context.Context, obj client.O
 		return nil
 	}
 	return []ctrl.Request{{NamespacedName: client.ObjectKey{Namespace: ns, Name: name}}}
+}
+
+// mapVPCGatewayToVPC re-drives the VPC whose boundary changed.
+func (r *GatewayReconciler) mapVPCGatewayToVPC(ctx context.Context, obj client.Object) []ctrl.Request {
+	gw, ok := obj.(*sdnv1alpha1.VPCGateway)
+	if !ok || gw.Spec.VPCRef.Name == "" {
+		return nil
+	}
+	return []ctrl.Request{{NamespacedName: types.NamespacedName{
+		Namespace: gw.Namespace, Name: gw.Spec.VPCRef.Name,
+	}}}
 }

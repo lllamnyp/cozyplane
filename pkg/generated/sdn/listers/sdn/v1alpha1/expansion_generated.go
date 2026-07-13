@@ -66,6 +66,14 @@ type VPCBindingListerExpansion interface{}
 // VPCBindingNamespaceLister.
 type VPCBindingNamespaceListerExpansion interface{}
 
+// VPCGatewayListerExpansion allows custom methods to be added to
+// VPCGatewayLister.
+type VPCGatewayListerExpansion interface{}
+
+// VPCGatewayNamespaceListerExpansion allows custom methods to be added to
+// VPCGatewayNamespaceLister.
+type VPCGatewayNamespaceListerExpansion interface{}
+
 // VPCPeeringListerExpansion allows custom methods to be added to
 // VPCPeeringLister.
 type VPCPeeringListerExpansion interface{}

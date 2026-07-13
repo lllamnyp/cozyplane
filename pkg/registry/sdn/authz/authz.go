@@ -41,6 +41,18 @@ import (
 // where the ValidatingAdmissionPolicy twin owns enforcement. The aggregated
 // apiserver always wires the delegated authorizer in.
 func CheckVPCVerb(ctx context.Context, auth authorizer.Authorizer, verb, namespace, name string, path *field.Path) *field.Error {
+	return CheckResourceVerb(ctx, auth, verb, "vpcs", "VPC", namespace, name, path)
+}
+
+// CheckResourceVerb is the general form: a virtual verb on any resource in this
+// group. Cozyplane uses it wherever holding one object must not imply the right
+// to consume another — a VPC you may see but not bind (`export`), a VPC you may
+// not peer with (`peer`), an ExternalPool you may not draw addresses from
+// (`attach`). The pattern is always the same: the escalation is refused at the
+// aggregated apiserver, which admission webhooks never see.
+//
+// `kind` is only used to phrase the error.
+func CheckResourceVerb(ctx context.Context, auth authorizer.Authorizer, verb, resource, kind, namespace, name string, path *field.Path) *field.Error {
 	if auth == nil {
 		return nil
 	}
@@ -52,16 +64,20 @@ func CheckVPCVerb(ctx context.Context, auth authorizer.Authorizer, verb, namespa
 		User:            u,
 		Verb:            verb,
 		APIGroup:        sdn.GroupName,
-		Resource:        "vpcs",
+		Resource:        resource,
 		Namespace:       namespace,
 		Name:            name,
 		ResourceRequest: true,
 	})
+	who := name
+	if namespace != "" {
+		who = namespace + "/" + name
+	}
 	if err != nil {
-		return field.Forbidden(path, fmt.Sprintf("checking the %q verb on VPC %s/%s: %v", verb, namespace, name, err))
+		return field.Forbidden(path, fmt.Sprintf("checking the %q verb on %s %s: %v", verb, kind, who, err))
 	}
 	if decision != authorizer.DecisionAllow {
-		msg := fmt.Sprintf("requires the %q verb on VPC %s/%s (sdn.cozystack.io vpcs)", verb, namespace, name)
+		msg := fmt.Sprintf("requires the %q verb on %s %s (sdn.cozystack.io %s)", verb, kind, who, resource)
 		if reason != "" {
 			msg += ": " + reason
 		}

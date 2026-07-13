@@ -74,7 +74,12 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCBinding":              schema_cozyplane_api_sdn_v1alpha1_VPCBinding(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCBindingList":          schema_cozyplane_api_sdn_v1alpha1_VPCBindingList(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCBindingSpec":          schema_cozyplane_api_sdn_v1alpha1_VPCBindingSpec(ref),
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCEgress":               schema_cozyplane_api_sdn_v1alpha1_VPCEgress(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGateway":              schema_cozyplane_api_sdn_v1alpha1_VPCGateway(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayIngress":       schema_cozyplane_api_sdn_v1alpha1_VPCGatewayIngress(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayList":          schema_cozyplane_api_sdn_v1alpha1_VPCGatewayList(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayNAT":           schema_cozyplane_api_sdn_v1alpha1_VPCGatewayNAT(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewaySpec":          schema_cozyplane_api_sdn_v1alpha1_VPCGatewaySpec(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayStatus":        schema_cozyplane_api_sdn_v1alpha1_VPCGatewayStatus(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCList":                 schema_cozyplane_api_sdn_v1alpha1_VPCList(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCPeering":              schema_cozyplane_api_sdn_v1alpha1_VPCPeering(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCPeeringList":          schema_cozyplane_api_sdn_v1alpha1_VPCPeeringList(ref),
@@ -1995,16 +2000,63 @@ func schema_cozyplane_api_sdn_v1alpha1_VPCBindingSpec(ref common.ReferenceCallba
 	}
 }
 
-func schema_cozyplane_api_sdn_v1alpha1_VPCEgress(ref common.ReferenceCallback) common.OpenAPIDefinition {
+func schema_cozyplane_api_sdn_v1alpha1_VPCGateway(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "VPCEgress is the egress configuration of a VPC.",
+				Description: "VPCGateway is a VPC's north-south boundary: the one place where its traffic to and from the outside world is declared, permitted and counted (docs/north-south.md).\n\nIt is a boundary, not a hop. Packets are not detoured through it — enforcement stays in the datapath's eBPF hooks, exactly where it already is. What the gateway does is give that enforcement an owner: without one, a VPC has no way out (no NAT egress) and no way in (no LoadBalancer ingress), and the bytes that cross have nothing to be attributed to.\n\nA VPC has exactly one. Creating a gateway is the tenant's act; the pool it draws from is the operator's grant, enforced by the \"attach\" verb on the ExternalPool — the same shape as VPCBinding's \"export\" and VPCPeering's \"peer\".",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
-					"natGateway": {
+					"kind": {
 						SchemaProps: spec.SchemaProps{
-							Description: "NATGateway runs a per-VPC gateway pod that forwards off-VPC traffic to the outside world (masqueraded to the gateway's address) and to cluster DNS; other cluster-internal destinations stay denied.",
+							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"metadata": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref(v1.ObjectMeta{}.OpenAPIModelName()),
+						},
+					},
+					"spec": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewaySpec"),
+						},
+					},
+					"status": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayStatus"),
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewaySpec", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayStatus", v1.ObjectMeta{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_VPCGatewayIngress(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "VPCGatewayIngress configures what may enter the VPC from outside.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"loadBalancer": {
+						SchemaProps: spec.SchemaProps{
+							Description: "LoadBalancer admits Service type=LoadBalancer traffic onto this VPC's pods. It is FALSE by default, and that default is the point: without a gateway saying otherwise, a Service created in any namespace cannot open a door into a tenant's VPC. Ingress into a VPC is something the VPC's own boundary admits (docs/north-south.md, tenet 7).\n\nIt admits the traffic to the boundary; the destination's SecurityGroups still decide which pods and ports answer.",
 							Type:        []string{"boolean"},
 							Format:      "",
 						},
@@ -2012,6 +2064,155 @@ func schema_cozyplane_api_sdn_v1alpha1_VPCEgress(ref common.ReferenceCallback) c
 				},
 			},
 		},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_VPCGatewayList(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "VPCGatewayList contains a list of VPCGateway.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"metadata": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref(v1.ListMeta{}.OpenAPIModelName()),
+						},
+					},
+					"items": {
+						SchemaProps: spec.SchemaProps{
+							Type: []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGateway"),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"items"},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGateway", v1.ListMeta{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_VPCGatewayNAT(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "VPCGatewayNAT configures many-to-one egress for pods with no address of their own. Today it runs the per-VPC gateway pod; the datapath will take the SNAT over (docs/north-south.md § increments).",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"enabled": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Enabled opens outbound access for VPC pods that hold no floating address, masqueraded to an address of the VPC's own.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_VPCGatewaySpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "VPCGatewaySpec declares a VPC's north-south boundary.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"vpcRef": {
+						SchemaProps: spec.SchemaProps{
+							Description: "VPCRef is the VPC this gateway is the boundary of, in this namespace.",
+							Default:     map[string]interface{}{},
+							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalVPCRef"),
+						},
+					},
+					"poolRef": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PoolRef is the ExternalPool the VPC's outside-facing addresses are drawn from — its NAT identity, and the floating addresses bound to its ports. Creating a VPCGateway requires the \"attach\" verb on this pool: pools are a scarce, cluster-scoped, billable resource, so an operator grants one and a tenant opens its own door onto it.",
+							Default:     map[string]interface{}{},
+							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolRef"),
+						},
+					},
+					"nat": {
+						SchemaProps: spec.SchemaProps{
+							Description: "NAT configures many-to-one egress.",
+							Default:     map[string]interface{}{},
+							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayNAT"),
+						},
+					},
+					"ingress": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Ingress configures what may enter the VPC from outside.",
+							Default:     map[string]interface{}{},
+							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayIngress"),
+						},
+					},
+				},
+				Required: []string{"vpcRef"},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolRef", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalVPCRef", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayIngress", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayNAT"},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_VPCGatewayStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "VPCGatewayStatus is the observed state of a VPCGateway.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"phase": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Phase is the lifecycle phase.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"conditions": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Conditions is the detailed state.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref(v1.Condition{}.OpenAPIModelName()),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			v1.Condition{}.OpenAPIModelName()},
 	}
 }
 
@@ -2300,17 +2501,9 @@ func schema_cozyplane_api_sdn_v1alpha1_VPCSpec(ref common.ReferenceCallback) com
 							Format:      "int32",
 						},
 					},
-					"egress": {
-						SchemaProps: spec.SchemaProps{
-							Description: "Egress configures how workloads in this VPC reach destinations outside it. Absent means no egress: the VPC is a closed island for outbound traffic (inbound north-south via the fabric IP still works).",
-							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCEgress"),
-						},
-					},
 				},
 			},
 		},
-		Dependencies: []string{
-			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCEgress"},
 	}
 }
 

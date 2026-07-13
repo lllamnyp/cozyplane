@@ -99,7 +99,7 @@ stack was never involved.
 
 ## 3. The model
 
-**`VPCGateway`** (shape TBD — a kind, or a field on `VPC`) declares the VPC's
+**`VPCGateway`** (a namespaced kind — built) declares the VPC's
 north-south boundary: whether the VPC may reach the internet at all, which
 `ExternalPool` its NAT identity is drawn from, the egress policy, and the counters
 every crossing increments. Behind that one declaration sit three mechanisms:
@@ -219,8 +219,30 @@ Not a commitment; the order the pieces actually depend on each other.
    the door's traffic can only be exercised with a socket-LB-bypassing raw SYN, and
    that anyone reasoning about "who can reach a VPC pod" must remember the socket-LB
    shortcut exists.
-1. **`VPCGateway`: the boundary object.** Declared policy + NAT identity + counters,
-   enforced in the existing hooks. No datapath rewrite yet.
+1. **`VPCGateway`: the boundary object — DONE 2026-07-13.** A namespaced kind
+   naming its VPC and an `ExternalPool`, with `nat.enabled` and
+   `ingress.loadBalancer`. Creating one requires the **`attach` verb on the pool** —
+   the same escalation gate as `VPCBinding`'s `export` and `VPCPeering`'s `peer`,
+   enforced in the aggregated registry. That closes a real hole: `VPC.spec.egress.
+   natGateway` was a **bool on an object the tenant owns**, so a tenant granted
+   *itself* internet. The field is deleted.
+
+   A VPC has exactly one boundary — the **oldest** gateway (`EffectiveGateway`),
+   which lives in the API package precisely because three things must agree on it
+   without coordinating: the controller that realizes the gateway pod, the CNI that
+   gives that pod its VPC leg, and the agent that opens the ingress gate.
+
+   **Tenet 7 is now enforced, not aspirational:** `vpc_ingress[net]` is programmed
+   only for a VPC whose gateway admits LoadBalancer traffic, and `lb_ingress` drops
+   otherwise. An LB Service naming a VPC pod as its backend previously got a free
+   ride — attracted by the platform, delivered by the platform's uplink hook, the
+   tenant's networking never consulted. Refusals are counted separately from
+   crossings (`ns_denied[door]`): a refused packet did **not** cross, so folding it
+   into the byte meter would corrupt the one number the boundary exists to produce.
+
+   Still deliberately absent: the per-VPC NAT **identity**. The gateway declares the
+   door; egress still launders into the node's address until increment 2. Better to
+   sequence that honestly than to ship a field the datapath ignores.
 2. **NAT gateway in eBPF, per-VPC identity.** Retire the gateway pod.
 3. **EIP re-parented onto the gateway**; delete the announcement layer, and with it
    `ExternalPool.spec.advertisement`.
