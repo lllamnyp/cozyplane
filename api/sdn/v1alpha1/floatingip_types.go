@@ -42,10 +42,17 @@ const (
 	// allocated from the pool to this binding.
 	FloatingIPConditionAddressAssigned = "AddressAssigned"
 	// FloatingIPConditionTargetLive is True when the target tenant IP belongs to
-	// a live Port — a running pod on some node. That node is where the address is
-	// advertised from and delivered to, so without a live target the address is
-	// reserved but not announced (the binding stays Pending).
+	// a live Port — a running pod on some node. Without a live target the address
+	// is reserved but not announced (the binding stays Pending).
 	FloatingIPConditionTargetLive = "TargetLive"
+	// FloatingIPConditionTargetExclusive is False when ANOTHER FloatingIP already
+	// binds this target. A floating IP is a 1:1 bijection — the datapath's reverse
+	// map is keyed by {net, VPC IP} alone, so a second binding on the same target
+	// would overwrite the first's egress entry and the pod's replies would leave
+	// as the WRONG public address (a client dialling the first address gets a
+	// reply from the second, and drops it). The loser is left Pending and dark
+	// rather than allowed to break the winner.
+	FloatingIPConditionTargetExclusive = "TargetExclusive"
 )
 
 // FloatingIPSpec binds one externally-routable address 1:1 to a workload inside

@@ -73,20 +73,36 @@ func (r *FloatingIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// is the readiness gate. We never touch the VPC or a gateway.
 	targetLive := r.targetHasLivePort(ctx, fip)
 
+	// A floating IP is a BIJECTION, and only the forward half of it is keyed by
+	// the public address; the reverse half (floating_egress) is keyed by the
+	// target's {net, VPC IP} alone. So two FloatingIPs on one target do not
+	// coexist — the second overwrites the first's egress entry, and the first
+	// address silently stops working: its client gets a SYN-ACK sourced from the
+	// second address and drops it. Nothing in the datapath can detect this, so the
+	// conflict is refused here. First writer wins (oldest, then by name for a
+	// same-timestamp tie); the loser stays Pending and is never programmed.
+	conflict := r.conflictingFIP(ctx, fip)
+	exclusive := conflict == ""
+
 	status := sdnv1alpha1.FloatingIPStatus{
 		Phase:   sdnv1alpha1.FloatingIPPhasePending,
 		Address: fip.Status.Address,
 	}
 
 	addressAssigned := false
-	if pool != nil {
+	switch {
+	case !exclusive:
+		// Do not even allocate: an address held by a binding that can never be
+		// programmed is just a leak.
+		status.Address = ""
+	case pool != nil:
 		addr, err := r.ensureAddress(ctx, fip, pool)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 		status.Address = addr
 		addressAssigned = addr != ""
-	} else {
+	default:
 		// Without a resolvable pool the previously-held address is meaningless.
 		status.Address = ""
 	}
@@ -97,8 +113,15 @@ func (r *FloatingIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		"AddressAssigned", "an address was allocated from the pool")
 	setFIPCondition(&status, sdnv1alpha1.FloatingIPConditionTargetLive, targetLive,
 		"TargetLive", "the target tenant IP belongs to a running pod's Port")
+	if exclusive {
+		setFIPCondition(&status, sdnv1alpha1.FloatingIPConditionTargetExclusive, true,
+			"TargetExclusive", "no other FloatingIP binds this target")
+	} else {
+		setFIPCondition(&status, sdnv1alpha1.FloatingIPConditionTargetExclusive, false,
+			"TargetConflict", fmt.Sprintf("FloatingIP %q already binds target %s; a target takes exactly one floating address", conflict, fip.Spec.Target))
+	}
 
-	if pool != nil && addressAssigned && targetLive {
+	if pool != nil && addressAssigned && targetLive && exclusive {
 		status.Phase = sdnv1alpha1.FloatingIPPhaseReady
 	}
 
@@ -202,6 +225,37 @@ func (r *FloatingIPReconciler) targetHasLivePort(ctx context.Context, fip *sdnv1
 		}
 	}
 	return false
+}
+
+// conflictingFIP returns the name of another FloatingIP that already binds this
+// one's target, or "" when this FloatingIP owns the target. First writer wins:
+// the older object holds the target, ties broken by name so every replica of the
+// controller reaches the same verdict.
+//
+// The datapath cannot arbitrate this itself — floating_egress is keyed by the
+// target's {net, VPC IP}, so the last writer simply wins and the loser's clients
+// break silently (see FloatingIPConditionTargetExclusive).
+func (r *FloatingIPReconciler) conflictingFIP(ctx context.Context, fip *sdnv1alpha1.FloatingIP) string {
+	var list sdnv1alpha1.FloatingIPList
+	if err := r.List(ctx, &list, client.InNamespace(fip.Namespace)); err != nil {
+		// Fail closed: an unverifiable target is not provably ours, and programming
+		// it could break a binding that already works.
+		return "unknown (FloatingIP list failed)"
+	}
+	for i := range list.Items {
+		other := &list.Items[i]
+		if other.Name == fip.Name ||
+			other.Spec.VPCRef.Name != fip.Spec.VPCRef.Name ||
+			other.Spec.Target != fip.Spec.Target ||
+			!other.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if other.CreationTimestamp.Time.Before(fip.CreationTimestamp.Time) ||
+			(other.CreationTimestamp.Equal(&fip.CreationTimestamp) && other.Name < fip.Name) {
+			return other.Name
+		}
+	}
+	return ""
 }
 
 // addrInCIDRs reports whether ip parses and falls within any of the CIDRs.

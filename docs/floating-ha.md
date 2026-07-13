@@ -236,7 +236,27 @@ already reserves the `L2 | BGP` enum for it (it is presently dead — nothing re
 it). The speaker belongs outside the datapath, as its own component, and it is
 out of scope here.
 
-## 9. Non-goals
+## 9. One target, one address (found while testing this)
+
+A floating IP is a **bijection**, and only its forward half is keyed by the public
+address. The reverse half — `floating_egress`, which SNATs the pod's replies — is
+keyed by the target's `{net, VPC IP}` **alone**. So two FloatingIPs bound to one
+target do not coexist: the second overwrites the first's egress entry, and the
+first address starts answering *from the second address*. A client that dialled
+the first gets a SYN-ACK from an address it never contacted, drops it, and the
+first floating IP is silently dead.
+
+Nothing in the datapath can see this — the map simply holds whatever was written
+last. It is refused in the controller instead: the oldest binding owns the target
+(ties broken by name, so every controller replica agrees), and any later one stays
+`Pending` with `TargetExclusive=False` rather than being allocated an address it
+would only use to break its predecessor. Deleting the winner frees the target, and
+the loser is re-queued and takes it.
+
+This predates the HA work — the reverse map was always keyed this way — and it
+surfaced only because the HA e2e (wrongly) pointed four addresses at one pod.
+
+## 10. Non-goals
 
 - **Anycast / multi-node active-active on L2.** ARP resolves to one MAC; one
   announcer per address is the L2 ceiling. Active-active is what increment 2 buys.

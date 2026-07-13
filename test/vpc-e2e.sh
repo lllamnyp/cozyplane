@@ -316,75 +316,88 @@ kind: ExternalPool
 metadata: {name: e2e-float}
 spec: {cidrs: ["$FLOAT_CIDR"]}
 EOF
-  # Several addresses: the announcer is a hash of the address, so a handful is
-  # enough to land at least one away from a1's node (which is the case we care
-  # about). One would be a coin toss.
-  for i in 1 2 3 4; do
+  # One FloatingIP per pod — a target takes exactly one floating address (the
+  # datapath's reverse map is keyed by the target alone, so two bindings on one
+  # target would fight; the controller refuses the second, and that is asserted
+  # below). Four bindings across four pods, because the announcer is a hash of the
+  # ADDRESS: with a handful, at least one lands away from its target's node, which
+  # is the case worth testing. One binding would be a coin toss.
+  #
+  #   pod  vpc  target  the node it runs on
+  FIPS=("a1 va $A1 $W" "a2 va $A2 $W2" "b1 vb $B1 $W2" "c1 vc $C1 $W2")
+  for f in "${FIPS[@]}"; do
+    read -r pod vpc target _ <<<"$f"
     apply <<EOF
 apiVersion: sdn.cozystack.io/v1alpha1
 kind: FloatingIP
-metadata: {name: fip-$i, namespace: $NS}
+metadata: {name: fip-$pod, namespace: $NS}
 spec:
-  vpcRef: {name: va}
-  target: "$A1"
+  vpcRef: {name: $vpc}
+  target: "$target"
   poolRef: {name: e2e-float}
 EOF
   done
-  # announcer <public-ip> -> the node whose agent has it in float_announce
+  # announces <public-ip> -> the nodes whose agent has it in float_announce
   # (cozyplane_floating_announced). The election writes no API object — the
   # datapath map is the truth, and the metric is how it is read.
-  announcer() {
-    for a in $($K -n kube-system get pods -l app=cozyplane-agent -o name 2>/dev/null); do
-      if $K -n kube-system exec "$a" -c agent -- \
-           curl -gs -m3 localhost:9411/metrics 2>/dev/null | grep -q "cozyplane_floating_announced{public=\"$1\""; then
-        $K -n kube-system get "$a" -o jsonpath='{.spec.nodeName}'
-        return
-      fi
+  #
+  # Scraped over each node's address from an ordinary pod: the agent is
+  # hostNetwork, so :9411 is on the node, and the agent's own container is a
+  # minimal image with no shell tooling to exec into.
+  mapfile -t NODEIPS < <($K get nodes \
+    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}')
+  announces() {
+    local pub="$1" node ip
+    for n in "${NODEIPS[@]}"; do
+      read -r node ip <<<"$n"
+      $K -n "$NS" exec net0 -- curl -gs -m5 "http://${ip}:9411/metrics" 2>/dev/null \
+        | grep -q "cozyplane_floating_announced{public=\"$pub\"" && echo "$node"
     done
   }
+  announcer() { announces "$1" | head -1; }
 
-  # Wait for the addresses, then find one announced AWAY from a1's node.
-  FIP=""; FIPNODE=""
+  # Wait for the addresses, then find one announced AWAY from its target's node.
+  FIP=""; FIPNODE=""; FIPPOD=""; FIPHOST=""
   for _ in $(seq 1 20); do
-    for i in 1 2 3 4; do
-      addr=$($K -n "$NS" get floatingip "fip-$i" -o jsonpath='{.status.address}' 2>/dev/null)
+    for f in "${FIPS[@]}"; do
+      read -r pod _ _ host <<<"$f"
+      addr=$($K -n "$NS" get floatingip "fip-$pod" -o jsonpath='{.status.address}' 2>/dev/null)
       [ -n "$addr" ] || continue
       n=$(announcer "$addr")
       [ -n "$n" ] || continue
-      # Any announced address proves the map is programmed; a REMOTE one is the
-      # case worth testing.
-      [ -z "$FIP" ] && { FIP="$addr"; FIPNODE="$n"; }
-      if [ "$n" != "$W" ]; then FIP="$addr"; FIPNODE="$n"; break 2; fi
+      # Any announced address proves the map is programmed; one announced from a
+      # node that does NOT host its pod is the case worth testing.
+      [ -z "$FIP" ] && { FIP="$addr"; FIPNODE="$n"; FIPPOD="$pod"; FIPHOST="$host"; }
+      if [ "$n" != "$host" ]; then FIP="$addr"; FIPNODE="$n"; FIPPOD="$pod"; FIPHOST="$host"; break 2; fi
     done
     sleep 3
   done
 
   if [ -z "$FIP" ]; then
     fail "no floating IP was announced by any node (the election never converged)"
+    echo "  --- diagnostics ---"
+    $K -n "$NS" get floatingips -o custom-columns=NAME:.metadata.name,ADDR:.status.address,PHASE:.status.phase 2>&1 | head -6
+    $K get nodes -o jsonpath='{range .items[*]}{"  node "}{.metadata.name}{" pools="}{.metadata.annotations.cozyplane\.io/external-pools}{"\n"}{end}'
   else
     pass "the address is announced from exactly one node (elected, not derived from the pod's location)"
-    echo "  floating $FIP announced by $FIPNODE; pod a1 is on $W"
+    echo "  floating $FIP -> pod $FIPPOD (on $FIPHOST), announced by $FIPNODE"
 
     # Exactly one announcer — two would be a split brain, and ARP would flap.
-    COUNT=0
-    for a in $($K -n kube-system get pods -l app=cozyplane-agent -o name 2>/dev/null); do
-      $K -n kube-system exec "$a" -c agent -- curl -gs -m3 localhost:9411/metrics 2>/dev/null \
-        | grep -q "cozyplane_floating_announced{public=\"$FIP\"" && COUNT=$((COUNT + 1))
-    done
+    COUNT=$(announces "$FIP" | wc -l)
     [ "$COUNT" -eq 1 ] && pass "exactly one node announces it (no split brain)" \
       || fail "$COUNT nodes announce $FIP — ARP would flap between them"
 
-    if [ "$FIPNODE" = "$W" ]; then
-      skip "announcer landed on the pod's own node for every address — the asymmetric path is untested this run"
+    if [ "$FIPNODE" = "$FIPHOST" ]; then
+      skip "every address was announced by its own pod's node this run — the asymmetric path went untested"
     else
       # The client must be neither the announcer nor the host, so the request
       # crosses the overlay and the reply comes back from a third direction.
       CLIENT=""
       for n in "${READY[@]}"; do
-        [ "$n" != "$FIPNODE" ] && [ "$n" != "$W" ] && { CLIENT="$n"; break; }
+        [ "$n" != "$FIPNODE" ] && [ "$n" != "$FIPHOST" ] && { CLIENT="$n"; break; }
       done
       [ -n "$CLIENT" ] || CLIENT="$W2"
-      echo "  external client on $CLIENT -> $FIP (announced by $FIPNODE, pod on $W)"
+      echo "  external client on $CLIENT -> $FIP (attract on $FIPNODE, deliver on $FIPHOST)"
       apply <<EOF
 apiVersion: v1
 kind: Pod
@@ -397,14 +410,39 @@ EOF
       $K -n "$NS" wait --for=condition=Ready pod/extclient --timeout=120s >/dev/null 2>&1
       GOT=""
       for _ in $(seq 1 10); do
-        GOT=$($K -n "$NS" exec extclient -- curl -gs -m3 "http://$FIP:8080" 2>/dev/null | tr -d "[:space:]")
+        GOT=$($K -n "$NS" exec extclient -- curl -gs -m5 "http://$FIP:8080" 2>/dev/null | tr -d "[:space:]")
         [ -n "$GOT" ] && break
         sleep 2
       done
-      [ "$GOT" = "a1" ] \
-        && pass "a client off the VPC reaches the pod through an address announced by ANOTHER node (attract on $FIPNODE, deliver on $W)" \
-        || fail "the floating IP did not reach the pod across nodes (got '$GOT', want 'a1')"
+      [ "$GOT" = "$FIPPOD" ] \
+        && pass "a client off the VPC reaches the pod through an address announced by ANOTHER node (attract $FIPNODE, deliver $FIPHOST, client $CLIENT)" \
+        || fail "the floating IP did not reach the pod across nodes (got '$GOT', want '$FIPPOD')"
     fi
+
+    # A target takes exactly ONE floating address. The reverse map is keyed by the
+    # target alone, so a second binding would overwrite the first's egress and the
+    # first address would start replying from the second — a silent break the
+    # datapath cannot detect. The controller must refuse it.
+    apply <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: FloatingIP
+metadata: {name: fip-dup, namespace: $NS}
+spec:
+  vpcRef: {name: va}
+  target: "$A1"
+  poolRef: {name: e2e-float}
+EOF
+    DUP=""
+    for _ in $(seq 1 10); do
+      DUP=$($K -n "$NS" get floatingip fip-dup -o jsonpath='{.status.address}' 2>/dev/null)
+      PH=$($K -n "$NS" get floatingip fip-dup -o jsonpath='{.status.phase}' 2>/dev/null)
+      [ "$PH" = "Pending" ] && [ -z "$DUP" ] && break
+      sleep 2
+    done
+    [ -z "$DUP" ] \
+      && pass "a second FloatingIP on an already-bound target is refused (stays dark; it would have hijacked the first's egress)" \
+      || fail "a second FloatingIP on the same target was allocated $DUP — it silently breaks the first address"
+    $K -n "$NS" delete floatingip fip-dup >/dev/null 2>&1
   fi
   $K -n "$NS" delete floatingip --all >/dev/null 2>&1
   $K delete externalpool e2e-float >/dev/null 2>&1
