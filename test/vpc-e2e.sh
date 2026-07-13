@@ -268,30 +268,27 @@ phase "anti-spoof: from_pod RPF drops a forged source"
 if ! $K -n "$NS" exec a2 -- sh -c 'command -v nping && command -v tcpdump' >/dev/null 2>&1; then
   skip "RPF (nping/tcpdump not in the image)"
 else
-  # A forged source in the VPC CIDR that a2 does NOT own (a1's neighbour range).
-  SPOOF="10.90.0.240"
-  cap() { # <filter-src>: 1 if a SYN to :8080 from that src reached a1, else 0.
-    # tcpdump -c1 prints at most one packet line; count lines, not a keyword
-    # (tcpdump prints "Flags", and a case-mismatched grep silently reads 0).
-    $K -n "$NS" exec a1 -- sh -c \
-      "timeout 6 tcpdump -lni any -c1 \"tcp[tcpflags] \& tcp-syn != 0 and dst port 8080 and src host $1\" 2>/dev/null | wc -l"
-  }
-  fire() { # <src-ip> — a spoofed (or genuine) SYN from a2 to a1:8080
-    $K -n "$NS" exec a2 -- nping --tcp -c 3 -p 8080 --flags syn -S "$1" --rate 3 "$A1" >/dev/null 2>&1
-  }
-  # Positive control: a2's OWN source must arrive (proves the capture path works
-  # AND that a genuine SYN from a2 is delivered, i.e. RPF admits the honest one).
-  ( sleep 1; fire "$A2" ) &
-  got=$(cap "$A2"); wait
-  [ "${got:-0}" -ge 1 ] && pass "positive control: a2's genuine SYN reaches a1 (RPF admits the honest source)" \
-    || fail "positive control failed — a2's real SYN did not arrive (got '$got')"
-  # The spoof: a2 forges a co-VPC source it does not own. RPF must drop it at
-  # a2's own from_pod, so a1 never sees it — decisive because delivery, not a
-  # reply, is what is observed (a spoofed packet forfeits its reply regardless).
-  ( sleep 1; fire "$SPOOF" ) &
-  got=$(cap "$SPOOF"); wait
-  [ "${got:-0}" -eq 0 ] && pass "a forged co-VPC source is dropped at the origin veth (RPF); a1 never sees it" \
-    || fail "SPOOFED packet reached a1 — RPF did not drop it (got '$got')"
+  SPOOF="10.90.0.240"   # a co-VPC address a2 does NOT own
+  fire() { $K -n "$NS" exec a2 -- nping --tcp -c 3 -p 8080 --flags syn -S "$1" --rate 5 "$A1" >/dev/null 2>&1; }
+  # ONE capture spans the whole window (no -c1: it must not exit on the first
+  # genuine SYN before the spoofed fire), started first and given time to arm —
+  # the capture-then-fire race is why an inline probe read nothing.
+  $K -n "$NS" exec a1 -- sh -c \
+    'timeout 12 tcpdump -lni any "tcp[tcpflags] & tcp-syn != 0 and dst port 8080" > /tmp/rpfcap 2>/dev/null' &
+  CAP=$!
+  sleep 4
+  fire "$A2"       # genuine source — must arrive (RPF admits the honest one)
+  fire "$SPOOF"    # forged source — must be dropped at a2's own from_pod
+  sleep 3
+  wait "$CAP" 2>/dev/null
+  genuine=$($K -n "$NS" exec a1 -- sh -c "grep -cF ' $A2.' /tmp/rpfcap" 2>/dev/null || echo 0)
+  spoofed=$($K -n "$NS" exec a1 -- sh -c "grep -cF ' $SPOOF.' /tmp/rpfcap" 2>/dev/null || echo 0)
+  [ "${genuine:-0}" -ge 1 ] && pass "positive control: a2's genuine SYN reaches a1 (RPF admits the honest source)" \
+    || fail "positive control failed — a2's real SYN did not arrive (got '$genuine')"
+  # Decisive by DELIVERY, not a reply: a spoofed packet forfeits its reply
+  # regardless, so only observing arrival distinguishes RPF-dropped from that.
+  [ "${spoofed:-0}" -eq 0 ] && pass "a forged co-VPC source is dropped at the origin veth (RPF); a1 never sees it" \
+    || fail "SPOOFED packet reached a1 — RPF did not drop it (got '$spoofed')"
 fi
 
 # ---------------------------------------------------------------------------
