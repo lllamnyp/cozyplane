@@ -994,6 +994,64 @@ hack/                       codegen scripts; Makefile drives generate/build
   the multi-stage `Dockerfile` builds all four binaries and bundles the upstream
   `host-local`/`loopback` plugins and `iptables`.
 
+## 6a. The agent's memory is mostly eBPF maps, not heap
+
+**Read this before you touch a map's `max_entries`, and before you believe a
+memory graph.**
+
+Since Linux 5.11 a BPF map's memory is charged to the **memory cgroup of the
+process that created it** — so every pinned map cozyplane loads is charged to the
+*agent's* container, for as long as the agent lives. And most of them are
+**preallocated at load**: a `BPF_MAP_TYPE_HASH` or `LRU_HASH` without
+`BPF_F_NO_PREALLOC` allocates all `max_entries` up front, whether or not a single
+entry is ever written.
+
+The footprint is dominated by a handful of maps:
+
+| map | entries | preallocated? |
+|-----|---------|---------------|
+| `ct_fwd`, `ct_rev` | 262,144 each | yes (LRU) |
+| `svc_fwd`, `svc_rev` | 262,144 each | yes (LRU) |
+| `np_ct` | 131,072 | yes (LRU) |
+| `np_allow`, `remotes` | 524,288 / 131,072 | no (LPM, on demand) |
+
+That is ~100MB+ of kernel memory before a single packet is forwarded. **PERCPU**
+maps are the sharp edge: a preallocated entry costs `value_size × nr_cpus`, so
+growing a PERCPU value silently multiplies by the machine's core count.
+
+### The failure mode, and why it is so hard to debug
+
+The agent gets **OOM-killed while its RSS is ~10% of the limit**. Both numbers are
+true at once:
+
+- `container_memory_rss` counts **anonymous pages** — the Go heap. It looked fine
+  (28MB against a 256Mi limit) right up to the kill.
+- `container_memory_working_set_bytes` is what the **OOM killer** measures, and it
+  **includes the kernel charge** — i.e. the maps. That was at the limit.
+
+So the metric everyone habitually graphs is exactly the one that cannot see this.
+The `dmesg` line says it plainly if you look — `anon-rss:28032kB` next to a
+cgroup OOM — but nothing on a dashboard does.
+
+**The signal:** `working_set_bytes` near the limit while `rss` (and
+`container_memory_cache`) stay small. The difference is kernel/slab memory.
+
+**The specific answer:** the agent publishes
+`cozyplane_bpf_map_memlock_bytes{map=...}` (and `..._total`), read from the
+kernel's own accounting in `/proc/self/fdinfo/<map fd>`. It names the map, so you
+do not have to infer it. If the agent is being OOM-killed, look there first.
+
+### Rules of thumb
+
+- Do not preallocate a map that will hold tens of entries. Add
+  `BPF_F_NO_PREALLOC` and size `max_entries` for the ceiling, not the budget.
+  (Maps written only from userspace — `float_announce`, `vpc_counters` — cost
+  nothing on demand.)
+- Treat a PERCPU value-size increase as a per-core multiplication.
+- The agent's memory **limit** must be sized for the map footprint, not for the
+  Go heap. It is `512Mi`; `256Mi` was marginal for years-worth of maps and finally
+  broke when ~8MB of new ones landed.
+
 ## 7. Known limitations / divergence from the design
 
 The design (three planes, dual-address bridge, identity-based policy, etc.) is

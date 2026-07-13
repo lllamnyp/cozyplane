@@ -2120,6 +2120,23 @@ func serveMetrics(ctx context.Context, mgr *datapath.Manager, vpcs sdnv1alpha1in
 			}
 		}
 
+		// How much of the agent's memory cgroup each eBPF map is charging. Almost
+		// all of the agent's memory IS its maps, not its heap — so RSS is a lie
+		// here, and an operator watching container_memory_rss sees nothing wrong
+		// right up until the OOM kill (the killer measures working_set, which
+		// includes the kernel charge). This is the metric that makes that
+		// debuggable: it names the map.
+		if ml, err := mgr.MapMemlock(); err == nil {
+			fmt.Fprintf(&b, "# HELP cozyplane_bpf_map_memlock_bytes Kernel memory an eBPF map charges to the agent's memory cgroup.\n# TYPE cozyplane_bpf_map_memlock_bytes gauge\n")
+			var total uint64
+			for name, bytes := range ml {
+				total += bytes
+				fmt.Fprintf(&b, "cozyplane_bpf_map_memlock_bytes{map=%q,node=%q} %d\n", name, nodeName, bytes)
+			}
+			fmt.Fprintf(&b, "# HELP cozyplane_bpf_map_memlock_bytes_total Kernel memory ALL eBPF maps charge to the agent's cgroup.\n# TYPE cozyplane_bpf_map_memlock_bytes_total gauge\n")
+			fmt.Fprintf(&b, "cozyplane_bpf_map_memlock_bytes_total{node=%q} %d\n", nodeName, total)
+		}
+
 		// Security-group policy drops (#7), same per-VPC labeling.
 		if drops, err := mgr.SGDrops(); err == nil {
 			fmt.Fprintf(&b, "# HELP cozyplane_sg_drops_total Packets dropped by security-group policy (this node).\n# TYPE cozyplane_sg_drops_total counter\n")
