@@ -27,6 +27,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"net"
 	"net/http"
@@ -92,6 +93,7 @@ func main() {
 		masqMode      string
 		vpcDNS        bool
 		clusterDNSIPs string
+		floatingHA    bool
 	)
 	flag.IntVar(&mtu, "mtu", 1450, "pod MTU (underlay MTU minus Geneve overhead)")
 	flag.UintVar(&vni, "vni", uint(datapath.DefaultVNI), "VNI for the default network")
@@ -109,6 +111,8 @@ func main() {
 		"steer VPC pods' cluster-DNS queries to the node-local split-horizon resolver (docs/services-in-vpc.md)")
 	flag.StringVar(&clusterDNSIPs, "cluster-dns", "",
 		"comma-separated cluster DNS ClusterIP(s) to steer; empty auto-discovers from the kube-system/kube-dns Service")
+	flag.BoolVar(&floatingHA, "floating-ha", true,
+		"elect the node that announces a floating IP independently of the node hosting its target pod (docs/floating-ha.md); off pins the announcement to the target's node, which requires the underlay to accept the pool address only from there")
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
@@ -118,13 +122,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(nodeName, mtu, uint32(vni), cniConfName, uint16(genevePort), clusterCIDR, internalCIDRs, masqMode, vpcDNS, clusterDNSIPs, log); err != nil {
+	if err := run(nodeName, mtu, uint32(vni), cniConfName, uint16(genevePort), clusterCIDR, internalCIDRs, masqMode, vpcDNS, clusterDNSIPs, floatingHA, log); err != nil {
 		log.Error("agent failed", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort uint16, clusterCIDR, internalCIDRs, masqMode string, vpcDNS bool, clusterDNSIPs string, log *slog.Logger) error {
+func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort uint16, clusterCIDR, internalCIDRs, masqMode string, vpcDNS bool, clusterDNSIPs string, floatingHA bool, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -368,6 +372,9 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	}
 	localFactory := localinformers.NewSharedInformerFactory(lc, 0)
 	nodeIPs := newNodeIPIndex()
+	// The floating-IP electorate (docs/floating-ha.md): who is Ready, and who can
+	// serve which pool's link. Fed by the same Node informer below.
+	nodePools := newNodePoolIndex()
 
 	// A node's tunnel endpoint may arrive after the FabricIPs that reference it
 	// (informer ordering is not ours to choose), so a node event re-drives the
@@ -388,7 +395,7 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		}
 	}
 
-	if err := watchNodes(ctx, client, mgr, nodeName, nodeIPs, fabricResync, log); err != nil {
+	if err := watchNodes(ctx, client, mgr, nodeName, nodeIPs, nodePools, fabricResync, log); err != nil {
 		return err
 	}
 	if err := watchFabricIPs(ctx, localFactory, mgr, nodeIPs.get, nodeName, log); err != nil {
@@ -415,8 +422,8 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		watchPorts(ctx, factory, localFactory, sdnClient, client, mgr, nodeName, state.NodeIP, log)
 		watchPeerings(ctx, factory, mgr, log)
 		watchGateways(ctx, factory, mgr, nodeName, log)
-		watchFloatingIPs(ctx, factory, mgr, nodeName, log)
-		go ensurePoolUplinks(ctx, sdnClient, mgr, log)
+		watchFloatingIPs(ctx, factory, mgr, nodePools, nodeName, floatingHA, log)
+		go ensurePoolUplinks(ctx, sdnClient, client, mgr, nodeName, log)
 		watchServiceVIPs(ctx, factory, mgr, log)
 		watchSecurityGroups(ctx, factory, mgr, log)
 		if err := watchHostFirewalls(ctx, factory, client, mgr, nodeName, log); err != nil {
@@ -479,9 +486,29 @@ func nodeAddresses(node *corev1.Node) []net.IP { return npNodeAddresses(node) }
 // into the remotes map, and every other node's addresses into node_remotes. It
 // blocks until the cache is synced.
 func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.Manager, selfName string,
-	nodeIPs *nodeIPIndex, fabricResync func(), log *slog.Logger) error {
+	nodeIPs *nodeIPIndex, nodePools *nodePoolIndex, fabricResync func(), log *slog.Logger) error {
 	factory := informers.NewSharedInformerFactory(client, 0)
 	nodeInformer := factory.Core().V1().Nodes().Informer()
+
+	// The floating-IP electorate (docs/floating-ha.md): readiness and the pools
+	// each node published as servable. Includes THIS node — a node is a candidate
+	// to announce its own addresses like any other.
+	poolApply := func(obj any) {
+		if node, ok := obj.(*corev1.Node); ok {
+			nodePools.set(node)
+		}
+	}
+	if _, err := nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    poolApply,
+		UpdateFunc: func(_, newObj any) { poolApply(newObj) },
+		DeleteFunc: func(obj any) {
+			if node, ok := obj.(*corev1.Node); ok {
+				nodePools.del(node.Name)
+			}
+		},
+	}); err != nil {
+		return fmt.Errorf("add node pool handler: %w", err)
+	}
 
 	apply := func(obj any) {
 		node, ok := obj.(*corev1.Node)
@@ -1093,7 +1120,13 @@ func desiredGateways(ports []*sdnv1alpha1.Port, selfName string) map[uint32]gate
 // configured the link per programmed address; pools make it unconditional.
 // Poll-based: pools are tiny, near-static, and EnsureFloatingUplink is
 // idempotent.
-func ensurePoolUplinks(ctx context.Context, client sdnclientset.Interface, mgr *datapath.Manager, log *slog.Logger) {
+//
+// The same pass publishes which pools this node can serve (publishPoolEligibility),
+// which is what makes it electable to ANNOUNCE their addresses — the FIB answers
+// both questions, so they are asked together.
+func ensurePoolUplinks(ctx context.Context, client sdnclientset.Interface, kube kubernetes.Interface,
+	mgr *datapath.Manager, nodeName string, log *slog.Logger) {
+	last := ""
 	for {
 		pools, err := client.SdnV1alpha1().ExternalPools().List(ctx, metav1.ListOptions{})
 		if err != nil {
@@ -1110,6 +1143,12 @@ func ensurePoolUplinks(ctx context.Context, client sdnclientset.Interface, mgr *
 					}
 				}
 			}
+			if served, err := publishPoolEligibility(ctx, kube, client, mgr, nodeName, log); err != nil {
+				log.Warn("publish pool eligibility", "err", err)
+			} else if served != last {
+				log.Info("announceable pools", "pools", served)
+				last = served
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -1119,16 +1158,30 @@ func ensurePoolUplinks(ctx context.Context, client sdnclientset.Interface, mgr *
 	}
 }
 
-// watchFloatingIPs programs this node's floating IPs: for each FloatingIP whose
-// target tenant IP is realized by a Port on THIS node, it writes the
-// publicIP -> {net, VPC IP} floating-map entry and answers ARP for the public
-// address on the uplink. Like watchGateways it recomputes and diffs against the
-// pinned map on every relevant event, so a restarted agent prunes floating IPs
-// whose FloatingIP or target Port vanished while it was down. Advertising only
-// from the target's node keeps ingress local (DVR).
-func watchFloatingIPs(ctx context.Context, factory sdninformers.SharedInformerFactory, mgr *datapath.Manager, selfName string, log *slog.Logger) {
+// watchFloatingIPs programs this node's floating IPs. Two independent decisions
+// (docs/floating-ha.md):
+//
+//   - DELIVERY — the publicIP -> {net, VPC IP} `floating` entry, which every node
+//     programs for every live FloatingIP. It says where the address leads, not
+//     that we own it: from_uplink needs it to resolve an address whose pod is on
+//     another node and forward it over the overlay.
+//   - ATTRACTION — the `float_announce` entry, written only by the node ELECTED to
+//     advertise the address (announcerFor). That entry, and nothing else, makes
+//     from_uplink answer ARP/NDP for it.
+//
+// The split is what makes a VM live-migration invisible to the external network:
+// the pod moves, `remotes` re-points, and the announcer never changes — so no
+// gratuitous ARP is needed and no L2 cache has to be corrected. It also lifts the
+// unspoken rule that a floating-IP target had to be scheduled onto a node sitting
+// on the pool's L2.
+//
+// Like watchGateways it recomputes and diffs against the pinned maps on every
+// relevant event, so a restarted agent prunes entries whose FloatingIP or target
+// Port vanished while it was down.
+func watchFloatingIPs(ctx context.Context, factory sdninformers.SharedInformerFactory, mgr *datapath.Manager, nodes *nodePoolIndex, selfName string, ha bool, log *slog.Logger) {
 	fips := factory.Sdn().V1alpha1().FloatingIPs()
 	ports := factory.Sdn().V1alpha1().Ports()
+	pools := factory.Sdn().V1alpha1().ExternalPools()
 
 	var mu sync.Mutex
 	resync := func() {
@@ -1145,11 +1198,21 @@ func watchFloatingIPs(ctx context.Context, factory sdninformers.SharedInformerFa
 			log.Error("list ports", "err", err)
 			return
 		}
-		desired := desiredFloating(allFips, allPorts, selfName)
+		allPools, err := pools.Lister().List(labels.Everything())
+		if err != nil {
+			log.Error("list externalpools", "err", err)
+			return
+		}
+		desired := desiredFloating(allFips, allPorts)
 
 		current, err := mgr.Floatings()
 		if err != nil {
 			log.Error("read floating map", "err", err)
+			return
+		}
+		announced, err := mgr.Announcements()
+		if err != nil {
+			log.Error("read float_announce map", "err", err)
 			return
 		}
 		for pub, v := range desired {
@@ -1160,25 +1223,43 @@ func watchFloatingIPs(ctx context.Context, factory sdninformers.SharedInformerFa
 				log.Warn("ensure floating uplink", "public", pub, "err", err)
 			}
 			// Put unconditionally: an existing entry may be stale (target moved).
-			// Programming the map both delivers and advertises (from_uplink
-			// answers ARP for it); there is no separate host-side advertise step.
 			if err := mgr.SetFloating(pub, v.vpcIP, v.vni); err != nil {
 				log.Error("set floating", "public", pub, "err", err)
 				continue
 			}
 			if !current[pub] {
-				// Newly local here (created, or moved from another node):
-				// nudge external L2 caches at the old location (GARP /
-				// unsolicited NA). Best-effort — new queries are answered by
-				// the datapath regardless.
+				log.Info("floating set", "public", pub, "target", v.vpcIP, "vni", v.vni)
+			}
+
+			// Attraction: am I the elected announcer for this address?
+			mine := announcerFor(pub, v, nodes, allPools, ha) == selfName
+			switch {
+			case mine && !announced[pub]:
+				if err := mgr.SetAnnounce(pub); err != nil {
+					log.Error("announce floating", "public", pub, "err", err)
+					continue
+				}
+				// Newly won: nudge the external L2 caches still pointing at the
+				// previous announcer (GARP / unsolicited NA). Best-effort — new
+				// queries are answered by the datapath regardless.
 				if err := mgr.AnnounceAddress(net.ParseIP(pub)); err != nil {
 					log.Warn("announce floating address", "public", pub, "err", err)
 				}
-				log.Info("floating set", "public", pub, "target", v.vpcIP, "vni", v.vni)
+				log.Info("floating announced from this node", "public", pub)
+			case !mine && announced[pub]:
+				// Lost the election (a node joined, or we stopped being eligible):
+				// go silent, and let the winner's announcement correct the caches.
+				if err := mgr.DelAnnounce(pub); err != nil {
+					log.Error("stop announcing floating", "public", pub, "err", err)
+				}
+				log.Info("floating announcement released", "public", pub)
 			}
 		}
 		for pub := range current {
 			if _, ok := desired[pub]; !ok {
+				if err := mgr.DelAnnounce(pub); err != nil {
+					log.Error("stop announcing floating", "public", pub, "err", err)
+				}
 				if err := mgr.DelFloating(pub); err != nil {
 					log.Error("del floating", "public", pub, "err", err)
 					continue
@@ -1194,41 +1275,53 @@ func watchFloatingIPs(ctx context.Context, factory sdninformers.SharedInformerFa
 		DeleteFunc: func(any) { resync() },
 	}
 	_, _ = fips.Informer().AddEventHandler(onAny)
-	// Ports too: a target IP gaining or losing a live Port on this node — or a
-	// Port moving nodes — changes what this node advertises.
+	// Ports too: a target IP gaining or losing a live Port anywhere — or a Port
+	// moving nodes — changes what this node programs (though, by design, not who
+	// announces). Pools too: they decide which nodes are eligible to announce.
 	_, _ = ports.Informer().AddEventHandler(onAny)
+	_, _ = pools.Informer().AddEventHandler(onAny)
+	// And the Node set, which is the election's electorate: a node joining,
+	// leaving, or going NotReady re-homes the addresses it would have won.
+	nodes.onChange(resync)
 
 	go func() {
-		if cache.WaitForCacheSync(ctx.Done(), fips.Informer().HasSynced, ports.Informer().HasSynced) {
+		if cache.WaitForCacheSync(ctx.Done(), fips.Informer().HasSynced, ports.Informer().HasSynced, pools.Informer().HasSynced) {
 			resync()
 		}
 	}()
 }
 
-// floatingView is what this node must program for one floating IP: the target
-// tenant IP and its network id (VNI).
+// floatingView is what a node must program for one floating IP: the target tenant
+// IP, its network id (VNI), and the node its Port currently lives on.
 type floatingView struct {
 	vpcIP string
 	vni   uint32
+	node  string
 }
 
-// desiredFloating computes the floating IPs this node must program: those whose
-// target tenant IP is realized by a live Port on THIS node (the node that
-// advertises and delivers). The VNI comes from the target Port's name. A
-// FloatingIP's local vpcRef resolves in its own namespace, which is the target
-// Port's VPCRef namespace.
-func desiredFloating(fips []*sdnv1alpha1.FloatingIP, ports []*sdnv1alpha1.Port, selfName string) map[string]floatingView {
+// desiredFloating computes the floating IPs to program — those whose target
+// tenant IP is realized by a live Port ANYWHERE in the cluster, not just here.
+// Every node needs the mapping: the announcer must be able to resolve an address
+// whose pod is elsewhere (from_uplink then forwards it over the overlay), and the
+// host must be able to SNAT the pod's replies back to it. The VNI comes from the
+// target Port's name. A FloatingIP's local vpcRef resolves in its own namespace,
+// which is the target Port's VPCRef namespace.
+func desiredFloating(fips []*sdnv1alpha1.FloatingIP, ports []*sdnv1alpha1.Port) map[string]floatingView {
 	type portKey struct{ ns, name, ip string }
-	local := map[portKey]uint32{}
+	type portVal struct {
+		vni  uint32
+		node string
+	}
+	live := map[portKey]portVal{}
 	for _, p := range ports {
-		if p.Spec.Node != selfName || p.Spec.IP == "" {
+		if p.Spec.Node == "" || p.Spec.IP == "" {
 			continue
 		}
 		vni, ok := vniFromPortName(p.Name)
 		if !ok {
 			continue
 		}
-		local[portKey{p.Spec.VPCRef.Namespace, p.Spec.VPCRef.Name, p.Spec.IP}] = vni
+		live[portKey{p.Spec.VPCRef.Namespace, p.Spec.VPCRef.Name, p.Spec.IP}] = portVal{vni, p.Spec.Node}
 	}
 
 	out := map[string]floatingView{}
@@ -1236,13 +1329,95 @@ func desiredFloating(fips []*sdnv1alpha1.FloatingIP, ports []*sdnv1alpha1.Port, 
 		if f.Status.Address == "" {
 			continue
 		}
-		vni, ok := local[portKey{f.Namespace, f.Spec.VPCRef.Name, f.Spec.Target}]
+		v, ok := live[portKey{f.Namespace, f.Spec.VPCRef.Name, f.Spec.Target}]
 		if !ok {
-			continue // target not a live Port on this node
+			continue // no live Port for the target: the address stays dark
 		}
-		out[f.Status.Address] = floatingView{vpcIP: f.Spec.Target, vni: vni}
+		out[f.Status.Address] = floatingView{vpcIP: f.Spec.Target, vni: v.vni, node: v.node}
 	}
 	return out
+}
+
+// announcerFor elects the node that advertises a public address.
+//
+// The electorate is the set of Ready nodes that can actually serve the address's
+// pool link — a node that cannot put a frame on that L2 must never win, or the
+// address is attracted into a black hole. Nodes publish their own eligibility
+// (cozyplane.io/external-pools), because only a node's own FIB knows.
+//
+// The winner is picked by rendezvous (highest-random-weight) hash: every agent
+// computes the same answer from state it already watches, so there is no lease,
+// no leader and no coordination — the same "no announcer, no election" property
+// lb-ingress.md keeps for LoadBalancer IPs, reached from the other side. Losing a
+// node re-homes only the addresses that node held, instead of reshuffling the
+// fleet the way a modulo would.
+//
+// Note it takes no "self": the winner is a function of cluster state alone, so
+// every agent necessarily agrees — agreement is structural, not asserted.
+//
+// Falls back to the target pod's own node when nothing is eligible (a routed
+// pool, where an L2 announcement means nothing anyway) or when HA is switched
+// off — which is exactly the pre-HA behaviour.
+func announcerFor(pub string, v floatingView, nodes *nodePoolIndex, pools []*sdnv1alpha1.ExternalPool, ha bool) string {
+	if !ha {
+		return v.node
+	}
+	eligible := nodes.serving(poolOf(pub, pools))
+	if len(eligible) == 0 {
+		return v.node
+	}
+	best, bestScore := "", uint64(0)
+	for _, n := range eligible {
+		if s := rendezvous(n, pub); best == "" || s > bestScore || (s == bestScore && n < best) {
+			best, bestScore = n, s
+		}
+	}
+	return best
+}
+
+// rendezvous scores a (node, address) pair: stable across agents and restarts,
+// and — the part that takes care — uncorrelated between addresses.
+//
+// FNV-1a alone is NOT good enough here, though it looks it. Rendezvous compares
+// the scores of several nodes for the SAME address, i.e. of several hashes that
+// share a common suffix. FNV's tail multiplications leave the difference between
+// two such hashes nearly independent of the address, so one node's score sits
+// above another's for almost every address and a single node wins nearly the
+// whole pool (caught by TestAnnouncerStability: 50 of 59 addresses on one node).
+// The splitmix64 finalizer avalanches the bits and restores an even spread.
+func rendezvous(node, addr string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(node))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(addr))
+	return mix64(h.Sum64())
+}
+
+func mix64(x uint64) uint64 {
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	x ^= x >> 31
+	return x
+}
+
+// poolOf finds the ExternalPool a public address was allocated from. An address
+// belongs to exactly one pool (the allocator picks from one CIDR set), so the
+// first containing pool is the answer.
+func poolOf(pub string, pools []*sdnv1alpha1.ExternalPool) string {
+	ip := net.ParseIP(pub)
+	if ip == nil {
+		return ""
+	}
+	for _, p := range pools {
+		for _, c := range p.Spec.CIDRs {
+			if _, n, err := net.ParseCIDR(c); err == nil && n.Contains(ip) {
+				return p.Name
+			}
+		}
+	}
+	return ""
 }
 
 // hostCIDR appends the host-route prefix length for a bare IP: /32 for IPv4,

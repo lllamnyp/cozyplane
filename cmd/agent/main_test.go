@@ -17,8 +17,10 @@ limitations under the License.
 package main
 
 import (
+	"fmt"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
@@ -77,27 +79,156 @@ func TestDesiredGateways(t *testing.T) {
 	}
 }
 
-// desiredFloating programs only floating IPs whose target tenant IP is realized
-// by a live Port on THIS node, carrying the target IP and the Port's VNI. A
-// remote target, an unassigned address, or a target with no live Port here all
-// contribute nothing.
+// desiredFloating programs every floating IP whose target has a live Port
+// ANYWHERE in the cluster — not just here (docs/floating-ha.md). The announcer
+// must be able to resolve an address whose pod is on another node in order to
+// forward to it, so the mapping is cluster-wide; what is node-specific is the
+// announcement, not the mapping. An unassigned address, or a target with no live
+// Port at all, still contributes nothing.
 func TestDesiredFloating(t *testing.T) {
 	ports := []*sdnv1alpha1.Port{
 		vpcPort("v101.10-0-0-5", "team-a", "vpc-a", "10.0.0.5", "self"),
 		vpcPort("v101.10-0-0-6", "team-a", "vpc-a", "10.0.0.6", "other"),
 	}
 	fips := []*sdnv1alpha1.FloatingIP{
-		floatingIPObj("team-a", "web", "vpc-a", "10.0.0.5", "203.0.113.7"),   // local target: programmed
-		floatingIPObj("team-a", "api", "vpc-a", "10.0.0.6", "203.0.113.8"),   // target on another node: skipped
+		floatingIPObj("team-a", "web", "vpc-a", "10.0.0.5", "203.0.113.7"),   // target here
+		floatingIPObj("team-a", "api", "vpc-a", "10.0.0.6", "203.0.113.8"),   // target elsewhere: still programmed
 		floatingIPObj("team-a", "unset", "vpc-a", "10.0.0.5", ""),            // no address yet: skipped
 		floatingIPObj("team-a", "nopod", "vpc-a", "10.0.0.9", "203.0.113.9"), // no live Port: skipped
 	}
-	got := desiredFloating(fips, ports, "self")
-	if len(got) != 1 {
-		t.Fatalf("got %d, want 1: %+v", len(got), got)
+	got := desiredFloating(fips, ports)
+	if len(got) != 2 {
+		t.Fatalf("got %d, want 2: %+v", len(got), got)
 	}
-	if v, ok := got["203.0.113.7"]; !ok || v.vpcIP != "10.0.0.5" || v.vni != 101 {
-		t.Errorf("203.0.113.7 = %+v (ok=%v), want {10.0.0.5 101}", v, ok)
+	if v, ok := got["203.0.113.7"]; !ok || v.vpcIP != "10.0.0.5" || v.vni != 101 || v.node != "self" {
+		t.Errorf("203.0.113.7 = %+v (ok=%v), want {10.0.0.5 101 self}", v, ok)
+	}
+	// The decisive one: a target on another node is programmed here too, and
+	// carries that node — from_uplink needs it to forward over the overlay.
+	if v, ok := got["203.0.113.8"]; !ok || v.vpcIP != "10.0.0.6" || v.node != "other" {
+		t.Errorf("203.0.113.8 = %+v (ok=%v), want {10.0.0.6 101 other}", v, ok)
+	}
+}
+
+func readyNode(name string, pools string) *corev1.Node {
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: map[string]string{poolsAnnotation: pools}},
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}},
+		},
+	}
+}
+
+func pool(name string, cidrs ...string) *sdnv1alpha1.ExternalPool {
+	return &sdnv1alpha1.ExternalPool{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec:       sdnv1alpha1.ExternalPoolSpec{CIDRs: cidrs},
+	}
+}
+
+// The election's core promise: the announcer is chosen from the nodes that can
+// SERVE the pool, independently of where the target pod runs. (Every agent agrees
+// structurally — announcerFor takes no "self", so agreement is not something the
+// nodes could disagree about.)
+func TestAnnouncerFor(t *testing.T) {
+	idx := newNodePoolIndex()
+	idx.set(readyNode("node0", "public"))
+	idx.set(readyNode("node1", "public"))
+	idx.set(readyNode("node2", "public"))
+	pools := []*sdnv1alpha1.ExternalPool{pool("public", "203.0.113.0/24")}
+	v := floatingView{vpcIP: "10.0.0.5", vni: 101, node: "node2"}
+
+	if got := announcerFor("203.0.113.7", v, idx, pools, true); got != "node0" && got != "node1" && got != "node2" {
+		t.Fatalf("elected a node that does not exist: %q", got)
+	}
+
+	// A node that cannot serve the pool must never win, however the hash falls:
+	// attracting an address to a node with no path to that L2 is a black hole.
+	only := newNodePoolIndex()
+	only.set(readyNode("node0", "public"))
+	only.set(readyNode("node1", "")) // no servable pools
+	for _, addr := range []string{"203.0.113.7", "203.0.113.8", "203.0.113.9", "203.0.113.10"} {
+		if got := announcerFor(addr, v, only, pools, true); got != "node0" {
+			t.Errorf("%s elected %q, want node0 (the only node serving the pool)", addr, got)
+		}
+	}
+
+	// NotReady is the same as gone.
+	down := newNodePoolIndex()
+	down.set(readyNode("node0", "public"))
+	notReady := readyNode("node1", "public")
+	notReady.Status.Conditions[0].Status = corev1.ConditionFalse
+	down.set(notReady)
+	if got := announcerFor("203.0.113.7", v, down, pools, true); got != "node0" {
+		t.Errorf("elected %q, want node0 (node1 is NotReady)", got)
+	}
+
+	// No eligible node (a routed pool, say) falls back to the target's own node —
+	// the pre-HA behaviour. So does --floating-ha=false.
+	empty := newNodePoolIndex()
+	if got := announcerFor("203.0.113.7", v, empty, pools, true); got != "node2" {
+		t.Errorf("elected %q, want the target's node (node2) when nothing is eligible", got)
+	}
+	if got := announcerFor("203.0.113.7", v, idx, pools, false); got != "node2" {
+		t.Errorf("elected %q, want the target's node (node2) with HA off", got)
+	}
+}
+
+// Rendezvous hashing spreads addresses across announcers, and — the property that
+// matters — re-homes only the lost node's addresses when a node goes away, rather
+// than reshuffling the fleet the way a modulo would.
+func TestAnnouncerStability(t *testing.T) {
+	pools := []*sdnv1alpha1.ExternalPool{pool("public", "203.0.113.0/24")}
+	v := floatingView{vpcIP: "10.0.0.5", vni: 101, node: "node0"}
+	all := newNodePoolIndex()
+	for _, n := range []string{"node0", "node1", "node2"} {
+		all.set(readyNode(n, "public"))
+	}
+	fewer := newNodePoolIndex()
+	for _, n := range []string{"node0", "node1"} {
+		fewer.set(readyNode(n, "public"))
+	}
+
+	var addrs []string
+	for i := 1; i < 60; i++ {
+		addrs = append(addrs, fmt.Sprintf("203.0.113.%d", i))
+	}
+	before := map[string]string{}
+	spread := map[string]int{}
+	for _, a := range addrs {
+		before[a] = announcerFor(a, v, all, pools, true)
+		spread[before[a]]++
+	}
+	if len(spread) < 3 {
+		t.Errorf("addresses landed on %d nodes, want all 3 used: %v", len(spread), spread)
+	}
+	// Drop node2: every address it did NOT hold must stay exactly where it was.
+	for _, a := range addrs {
+		after := announcerFor(a, v, fewer, pools, true)
+		if before[a] != "node2" && after != before[a] {
+			t.Errorf("%s moved from %s to %s when an unrelated node left", a, before[a], after)
+		}
+		if after == "node2" {
+			t.Errorf("%s still elected the departed node2", a)
+		}
+	}
+}
+
+func TestPoolOf(t *testing.T) {
+	pools := []*sdnv1alpha1.ExternalPool{
+		pool("public", "203.0.113.0/24"),
+		pool("other", "198.51.100.0/24", "2001:db8::/64"),
+	}
+	for addr, want := range map[string]string{
+		"203.0.113.7":  "public",
+		"198.51.100.1": "other",
+		"2001:db8::1":  "other",
+		"192.0.2.1":    "", // in no pool
+		"not-an-ip":    "",
+	} {
+		if got := poolOf(addr, pools); got != want {
+			t.Errorf("poolOf(%s) = %q, want %q", addr, got, want)
+		}
 	}
 }
 

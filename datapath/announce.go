@@ -20,18 +20,37 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-// AnnounceAddress broadcasts a floating address's new location on the uplink:
-// a gratuitous ARP (v4, announcement form: request with spa == tpa) or an
-// unsolicited Neighbor Advertisement (v6, override flag, to all-nodes).
-// Without it, external peers keep resolving the address to the PREVIOUS
-// node's MAC until their cache entry expires — the datapath answers new
-// queries immediately (floating_arp / floating_ndp), but nothing prompts a
-// peer holding a warm cache to re-ask. Best-effort by nature: a lost
-// announcement only means waiting out the peer's cache.
+// announceBurst is how many times an announcement is repeated, and how long
+// apart. An announcement is unacknowledged by construction — nothing tells us a
+// peer took it — so a single frame makes the whole address hostage to one packet
+// loss: the peer keeps sending to the PREVIOUS announcer's MAC until its cache
+// entry expires, which is minutes. Repetition is the only recourse an
+// unacknowledged protocol has, and it is what every L2 failover implementation
+// does. RFC 5227 §2.3 recommends the same for ARP announcements.
+const (
+	announceBurst    = 3
+	announceInterval = 100 * time.Millisecond
+)
+
+// AnnounceAddress broadcasts a floating address's location on the uplink: a
+// gratuitous ARP (v4, announcement form: request with spa == tpa) or an
+// unsolicited Neighbor Advertisement (v6, override flag, to all-nodes). Sent as a
+// short burst (see announceBurst).
+//
+// Without it, external peers keep resolving the address to the previous
+// announcer's MAC until their cache entry expires — the datapath answers new
+// queries immediately (floating_arp / floating_ndp), but nothing prompts a peer
+// holding a warm cache to re-ask. Still best-effort: losing a whole burst only
+// means waiting out the peer's cache.
+//
+// Called when this node newly WINS an address, not when the target pod moves —
+// under docs/floating-ha.md a migration does not change who announces, so it
+// makes no L2 claim at all.
 func (m *Manager) AnnounceAddress(ip net.IP) error {
 	// Announce on the link that owns the address: the floating uplink when it
 	// differs from the default route (EnsureFloatingUplink), else the uplink.
@@ -58,8 +77,13 @@ func (m *Manager) AnnounceAddress(ip net.IP) error {
 	defer unix.Close(fd)
 	addr := &unix.SockaddrLinklayer{Ifindex: ifindex, Halen: 6}
 	copy(addr.Addr[:], frame[0:6]) // the frame's destination
-	if err := unix.Sendto(fd, frame, 0, addr); err != nil {
-		return fmt.Errorf("send announcement: %w", err)
+	for i := range announceBurst {
+		if i > 0 {
+			time.Sleep(announceInterval)
+		}
+		if err := unix.Sendto(fd, frame, 0, addr); err != nil {
+			return fmt.Errorf("send announcement: %w", err)
+		}
 	}
 	return nil
 }

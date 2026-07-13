@@ -10,10 +10,14 @@ kind: ClusterRole
 metadata:
   name: cozyplane-agent
 rules:
-  # The agent learns remote pod CIDRs from Node objects.
+  # The agent learns every node's addresses and readiness from Node objects, and
+  # patches its OWN node with what only its FIB knows: the address host traffic
+  # sources from (cozyplane.io/node-addresses) and the ExternalPools whose link it
+  # can serve (cozyplane.io/external-pools — the floating-IP electorate,
+  # docs/floating-ha.md). Without `patch` both are silently best-effort no-ops.
   - apiGroups: [""]
     resources: ["nodes"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "patch"]
   # The plugin (using this SA) reads pod annotations to resolve VPC membership;
   # the agent's NetworkPolicy compiler watches pods for identities/membership
   # (docs/network-policy.md).

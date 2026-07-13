@@ -469,11 +469,13 @@ stateless model — inbound public→VPC DNAT preserving the client
 (`floating_forward`/`floating_forward6`), outbound VPC→public SNAT out the
 uplink (`floating_egress_snat`/`floating_egress_snat6`) — including the
 ICMP/ICMPv6 error embedded-header rewrites, so PMTU and traceroute work through
-a floating address in either family. When the agent programs a floating address
-locally (creation, or a move from another node) it also **announces** it — a
-gratuitous ARP or an unsolicited override Neighbor Advertisement on the uplink —
-so external peers holding a warm cache for the previous node re-learn
-immediately instead of waiting out their cache.
+a floating address in either family. When a node newly **wins** a floating
+address (the election in `docs/floating-ha.md`) it announces it — a burst of
+gratuitous ARPs, or unsolicited override Neighbor Advertisements, on the uplink —
+so external peers holding a warm cache for the previous announcer re-learn
+immediately instead of waiting out their cache. Note *wins*, not *hosts*: the pod
+moving between nodes does not change who announces, so a live migration makes no
+L2 claim at all.
 
 The dual-address bridge above is *internal* north-south: a fabric IP reachable
 from the cluster's default overlay. A **floating IP** is the same idea turned
@@ -482,27 +484,27 @@ tenant IP — realized as an **extension of the eBPF bridge, not the gateway**. 
 iptables, no gateway pod: it is the fabric bridge with an external address and
 the client-masquerade removed, so the tenant sees the *real* caller. The pieces:
 
-- **`floating` map** (`publicIP → {net, vpcIP}`), programmed by the agent — the
-  external-facing sibling of `bridges`.
+- **`floating` map** (`publicIP → {net, vpcIP}`), programmed by the agent on
+  **every** node — the external-facing sibling of `bridges`. It says where an
+  address leads, not who owns it.
+- **`float_announce` map** (`publicIP → 1`), programmed only on the node **elected**
+  to advertise the address. Attraction and delivery are separate decisions
+  (`docs/floating-ha.md`): this map is the whole of the first one.
 - **Advertisement in `from_uplink` itself.** The address is announced with no
   host-side state at all: `from_uplink`, already at the uplink ingress, answers
-  ARP for it. On an ARP *request* whose target is a `floating` key with a live
-  local pod, it rewrites the frame into a *reply* in place (sender = the node's
-  uplink MAC + the floating IP, target = the requester) and reflects it back out
-  the uplink. The `floating` map *is* the advertisement — programming it is
-  enough; there is no `ip addr`, no route, no proxy-ARP. (Proxy-ARP was a dead
-  end: a floating IP is drawn from an L2 the node already sits on, so the kernel
-  treats it as same-link and never proxies it — the MetalLB-L2 problem. Assigning
-  a local `/32` worked but made the reply a martian source; answering in eBPF
-  avoids both.) Because a node only answers for a floating IP whose target pod is
-  *local*, `client → publicIP` always arrives where the pod already is: floating
-  ingress is always *local*, never cross-node, and the address follows the pod on
-  reschedule. (L2 today; BGP later. A pod moving nodes relies on the client's ARP
-  cache expiring — a gratuitous ARP on move is a later refinement.)
+  ARP for it. On an ARP *request* whose target is in `float_announce`, it rewrites
+  the frame into a *reply* in place (sender = the node's uplink MAC + the floating
+  IP, target = the requester) and reflects it back out the uplink. There is no
+  `ip addr`, no route, no proxy-ARP. (Proxy-ARP was a dead end: a floating IP is
+  drawn from an L2 the node already sits on, so the kernel treats it as same-link
+  and never proxies it — the MetalLB-L2 problem. Assigning a local `/32` worked but
+  made the reply a martian source; answering in eBPF avoids both.)
 - **An uplink-ingress hook** (`from_uplink`). A tc program at the node uplink's
   ingress catches `client → publicIP` and `bpf_redirect`s it into the target's
-  veth by identity (`locals[{net, vpcIP}]` — the pod is local by construction).
-  It does *not* rewrite the packet: the DNAT happens where the bridge's does, in
+  veth by identity (`locals[{net, vpcIP}]`) when the pod is local — and
+  Geneve-encapsulates it to the pod's node (`remotes[{net, vpcIP}]`) when it is
+  not, since the announcer need not be the host. Either way it does *not* rewrite
+  the packet: the DNAT happens where the bridge's does, in
   `to_pod`. This mirrors the bridge exactly (`from_uplink` is to floating what
   `from_pod`/`from_overlay` are to the fabric bridge).
 - **`to_pod` does the inbound DNAT** (`floating_forward`, beside `bridge_forward`).
@@ -550,9 +552,10 @@ is one stateless bijection: inbound DNAT via `floating`, outbound SNAT via
 
 **No gateway.** A floating pod uses neither the VPC's egress gateway nor any
 conntrack; both directions are the 1:1 map. A floating IP is `Ready` once its
-target IP is a **live Port** (a running pod to advertise from and deliver to);
-with no live target the address stays reserved but silent (see §4, the
-controller). It is distributed (DVR) from day one because it rides the pod's node.
+target IP is a **live Port** (a running pod to deliver to); with no live target the
+address stays reserved but silent (see §4, the controller). Egress is distributed
+(DVR) — the reply leaves from the pod's own node, sourced as the public address,
+whichever node attracted the request.
 
 ### Addressing / byte order (for maintainers)
 

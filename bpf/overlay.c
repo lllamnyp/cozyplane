@@ -375,11 +375,16 @@ struct {
 
 // floating: externally-routable IP (network order) -> the bound pod's {net, VPC
 // IP} (reusing struct bridge_ep). The bridges map turned outward: instead of a
-// fabric IP from the node pod CIDR, the key is a public address advertised
-// (ARP/NDP) from the target pod's own node. from_uplink redirects an inbound
-// packet into the pod's veth; to_pod DNATs public->VPC (keeping the client's
-// source), and from_pod SNATs the pod's egress the other way. A true public IP:
-// the same address inbound and outbound, no masquerade, no gateway, no conntrack.
+// fabric IP from the node pod CIDR, the key is a public address. EVERY node
+// programs it, not just the pod's host: the node that attracts the traffic and
+// the node that hosts the pod are decided separately (docs/floating-ha.md), so
+// from_uplink must be able to resolve a floating address on a node that has no
+// local pod for it and forward it over the overlay. from_uplink redirects (or
+// encapsulates) an inbound packet into the pod's veth; to_pod DNATs public->VPC
+// (keeping the client's source), and from_pod SNATs the pod's egress the other
+// way — straight out the host's own uplink, so the reply never returns via the
+// announcer. A true public IP: the same address inbound and outbound, no
+// masquerade, no gateway, no conntrack.
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, struct addr128);
@@ -399,6 +404,24 @@ struct {
 	__uint(max_entries, 65536);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } floating_egress SEC(".maps");
+
+// float_announce: public IP -> 1, present ONLY on the node elected to advertise
+// that address (docs/floating-ha.md). It is the sole gate on the ARP/NDP
+// responders, and it is what separates *attraction* from *delivery*: the
+// `floating` map above says where a public address leads, this map says whether
+// THIS node is the one that pulls it off the wire. The election is a pure
+// function of cluster state (a rendezvous hash over the nodes that can serve the
+// pool's link), so there is no lease and no leader — an agent simply programs
+// this map for the addresses it won. Before, "programming the map was the
+// advertisement", which welded the announcement to the pod's location and made a
+// migrating VM's public address depend on one gratuitous ARP landing.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct addr128);
+	__type(value, __u8);
+	__uint(max_entries, 65536);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} float_announce SEC(".maps");
 
 // internal holds the cluster-internal CIDRs (pod/service/node networks) at scope
 // 0. A floating pod egresses straight out the uplink, bypassing the VPC gateway
@@ -1722,6 +1745,14 @@ static __always_inline struct bridge_ep *bridge_of(struct addr128 fabric)
 static __always_inline struct bridge_ep *float_of(struct addr128 pub)
 {
 	return bpf_map_lookup_elem(&floating, &pub);
+}
+
+// announces returns true when this node is the elected announcer for a public
+// address — the one gate on the ARP/NDP responders. It replaces the old "do I
+// host the target pod" test, which is now a separate question entirely.
+static __always_inline int announces(struct addr128 pub)
+{
+	return bpf_map_lookup_elem(&float_announce, &pub) != NULL;
 }
 
 static __always_inline struct addr128 *floating_egress_of(__u32 net, struct addr128 vpc_ip)
@@ -3115,10 +3146,11 @@ static __always_inline int floating_egress_snat6(struct __sk_buff *skb, struct p
 	return bpf_redirect_neigh(uplink, NULL, 0, 0);
 }
 
-// floating_ndp answers a Neighbor Solicitation for a floating v6 address with
-// a solicited+override Neighbor Advertisement carrying the uplink MAC — the
-// NDP twin of floating_arp (the L2 advertisement that pulls inbound traffic
-// to this node). The NS is rewritten to the NA in place and sent back out the
+// floating_ndp answers a Neighbor Solicitation for a floating v6 address this
+// node was elected to announce, with a solicited+override Neighbor Advertisement
+// carrying the uplink MAC — the NDP twin of floating_arp (the L2 advertisement
+// that pulls inbound traffic to this node; the pod it is destined for may live
+// anywhere). The NS is rewritten to the NA in place and sent back out the
 // uplink; the ICMPv6 checksum is updated incrementally for every changed
 // field, pseudo-header included. DAD probes (unspecified source) are left
 // unanswered: cozyplane owns the address authoritatively, and answering DAD
@@ -3145,11 +3177,8 @@ static __always_inline int floating_ndp(struct __sk_buff *skb)
 	if (addr128_eq(&req, &zero))
 		return FLOAT_MISS; // DAD probe; not answered (see above)
 
-	struct bridge_ep *fe = float_of(target);
-	if (!fe)
-		return FLOAT_MISS;
-	if (!local_of(fe->net, fe->vpc_ip))
-		return FLOAT_MISS;
+	if (!announces(target))
+		return FLOAT_MISS; // not the elected announcer for this address
 	struct cozy_mac *node = responder_mac(skb);
 	if (!node)
 		return FLOAT_MISS;
@@ -4949,6 +4978,26 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 		return deliver_local(skb, ep);
 	}
 
+	// Inbound to a floating IP, forwarded here by the node that announced it
+	// (docs/floating-ha.md): the destination is still the PUBLIC address, so
+	// local_of missed above — `locals` is keyed by VPC IP. Resolve it through
+	// `floating` and hand it to the pod's veth, where to_pod's floating_forward
+	// DNATs public->VPC and applies the north-south SG gate, exactly as it does
+	// for a packet that arrived on this node's own uplink.
+	//
+	// This MUST come before the gateway lookup below: a public destination is
+	// not a local pod, so it would otherwise fall into `gateways` and be
+	// delivered into this VPC's gateway pod — a mis-delivery, not a drop. It
+	// must equally come AFTER the SG-TLV block above: a floating packet carries
+	// no identity option (its source is an external client, not a group member)
+	// and must not be judged as east-west traffic.
+	struct bridge_ep *fe = float_of(p.dst);
+	if (fe && fe->net == vni) {
+		struct endpoint *fep = local_of(fe->net, fe->vpc_ip);
+		if (fep)
+			return deliver_local(skb, fep);
+	}
+
 	// Not a local pod: tenant->outside traffic for a gateway hosted here.
 	struct gw_entry *g = bpf_map_lookup_elem(&gateways, &vni);
 	if (g && !g->node_ip) {
@@ -4969,12 +5018,15 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 	return TC_ACT_OK;
 }
 
-// floating_arp answers ARP for a floating IP whose target pod is local: it is
-// how the address is advertised, with no host-side /32 or proxy_arp. An ARP
-// request for such an IP is rewritten in place into a reply — sender = this
-// node's uplink MAC + the floating IP, target = the requester — and reflected
-// back out the uplink. Returns a TC action when handled, or FLOAT_MISS to let
-// the caller fall through (not an ARP request for one of our floating IPs).
+// floating_arp answers ARP for a floating IP this node was ELECTED to announce
+// (float_announce) — not, as before, for one whose target pod happens to be
+// local. That is the whole of the attraction/delivery split: the announcer pulls
+// the address off the wire, and the packet then finds the pod wherever it lives.
+// Advertisement still needs no host-side /32 and no proxy_arp. An ARP request
+// for such an IP is rewritten in place into a reply — sender = this node's uplink
+// MAC + the floating IP, target = the requester — and reflected back out the
+// uplink. Returns a TC action when handled, or FLOAT_MISS to let the caller fall
+// through (not an ARP request for an address we announce).
 static __always_inline int floating_arp(struct __sk_buff *skb)
 {
 	void *data = (void *)(long)skb->data;
@@ -4991,11 +5043,8 @@ static __always_inline int floating_arp(struct __sk_buff *skb)
 	// ARP is v4-only (v6 floating IPs advertise via NDP, a later phase).
 	struct addr128 tip128;
 	v4_to_128(&tip128, arp->tip);
-	struct bridge_ep *fe = float_of(tip128);
-	if (!fe)
-		return FLOAT_MISS;
-	if (!local_of(fe->net, fe->vpc_ip))
-		return FLOAT_MISS; // not our pod (shouldn't be programmed here otherwise)
+	if (!announces(tip128))
+		return FLOAT_MISS; // not the elected announcer for this address
 
 	struct cozy_mac *node = responder_mac(skb);
 	if (!node)
@@ -5018,13 +5067,14 @@ static __always_inline int floating_arp(struct __sk_buff *skb)
 }
 
 // cozyplane_from_uplink: attached at the node uplink's ingress. It is the only
-// entry point for off-cluster ingress, and it also advertises floating IPs by
-// answering ARP for them (floating_arp). A packet destined to a floating IP with
-// a live local pod is redirected into that pod's veth, where to_pod's
-// floating_forward DNATs public->VPC (source-preserving); everything else —
-// overlay traffic, node traffic — is left to the kernel untouched, at the cost of
-// one hash lookup. The target is always local: a floating IP is advertised only
-// from the node hosting its pod.
+// entry point for off-cluster ingress, and it also advertises the floating IPs
+// this node was elected to announce (floating_arp / floating_ndp). A packet
+// destined to a floating IP is redirected into the target pod's veth when that
+// pod is local, and encapsulated to the pod's node when it is not — attraction
+// and delivery are separate decisions (docs/floating-ha.md). to_pod's
+// floating_forward does the public->VPC DNAT (source-preserving) at the far end
+// either way. Everything else — overlay traffic, node traffic — is left to the
+// kernel untouched, at the cost of one hash lookup.
 SEC("tc")
 int cozyplane_from_uplink(struct __sk_buff *skb)
 {
@@ -5049,6 +5099,10 @@ int cozyplane_from_uplink(struct __sk_buff *skb)
 				struct endpoint *l6 = local_of(fe6->net, fe6->vpc_ip);
 				if (l6)
 					return deliver_local(skb, l6);
+				// Host is elsewhere: forward over the overlay (v4 arm above).
+				__u32 *n6 = remote_of(fe6->net, fe6->vpc_ip);
+				if (n6)
+					return encap(skb, fe6->net, *n6, 0);
 			}
 		}
 		// v6 exits here without the v4 path's LB tail call below — but
@@ -5075,9 +5129,20 @@ int cozyplane_from_uplink(struct __sk_buff *skb)
 	struct bridge_ep *fe = float_of(d128);
 	if (fe) {
 		struct endpoint *l = local_of(fe->net, fe->vpc_ip);
-		if (!l)
-			return TC_ACT_OK; // advertised here but the pod moved: leave it to the kernel
-		return deliver_local(skb, l);
+		if (l)
+			return deliver_local(skb, l);
+		// The pod lives elsewhere: we attracted the address, another node
+		// delivers it. `floating` gave us the pod's {net, VPC IP} — exactly
+		// the key `remotes` is fed with per-pod — so the host is one lookup
+		// away. Encapsulate verbatim (public dst and client src intact) and
+		// let from_overlay hand it to the pod's veth, where to_pod DNATs it
+		// like any other floating packet. The reply does NOT come back
+		// through here: the host SNATs it to the public address and sends it
+		// straight to the client (docs/floating-ha.md).
+		__u32 *node_ip = remote_of(fe->net, fe->vpc_ip);
+		if (node_ip)
+			return encap(skb, fe->net, *node_ip, 0);
+		return TC_ACT_OK; // no live target anywhere: leave it to the kernel
 	}
 
 	// LoadBalancer/NodePort ingress (docs/lb-ingress.md): dst may be a
