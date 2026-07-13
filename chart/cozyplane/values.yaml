@@ -1,6 +1,6 @@
 # Container image for all cozyplane components (agent, CNI plugin, controller).
 # Digest-pinned (no floating tag); update on each published build.
-image: ghcr.io/lllamnyp/cozyplane@sha256:713e3b5d7632a223d93da41df360cb770dbf6bdc7ecb077b40acf682c79f3596
+image: ghcr.io/lllamnyp/cozyplane@sha256:680bee29ea155834b47eecd40e90f6658384d8f6253bcde8943bd0bffc26c7c5
 imagePullPolicy: IfNotPresent
 imagePullSecrets: []
 
@@ -71,9 +71,16 @@ agent:
   resources:
     requests:
       cpu: 50m
-      memory: 64Mi
+      # The eBPF maps are charged to the agent's memory cgroup, and most of them
+      # are PREALLOCATED at load: the LRU conntrack and service maps alone
+      # (ct_fwd/ct_rev/svc_fwd/svc_rev at 262k entries each, np_ct at 131k) come
+      # to ~100MB+ before the Go heap. Request enough that the scheduler knows.
+      memory: 192Mi
     limits:
-      memory: 256Mi
+      # 256Mi was marginal and finally bit: the agent was OOM-killed at startup on
+      # every node (28MB anon RSS — the cgroup was full of *map* memory, not heap).
+      # A few MB of new maps was the difference. Size for the map footprint.
+      memory: 512Mi
 
 controller:
   replicas: 1

@@ -438,7 +438,13 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, struct addr128);
 	__type(value, __u8);
-	__uint(max_entries, 65536);
+	__uint(max_entries, 4096);
+	// NO_PREALLOC: a cluster holds tens of floating addresses, not thousands, and
+	// this map is written only from userspace. Preallocating charged the agent's
+	// memory cgroup for entries that will never exist — and the agent runs close
+	// enough to its limit (the LRU conntrack/service maps preallocate ~100MB+)
+	// that a few needless megabytes decide whether it starts or is OOM-killed.
+	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } float_announce SEC(".maps");
 
@@ -679,6 +685,12 @@ struct {
 	__type(key, __u32); // net (VNI)
 	__type(value, struct vpc_counter);
 	__uint(max_entries, 4096);
+	// NO_PREALLOC, and it matters more here than anywhere: this is a PERCPU map,
+	// so every preallocated entry costs sizeof(vpc_counter) * nr_cpus — and the
+	// value grew when north-south metering landed. The agent creates one entry per
+	// VPC and the datapath only ever increments an existing one, so nothing is
+	// lost by allocating on demand.
+	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } vpc_counters SEC(".maps");
 
