@@ -249,7 +249,28 @@ Not a commitment; the order the pieces actually depend on each other.
    Still deliberately absent: the per-VPC NAT **identity**. The gateway declares the
    door; egress still launders into the node's address until increment 2. Better to
    sequence that honestly than to ship a field the datapath ignores.
-2. **NAT gateway in eBPF, per-VPC identity.** Retire the gateway pod.
+2. **NAT gateway in eBPF, per-VPC identity — DONE 2026-07-13.** The gateway pod is
+   retired. Dev-cluster-proven, on the asymmetric triangle that is the whole point:
+   SNAT on the pod's node, the address attracted by a *different* node, the client
+   on a third. On the wire the tenant's source is its OWN address, never the node's,
+   and both the local and cross-node reverse paths deliver (HTTP 200). The
+   tenant→system boundary still refuses cluster-internal destinations, DNS still
+   works (the split-horizon resolver never needed the pod), and a VPC with no
+   gateway is still a closed island.
+
+   Three bugs it took to get there, all worth remembering:
+   - `nodeIPIndex` holds only the OTHER nodes (it feeds `remotes`, and `watchNodes`
+     skips self), so every agent programmed the shard table for its peers and
+     **silently skipped its own shard** — the reverse lookup then missed on exactly
+     the node holding the flow. The tell was a node ARPing for an address it
+     announces itself.
+   - The un-NAT'd reply must be marked **`GW_MARK`, assigned** — it *is*
+     gateway-forwarded ingress. `to_pod`'s isolation escape tests
+     `skb->mark == GW_MARK` for **exact equality**, so `|= SG_OK` was as good as no
+     mark at all and the reply was thrown away on the pod's own doorstep.
+   - `nat_owner` stores node IPs host-order (as `remotes` does, which is what
+     `encap` wants) while `CFG_NODE_IP` holds network-order bytes; comparing them
+     unswapped would have made every reply "someone else's" and looped it.
 
    **Why the gateway pod exists at all** — worth stating, because it dictates the
    design. `masq_snat` (the cluster-egress masquerade) identifies a default-network
