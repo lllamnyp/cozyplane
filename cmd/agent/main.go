@@ -2090,6 +2090,18 @@ func serveMetrics(ctx context.Context, mgr *datapath.Manager, vpcs sdnv1alpha1in
 			}
 		}
 
+		// Which floating IPs THIS node attracts (docs/floating-ha.md). The
+		// election is a pure function of cluster state, so nothing in the API
+		// records its outcome — this gauge is how an operator answers "which node
+		// is pulling that address off the wire", and it is the only way to see a
+		// split brain (the same address announced twice) if one ever occurs.
+		if announced, err := mgr.Announcements(); err == nil {
+			fmt.Fprintf(&b, "# HELP cozyplane_floating_announced Floating IPs this node is elected to advertise.\n# TYPE cozyplane_floating_announced gauge\n")
+			for pub := range announced {
+				fmt.Fprintf(&b, "cozyplane_floating_announced{public=%q,node=%q} 1\n", pub, nodeName)
+			}
+		}
+
 		// Default-net NetworkPolicy drops + compiler sync failures
 		// (docs/network-policy.md — a failed np_allow sync only over-drops,
 		// but it must be visible).

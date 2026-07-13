@@ -10,9 +10,14 @@
 # kinds.
 #
 # What it does NOT cover: anything needing an off-cluster client on a docker
-# network (floating-IP ingress, LoadBalancer ingress, north-south masquerade).
-# Those live in test/e2e.sh, which builds its own kind cluster because the
-# "external" client is a container on kind's network.
+# network (LoadBalancer ingress, north-south masquerade). Those live in
+# test/e2e.sh, which builds its own kind cluster because the "external" client is
+# a container on kind's network.
+#
+# Floating-IP HA (docs/floating-ha.md) IS covered, when FLOAT_CIDR names a spare
+# on-link range on the cluster's external L2 — the client there is a hostNetwork
+# pod, which is off the VPC and reaches the address over the real fabric, so the
+# announcer/host/client triangle is genuine without needing a docker network.
 set -u
 KCTX="${KCTX:?set KCTX}"
 K="kubectl --context ${KCTX}"
@@ -289,6 +294,120 @@ else
   # regardless, so only observing arrival distinguishes RPF-dropped from that.
   [ "${spoofed:-0}" -eq 0 ] && pass "a forged co-VPC source is dropped at the origin veth (RPF); a1 never sees it" \
     || fail "SPOOFED packet reached a1 — RPF did not drop it (got '$spoofed')"
+fi
+
+# ---------------------------------------------------------------------------
+phase "floating-IP HA: the announcer need not be the pod's host"
+# docs/floating-ha.md. Attraction (who answers ARP) and delivery (who runs the
+# pod) are separate decisions now. The decisive case is the ASYMMETRIC one: an
+# address announced by node X, whose pod lives on node Y, reached by a client on
+# node Z. It exercises the remote arm in from_uplink, the floating probe in
+# from_overlay, and the DSR reply out the host's own uplink — none of which the
+# old same-node path ever touched.
+#
+# Needs a spare on-link range on the cluster's external L2 (FLOAT_CIDR), because
+# an L2 announcement is only meaningful on a fabric the nodes are attached to.
+if [ -z "${FLOAT_CIDR:-}" ]; then
+  skip "floating-IP HA (set FLOAT_CIDR=<spare on-link range> to run it)"
+else
+  apply <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: ExternalPool
+metadata: {name: e2e-float}
+spec: {cidrs: ["$FLOAT_CIDR"]}
+EOF
+  # Several addresses: the announcer is a hash of the address, so a handful is
+  # enough to land at least one away from a1's node (which is the case we care
+  # about). One would be a coin toss.
+  for i in 1 2 3 4; do
+    apply <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: FloatingIP
+metadata: {name: fip-$i, namespace: $NS}
+spec:
+  vpcRef: {name: va}
+  target: "$A1"
+  poolRef: {name: e2e-float}
+EOF
+  done
+  # announcer <public-ip> -> the node whose agent has it in float_announce
+  # (cozyplane_floating_announced). The election writes no API object — the
+  # datapath map is the truth, and the metric is how it is read.
+  announcer() {
+    for a in $($K -n kube-system get pods -l app=cozyplane-agent -o name 2>/dev/null); do
+      if $K -n kube-system exec "$a" -c agent -- \
+           curl -gs -m3 localhost:9411/metrics 2>/dev/null | grep -q "cozyplane_floating_announced{public=\"$1\""; then
+        $K -n kube-system get "$a" -o jsonpath='{.spec.nodeName}'
+        return
+      fi
+    done
+  }
+
+  # Wait for the addresses, then find one announced AWAY from a1's node.
+  FIP=""; FIPNODE=""
+  for _ in $(seq 1 20); do
+    for i in 1 2 3 4; do
+      addr=$($K -n "$NS" get floatingip "fip-$i" -o jsonpath='{.status.address}' 2>/dev/null)
+      [ -n "$addr" ] || continue
+      n=$(announcer "$addr")
+      [ -n "$n" ] || continue
+      # Any announced address proves the map is programmed; a REMOTE one is the
+      # case worth testing.
+      [ -z "$FIP" ] && { FIP="$addr"; FIPNODE="$n"; }
+      if [ "$n" != "$W" ]; then FIP="$addr"; FIPNODE="$n"; break 2; fi
+    done
+    sleep 3
+  done
+
+  if [ -z "$FIP" ]; then
+    fail "no floating IP was announced by any node (the election never converged)"
+  else
+    pass "the address is announced from exactly one node (elected, not derived from the pod's location)"
+    echo "  floating $FIP announced by $FIPNODE; pod a1 is on $W"
+
+    # Exactly one announcer — two would be a split brain, and ARP would flap.
+    COUNT=0
+    for a in $($K -n kube-system get pods -l app=cozyplane-agent -o name 2>/dev/null); do
+      $K -n kube-system exec "$a" -c agent -- curl -gs -m3 localhost:9411/metrics 2>/dev/null \
+        | grep -q "cozyplane_floating_announced{public=\"$FIP\"" && COUNT=$((COUNT + 1))
+    done
+    [ "$COUNT" -eq 1 ] && pass "exactly one node announces it (no split brain)" \
+      || fail "$COUNT nodes announce $FIP — ARP would flap between them"
+
+    if [ "$FIPNODE" = "$W" ]; then
+      skip "announcer landed on the pod's own node for every address — the asymmetric path is untested this run"
+    else
+      # The client must be neither the announcer nor the host, so the request
+      # crosses the overlay and the reply comes back from a third direction.
+      CLIENT=""
+      for n in "${READY[@]}"; do
+        [ "$n" != "$FIPNODE" ] && [ "$n" != "$W" ] && { CLIENT="$n"; break; }
+      done
+      [ -n "$CLIENT" ] || CLIENT="$W2"
+      echo "  external client on $CLIENT -> $FIP (announced by $FIPNODE, pod on $W)"
+      apply <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: extclient, namespace: $NS}
+spec:
+  nodeName: $CLIENT
+  hostNetwork: true
+  containers: [{name: c, image: nicolaka/netshoot, command: [sleep, infinity]}]
+EOF
+      $K -n "$NS" wait --for=condition=Ready pod/extclient --timeout=120s >/dev/null 2>&1
+      GOT=""
+      for _ in $(seq 1 10); do
+        GOT=$($K -n "$NS" exec extclient -- curl -gs -m3 "http://$FIP:8080" 2>/dev/null | tr -d "[:space:]")
+        [ -n "$GOT" ] && break
+        sleep 2
+      done
+      [ "$GOT" = "a1" ] \
+        && pass "a client off the VPC reaches the pod through an address announced by ANOTHER node (attract on $FIPNODE, deliver on $W)" \
+        || fail "the floating IP did not reach the pod across nodes (got '$GOT', want 'a1')"
+    fi
+  fi
+  $K -n "$NS" delete floatingip --all >/dev/null 2>&1
+  $K delete externalpool e2e-float >/dev/null 2>&1
 fi
 
 # ---------------------------------------------------------------------------
