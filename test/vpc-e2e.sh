@@ -281,8 +281,8 @@ else
   fire "$SPOOF"    # forged source — must be dropped at a2's own from_pod
   sleep 3
   wait "$CAP" 2>/dev/null
-  genuine=$($K -n "$NS" exec a1 -- sh -c "grep -cF ' $A2.' /tmp/rpfcap" 2>/dev/null || echo 0)
-  spoofed=$($K -n "$NS" exec a1 -- sh -c "grep -cF ' $SPOOF.' /tmp/rpfcap" 2>/dev/null || echo 0)
+  genuine=$($K -n "$NS" exec a1 -- sh -c "grep -cF ' $A2.' /tmp/rpfcap || true" 2>/dev/null | head -1)
+  spoofed=$($K -n "$NS" exec a1 -- sh -c "grep -cF ' $SPOOF.' /tmp/rpfcap || true" 2>/dev/null | head -1)
   [ "${genuine:-0}" -ge 1 ] && pass "positive control: a2's genuine SYN reaches a1 (RPF admits the honest source)" \
     || fail "positive control failed — a2's real SYN did not arrive (got '$genuine')"
   # Decisive by DELIVERY, not a reply: a spoofed packet forfeits its reply
