@@ -232,6 +232,12 @@ Not a commitment; the order the pieces actually depend on each other.
    without coordinating: the controller that realizes the gateway pod, the CNI that
    gives that pod its VPC leg, and the agent that opens the ingress gate.
 
+   **Dev-cluster-validated (deny-then-admit):** with no gateway, 4 raw SYNs to a
+   LoadBalancer IP whose backend is a VPC pod are refused (4 denied, 0 crossed);
+   with a gateway that declines LB ingress, 4 more are refused (8 denied, still 0
+   crossed); the moment the gateway admits, the *same unchanged Service* delivers
+   (7 crossed, no new refusals) and an HTTP request returns 200.
+
    **Tenet 7 is now enforced, not aspirational:** `vpc_ingress[net]` is programmed
    only for a VPC whose gateway admits LoadBalancer traffic, and `lb_ingress` drops
    otherwise. An LB Service naming a VPC pod as its backend previously got a free
