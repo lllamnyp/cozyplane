@@ -150,20 +150,14 @@ cannot be billed is a costume.
 
 ### R8. ~~A tenant's namespaces are one tenant.~~
 
-**Dissolved, 2026-07-14 — there was no question.** A **namespace *is* the tenant**,
-full stop. That is not cozyplane's simplification of someone else's model; it is
-the model. A Cozystack tenant is a namespace.
+**Dissolved.** In Cozystack a tenant *is* a namespace, so the rule has no referent.
 
-So "two namespaces of the same tenant" is not a thing that exists, and the premise
-of the rule was wrong. Cross-namespace **is** cross-tenant, and the `export` grant
-is not friction — it is the correct answer, applied uniformly, with no exception
-carved for a relationship that has no referent.
+Elsewhere a tenant may span namespaces — and that case is already served: `export`
+on the VPC plus a `VPCBinding` is exactly how one namespace lets another attach to
+its network. It is the mechanism, not a workaround for the absence of one.
 
-The rule is recorded here only because the fix it proposed would have been a real
-mistake: teaching cozyplane a platform-specific notion of tenancy (a `Tenant` kind,
-a namespace-tree label) to serve a case that does not arise. **Cozyplane does not
-learn tenancy from anything. The namespace is the anchor, and that is the whole
-model.** No platform specifics.
+So there is nothing to build, and specifically no `Tenant` kind and no namespace-tree
+label. **Cozyplane learns tenancy from no platform.**
 
 ### R9. Operators are not tenants.
 

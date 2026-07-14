@@ -92,9 +92,10 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
 **Deferred by decision** — not gaps; recorded so they aren't re-litigated:
 **BGP** (§3 — a CNI holds no routing sessions; attraction is the platform's job);
 multi-tenancy **R3** (address-thinking — tenet 4 says identity, not addresses) and
-**R8** (**dissolved** — a namespace *is* the tenant, so cross-namespace is
-cross-tenant and the `export` grant is correct; cozyplane learns tenancy from no
-platform, [multitenancy.md](multitenancy.md)); the **stopped-VM address**
+**R8** (**dissolved** — in Cozystack a tenant *is* a namespace; where one spans
+namespaces, `export` + `VPCBinding` already serves it, so cozyplane needs no
+`Tenant` kind and learns tenancy from no platform —
+[multitenancy.md](multitenancy.md)); the **stopped-VM address**
 (multitenancy R1's one uncovered case — a persistent Port outlives its launcher, so
 there is no pod to carry the annotation; the fix couples us to KubeVirt or costs a
 projected read, so decide when a VM tenant asks); the CRD-storage shim (§7 — no
