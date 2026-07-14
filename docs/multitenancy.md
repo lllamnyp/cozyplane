@@ -27,9 +27,12 @@ surface someone will have to defend.
 | **R7** | Everything a tenant sends across a boundary is attributable to it | already true (north-south metering) |
 | **R8** | ~~A tenant's namespaces are one tenant~~ | **dissolved** — a namespace *is* the tenant |
 | **R9** | Operators are not tenants | already true |
+| **R10** | A field that selects a privileged thing is gated by an object, not RBAC | **open** — pre-existing; closed for pods, not for Services |
 
-Only one thing in this document is outstanding, and it is deliberately unbuilt: how
-a tenant reads the pinned address of a **stopped VM** (§ "The mechanism for R1").
+Two things are outstanding. One is deliberately unbuilt: how a tenant reads the pinned
+address of a **stopped VM** (§ "The mechanism for R1"). The other is **R10** — a
+pre-existing gap, closed for pods and not yet for Services, and not widened by
+anything built so far.
 
 ---
 
@@ -166,6 +169,34 @@ tenant role includes them. An operator may read cluster-scoped objects (that is
 what R2 protects *from tenants*, not from the platform). The two personas get two
 role sets, and no rule quietly serves both.
 
+### R10. A field that selects a privileged thing must be gated by an object, not by RBAC.
+
+**Keep — OPEN.** The one rule here that is not yet satisfied, and it is not new: it
+predates cozyplane and it is not made worse by anything built so far.
+
+RBAC authorizes **verbs on resources**. It cannot authorize a **field**. So every time
+a privileged capability is selected by writing a field on an object a tenant already
+owns, ordinary RBAC has nothing to say about it:
+
+| the field | what it reaches for |
+|---|---|
+| a pod's `sdn.cozystack.io/vpc` annotation | attaching to a VPC |
+| a Service's `service.kubernetes.io/service-proxy-name` label | a real public address ([public-ip.md](public-ip.md)) |
+
+**The pod case is the one we already closed, and it shows the shape of the answer.**
+We did not gate the annotation. We required a **separate object whose creation RBAC
+*can* gate** — the `VPCBinding`, gated by `export` on the VPC. The field became a
+*reference*; the authorization moved to an object.
+
+The Service case is not closed. Anyone who can create a Service in a namespace can
+label it and draw a public address from the platform's LB pool. That is exactly as
+true of the nftables implementation cozyplane supersedes, so nothing is widened — but
+it stays a gap until the same treatment is applied.
+
+**Do it once, not case by case.** The temptation is a bespoke gate per field as each
+one surfaces; the result of that is a policy surface nobody can enumerate. The rule is
+the general form: find the object that *should* carry the grant, and require it.
+
 ---
 
 ## The mechanism for R1
@@ -301,7 +332,11 @@ and predate this document. R1, R2 and R5 — the persona, the self-view and the
 ceiling — are built on top of them, and `test/tenant-e2e.sh` is the check that they
 stay true.
 
-**What is left is one open question, and it is not a gap:** the address of a
+**R10 is a real gap** — field-level authorization, closed for pods by the `VPCBinding`
+and still open for Services. It predates cozyplane and nothing built so far widens it,
+but it is the next piece of tenancy work with teeth.
+
+**The other open item is not a gap, it is a question:** the address of a
 **stopped VM** (§ "The mechanism for R1"). A persistent Port outlives its launcher
 pods by design, so between launchers there is no pod to carry the annotation — and
 that is exactly when a tenant asks. The answer is either a stamp on the KubeVirt

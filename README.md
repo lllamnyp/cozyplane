@@ -2,20 +2,20 @@
 
 A multi-tenant, eBPF-based CNI for [Cozystack](https://cozystack.io), built so
 that cloud-style tenancy — not a flat cluster network — is the backbone. It
-replaces kube-ovn for VPC networking; ClusterIP/Service load-balancing stays with
-kube-proxy or Cilium's kube-proxy replacement, which cozyplane coexists with (a
-built-in replacement that imports Cilium's LB components is
-[under design](docs/kube-proxy-replacement.md)).
+replaces kube-ovn for VPC networking, and it can own Services too: `cozyplane-kpr`
+(Cilium's LB control plane + socket-LB) replaces kube-proxy outright.
 
 > **Status: functional, pre-production.** The default pod network and the full VPC
-> datapath — tenant isolation, overlapping CIDRs, peering, egress, floating public
-> IPs, and IPv6/dual-stack — work and are covered by an e2e suite. VM live
-> migration with **IP + MAC preservation** is validated on a real cluster with
-> KubeVirt (including an IPv6 VM), and the whole thing is packaged for Cozystack.
-> Not yet: network policy / security groups, split-horizon DNS, and removing the
-> interim netfilter dependency. See [docs/roadmap.md](docs/roadmap.md) for the full
-> built-vs-outstanding checklist, [docs/design.md](docs/design.md) for the vision,
-> and [docs/internals.md](docs/internals.md) for what exists as-built.
+> datapath — tenant isolation, overlapping CIDRs, peering, a declared and metered
+> north-south boundary, floating public IPs, and IPv6/dual-stack — work and are
+> covered by an e2e suite. All three policy layers (`SecurityGroup`,
+> `NetworkPolicy`, `HostFirewall`), split-horizon DNS, per-VPC Services, and a
+> tenant persona in the API are built. VM live migration with **IP + MAC
+> preservation** is validated on a real cluster with KubeVirt (including an IPv6
+> VM), and the whole thing is packaged for Cozystack. See
+> [docs/roadmap.md](docs/roadmap.md) for the built-vs-outstanding checklist,
+> [docs/design.md](docs/design.md) for the vision, and
+> [docs/internals.md](docs/internals.md) for what exists as-built.
 
 ## What works today
 
@@ -79,7 +79,6 @@ built-in replacement that imports Cilium's LB components is
   (M=1) and runs a per-veth DHCPv6 responder handing out the exact pinned
   `/128` — a bridge-bound VM guest learns its address, default route, and DNS
   server with no console access.
-
 - **All three policy layers**: `SecurityGroup` (intra-VPC, identity-selected),
   upstream `NetworkPolicy` (the default network), and a cluster-scoped
   `HostFirewall` (node ingress/egress) — all enforced in eBPF.
@@ -114,6 +113,7 @@ Start with [design.md](docs/design.md) (the vision and the **design tenets**), t
 | [docs/services-in-vpc.md](docs/services-in-vpc.md) | Services inside a VPC (per-VPC VIPs, split-horizon DNS) |
 | [docs/kube-proxy-replacement.md](docs/kube-proxy-replacement.md) | Owning Services by importing Cilium's LB + socket-LB |
 | [docs/lb-ingress.md](docs/lb-ingress.md) | LoadBalancer ingress + NodePort (delivery only — cozyplane does not announce) |
+| [docs/public-ip.md](docs/public-ip.md) | *Design* — a real public address for a default-network VM; supersedes cozy-proxy |
 | [docs/api-groups.md](docs/api-groups.md) | The two API groups (`local.sdn` CRDs vs the aggregated `sdn`) |
 | [docs/floating-ha.md](docs/floating-ha.md) | Floating IPs: separating attraction from delivery |
 | [docs/vm-provisioning.md](docs/vm-provisioning.md) | *Design draft* — metadata endpoint & guest autoconfiguration |
