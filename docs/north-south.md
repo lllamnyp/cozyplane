@@ -127,7 +127,11 @@ the boundary rather than waved through.
   `floating_ndp`, `AnnounceAddress`, the announcer election: a MetalLB L2
   implementation living inside a CNI. Deleted (increment 3).
 - **The per-VPC gateway pod** — replaced by eBPF SNAT with a per-VPC identity
-  (increment 2). With it went the last netns firewall in the tree.
+  (increment 2), **for a gateway that has a pool**. It is not gone from the tree: a
+  `nat.enabled` gateway with **no `poolRef`** has no identity to wear, so it still
+  gets a pod, and that pod still carries the netns firewall — and still launders the
+  tenant into the node's address, which is the tenet-8 violation increment 2 exists
+  to end. Requiring `poolRef` would delete `cmd/gateway` outright. **Open** (§7).
 - **`ExternalPool.spec.advertisement`** (`L2 | BGP`) — dead code that stayed dead.
 - **`FloatingIP` as a top-level, self-sufficient object** — it is an EIP under a
   gateway (increment 3).
@@ -176,8 +180,9 @@ not be in a CNI.
 - **Per-VPC NAT port-pool sizing and exhaustion** — the node masquerade's pool is
   shared; a per-VPC pool needs its own accounting and a story for what happens when
   a tenant exhausts it.
-- **Metering shape** — per-VPC byte/packet counters at the boundary, split by
-  direction and by mechanism (NAT-GW / EIP / LB), closing [#2](../../issues/2)'s
+- ~~**Metering shape**~~ — **answered by increment 0**: per-VPC byte/packet counters
+  at the boundary, split by direction and by door (gateway / eip / loadbalancer),
+  with refusals counted separately from crossings. Closed [#2](../../issues/2)'s
   north-south half.
 
 ## 8. Sketch of the increments
@@ -350,4 +355,8 @@ Not a commitment; the order the pieces actually depend on each other.
    not just its NAT identity — and every external address a VPC uses crosses, and is
    counted at, one boundary. Tenet 2, finally true.
 4. **LoadBalancer ingress into a VPC crosses the boundary** — admitted and counted,
-   not waved through.
+   not waved through. **Absorbed — DONE**, and it never became its own increment:
+   increment 0 counts the `loadbalancer` door in both directions, and increment 1's
+   `vpc_ingress` gate is what makes the crossing *admitted* rather than waved
+   through (with refusals in `ns_denied[door]`). Recorded rather than deleted so the
+   arc's fourth piece is visibly accounted for.

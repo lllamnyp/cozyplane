@@ -4,14 +4,32 @@ Cozyplane's datapath has been multi-tenant since early on: VNI-scoped delivery,
 overlapping tenant CIDRs, default-deny across VPCs, identities scoped to the VPC,
 a declared north-south boundary with its own egress identity and its own meter.
 
-Its **API** is not. Not because isolation leaks — it does not — but because there
-is no *tenant* in it. There is no role a tenant could hold, no surface shaped for
-one, and no ceiling on what one can consume. An operator does everything, and a
-tenant is a thing the datapath enforces rather than a thing the API knows about.
+Its **API** was not — not because isolation leaked (it did not), but because there
+was no *tenant* in it: no role a tenant could hold, no surface shaped for one, and
+no ceiling on what one could consume. An operator did everything, and a tenant was
+a thing the datapath enforced rather than a thing the API knew about.
+
+That gap is closed. **A namespace is the tenant** — cozyplane learns tenancy from
+no platform, and the namespace is the whole anchor.
 
 This document is the rules. Each one is stated as a rule, justified, and kept — or
 justified badly and dropped. A rule with no justification is a future attack
 surface someone will have to defend.
+
+| | rule | state |
+|---|---|---|
+| **R1** | A tenant can learn the network identity of its own workloads | **built** — the CNI stamps the pod |
+| **R2** | A tenant can enumerate nothing it does not own | **built** — structurally; namespaced roles only |
+| **R3** | ~~A tenant can list the ports of its VPC~~ | **dropped** — address-thinking (tenet 4) |
+| **R4** | A tenant opens its own door; it does not mint what is behind it | already true (`attach`) |
+| **R5** | A tenant cannot exhaust what it does not own | **built** — stock `ResourceQuota` |
+| **R6** | Consent is mutual, and never inferred | already true (`export` / `peer`) |
+| **R7** | Everything a tenant sends across a boundary is attributable to it | already true (north-south metering) |
+| **R8** | ~~A tenant's namespaces are one tenant~~ | **dissolved** — a namespace *is* the tenant |
+| **R9** | Operators are not tenants | already true |
+
+Only one thing in this document is outstanding, and it is deliberately unbuilt: how
+a tenant reads the pinned address of a **stopped VM** (§ "The mechanism for R1").
 
 ---
 
@@ -19,7 +37,8 @@ surface someone will have to defend.
 
 ### R1. A tenant can learn the network identity of its own workloads.
 
-**Keep.** This is the one thing a tenant genuinely cannot do today.
+**Keep — built** (Option C below; `test/tenant-e2e.sh`). This was the one thing a
+tenant genuinely could not do.
 
 `status.podIP` is the **fabric IP** — the underlay handle, the address kubelet
 probes and the platform routes. It is *not* the address anything inside the VPC
@@ -28,14 +47,23 @@ tenant's actual identity — its VPC address, and for a VM its pinned MAC — ap
 in exactly one place in the API: the cluster-scoped `Port`. Which the tenant
 cannot read (R2).
 
-So today a tenant literally cannot answer "what is my VM's address?" from the API.
+So a tenant literally could not answer "what is my VM's address?" from the API.
 That is not a tenancy nicety; a VM guest's provisioning, a tenant's own inventory,
 and the entire live-migration promise (*this identity survives a node move*) are
-all about an address the tenant cannot see.
+all about an address the tenant could not see. The e2e says it better than prose:
+
+```
+status.podIP (the FABRIC ip): 10.244.176.237
+annotated VPC ip / mac:       10.90.0.2 / 22:bc:74:2a:51:a3
+the Port's truth:             10.90.0.2
+```
+
+Kubernetes was showing the tenant a different address, on a different network.
 
 ### R2. A tenant can enumerate nothing it does not own.
 
-**Keep.** This is the rule the whole model rests on.
+**Keep — built** (`cozyplane-tenant-edit` / `-view`). This is the rule the whole
+model rests on.
 
 `Port` and `ServiceVIP` are **cluster-scoped**, and that is load-bearing: the IPAM
 claim is atomic *because* the name `v<vni>.<ip>` is globally unique. It is an
@@ -47,6 +75,14 @@ topology through the front door.
 
 Corollary: **no tenant role may ever include a cluster-scoped read.** If a tenant
 needs to see something, it is projected into a namespace or it is not shown.
+
+It holds **structurally**, not by vigilance: the tenant roles name only *namespaced*
+kinds, and a RoleBinding cannot grant access to a cluster-scoped resource. So `list
+ports` is unreachable from a tenant role by construction — not by our remembering to
+leave it out. Building this removed a loaded gun: the sample `cozyplane-vpc-owner`
+role granted `get/list/watch` on **ports**. Inert under a RoleBinding, but it
+documented the intent, and one `ClusterRoleBinding` would have handed every tenant
+every other tenant's pod names, addresses, MACs and node placement.
 
 ### R3. ~~A tenant can list the ports of its VPC.~~
 
@@ -88,11 +124,12 @@ consumes a shared resource, or reaches into another namespace, is a grant.**
 
 ### R5. A tenant cannot exhaust what it does not own.
 
-**Keep.** Missing today, and it is the rule that decides whether tenancy is real.
+**Keep — built** (stock `ResourceQuota`; see the sequence below). It is the rule
+that decides whether tenancy is real.
 
-Nothing bounds a tenant's consumption of VPCs (and therefore VNIs), addresses out
+Nothing bounded a tenant's consumption of VPCs (and therefore VNIs), addresses out
 of a pool it was granted, ServiceVIPs, or Ports. Kubernetes `ResourceQuota` does
-not cover aggregated-API kinds, so we get nothing for free. And `attach` today is a
+not cover aggregated-API kinds, so we got nothing for free. And `attach` is a
 **binary** grant: hold it, and you may drain the pool.
 
 Isolation without a ceiling is not tenancy — it is tenancy until the first tenant
@@ -139,8 +176,9 @@ role sets, and no rule quietly serves both.
 
 ## The mechanism for R1
 
-R1 is the only rule that needs a new mechanism, and it is worth doing carefully,
-because there are three plausible shapes and two of them are traps.
+R1 was the only rule that needed a new mechanism, and it was worth doing carefully,
+because there were three plausible shapes and two of them are traps. **Option C
+shipped.**
 
 ### Option A — a namespaced sentinel owned by the Port
 
@@ -164,7 +202,7 @@ source of truth. No copy, so no drift.
 durable, queryable, watchable tenant view. It costs virtual-REST machinery, and it
 must not be built to satisfy R3 (which is dropped) — only R1.
 
-### Option C — the workload carries its own identity  ← recommended
+### Option C — the workload carries its own identity  ← **BUILT**
 
 The CNI already knows the VPC address and MAC at ADD time — it *allocated* them.
 It writes them back onto **the pod**: `sdn.cozystack.io/vpc-ip`,
@@ -196,11 +234,11 @@ is a real cost and a real decision — so it is the open question, not a default
 
 ---
 
-## Sequence
+## Sequence — as built
 
-**Phase 1 and Phase 2 are one change**, and this is not an ordering preference —
-it is a safety property. You cannot grant a tenant *any* role until R2 holds,
-because the only tenant-relevant read that exists today is a cluster-scoped one.
+**R1 and R2 were one change**, and that was not an ordering preference — it is a
+safety property. You cannot grant a tenant *any* role until R2 holds, because the
+only tenant-relevant read that existed beforehand was a cluster-scoped one.
 
 1. **R1 + R2 together — DONE 2026-07-14** (`test/tenant-e2e.sh`, 19/19 on the dev
    cluster). The CNI stamps the pod with the address and MAC it allocated
@@ -260,9 +298,19 @@ because the only tenant-relevant read that exists today is a cluster-scoped one.
    is cross-tenant and the grant is simply right. No platform specifics; nothing to
    build.
 
-## What is already done (do not rebuild)
+## What is done (do not rebuild)
 
 The datapath (VNI-scoped, overlapping CIDRs, default-deny cross-VPC), the
 SecurityGroup identity model, the escalation verbs (`export` / `peer` / `attach`),
-the north-south boundary and its per-VPC metering. R4, R6 and R7 are satisfied
-today. The gap is R1, R2 and R5 — a persona, a projection, and a ceiling.
+the north-south boundary and its per-VPC metering — those satisfy R4, R6 and R7,
+and predate this document. R1, R2 and R5 — the persona, the self-view and the
+ceiling — are built on top of them, and `test/tenant-e2e.sh` is the check that they
+stay true.
+
+**What is left is one open question, and it is not a gap:** the address of a
+**stopped VM** (§ "The mechanism for R1"). A persistent Port outlives its launcher
+pods by design, so between launchers there is no pod to carry the annotation — and
+that is exactly when a tenant asks. The answer is either a stamp on the KubeVirt
+object (where a user looks, at the cost of coupling) or Option B's projected read
+(no coupling, more machinery). **Decide when a VM tenant asks; do not build ahead
+of it.**
