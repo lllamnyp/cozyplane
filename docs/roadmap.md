@@ -78,7 +78,10 @@ done).
    cluster a genuine off-cluster client, or accept kind-in-CI for exactly those
    phases (§8).
 
-**Deferred by decision** — not gaps; recorded so they aren't re-litigated: the
+**Deferred by decision** — not gaps; recorded so they aren't re-litigated:
+multi-tenancy R8 (**dissolved** — a namespace *is* the tenant, so cross-namespace is
+cross-tenant and the `export` grant is correct; cozyplane learns tenancy from no
+platform, [multitenancy.md](multitenancy.md)); the
 CRD-storage shim (§7 — no longer forced, now the built-in etcd is PVC-backed);
 `NodeFabric` (it would restate `Node` and fix nothing); name-based addressing
 (§3 — judgement pending on what the split-horizon resolver already gives).

@@ -111,19 +111,22 @@ side, and nothing is opened by inference — no "same tenant, so probably fine."
 (`docs/north-south.md`), and a VPC's egress wears its own address. Tenancy that
 cannot be billed is a costume.
 
-### R8. A tenant's namespaces are one tenant.
+### R8. ~~A tenant's namespaces are one tenant.~~
 
-**Open — needs a decision.** Cozyplane's authorization anchor is "the namespace is
-the tenant." Cozystack's tenants own namespace *trees*. Today, sharing a VPC
-between two namespaces of the same tenant needs an `export` grant — an operator in
-the loop for a purely internal act.
+**Dissolved, 2026-07-14 — there was no question.** A **namespace *is* the tenant**,
+full stop. That is not cozyplane's simplification of someone else's model; it is
+the model. A Cozystack tenant is a namespace.
 
-The grant exists to stop *cross-tenant* escalation. Inside one tenant it is
-friction with no security value. But "same tenant" is a fact cozyplane does not
-currently possess, and inventing one (a `Tenant` kind, a namespace label) is
-exactly the sort of thing that gets inferred wrongly. **Decide before building:**
-does cozyplane learn tenancy from Cozystack, or stay deliberately ignorant of it
-and keep the grant?
+So "two namespaces of the same tenant" is not a thing that exists, and the premise
+of the rule was wrong. Cross-namespace **is** cross-tenant, and the `export` grant
+is not friction — it is the correct answer, applied uniformly, with no exception
+carved for a relationship that has no referent.
+
+The rule is recorded here only because the fix it proposed would have been a real
+mistake: teaching cozyplane a platform-specific notion of tenancy (a `Tenant` kind,
+a namespace-tree label) to serve a case that does not arise. **Cozyplane does not
+learn tenancy from anything. The namespace is the anchor, and that is the whole
+model.** No platform specifics.
 
 ### R9. Operators are not tenants.
 
@@ -253,7 +256,9 @@ because the only tenant-relevant read that exists today is a cluster-scoped one.
    already bounds it). A tenant creates neither; it creates the pod or the Service
    that causes them. A ceiling on those would be a second, weaker spelling of a
    limit that already binds.
-3. **R8 — decide.** Cozystack composition. A decision, not a build.
+3. ~~**R8 — decide.**~~ Dissolved: a namespace *is* the tenant, so cross-namespace
+   is cross-tenant and the grant is simply right. No platform specifics; nothing to
+   build.
 
 ## What is already done (do not rebuild)
 
