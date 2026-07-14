@@ -21,9 +21,33 @@ once the north-south arc closed (one declared boundary, metered, with the tenant
 own egress identity; cozyplane attracts nothing) and the multi-tenancy rules were
 built (a tenant persona, a tenant that can see itself, a ceiling).
 
+**Regression — shipped and broken, fix first**
+
+0. **v6 VPC egress is dead when the `VPCGateway` has a `poolRef`.** `ensureNATAddress`
+   is **family-blind** (it takes `firstFreeAddress(pool.Spec.CIDRs, …)` and never looks
+   at the VPC's family, so a v6 VPC can even be handed a *v4* NAT address); the gateway
+   controller then deletes the gateway Deployment the moment `status.natAddress` is set;
+   no pod ⇒ no `.1` Port ⇒ **no `gateways[vni]` entry**. But `from_pod` guards the eBPF
+   NAT with `!p.is_v6` and `vpc_nat_snat` opens with `if (p->is_v6) return NAT_MISS`. So
+   a v6 packet skips the eBPF NAT, falls to the isolation block, reaches the gateway
+   path, **misses, and drops**. Before increment 2 this worked (dual-family gateway leg +
+   the v6 node masquerade). **Dual-stack is the nastiest case**: v4 keeps working through
+   the eBPF NAT so the VPC looks healthy while v6 silently blackholes.
+   **Fix:** gate the pod deletion on *family* — keep the gateway pod when the VPC has a
+   v6 CIDR. It composes, because `from_pod` tries `vpc_nat_snat` **before** the isolation
+   block: v4 takes the eBPF NAT and never reaches the pod, v6 falls through to the
+   gateway as before. And `ensureNATAddress` must allocate an address of the VPC's family.
+   **Uncaught because** the only v6-gateway-egress coverage is in `test/e2e.sh` — kind-only
+   *and* already broken (item 12); `vpc-e2e.sh` has one `VPCGateway` phase and it is v4.
+   Add a v6 gateway-egress phase there (§3, §4, §8).
+1. **v6 VPC NAT** — the v6 twin of `vpc_nat_snat`, plus a v6 pool/shard story. **This is
+   the prerequisite for retiring `cmd/gateway`** (item 6): the gateway pod is currently
+   the *only* v6 VPC egress path in the tree, so "require `poolRef` and delete the pod"
+   cannot happen until this lands. Not previously tracked anywhere (§3, §4).
+
 **Features**
 
-1. **Public IPs on the default network — supersede cozy-proxy** ([#14](../../issues/14)) —
+2. **Public IPs on the default network — supersede cozy-proxy** ([#14](../../issues/14)) —
    **[public-ip.md](public-ip.md)** (design, awaiting review). Cozystack today gives a
    net-0 VM a real public address (all ports in, and egress *as that address*) with
    [cozy-proxy](https://github.com/cozystack/cozy-proxy)'s nftables 1:1 NAT. Cozyplane
@@ -37,12 +61,12 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
    net-0 NP gate, so a naive port would let a public-IP'd pod bypass policy entirely —
    worse than what it replaces. Fix: hoist the whole-IP DNAT into the tail-called
    `lb_ingress`, so `to_pod` sees an ordinary packet and NP applies unchanged (§6).
-2. **Per-VPC metadata endpoint + guest autoconfiguration** — design drafted in
+3. **Per-VPC metadata endpoint + guest autoconfiguration** — design drafted in
    [vm-provisioning.md](vm-provisioning.md), awaiting review (§3).
-3. **Site-to-site VPN** ([#6](../../issues/6)) and **cross-family v4↔v6
+4. **Site-to-site VPN** ([#6](../../issues/6)) and **cross-family v4↔v6
    translation** ([#9](../../issues/9)) — design drafts exist; neither is urgent
    (§3, §4).
-4. **SecurityGroup v2 leftovers**, all low priority: ICMP rules; peer-existence
+5. **SecurityGroup v2 leftovers**, all low priority: ICMP rules; peer-existence
    validation for peer refs; and **a real connection table to replace the TCP
    SYN-gate** — that last one is shared with NetworkPolicy and HostFirewall, so it
    wants solving once for all three layers rather than three times. FQDN egress is
@@ -50,7 +74,7 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
 
 **North-south residue** — the arc is built; these are the ends it left loose.
 
-5. **The pool-less gateway pod still exists, and it still launders** — a
+6. **The pool-less gateway pod still exists, and it still launders** — a
    `VPCGateway` with `nat.enabled` but **no `poolRef`** (the field is `+optional`)
    has no address to wear, so the controller still spawns the per-VPC gateway pod
    for it, and that pod's egress is SNATed to its fabric IP and then re-SNATed by
@@ -60,23 +84,24 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
    `nat.enabled` (and delete `cmd/gateway`, the gateway controller's Deployment
    path, and the last netfilter outside `firewall.go`), or keep the pool-less door
    and say in writing why a tenant may wear the platform's identity. Leaning
-   strongly toward the former (§3).
-6. **The gateway's DNS door** — the gateway pod proxies cluster DNS on `:53`; the
+   strongly toward the former — **but it is blocked on item 1**: the pod is today the
+   only v6 VPC egress path, so deleting it without v6 VPC NAT would black-hole v6 (§3).
+7. **The gateway's DNS door** — the gateway pod proxies cluster DNS on `:53`; the
    split-horizon resolver already serves VPC pods, so it is probably vestigial.
-   Folded into (5): confirm before deleting, or tenant DNS breaks with the pod —
+   Folded into (6): confirm before deleting, or tenant DNS breaks with the pod —
    [north-south.md](north-south.md) §7.
-7. **Per-VPC NAT port-pool exhaustion** — each node SNATs a VPC's pods from its own
+8. **Per-VPC NAT port-pool exhaustion** — each node SNATs a VPC's pods from its own
    shard (`NAT_SHARD_SPAN` 4032, 16 shards). Nothing accounts for a tenant
    exhausting it, and a node-set change reshuffles shards and breaks live flows.
    Known and accepted at prototype scale; it needs a story before it is not
    ([north-south.md](north-south.md) §7).
-8. **Inbound MTU on an encapsulated north-south path** — clamp the TCP MSS in the
+9. **Inbound MTU on an encapsulated north-south path** — clamp the TCP MSS in the
    inbound SYN at the encapsulating node. Shared by the EIP request half and
    `etp: Cluster` DSR, so solve once — [floating-ha.md](floating-ha.md) §7 (§3).
 
 **Hardening**
 
-9. **Node-origin path-trust** — all three policy layers still recognise node
+10. **Node-origin path-trust** — all three policy layers still recognise node
    origin by *source address* (`np_nodes` / `hf_self` / `NS_MARK`-absence). The v6
    masquerade-laundering bug proved the class is exploitable; the fix is to trust
    the *channel* (host→veth same-node, `node_remotes` overlay cross-node,
@@ -84,16 +109,16 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
    `*_node_exempt_total` counters, so the exemption is at least visible.
    **Net-0 RPF for NetworkPolicy identity** is the same one-lookup shape as the
    `from_pod` RPF SG v2 shipped — the natural follow-on (§6).
-10. **NP egress vs VPC-pod fabric IPs** — a decision, not a build: either drop VPC
+11. **NP egress vs VPC-pod fabric IPs** — a decision, not a build: either drop VPC
    pods from `np_ident` (fabric IPs become `ipBlock` territory) or document the
    corner as intended (§6).
 
 **Test gaps**
 
-11. **VM-migration e2e** — none exists, anywhere; and the cutover path changed when
+12. **VM-migration e2e** — none exists, anywhere; and the cutover path changed when
     `Port.spec.fabricIP` was normalized away (the controller's fabric-IP copy was
     deleted). Real-cluster hand-validation is the only coverage (§5, §8).
-12. **`test/e2e.sh` is now broken, not merely stale** — it has not run since the
+13. **`test/e2e.sh` is now broken, not merely stale** — it has not run since the
     API-group split, and it still writes `ExternalPool.spec.advertisement: L2`, a
     field **deleted** with the announcement layer, so its floating-IP phases cannot
     even apply. It is the only coverage for *external* floating-IP and LoadBalancer

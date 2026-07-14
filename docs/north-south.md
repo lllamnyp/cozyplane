@@ -161,6 +161,21 @@ not be in a CNI.
   from the other end. It works, which is why it survived this long.
 - **Hairpinning north-south through a gateway pod** — tenet 1.
 
+## 6a. Known regression: v6 VPC egress
+
+**Increment 2's NAT is v4-only** (`vpc_nat_snat` opens with `if (p->is_v6) return
+NAT_MISS`), but the gateway controller deletes the gateway pod as soon as
+`status.natAddress` is set — and the pod is the *only* v6 egress path. So a v6 or
+dual-stack VPC with a **pooled** gateway loses v6 egress entirely: the packet skips the
+eBPF NAT, falls to the isolation block, reaches the gateway path, finds no
+`gateways[vni]` entry, and drops. Dual-stack hides it — v4 keeps working, so the VPC
+looks healthy.
+
+Fix: gate the pod deletion on **family** (keep the pod when the VPC has a v6 CIDR), and
+make `ensureNATAddress` allocate an address of the VPC's own family rather than the
+first free one in the pool. **v6 VPC NAT is therefore the prerequisite for retiring
+`cmd/gateway`** — see the roadmap.
+
 ## 7. Open questions
 
 - **Where does the gateway's DNS door go?** The gateway pod opens `:53` to cluster
