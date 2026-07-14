@@ -23,7 +23,7 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
 
 **Regression — shipped and broken, fix first**
 
-0. **v6 VPC egress is dead when the `VPCGateway` has a `poolRef`.** `ensureNATAddress`
+0. **v6 VPC egress is dead when the `VPCGateway` has a `poolRef`** ([#15](../../issues/15)). `ensureNATAddress`
    is **family-blind** (it takes `firstFreeAddress(pool.Spec.CIDRs, …)` and never looks
    at the VPC's family, so a v6 VPC can even be handed a *v4* NAT address); the gateway
    controller then deletes the gateway Deployment the moment `status.natAddress` is set;
@@ -40,7 +40,7 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
    **Uncaught because** the only v6-gateway-egress coverage is in `test/e2e.sh` — kind-only
    *and* already broken (item 12); `vpc-e2e.sh` has one `VPCGateway` phase and it is v4.
    Add a v6 gateway-egress phase there (§3, §4, §8).
-1. **v6 VPC NAT** — the v6 twin of `vpc_nat_snat`, plus a v6 pool/shard story. **This is
+1. **v6 VPC NAT** ([#15](../../issues/15)) — the v6 twin of `vpc_nat_snat`, plus a v6 pool/shard story. **This is
    the prerequisite for retiring `cmd/gateway`** (item 6): the gateway pod is currently
    the *only* v6 VPC egress path in the tree, so "require `poolRef` and delete the pod"
    cannot happen until this lands. Not previously tracked anywhere (§3, §4).
@@ -297,3 +297,4 @@ install installs nothing — [#10](../../issues/10)'s endgame.
 | [#12](../../issues/12) | Exclusive IPAM authority vs co-resident Cilium (closed: Cilium removed) | Deployment |
 | [#13](../../issues/13) | LoadBalancer ingress (etp: Local, source-preserving); NodePort decoupled, low priority | Services |
 | [#14](../../issues/14) | Public IPs on the default network: supersede cozy-proxy (1:1 NAT for a net-0 VM) | North-south / Services |
+| [#15](../../issues/15) | v6 VPC egress dead with a pooled VPCGateway; v6 VPC NAT missing | North-south / IPv6 |

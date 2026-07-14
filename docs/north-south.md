@@ -161,7 +161,7 @@ not be in a CNI.
   from the other end. It works, which is why it survived this long.
 - **Hairpinning north-south through a gateway pod** — tenet 1.
 
-## 6a. Known regression: v6 VPC egress
+## 6a. Known regression: v6 VPC egress ([#15](../../issues/15))
 
 **Increment 2's NAT is v4-only** (`vpc_nat_snat` opens with `if (p->is_v6) return
 NAT_MISS`), but the gateway controller deletes the gateway pod as soon as
