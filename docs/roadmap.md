@@ -23,7 +23,7 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
 
 **Features**
 
-1. **Public IPs on the default network — supersede cozy-proxy** —
+1. **Public IPs on the default network — supersede cozy-proxy** ([#14](../../issues/14)) —
    **[public-ip.md](public-ip.md)** (design, awaiting review). Cozystack today gives a
    net-0 VM a real public address (all ports in, and egress *as that address*) with
    [cozy-proxy](https://github.com/cozystack/cozy-proxy)'s nftables 1:1 NAT. Cozyplane
@@ -271,3 +271,4 @@ install installs nothing — [#10](../../issues/10)'s endgame.
 | [#11](../../issues/11) | SG north-south `from.cidr` rules don't union across groups (FIXED: compiler-side union) | Security groups |
 | [#12](../../issues/12) | Exclusive IPAM authority vs co-resident Cilium (closed: Cilium removed) | Deployment |
 | [#13](../../issues/13) | LoadBalancer ingress (etp: Local, source-preserving); NodePort decoupled, low priority | Services |
+| [#14](../../issues/14) | Public IPs on the default network: supersede cozy-proxy (1:1 NAT for a net-0 VM) | North-south / Services |

@@ -1,6 +1,6 @@
 # Public IPs on the default network — superseding cozy-proxy
 
-**Status: DESIGN — not implemented.**
+**Status: DESIGN — not implemented.** Tracked in [#14](../../issues/14).
 
 A Cozystack VM on the default network sometimes needs a real public address: all
 ports forwarded to it, and its own outbound traffic leaving *as that address*, so
