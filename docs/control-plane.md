@@ -155,6 +155,10 @@ Two tiers: **declarative** (authored by tenants/operators, desired state) and
   externally-routable addresses; the MetalLB IPAddressPool analog, minus the
   announcement — **cozyplane attracts nothing**, so there is no `advertisement`
   field to configure. `status` tracks allocation counts.
+  **DEPRECATED** ([north-south.md](north-south.md) §9): the pool is a CIDR list that
+  nothing routes — cozyplane allocates out of it and nothing attracts what it
+  allocates. It is replaced by a reference to a platform-allocated, platform-attracted
+  **claim**, which also carries the `attach` grant. Do not build new surface on it.
 - **`HostFirewall`** (cluster-scoped, operator-only) — `{ nodeSelector,
   ingress[] (cidr/except → proto/port) }`. Ingress policy for the nodes
   themselves — the node-scoped sibling of NetworkPolicy (net-0 pods) and

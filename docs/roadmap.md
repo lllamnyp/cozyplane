@@ -47,7 +47,25 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
 
 **Features**
 
-2. **Public IPs on the default network — supersede cozy-proxy** ([#14](../../issues/14)) —
+2. **Retire `ExternalPool`; an external address comes from a claim** —
+   **[north-south.md](north-south.md) §9** (decided, not built). Tenet 3 was only
+   half-applied: increment 3 deleted the announcer, but cozyplane still **allocates**
+   external addresses (`firstFreeAddress` over `ExternalPool.spec.cidrs`, for both the
+   `VPCGateway`'s NAT identity and every `FloatingIP`) — and **nothing attracts what it
+   allocates**. An `ExternalPool` is a hand-written CIDR list that nothing routes; the
+   e2e says so itself (*"here we do what a CCM would do and simply configure it on
+   one"*). Pinning the address onto a Service does **not** bridge it: MetalLB's
+   `autoAssign: false` does not reserve, so it stays the allocator of record and can
+   hand the same address to another Service. The fix is to finish the tenet —
+   **cozyplane does not allocate either** — and consume a platform-allocated,
+   platform-attracted **`PublicIPClaim`** ([community#35](https://github.com/cozystack/community/pull/35)).
+   Consequences: the `attach` grant moves onto the claim (it must — a bare Service would
+   reopen R10); a pod references a **claim, not an address**, which makes
+   `FloatingIP.spec.target` identity-shaped and "one target, one address" structural;
+   and **`FloatingIP` as a kind is likely superseded** by a pod annotation naming a
+   claim. **The eBPF does not change at all** — the maps key on an address that arrives
+   from somewhere and never cared who picked it (§1, §3).
+3. **Public IPs on the default network — supersede cozy-proxy** ([#14](../../issues/14)) —
    **[public-ip.md](public-ip.md)** (design, awaiting review). Cozystack today gives a
    net-0 VM a real public address (all ports in, and egress *as that address*) with
    [cozy-proxy](https://github.com/cozystack/cozy-proxy)'s nftables 1:1 NAT. Cozyplane
@@ -61,12 +79,12 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
    net-0 NP gate, so a naive port would let a public-IP'd pod bypass policy entirely —
    worse than what it replaces. Fix: hoist the whole-IP DNAT into the tail-called
    `lb_ingress`, so `to_pod` sees an ordinary packet and NP applies unchanged (§6).
-3. **Per-VPC metadata endpoint + guest autoconfiguration** — design drafted in
+4. **Per-VPC metadata endpoint + guest autoconfiguration** — design drafted in
    [vm-provisioning.md](vm-provisioning.md), awaiting review (§3).
-4. **Site-to-site VPN** ([#6](../../issues/6)) and **cross-family v4↔v6
+5. **Site-to-site VPN** ([#6](../../issues/6)) and **cross-family v4↔v6
    translation** ([#9](../../issues/9)) — design drafts exist; neither is urgent
    (§3, §4).
-5. **SecurityGroup v2 leftovers**, all low priority: ICMP rules; peer-existence
+6. **SecurityGroup v2 leftovers**, all low priority: ICMP rules; peer-existence
    validation for peer refs; and **a real connection table to replace the TCP
    SYN-gate** — that last one is shared with NetworkPolicy and HostFirewall, so it
    wants solving once for all three layers rather than three times. FQDN egress is
@@ -74,7 +92,7 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
 
 **North-south residue** — the arc is built; these are the ends it left loose.
 
-6. **The pool-less gateway pod still exists, and it still launders** — a
+7. **The pool-less gateway pod still exists, and it still launders** — a
    `VPCGateway` with `nat.enabled` but **no `poolRef`** (the field is `+optional`)
    has no address to wear, so the controller still spawns the per-VPC gateway pod
    for it, and that pod's egress is SNATed to its fabric IP and then re-SNATed by
@@ -86,22 +104,22 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
    and say in writing why a tenant may wear the platform's identity. Leaning
    strongly toward the former — **but it is blocked on item 1**: the pod is today the
    only v6 VPC egress path, so deleting it without v6 VPC NAT would black-hole v6 (§3).
-7. **The gateway's DNS door** — the gateway pod proxies cluster DNS on `:53`; the
+8. **The gateway's DNS door** — the gateway pod proxies cluster DNS on `:53`; the
    split-horizon resolver already serves VPC pods, so it is probably vestigial.
-   Folded into (6): confirm before deleting, or tenant DNS breaks with the pod —
+   Folded into (7): confirm before deleting, or tenant DNS breaks with the pod —
    [north-south.md](north-south.md) §7.
-8. **Per-VPC NAT port-pool exhaustion** — each node SNATs a VPC's pods from its own
+9. **Per-VPC NAT port-pool exhaustion** — each node SNATs a VPC's pods from its own
    shard (`NAT_SHARD_SPAN` 4032, 16 shards). Nothing accounts for a tenant
    exhausting it, and a node-set change reshuffles shards and breaks live flows.
    Known and accepted at prototype scale; it needs a story before it is not
    ([north-south.md](north-south.md) §7).
-9. **Inbound MTU on an encapsulated north-south path** — clamp the TCP MSS in the
+10. **Inbound MTU on an encapsulated north-south path** — clamp the TCP MSS in the
    inbound SYN at the encapsulating node. Shared by the EIP request half and
    `etp: Cluster` DSR, so solve once — [floating-ha.md](floating-ha.md) §7 (§3).
 
 **Hardening**
 
-10. **Node-origin path-trust** — all three policy layers still recognise node
+11. **Node-origin path-trust** — all three policy layers still recognise node
    origin by *source address* (`np_nodes` / `hf_self` / `NS_MARK`-absence). The v6
    masquerade-laundering bug proved the class is exploitable; the fix is to trust
    the *channel* (host→veth same-node, `node_remotes` overlay cross-node,
@@ -109,16 +127,16 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
    `*_node_exempt_total` counters, so the exemption is at least visible.
    **Net-0 RPF for NetworkPolicy identity** is the same one-lookup shape as the
    `from_pod` RPF SG v2 shipped — the natural follow-on (§6).
-11. **NP egress vs VPC-pod fabric IPs** — a decision, not a build: either drop VPC
+12. **NP egress vs VPC-pod fabric IPs** — a decision, not a build: either drop VPC
    pods from `np_ident` (fabric IPs become `ipBlock` territory) or document the
    corner as intended (§6).
 
 **Test gaps**
 
-12. **VM-migration e2e** — none exists, anywhere; and the cutover path changed when
+13. **VM-migration e2e** — none exists, anywhere; and the cutover path changed when
     `Port.spec.fabricIP` was normalized away (the controller's fabric-IP copy was
     deleted). Real-cluster hand-validation is the only coverage (§5, §8).
-13. **`test/e2e.sh` is now broken, not merely stale** — it has not run since the
+14. **`test/e2e.sh` is now broken, not merely stale** — it has not run since the
     API-group split, and it still writes `ExternalPool.spec.advertisement: L2`, a
     field **deleted** with the announcement layer, so its floating-IP phases cannot
     even apply. It is the only coverage for *external* floating-IP and LoadBalancer

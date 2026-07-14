@@ -104,6 +104,12 @@ north-south boundary: whether the VPC may reach the internet at all, which
 `ExternalPool` its NAT identity is drawn from, the egress policy, and the counters
 every crossing increments. Behind that one declaration sit three mechanisms:
 
+> **`ExternalPool` is on its way out — see §9.** It is a hand-written list of CIDRs
+> that nothing routes: cozyplane allocates out of it and *nothing attracts* what it
+> allocates. The pool becomes a reference to a platform-allocated, platform-attracted
+> **claim**. Read §3 with that in mind; the mechanisms below are unaffected, because
+> the datapath never cared who picked the address.
+
 **NAT gateway — many-to-one egress.** A VPC's pods reach the internet SNATed to an
 address the *VPC* owns, drawn from its pool. This should be **eBPF at the uplink**,
 with a per-VPC address and port pool, connection-tracked in the datapath's own
@@ -182,16 +188,10 @@ first free one in the pool. **v6 VPC NAT is therefore the prerequisite for retir
   DNS so tenant pods resolve with a stock `resolv.conf`. The split-horizon resolver
   (`dns_steer` + the per-node responder) already serves VPC pods. Is the gateway's
   DNS proxy now vestigial? Probably — verify before deleting.
-- **Who attracts an EIP, concretely?** MetalLB and CCMs announce *Service* LB
-  addresses; neither has a concept of "advertise this address because a cozyplane
-  object says so." On OCI the right primitive is a **secondary private IP on a
-  node's VNIC**, which is a CCM's job. On a bare-metal L2 fabric there may be no
-  announcer at all — in which case the honest answer is a static route, not a CNI
-  that pretends to be a router.
-- **Does an EIP's ingress half survive at all**, or does `Service type: LB` cover
-  every ingress case and leave the EIP a pure *egress identity*? (AWS's EIP is
-  bidirectional; ours could be egress-only, which is simpler and cedes more to the
-  k8s primitive.)
+- ~~**Who attracts an EIP, concretely?**~~ and ~~**does an EIP's ingress half
+  survive?**~~ — **both answered in §9.** Short version: nobody attracts it today,
+  because we only half-applied tenet 3. The answer is that cozyplane must stop
+  *allocating* external addresses too, and `ExternalPool` is retired.
 - **Per-VPC NAT port-pool sizing and exhaustion** — the node masquerade's pool is
   shared; a per-VPC pool needs its own accounting and a story for what happens when
   a tenant exhausts it.
@@ -375,3 +375,106 @@ Not a commitment; the order the pieces actually depend on each other.
    `vpc_ingress` gate is what makes the crossing *admitted* rather than waved
    through (with refusals in `ns_denied[door]`). Recorded rather than deleted so the
    arc's fourth piece is visibly accounted for.
+
+---
+
+## 9. `ExternalPool` is a stopgap — retire it
+
+**Status: DECIDED, not built.** This resolves §7's "who attracts an EIP" and "does
+the ingress half survive", and it supersedes the pool.
+
+### The half-applied tenet
+
+Tenet 3 says *the CNI does not announce*, and increment 3 deleted the announcer. But
+it left the **allocator** in place, and that is the inconsistency:
+
+| | allocation | attraction | cozyplane's role |
+|---|---|---|---|
+| `Service type: LoadBalancer` | MetalLB / a CCM | MetalLB / a CCM | **consumes** `status.loadBalancer.ingress` |
+| `FloatingIP` (EIP) | **cozyplane** (`firstFreeAddress` over `ExternalPool.spec.cidrs`) | **nobody** | allocates, then delivers |
+| `VPCGateway.status.natAddress` | **cozyplane** (the same allocator) | **nobody** | allocates, then delivers |
+
+An `ExternalPool` is a hand-written list of CIDRs that **nothing routes**. Cozyplane
+picks addresses out of it, and whether the fabric ever delivers them to a node is
+somebody else's problem, arranged out of band. The e2e admits this in its own comment
+— *"here we do what a CCM would do and simply configure it on one"* — and that CCM
+does not exist. `lb-ingress.md` already got this right for LoadBalancer IPs (*"no
+allocator, no announcer, no election, no leader"*); the EIP path never followed.
+
+**Allocation without attraction is an address that exists in etcd and nowhere on the
+wire.** Finishing the tenet means cozyplane does not allocate external addresses
+either. It consumes an address that something else both allocated **and** attracted.
+
+### Why the obvious fix is a trap
+
+"Keep allocating, and pin the address onto a `Service` with
+`metallb.io/loadBalancerIPs`" looks like it bridges the gap. It does not:
+**`IPAddressPool.spec.autoAssign: false` does not reserve anything.** It only
+suppresses MetalLB's *implicit* allocation path; MetalLB remains the allocator of
+record for every address in the pool, and will hand the address cozyplane chose to
+any other Service that explicitly asks for it. Two IPAMs over one range, no
+arbitration. (Cilium LB IPAM has the same property.)
+
+And the structural fact underneath: **an LB implementation only announces an address
+that is the live `status.loadBalancer.ingress` of a Service it allocated.** So an
+external address can only be attracted if *some object holds it* — which is the whole
+problem, and the reason the answer is an object rather than a annotation.
+
+### What replaces it
+
+An address comes from a **`PublicIPClaim`** — a namespaced, RBAC-gated request that
+the *platform* allocates and arranges attraction for (see the Cozystack design
+proposal). Cozyplane references the claim and delivers. Three things fall out, and
+each of them fixes something we currently paper over:
+
+1. **The grant survives, and gets better.** `ExternalPool` + the **`attach`** verb is
+   cozyplane's only working answer to *"which tenant may wear a public address"*. A
+   bare `Service` would destroy it — anyone who can create a Service would mint a
+   public address — and that is exactly the R10 hole (RBAC gates verbs on resources,
+   not fields). A claim **is** an RBAC-gated object, so the grant moves onto it
+   intact. Whatever replaces the pool **must carry the grant**; that is the
+   requirement, not a nicety.
+
+2. **A pod references a claim, not an address.** Today `FloatingIP.spec.target` is a
+   VPC **IP** — address-thinking, against tenet 4. Replacing it with a claim
+   reference on the **pod** (an annotation) makes it identity-thinking, and it is safe
+   *precisely because* the claim is an object the tenant already owns and RBAC already
+   gates — the same shape as a pod's `sdn.cozystack.io/vpc` annotation, which is
+   sanctioned by the `VPCBinding` behind it. It also makes **"one target, one
+   address"** structural instead of a controller rule (the oldest-wins tiebreak that
+   exists today only because two `FloatingIP`s could name one target and silently
+   break each other's egress row).
+
+3. **It is the only shape that can hold an egress identity.** Tenet 5 already says
+   *"egress identity is the one thing Kubernetes cannot express"*. The EIP is 1:1 and
+   could plausibly ride a Service; **`VPCGateway.status.natAddress` cannot** — it is
+   many-to-one, it is not ingress, and there is no Service to hang it on. Yet it still
+   needs attracting, because the replies to the VPC's egress come back to it. So there
+   must exist an object that holds an address which is **not** an ingress. No LB
+   implementation anywhere provides one. **The VPC case is what proves the claim object
+   has to exist.**
+
+### The answers to §7
+
+- **Who attracts an EIP?** The platform, via the claim — the same answer tenet 3 gives
+  for announcement, extended to allocation. Not a CNI, and not a CCM taught to read
+  cozyplane's objects.
+- **Does the EIP's ingress half survive?** Yes, but it is no longer the interesting
+  half. `Service type: LoadBalancer` covers ingress (tenet 4), and the whole-IP
+  variant covers it for a VM that needs *every* port ([public-ip.md](public-ip.md)).
+  What only an EIP can do is **egress identity**, and that is what it is kept for.
+
+### Consequences to sequence
+
+- `ExternalPool` and the `attach` verb on it are **deprecated**, replaced by a claim
+  reference and RBAC on the claim. Do not build new surface on the pool.
+- `FloatingIP` as a kind is likely **superseded**: a pod annotation referencing a
+  `PublicIPClaim` expresses the same thing with an identity instead of an address, and
+  carries the grant with it.
+- `VPCGateway.spec.poolRef` becomes a **claim** reference; `status.natAddress` is read
+  back from the claim rather than allocated.
+- The datapath does not change at all. `floating`, `floating_forward`,
+  `floating_egress_snat`, `vpc_nat` and the shard machinery all key on an address that
+  arrives from *somewhere*; they never cared who picked it. **This is an API and
+  control-plane change, and the eBPF is already correct for it** — which is the
+  strongest evidence the boundary was drawn in the right place.
