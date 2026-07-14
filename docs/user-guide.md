@@ -34,10 +34,12 @@ where it's headed.
 ## Requirements
 
 - A Linux kernel with BTF (`/sys/kernel/btf/vmlinux`) — 5.10+; tested on 6.8.
-- A cluster where each node has `spec.podCIDR` set (`kube-controller-manager
-  --allocate-node-cidrs`, which kubeadm/kind set by default).
-- A Service implementation: stock **kube-proxy** (iptables/nft) or Cilium in
-  kube-proxy-replacement mode. cozyplane does **not** provide Services.
+- A cluster pod CIDR, passed to the agent as `--cluster-cidr`. Fabric addresses are
+  drawn from that **flat, cluster-wide** pool — a node's `spec.podCIDR` is no longer
+  carved up (it survives only as a fallback when `--cluster-cidr` is unset).
+- A Service implementation: stock **kube-proxy**, or **`cozyplane-kpr`**
+  (`deploy/kpr-daemonset.yaml`) — cozyplane can now be the cluster's only service
+  proxy. See [kube-proxy-replacement.md](kube-proxy-replacement.md).
 - For building the image: Docker. For regenerating code: `clang`, `bpftool`.
 
 ## Prerequisite: a cluster with no other CNI
@@ -58,11 +60,18 @@ Nodes will be `NotReady` until cozyplane is installed.
 
 Build and load the image, then apply the manifests in order.
 
+**The tenant API is not CRDs.** cozyplane serves two API groups, and this trips
+people up: `local.sdn.cozystack.io` (just `FabricIP`) is a CRD, but the tenant kinds
+— `VPC`, `VPCBinding`, `VPCGateway`, `Port`, `FloatingIP`, `ExternalPool`,
+`SecurityGroup`, … — live in `sdn.cozystack.io`, which is served **only by the
+aggregated apiserver**. Skip that component and every example below fails with
+`no matches for kind "VPC"`. (Why the groups are disjoint: [api-groups.md](api-groups.md).)
+
 ```bash
 docker build -t ghcr.io/lllamnyp/cozyplane:dev .
 kind load docker-image ghcr.io/lllamnyp/cozyplane:dev --name cozyplane   # kind only
 
-# CRDs for the VPC/Port API (served as CRDs in the prototype)
+# the local CRD (FabricIP) — fabric IPAM. NOT the tenant API.
 kubectl apply -f config/crd/
 
 # the node agent (DaemonSet) — brings up the default network; nodes go Ready
@@ -70,15 +79,21 @@ kubectl apply -f deploy/agent.yaml
 
 # the controller (assigns each VPC a network id)
 kubectl apply -f deploy/controller.yaml
+
+# the aggregated apiserver — REQUIRED, it serves sdn.cozystack.io
+kubectl apply -f deploy/apiserver.yaml
 ```
 
-Or install everything as a Helm chart (the packaging used for Cozystack):
+Or as Helm charts — note these are **two** charts, and you need both:
 
 ```bash
 helm install cozyplane ./chart/cozyplane \
   --namespace cozy-cozyplane --create-namespace
 # override e.g. the CNI conf precedence and MTU:
 #   --set cniConfName=00-cozyplane.conflist --set mtu=1450
+
+helm install cozyplane-apiserver ./chart/cozyplane-apiserver \
+  --namespace cozy-cozyplane          # serves sdn.cozystack.io; needs cert-manager
 ```
 
 See [chart/cozyplane/README.md](../chart/cozyplane/README.md) for the values.
@@ -141,10 +156,19 @@ spec:
     name: tenant-a
 ```
 
-Creating it requires the `export` verb on the referenced VPC (enforced by a
-`ValidatingAdmissionPolicy`), so a tenant can't bind to a VPC it doesn't own.
-Bind the sample `cozyplane-vpc-owner` ClusterRole (`deploy/authz.yaml`) into a
-namespace to grant ownership there.
+Creating it requires the **`export`** verb on the referenced VPC, so a tenant can't
+bind to a VPC it doesn't own. Because `sdn.cozystack.io` is aggregated-only, that is
+enforced in the apiserver's **create strategy** — admission webhooks never see
+aggregated resources.
+
+The tenant roles ship with the chart: `cozyplane-tenant-edit` and
+`cozyplane-tenant-view` (`deploy/tenant-rbac.yaml`) aggregate into the built-in
+`admin`/`edit`/`view` ClusterRoles, so a namespace admin gets cozyplane's tenant
+surface with nothing to wire up. They grant `export` and `peer` on VPCs, and they
+name **only namespaced kinds** — deliberately: a RoleBinding cannot grant
+cluster-scoped access, so a tenant can never be given `list ports` (which would
+expose every other tenant's pods, addresses, MACs and placement). Never add a
+cluster-scoped kind to a tenant role. See [multitenancy.md](multitenancy.md).
 
 ## Attach pods to the VPC
 
@@ -174,9 +198,15 @@ interface inside the netns carries the VPC IP. The `Port` shows both:
 ```bash
 kubectl get pod app-1 -o wide    # status.podIP is the fabric IP, e.g. 10.244.2.16
 kubectl exec app-1 -- ip -4 addr show eth0   # the VPC IP, e.g. 10.10.0.2/32
-kubectl get ports -o custom-columns=NAME:.metadata.name,VPCIP:.spec.ip,FABRIC:.spec.fabricIP
-# NAME              VPCIP       FABRIC
-# v100.10-10-0-2    10.10.0.2   10.244.2.16
+
+# A tenant reads its OWN address off its own pod — no cluster-scoped read needed:
+kubectl get pod app-1 -o jsonpath='{.metadata.annotations.sdn\.cozystack\.io/vpc-ip}'
+
+# An OPERATOR can see the Port (cluster-scoped; a tenant may not read these):
+kubectl get ports -o custom-columns=NAME:.metadata.name,VPCIP:.spec.ip,NODE:.spec.node
+# NAME              VPCIP       NODE
+# v100.10-10-0-2    10.10.0.2   node-2
+kubectl get fabricips            # the fabric address lives here, not on the Port
 ```
 
 > Ports are cluster-scoped and named `v<vni>.<ip-dashed>` — keyed by the
@@ -291,17 +321,22 @@ spec:
 A VPC has **exactly one** boundary (the oldest gateway wins), and everything
 that crosses it is counted per VPC and per door — `cozyplane_vpc_ns_bytes_total`.
 
-The controller spawns a per-VPC **gateway pod** in the system namespace — a
-default-network pod with a second leg carrying the VPC's reserved `.1`
-address — and the datapath starts delivering the VPC's off-net traffic to it.
-The gateway forwards under a default-deny filter:
+**With a `poolRef` (the example above), there is no gateway pod.** Egress is
+realized in eBPF at each pod's own veth: the VPC's off-net traffic is SNATed
+straight out the uplink to `status.natAddress` — **an address of the VPC's own**,
+drawn from the pool. It is distributed across nodes (each node draws ports from its
+own shard of the address), so there is no hairpin, no single conntrack point, and no
+per-VPC single point of failure. Cluster-internal destinations are still refused;
+cluster DNS still works, because the split-horizon resolver serves VPC pods directly
+and never needed a pod to proxy it.
 
-- **Internet**: forwarded, masqueraded to the gateway's fabric address (a
-  stable per-VPC egress identity, one conntrack point).
-- **Cluster DNS on :53**: the one cluster-internal door, so tenant pods
-  resolve with their stock resolv.conf.
-- **Everything else cluster-internal** (pod, Service, node networks): dropped.
-  The tenant→system boundary holds through the gateway.
+Only a `nat.enabled` gateway with **no `poolRef`** still spawns a per-VPC **gateway
+pod** (a default-network pod with a second leg on the VPC's reserved `.1`), which
+forwards under a default-deny filter: internet forwarded, cluster DNS on `:53`
+allowed, everything else cluster-internal dropped. That path has no address of its
+own, so its egress is masqueraded to the gateway pod's fabric address and then again
+to the **node's** — meaning the tenant is indistinguishable from the platform on the
+wire. Prefer a pool.
 
 ```bash
 kubectl exec app-1 -- ping -c2 1.1.1.1          # works
@@ -336,8 +371,19 @@ tenant IP, with the caller's **real source address preserved**. Unlike a Service
 workload. It is a **true public IP**: the workload also *egresses the internet
 from it*, so its outbound source address equals the public IP it is reached on
 (what external allow-listing needs). Cluster-internal traffic (its own VPC, cluster
-DNS) is unaffected — only internet egress takes the public IP. It needs no egress
-gateway; the address maps straight to the tenant IP in the eBPF datapath.
+DNS) is unaffected — only internet egress takes the public IP. Its *delivery* does
+not route through the gateway: the address maps straight to the tenant IP in the
+eBPF datapath.
+
+Its *address*, though, comes from the VPC's gateway. **A VPC with no `VPCGateway`
+gets no floating address at all** — the `attach` verb on the pool is what governs
+every address a tenant can wear, so create the gateway (above) first.
+
+> **cozyplane does not announce the address.** It *delivers* it. Something else must
+> attract it to a node — a CCM assigning it to a VNIC, MetalLB, a static route, or
+> simply the address configured on a node. Whichever node it lands on will deliver
+> it, because the uplink hook runs at tc ingress, ahead of the kernel's routing
+> decision. There is no ARP/NDP responder and no BGP speaker here, by design.
 
 An operator defines a pool of routable addresses once, cluster-wide:
 
@@ -347,7 +393,6 @@ kind: ExternalPool
 metadata: {name: public}
 spec:
   cidrs: ["203.0.113.0/24"]
-  advertisement: L2
 ```
 
 A tenant then claims one for a workload in their VPC:
@@ -359,7 +404,8 @@ metadata: {name: web, namespace: team-a}
 spec:
   vpcRef: {name: vpc-a}      # a VPC in this namespace
   target: 10.0.0.5           # the tenant IP to expose
-  # poolRef: {name: public}  # optional; the single pool if omitted
+  # poolRef: {name: public}  # optional; defaults to this VPC's VPCGateway's pool
+                             # (no gateway => no pool => no address, ever)
   # address: 203.0.113.7     # optional; a specific address, else lowest free
 ```
 
@@ -386,11 +432,11 @@ Start a pod with `10.0.0.5` in `vpc-a` and the binding goes `Ready`. Binding a
 floating IP to a VM NIC's persistent address makes it a stable public IP that
 survives pod churn and live migration.
 
-> **Status today.** The `ExternalPool`/`FloatingIP` API and address allocation
-> are live. The eBPF datapath that carries packets to and from the floating
-> address (the `floating` map, the uplink-ingress DNAT with source preservation,
-> the `from_pod` reply, and ARP/NDP advertisement) is being wired incrementally,
-> so end-to-end reachability does not work on every setup yet.
+> **Status today.** Live and dev-cluster-validated end to end: the `floating` map,
+> the uplink-ingress DNAT with source preservation, the `from_pod` SNAT reply, and
+> delivery to the pod wherever it lives (over the overlay if the address landed on a
+> different node). What does *not* exist, and never will, is an announcement layer —
+> see the note above: attraction is the platform's job.
 
 ## Limitations (today)
 
@@ -403,17 +449,23 @@ These are prototype constraints, not permanent:
   restriction: **overlapping VPCs cannot peer** (peered traffic is routed
   natively, so a shared address would be ambiguous); a `VPCPeering` between them
   stays `Pending` with `CIDRsDisjoint=False`.
-- **VPC egress is all-or-nothing**: `spec.egress.natGateway` opens internet +
-  cluster DNS; there is no per-destination policy, no Service exposure into a
-  VPC, and no metadata endpoint yet. Without it a VPC remains a closed island for
-  outbound traffic (inbound north-south, same-VPC, and peered-VPC traffic still
-  work). Per-workload **public ingress** now has an API — floating IPs, see above
-  — but its packet datapath is still landing.
-- **The gateway is a single pod per VPC** (Recreate strategy): a node failure
-  or image roll interrupts tenant egress until it reschedules; established
-  flows don't survive the move (conntrack is in the pod).
-- **No network policy / security groups yet** within or across VPCs; a
-  `VPCPeering` opens the two VPCs to each other completely.
+- **A VPC's way in and out is its `VPCGateway`, not a field on the VPC.** With no
+  gateway a VPC is a closed island (no internet, no external address, no
+  LoadBalancer ingress); same-VPC and peered-VPC traffic still work. `nat.enabled`
+  opens outbound; `ingress.loadBalancer` admits a `Service type=LB` onto its pods.
+  Still missing: per-destination *egress* policy beyond SecurityGroups, and a
+  metadata endpoint ([vm-provisioning.md](vm-provisioning.md)).
+- **The single-pod gateway is gone — unless you skip the pool.** A gateway with a
+  `poolRef` has no pod at all (eBPF SNAT at each pod's veth, state on the pod's own
+  node). A `nat.enabled` gateway with *no* pool still gets one pod per VPC (Recreate
+  strategy): a node failure or image roll interrupts that VPC's egress until it
+  reschedules, and established flows don't survive the move (conntrack is in the
+  pod). Give the gateway a pool.
+- **All three policy layers exist**: `SecurityGroup` (within and across peered
+  VPCs), upstream `NetworkPolicy` (the default network) and `HostFirewall` (nodes).
+  A `VPCPeering` no longer opens two VPCs to each other completely — SecurityGroups
+  still gate what crosses. See [policy-layers.md](policy-layers.md). Known gaps:
+  ICMP rules, and the TCP SYN-gate standing in for a real connection table.
 - **IPv4 only.**
 - **Revocation is one-way:** deleting a `VPCBinding` severs attached pods, but
   recreating the binding does not reattach a running pod — recreate the pod.
@@ -421,19 +473,24 @@ These are prototype constraints, not permanent:
   reaped `Port` terminating until the node's agent acknowledges, and the
   controller releases it if the node itself is gone. `VPCPeering` revocation is
   simpler still: recreating a deleted half re-activates the peering.)
-- **The API can be served two ways** (same GVK, transparent to clients): as CRDs
-  (the default, lightweight — no etcd/cert-manager) or via the real **aggregated
-  API server** (`apiserver.enabled=true`; a dedicated etcd + cert-manager serving
-  cert), which is the design target and unlocks custom validation and
-  subresources (e.g. a future `/ports` observability subresource) beyond CRD
-  ergonomics.
+- **The tenant API is aggregated-only.** `sdn.cozystack.io` (VPC, Port, VPCGateway,
+  FloatingIP, …) is served *exclusively* by the aggregated apiserver — there is no
+  CRD mode and no `apiserver.enabled` switch. Only `local.sdn.cozystack.io`
+  (`FabricIP`) is a CRD. The two groups are disjoint on purpose: a CRD keeps
+  publishing OpenAPI paths after an APIService takes its group over, the specs
+  collide, and `kubectl apply` of every cozyplane object then fails client-side.
+  ([api-groups.md](api-groups.md).) This is also *why* `export`/`peer`/`attach` are
+  enforced in the registry strategies: admission never sees aggregated resources.
 
 ## Troubleshooting
 
 - **Nodes stay NotReady / no CNI conf:** check the agent logs
   (`kubectl -n kube-system logs -l app=cozyplane-agent`). The agent writes
   `/etc/cni/net.d/10-cozyplane.conflist` only after the datapath is up. A common
-  cause is a node without `spec.podCIDR`.
+  cause is the agent having no pod supernet to allocate from — check `--cluster-cidr`.
+- **`no matches for kind "VPC"`:** the aggregated apiserver isn't installed or isn't
+  Ready. The tenant kinds are not CRDs — see Install. Check
+  `kubectl get apiservices | grep sdn.cozystack.io`.
 - **VPC pod stuck ContainerCreating:** the VPC may not be `Ready` (no VNI yet —
   check the controller), or the plugin couldn't reach the API. The plugin uses a
   kubeconfig the agent writes to `/run/cozyplane/kubeconfig` from its

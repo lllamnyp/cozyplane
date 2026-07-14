@@ -323,15 +323,26 @@ delivered by identity) turned outward, with an external address and the
 client-masquerade removed.
 
 - **Two resources, the MetalLB split.** An admin defines an `ExternalPool` (a
-  cluster-scoped range of routable addresses + how they're announced); a tenant
-  creates a `FloatingIP` binding one address from a pool 1:1 to a tenant IP in a
-  VPC. Operator owns the pool, tenant claims an address.
+  cluster-scoped range of routable addresses); a tenant creates a `FloatingIP`
+  binding one address from a pool 1:1 to a tenant IP in a VPC. Operator owns the
+  pool, tenant claims an address — and the `attach` verb on the pool is the grant
+  that makes that a real boundary rather than a naming convention.
 - **eBPF, distributed, no gateway.** A `floating` map (`publicIP → {net, vpcIP}`)
   is DNAT'd inbound at a tc uplink hook and reversed on the reply in `from_pod`
-  — no iptables, no gateway pod. The address is advertised (ARP/NDP; BGP later)
-  from the **target pod's own node**, so ingress is always local and the address
-  follows the pod: distributed (DVR) from day one. Overlapping CIDRs isolate for
-  free because delivery is by `{net, vpcIP}`, exactly like the bridge.
+  — no iptables, no gateway pod. Overlapping CIDRs isolate for free because
+  delivery is by `{net, vpcIP}`, exactly like the bridge.
+- **Delivered, not advertised — cozyplane attracts nothing.** Getting an external
+  address *onto* a node is the platform's job (a CCM, MetalLB, a static route, or
+  simply an address configured on a node); cozyplane's job begins when the packet
+  arrives. Because the uplink hook runs at **tc ingress, ahead of the kernel's
+  routing decision**, delivery does not care which node the address landed on: that
+  node finds the pod and reaches it, locally or over the overlay, and the reply
+  leaves the pod's *own* node directly (DSR). Ingress is therefore distributed (DVR)
+  and the address follows the pod, without cozyplane ever making an L2 claim.
+  An ARP/NDP responder and an announcer election were built here and then **deleted**
+  — that was MetalLB's L2 mode reimplemented inside a CNI, and **BGP was rejected**
+  outright: a CNI holds no routing sessions with the fabric
+  ([north-south.md](north-south.md), [floating-ha.md](floating-ha.md)).
 - **A true public IP, both directions.** Unlike the fabric bridge (which
   masquerades the caller to `169.254.1.1`), a floating IP keeps the real external
   client address inbound, and the workload also **originates** from that address
@@ -348,11 +359,13 @@ client-masquerade removed.
   1:many. They *layer* — a floating IP can later front a Service VIP — but they
   are different primitives, and floating IPs deliberately need neither the Service
   proxy nor the kube-proxy replacement.
-- **Readiness follows a live target, not a gateway.** A floating IP does not
-  touch the VPC it targets and needs no egress gateway. Its address is reserved
-  permanently by the controller, but it is advertised and delivered only while its
-  target IP is a **live Port** (a running pod gives a node to advertise from and
-  deliver to). No live target ⇒ the address is held but silent (clients time out
+- **Readiness follows a live target.** A floating IP's *delivery* does not route
+  through the VPC's boundary — inbound and outbound are pure DNAT/SNAT at the
+  bridge, no gateway pod, no hairpin. But its *address* is drawn from the VPC's
+  `VPCGateway` pool, so **a VPC with no door gets no external address**: the
+  `attach` verb governs every address a tenant can wear. The address is reserved
+  permanently by the controller, but it is delivered only while its target IP is a
+  **live Port**. No live target ⇒ the address is held but silent (clients time out
   cleanly rather than hitting a black hole). A persistent Port (a VM NIC) makes it
   a stable Elastic IP that follows the VM across live migration.
 
@@ -424,9 +437,13 @@ CRDs (sketch):
   node-side only). Audit operators that reverse-connect.
 - **Conntrack scale** for the per-pod bridge across many probes/connections.
 - **Geneve identity TLV** interop and offload support on target NICs.
-- **Gateway HA** and per-VPC egress-identity management. The egress gateway pod
-  is a single per-VPC anchor today (its conntrack is a single failure domain);
-  the distributed realization and failover on reschedule are open. (Floating-IP
-  *ingress* is already distributed — it rides the target pod's node, not the
-  gateway — so it does not share this failure domain.)
+- **Gateway HA for the pool-less fallback.** Largely *closed*: a `VPCGateway` with
+  a pool realizes its egress NAT **in eBPF at each pod's own veth**, with the VPC's
+  own address as its identity — no pod, no hairpin, no shared conntrack failure
+  domain (the port space is partitioned per node, so the state lives where the flow
+  does). What remains is the fallback: a `nat.enabled` gateway with **no `poolRef`**
+  has no identity to wear, so it still gets a per-VPC gateway pod — a single anchor,
+  a single conntrack failure domain, and an egress that launders into the *node's*
+  address rather than the tenant's. Whether to keep that path at all is open
+  ([north-south.md](north-south.md)).
 - **Migration cutover atomicity** under partial map-propagation failure.

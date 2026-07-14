@@ -16,7 +16,9 @@ plain()  { printf '        %s\n' "$*"; }
 
 # Ports (cluster-scoped) are the source of truth for a pod's addresses.
 vpcip()    { kubectl get ports -o jsonpath="{range .items[*]}{.spec.podName}{' '}{.spec.ip}{'\n'}{end}"       | awk -v p="$1" '$1==p {print $2; exit}'; }
-fabricip() { kubectl get ports -o jsonpath="{range .items[*]}{.spec.podName}{' '}{.spec.fabricIP}{'\n'}{end}" | awk -v p="$1" '$1==p {print $2; exit}'; }
+# The fabric address lives in the FabricIP object (local.sdn.cozystack.io), not on
+# the Port -- Port.spec.fabricIP was normalized away. status.podIP IS the fabric IP.
+fabricip() { kubectl -n "${2:-$RED_NS}" get pod "$1" -o jsonpath='{.status.podIP}'; }
 podnode()  { kubectl -n "$1" get pod "$2" -o jsonpath='{.spec.nodeName}'; }
 
 # The VM's persistent Port carries the pinned identity; select it by VM name.

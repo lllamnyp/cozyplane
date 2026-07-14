@@ -159,13 +159,6 @@ source's groups from its own `sg_members` map — consistent cluster-wide becaus
 the same controller feeds every agent. The TLV becomes necessary only when
 identities must cross a trust boundary (peered VPCs, v2).
 
-**Why not source-side too?** §7 wants egress rules eventually; the identity TLV
-in the Geneve header (§7) is what makes *destination trust of source identity*
-robust when source-side marking is added. In v1 the destination derives the
-source's groups from its own `sg_members` map — consistent cluster-wide because
-the same controller feeds every agent. The TLV becomes necessary only when
-identities must cross a trust boundary (peered VPCs, v2).
-
 ## Control plane (as built)
 
 - `SecurityGroup` — namespaced (VPC owner's namespace), aggregated-apiserver
@@ -443,7 +436,13 @@ egress inherits the peered-group anti-spoof for free. Two group-loops now run on
 a gated SYN (ingress over the dst's groups, egress over the src's) — bounded and
 verifier-checked like the ingress loop.
 
-**Off-VPC transit is exempt from the egress check.** A grouped pod's off-VPC
+**Off-VPC transit is exempt from the egress check.** *(This is about the legacy
+**gateway-pod** path — the fallback for a pool-less `VPCGateway`. On the primary
+eBPF VPC-NAT path the packet is SNATed and redirected out the uplink from inside
+`from_pod` and never reaches `to_pod` at all, so the bug below structurally cannot
+arise there; that path's own SG gate is its direct `ns_egress_ok` call.)*
+
+A grouped pod's off-VPC
 egress transits its VPC gateway: the packet is delivered onto the *gateway pod's*
 veth, so `to_pod` sees `dstnet` = the gateway's net (the gateway is a VPC pod)
 but the packet's destination is *not* a VPC address (it is the internet/cluster
@@ -513,12 +512,20 @@ may egress there (v4 in NAT64 form, like `sg_cidr`); `0.0.0.0/0` is just a `/0`
 entry, so no pseudo-group is needed. No group-loop, so `from_pod`'s budget is
 safe.
 
-**Coverage (both closed in the v2 tail).** The gate now covers **both** egress
-paths: the gateway path (in the isolation block) and the **floating** path —
-`floating_egress_snat`/`_snat6` call `ns_egress_ok` right after confirming the
-pod is floating and the destination external, before the SNAT. A grouped
-floating pod is gated by its `to: {cidr}` rules exactly like a gateway'd one;
-ungrouped pods, replies (SYN-gated) and ICMP pass. And the source-spoofing gap —
+**Coverage — all THREE north-south egress paths.** Every way a VPC pod can leave
+calls `ns_egress_ok`, and each is an independent enforcement point:
+
+1. **The eBPF VPC NAT** (`vpc_nat_snat`) — the *primary* path since
+   [north-south.md](north-south.md) increment 2: a `VPCGateway` with a pool SNATs
+   at the pod's own veth, with no gateway pod anywhere. It applies the same gate.
+2. **The legacy gateway-pod path** (in the isolation block) — the fallback for a
+   `nat.enabled` gateway with no pool.
+3. **The floating path** — `floating_egress_snat`/`_snat6` call `ns_egress_ok`
+   right after confirming the pod is floating and the destination external, before
+   the SNAT.
+
+A grouped floating pod is gated by its `to: {cidr}` rules exactly like a gateway'd
+one; ungrouped pods, replies (SYN-gated) and ICMP pass. And the source-spoofing gap —
 a co-VPC pod forging a same-VPC IP to borrow egress groups — is closed by
 **`from_pod` RPF** (§ anti-spoof, above): the forged packet is dropped at its
 origin veth before either egress gate ever sees it.

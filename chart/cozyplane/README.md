@@ -49,8 +49,8 @@ most likely to set:
 - `crds.enabled` — the CRD serving of the group (default true; disable only to
   keep the group unserved until the cozyplane-apiserver chart installs).
 - `egress.*` — cluster networking facts (pod/service CIDRs, cluster DNS) that
-  drive node masquerade and the per-VPC egress gateways
-  (`VPC.spec.egress.natGateway`); add node/management networks to
+  drive node masquerade and the pool-less per-VPC egress gateway pod (a
+  `VPCGateway` *with* a pool needs none -- its NAT is eBPF); add node/management networks to
   `egress.internalCIDRs`.
 
 ## What gets installed

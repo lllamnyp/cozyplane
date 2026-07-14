@@ -24,13 +24,22 @@ yet.
 **cert-manager-free** (`apiserver.enabled: false` in the Talos values), tenancy
 served as CRDs.
 
-**Fix (proper, done).** The chart is split: `chart/cozyplane` (the CNI) serves
-the group as **CRDs from the moment it lands** — the bootstrap surface — and
-`chart/cozyplane-apiserver` (apiserver + etcd + certs) is a separate component
-that `dependsOn` cert-manager. When it installs, its explicit APIService
-atomically takes over the group's serving from the CRDs (they stay, shadowed).
-Fresh clusters migrate nothing (the CRD store is empty at takeover); clusters
-with live CRD objects export → install → re-apply. See
+**Fix (superseded — see below).** The chart was split, with `chart/cozyplane` (the
+CNI) serving the group as **CRDs from the moment it lands** and
+`chart/cozyplane-apiserver` (apiserver + etcd + certs) a separate component that
+`dependsOn` cert-manager, whose APIService then *atomically took the group over*
+from the CRDs.
+
+**Fix (proper, done 2026-07-12) — the takeover was a dead end.** It could not work:
+**a CRD keeps publishing its OpenAPI paths after an APIService takes the group
+over**, the two specs collide on duplicated paths, the group's schema never serves,
+and `kubectl apply` of every cozyplane object fails client-side with "failed to
+download openapi" while core types keep working. So there is no takeover and no
+shadowing — the groups are made **disjoint** instead: `local.sdn.cozystack.io`
+(CRDs, ships with the CNI chart, holds only `FabricIP`) bootstraps before
+cert-manager, and `sdn.cozystack.io` (VPC, Port, VPCGateway, …) is served
+**exclusively** by the aggregated apiserver. Disjoint kinds ⇒ disjoint paths ⇒ the
+collision cannot occur. See [api-groups.md](api-groups.md) and
 [control-plane.md](control-plane.md) §0.
 
 ## 2. The agent can't reach the apiserver with no kube-proxy (solved)
@@ -80,8 +89,9 @@ since `feat(sdn): add SecurityGroup API types`: a single `SecurityGroup` kind,
 served by the **cozystack-api** aggregated apiserver as a projection over a
 `CiliumNetworkPolicy`, reconciled by securitygroup-controller. cozyplane
 *independently* uses `sdn.cozystack.io` for its whole object model (`vpcs, ports,
-securitygroups, floatingips, servicevips, vpcbindings, vpcpeerings,
-externalpools`), served as CRDs. Both define `securitygroups.sdn.cozystack.io`
+securitygroups, floatingips, servicevips, vpcbindings, vpcpeerings, vpcgateways,
+externalpools`) — served, **since 2026-07-12, only by its own aggregated
+apiserver**; at the time of this note it was CRDs. Both define `securitygroups.sdn.cozystack.io`
 with incompatible schemas, and the `v1alpha1.sdn.cozystack.io` APIService is a
 name-singleton: the moment cozystack-api deploys, its explicit APIService
 *hijacks* the group from cozyplane's CRDs and every non-SecurityGroup kind (VPC,
@@ -206,6 +216,12 @@ east-west overlay, and same-node host→pod. (Stock components that embed
 
 ## 7. Floating IPs on a multi-NIC node — the uplink follows the FIB (FIXED)
 
+*(The ARP/NDP responder and the GARP emitter named below were **deleted** on
+2026-07-14 — cozyplane attracts nothing now, it only delivers. The **link-selection
+bug and its fix are unchanged and still live**: `from_uplink`'s attach and the egress
+redirect must still follow the FIB, not the default route. Read the announcement
+parts as history.)*
+
 Two more instances of "the wrong link", found wiring a FloatingIP to the smoke
 VM: **(a)** all floating machinery — the `from_uplink` attach, the ARP/NDP
 responder MAC, the GARP announcement, the egress redirect — bound to the
@@ -226,7 +242,55 @@ diff-synced like the masquerade sources.
 
 Exposure recipe (OCI): a reserved public IP cannot attach to a VLAN address —
 use a **public Network Load Balancer** (free) in the VCN subnet with the
-floating IP as an IP backend (`is-preserve-source=false` for symmetric return);
-the VCN virtual router ARPs on the VLAN and cozyplane answers/GARPs on
-migration. The VLAN NSG must admit the traffic; the NLB needs an NSG allowing
-its listener from outside and egress to the VLAN.
+floating IP as an IP backend (`is-preserve-source=false` for symmetric return).
+The VLAN NSG must admit the traffic; the NLB needs an NSG allowing its listener
+from outside and egress to the VLAN. **Attraction is entirely the NLB's job** —
+cozyplane no longer answers ARP or emits a GARP on migration, and it does not need
+to: any node that receives the packet delivers it, and a node move makes no L2 claim
+at all.
+
+## 8. The agent is OOM-killed while its RSS reads 10% of the limit (FIXED)
+
+The nastiest one to date, because **every tool you would reach for says the process
+is fine.**
+
+**Symptom.** All three agents `OOMKilled`, repeatedly, on a cluster that had been
+stable. `dmesg` on the node:
+
+```
+Memory cgroup out of memory: Killed process 4012 (cozyplane-agent)
+total-vm:1311840kB, anon-rss:28032kB, ...
+```
+
+28 MB of anonymous RSS, against a 256 Mi limit. `container_memory_rss` agreed:
+roughly a tenth of the limit, flat. Nothing was leaking.
+
+**Root cause.** Since Linux 5.11, **the kernel memory backing an eBPF map is charged
+to the memory cgroup of the process that created the map.** The agent's real
+footprint is not its heap — it is its maps, and they lived in the cgroup while being
+invisible to every heap-shaped metric. They totalled **~223 MiB**, against a 256 Mi
+limit: the agent was one map away from death at all times, and any growth (or a
+PERCPU map on a bigger machine) pushed it over.
+
+Two multipliers make this bite harder than it looks:
+
+- **`BPF_F_NO_PREALLOC` is not the default.** A hash map sized for the worst case
+  allocates *all of it* at load, whether or not a single key is ever written.
+- **A PERCPU map's value is multiplied by the core count.** The same map is cheap on
+  a 4-core dev box and enormous on a 64-core node — so this scales with the hardware,
+  not with the workload.
+
+**Fix.** Shrink what was oversized and stop preallocating what is sparse (the
+announcement map — since deleted entirely — was sized 65536 and preallocated; the
+per-VPC counters are `NO_PREALLOC` now), and raise the limits to match reality
+(256Mi → 512Mi, request 64Mi → 192Mi).
+
+**The lasting fix is the metric**, because the next person will not guess this
+either: the agent now exports `cozyplane_bpf_map_memlock_bytes` **per map** (read
+from `/proc/self/fdinfo/<fd>`), so the thing that actually consumes the cgroup is
+visible from Prometheus instead of being inferred from a coroner's report.
+
+**If you take one thing from this note:** when a Go process is OOM-killed with a
+small RSS, do not look for a leak. `container_memory_rss` **cannot** see BPF maps;
+`container_memory_working_set_bytes` **can**. Compare the two — a large gap *is* the
+diagnosis. See [internals.md](internals.md) §6a.

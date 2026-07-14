@@ -21,8 +21,8 @@ The split is by concern, not by serving mechanism:
   everything above it — cert-manager, etcd, cozyplane's own apiserver — runs as
   default-network pods and therefore needs this layer first.
 - **`sdn.cozystack.io`** — the aggregated apiserver, only, never CRDs. `VPC`,
-  `VPCBinding`, `VPCPeering`, `Port`, `SecurityGroup`, `HostFirewall`,
-  `ServiceVIP`, `FloatingIP`, `ExternalPool`.
+  `VPCBinding`, `VPCPeering`, `VPCGateway`, `Port`, `SecurityGroup`,
+  `HostFirewall`, `ServiceVIP`, `FloatingIP`, `ExternalPool`.
 
 Disjoint kinds, so disjoint paths, so the collision cannot occur. What this
 deleted: APIService adoption, the `automanaged`-label fight with the CRD
@@ -122,12 +122,20 @@ ergonomics. Concretely we exploit:
 Two tiers: **declarative** (authored by tenants/operators, desired state) and
 **realized** (control-plane owned, the live state).
 
+> **Built vs sketched.** This section predates the implementation and still carries
+> shapes that were never built. **`Subnet`, `NetworkAttachment` and `GatewayPolicy`
+> do not exist** — a VPC carries its CIDRs directly, a pod attaches by annotation +
+> `VPCBinding`, and the VPC's door is the shipped **`VPCGateway`**. Treat the
+> unbuilt three as vocabulary from `design.md` §10, not as API.
+
 ### Declarative
 
-- **`VPC`** — `{ cidrs[v4,v6], mtu, routingMode, encryption }`. Server allocates a
-  unique **VNI** on create (validation rejects exhaustion/collision).
-- **`Subnet`** — `{ vpcRef, cidr, gateway, allocRanges[], dns }`. Validation
-  rejects overlap within the VPC and CIDR outside the VPC.
+- **`VPC`** — `{ cidrs[v4,v6], mtu }`. Server allocates a unique **VNI** on create
+  (validation rejects exhaustion/collision). (`routingMode` and `encryption` were
+  sketched here and never built.) `spec.egress` is **gone** — the boundary is a
+  `VPCGateway`, because a bool on an object the tenant owns lets a tenant grant
+  itself internet.
+- **`Subnet`** *(not built)* — `{ vpcRef, cidr, gateway, allocRanges[], dns }`.
 - **`SecurityGroup`** — `{ selector (labels, VPC-scoped), ingress[], egress[] }`;
   rules reference other SGs / FQDNs / external CIDRs — never internal IPs.
 - **`NetworkAttachment`** — binds a workload class to `{ vpcRef, subnetRef,
@@ -135,9 +143,18 @@ Two tiers: **declarative** (authored by tenants/operators, desired state) and
   annotation. A pod may reference several.
 - **`VPCPeering`**, **`GatewayPolicy`** — cross-VPC and the controlled doors
   (DNS/metadata/API/egress) from `design.md` §10.
-- **`ExternalPool`** (cluster-scoped) — `{ cidrs[], advertisement (L2|BGP) }`. An
-  admin-defined range of externally-routable addresses; the MetalLB
-  IPAddressPool analog. `status` tracks allocation counts.
+- **`VPCGateway`** — `{ vpcRef, poolRef?, nat.enabled, ingress.loadBalancer }`. A
+  VPC's **one** north-south boundary, and the object that replaced
+  `VPC.spec.egress.natGateway` — a bool on an object the tenant owned, so a tenant
+  could grant *itself* internet. Creating one requires the **`attach`** verb on the
+  referenced `ExternalPool` (the `export`/`peer` escalation-gate pattern): the
+  operator grants the pool, the tenant opens its own door onto it. `status.natAddress`
+  carries the address the VPC wears on the way out. A VPC has exactly one boundary
+  (the oldest gateway wins). See [north-south.md](north-south.md).
+- **`ExternalPool`** (cluster-scoped) — `{ cidrs[] }`. An admin-defined range of
+  externally-routable addresses; the MetalLB IPAddressPool analog, minus the
+  announcement — **cozyplane attracts nothing**, so there is no `advertisement`
+  field to configure. `status` tracks allocation counts.
 - **`HostFirewall`** (cluster-scoped, operator-only) — `{ nodeSelector,
   ingress[] (cidr/except → proto/port) }`. Ingress policy for the nodes
   themselves — the node-scoped sibling of NetworkPolicy (net-0 pods) and
@@ -399,35 +416,55 @@ workload died with its node.
 One known limitation of this iteration: **re-granting** (recreating the binding)
 does not restore a severed pod — it must be recreated.
 
-### Observability (deferred — exact shape TBD)
+### Observability — the `/ports` subresource was DROPPED
 
-A `/ports` virtual subresource on `vpcs` (owner: every Port on the VPC) and on
-`vpcbindings` (consumer: just their namespace's slice), computed and
-RBAC-filtered server-side over the cluster-scoped `Port` collection. Tenants get
-`get vpcbindings/ports` in their namespace; they **never** get `list ports`
-cluster-wide. CRDs can't carry custom subresources, so this lands with the
-aggregated apiserver.
+A `/ports` virtual subresource on `vpcs`/`vpcbindings` was proposed here, so a
+tenant could "list the ports of my VPC" without a cluster-scoped read.
 
-### Aggregated apiserver (built) vs CRDs
+**Dropped on reflection, and not for a technical reason.** Ask what a tenant *does*
+with that list: it discovers its peers **by address** — and tenet 4 says identity,
+not addresses. Membership is by label, name resolution is by the split-horizon DNS,
+and policy selects on metadata. A tenant that enumerates its VPC's addresses is
+doing the one thing the design refuses to make load-bearing, and the list would be a
+surface we defend forever.
 
-The `sdn.cozystack.io` group is served **either** as CRDs (lightweight default —
-no etcd/cert-manager) **or** by a real **aggregated API server**
-(`apiserver.enabled=true`): a dedicated etcd, a cert-manager serving cert, and an
-`APIService`. Both expose the same GVK, so the datapath clients (agent, CNI
-plugin, controller) are unaffected — the swap is transparent. The registries live
-in `pkg/registry/sdn/{vpc,port,vpcbinding}`; VPC carries a `/status` subresource
-so the controller's `Status().Update()` works unchanged; the Port name is the
-atomic IP claim (etcd name-uniqueness).
+What a tenant genuinely could not do was learn **its own** address — `status.podIP`
+is the *fabric* IP, and the real identity lived only on the cluster-scoped `Port`.
+That is answered without any new surface: the CNI stamps the pod it already owns with
+`sdn.cozystack.io/vpc-ip` and `sdn.cozystack.io/vpc-mac`. See
+[multitenancy.md](multitenancy.md) (R1, R3).
 
-Validated on a live cluster: after deleting the CRDs and registering the
-`APIService`, `kubectl`, the controller (VNI via `/status`), the CNI plugin (Port
-claim), and the `export` `ValidatingAdmissionPolicy` all work against the
-aggregated API, with a VPC pod attached end-to-end.
+### Tenancy: the persona, and the ceiling
 
-Only the aggregated apiserver can host the custom `/ports` observability
-subresource and can fold the `export` SAR into the create strategy (today it runs
-as a VAP, which works in both modes). The two-check authorization gate itself is
-deliverable in either mode.
+- **Tenant RBAC.** `cozyplane-tenant-edit` / `cozyplane-tenant-view` aggregate into
+  the built-in admin/edit/view ClusterRoles and list **only namespaced kinds**. That
+  is load-bearing, not tidiness: a RoleBinding cannot grant access to a
+  cluster-scoped resource, so `list ports` is unreachable from a tenant role **by
+  construction**. One `list ports` would hand over every other tenant's pod names,
+  VPC addresses, MACs and node placement.
+- **Quota.** The aggregated server enforces plain `ResourceQuota` —
+  `count/vpcs.sdn.cozystack.io` and friends — through the Kubernetes quota
+  **`Evaluator`** interface, because the kube-apiserver's quota admission cannot see
+  an aggregated API's kinds. No new kind, no new vocabulary. `Port` and `ServiceVIP`
+  are deliberately unbounded: a tenant creates neither, and `count/pods` /
+  `count/services` already bind them.
+
+### Aggregated apiserver — the only mode
+
+The `sdn.cozystack.io` group is served **exclusively** by the aggregated API server
+(a dedicated etcd, a cert-manager serving cert, an `APIService`). It is *not* served
+as CRDs, and there is no `apiserver.enabled` switch: the group and the CRD-served
+group are disjoint by construction (`local.sdn.cozystack.io` holds the CRDs — see
+[api-groups.md](api-groups.md)).
+
+That disjointness is why the escalation verbs live where they do. **Admission
+webhooks and `ValidatingAdmissionPolicy` never see aggregated resources**, so
+`export`, `peer` and `attach` are enforced in the registry **strategies**, not in a
+VAP. A VAP targeting `sdn.cozystack.io` cannot fire and would be a silent no-op.
+
+The registries live in `pkg/registry/sdn/{vpc,port,vpcbinding,vpcgateway,…}`; VPC
+carries a `/status` subresource so the controller's `Status().Update()` works
+unchanged; the Port name is the atomic IP claim (etcd name-uniqueness).
 
 ## 7. First milestone to build
 

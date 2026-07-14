@@ -35,7 +35,7 @@ floors**, and the object model has been pretending they are one:
 | Group | Served by | Holds | Dependency floor |
 |-------|-----------|-------|------------------|
 | **`local.sdn.cozystack.io`** | CustomResourceDefinitions, shipped with the CNI chart | `FabricIP` (and see `NodeFabric` below) | the kube API, nothing else |
-| **`sdn.cozystack.io`** | the aggregated apiserver, only — never CRDs | `VPC`, `VPCBinding`, `VPCPeering`, `Port`, `SecurityGroup`, `HostFirewall`, `ServiceVIP`, `FloatingIP`, `ExternalPool` | apiserver + storage |
+| **`sdn.cozystack.io`** | the aggregated apiserver, only — never CRDs | `VPC`, `VPCBinding`, `VPCPeering`, `VPCGateway`, `Port`, `SecurityGroup`, `HostFirewall`, `ServiceVIP`, `FloatingIP`, `ExternalPool` | apiserver + storage |
 
 Disjoint kinds ⇒ disjoint paths ⇒ the merge collision **cannot occur**, and
 nothing is duplicated between the groups. The takeover machinery — APIService

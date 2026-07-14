@@ -190,18 +190,23 @@ which socket-based approaches structurally cannot offer inside a VPC.
   know VIPs exist.
 - **KPR** ([kube-proxy-replacement.md](kube-proxy-replacement.md)): this lands
   first and needs no Cilium import — the controller watches Services and
-  EndpointSlices with plain client-go. When KPR arrives, its imported StateDB
-  tables can feed the same `svc_vips` map for net 0 (default-network VMs,
-  NodePort), unifying both worlds on one datapath primitive. This also settles
-  that draft's review Q2: the feed is tables → our maps; Cilium's map ABI
-  could never express net-scoped VPC-IP backends.
+  EndpointSlices with plain client-go. **As built, so does KPR's net-0 feed**
+  (`kpr/services.go`): it watches Services/EndpointSlices directly rather than
+  reading Cilium's StateDB tables, keeping a self-contained boundary with no
+  coupling to Cilium's internal LB schema. (That draft's review Q2 proposed
+  "tables → our maps"; the answer went the other way. Cilium's imported machinery
+  serves ClusterIP socket-LB only, never `svc_vips`.) Both feeds are Kubernetes
+  watchers into one map, partitioned by net: the agent owns net ≠ 0, kpr owns net 0.
 - **Public exposure needs nothing from this design** (review resolution
-  2026-07-10). A VPC pod's fabric IP is `status.podIP`, so it is an ordinary
-  Service endpoint: `type: LoadBalancer` / NodePort traffic arrives at the
-  cluster, the standard service layer DNATs to the fabric IP, and the bridge
-  translates into the VPC — validated on a real cluster (external client →
-  provider NLB → VM in a VPC). No ServiceVIP, no VPC address, no cozyplane
-  API is involved; SecurityGroups still gate at the bridge DNAT point. A
+  2026-07-10), *but it is no longer un-gated.* A VPC pod's fabric IP is
+  `status.podIP`, so it is an ordinary Service endpoint: `type: LoadBalancer` /
+  NodePort traffic arrives at the cluster, the standard service layer DNATs to the
+  fabric IP, and the bridge translates into the VPC — validated on a real cluster
+  (external client → provider NLB → VM in a VPC). No ServiceVIP and no VPC address
+  is involved — but **the VPC's `VPCGateway` now is**: `vpc_ingress[net]`
+  default-denies that crossing unless the gateway sets `ingress.loadBalancer`
+  ([lb-ingress.md](lb-ingress.md), [north-south.md](north-south.md)). Past that
+  gate, SecurityGroups gate at the bridge DNAT point as before. A
   "floating service" (a cozyplane-native public address fronting a
   ServiceVIP) was drafted and **rejected** as reimplementing
   `type: LoadBalancer`: the ServiceVIP exists for *east-west* traffic inside

@@ -86,7 +86,7 @@ rules:
   - apiGroups: ["kubevirt.io"]
     resources: ["virtualmachineinstances"]
     verbs: ["get", "list", "watch"]
-  # Egress gateway Deployments (spec.egress.natGateway -> per-VPC gateway pod).
+  # Gateway Deployments for a pool-less VPCGateway (a pooled one is pure eBPF).
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "create", "update", "delete"]

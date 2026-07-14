@@ -60,7 +60,8 @@ shared address would be ambiguous).
 - **`sdn-controller`** (`cmd/sdn-controller`, controller-runtime Deployment).
   Assigns each `VPC` a unique network id (VNI) and marks it `Ready`; reaps
   `Port`s on `VPCBinding` deletion; surfaces `VPCPeering` matched/ready status;
-  spawns per-VPC egress gateway Deployments for `spec.egress.natGateway`.
+  realizes a `VPCGateway` — for one with a pool, entirely in eBPF (no pod); only a
+  pool-less `nat.enabled` gateway still gets a per-VPC gateway Deployment.
 - **`cozyplane-gateway`** (`cmd/gateway`, one privileged pod per egress-enabled
   VPC). A default-network pod with a gateway-attached second leg; forwards the
   VPC's off-net traffic (masqueraded) under a default-deny filter — internet
@@ -721,8 +722,9 @@ namespace/name from `CNI_ARGS`, then:
   `sdn.cozystack.io/gateway-for` annotation gives the pod a *second* interface
   (`eth1`) carrying the VPC's reserved `.1`. Authorization is by placement:
   the pod must be in the agent's own namespace (published in the agent state —
-  only the cozyplane controller creates pods there) and the VPC must have
-  `spec.egress.natGateway`. The `.1` Port is claimed like any other, marked
+  only the cozyplane controller creates pods there) and the VPC must have a
+  pool-less `nat.enabled` `VPCGateway` (a gateway *with* a pool needs no pod at
+  all — see below). The `.1` Port is claimed like any other, marked
   `spec.gateway`; the leg gets the VPC CIDR routed via the proxy-arp'd
   link-local hop (onlink), `ip_forward` is enabled in the netns, and the host
   side is a normal VPC port with the gateway flag (ports bit 31).
@@ -916,8 +918,11 @@ misses:
   informer cache could lag a *just-created* pod and GC would otherwise kill a
   newborn Port.
 
-`GatewayReconciler` realizes `VPC.spec.egress.natGateway` as a per-VPC gateway
-Deployment (`cozyplane-gateway-<vni>`) in the system namespace: a privileged
+`GatewayReconciler` realizes a **pool-less** `VPCGateway` as a per-VPC gateway
+Deployment (`cozyplane-gateway-<vni>`) in the system namespace. A gateway that
+*has* a pool is realized in eBPF instead — `vpc_nat_snat` SNATs at each pod's own
+veth to the VPC's own address, so the reconciler **deletes** the Deployment once
+`status.natAddress` is set (docs/north-south.md). The pod path is: a privileged
 pod running `cozyplane-gateway` with the `gateway-for` annotation, Recreate
 strategy (the `.1` Port claim cannot roll). Deletion (egress disabled or VPC
 gone) finds Deployments by VPC labels — the VNI-derived name is unknowable
@@ -1063,8 +1068,9 @@ do not have to infer it. If the agent is being OOM-killed, look there first.
 
 ## 7. Known limitations / divergence from the design
 
-The design (three planes, dual-address bridge, identity-based policy, etc.) is
-mostly future work. As built:
+Most of the design has since been built (all three policy layers, the north-south
+boundary, Services, live migration, multi-tenancy). What remains divergent or
+rough, as built:
 
 - Overlapping VPC CIDRs are supported (net-scoped delivery, above); only
   *peering* overlapping VPCs is refused.
@@ -1085,22 +1091,28 @@ mostly future work. As built:
   rewrites ride the ICMPv6 pseudo-header via `nat_addr6`, the embedded v6
   header has no checksum of its own, and the embedded (mandatory) UDP checksum
   is recomputed over its pseudo-header. Errors about echo flows and embedded
-  packets behind extension headers are not translated. The tenant datapath is netfilter-free; the agent's two node-boundary
-  netfilter rules — the cluster-egress node masquerade (SNAT) and the overlay
-  FORWARD-ACCEPT (non-NAT) — are an **interim** dependency that currently makes
-  netfilter mandatory (both fatal to startup) and are slated to move to eBPF /
-  become optional ([#10](../../issues/10)). The gateway pod's internal filter runs
-  in its own netns.
-- VPC egress is opt-in and coarse: `spec.egress.natGateway` opens internet +
-  cluster DNS through a single per-VPC gateway pod; no per-destination policy,
-  Service exposure, or metadata endpoint yet. **Floating IPs** (source-preserving
-  public ingress) have an API and allocation; their gateway 1:1 NAT and address
-  advertisement are landing (see "Floating IPs" in §3). No policy/security groups
-  — a peering opens the two VPCs completely.
-- IPv4 only; single CIDR per VPC; no VM live-migration plumbing.
-- The API is served as CRDs by default; the aggregated apiserver
-  (`apiserver.enabled=true`) serves the same group with server-side validation
-  (e.g. VPCPeering spec immutability) in its strategies.
-- The plugin's kubeconfig token isn't refreshed; VNI allocation and Port IP
-  selection are list-then-pick (atomic at the claim, but not high-concurrency
-  optimized).
+  packets behind extension headers are not translated.
+- **Netfilter is now conditional** ([#10](../../issues/10), closed). The tenant
+  datapath is netfilter-free; the cluster-egress masquerade moved to eBPF
+  (`--masquerade=bpf`, the default), and the FORWARD-ACCEPT pair installs only where
+  kube-proxy's `KUBE-FORWARD` chain exists — so cozyplane touches netfilter only if
+  the cluster's kube-proxy does. It cannot be removed *entirely* under an iptables
+  kube-proxy: ClusterIP replies must traverse the client node's conntrack. The
+  pool-less gateway pod's internal filter still runs in its own netns.
+- VPC egress is opt-in via a `VPCGateway` (`nat.enabled`), and coarse: it opens the
+  internet, with no per-destination policy beyond SecurityGroups and no metadata
+  endpoint yet. LoadBalancer ingress into a VPC is default-deny until the gateway
+  admits it. A metadata endpoint is still missing (docs/vm-provisioning.md).
+- The tenant API (`sdn.cozystack.io`) is served **only** by the aggregated
+  apiserver — there is no CRD mode and no `apiserver.enabled` switch. Only
+  `local.sdn.cozystack.io` (`FabricIP`) is a CRD (docs/api-groups.md).
+- VNI allocation and Port IP selection are list-then-pick (atomic at the claim, but
+  not high-concurrency optimized). (The plugin's kubeconfig token *is* refreshed
+  now — it references a host-visible tokenFile the agent rewrites as kubelet
+  rotates the projected SA token.)
+- **A pool-less `VPCGateway` still launders.** `poolRef` is optional, so a
+  `nat.enabled` gateway without one has no address to wear: it falls back to a
+  gateway pod whose egress is SNATed to its fabric IP and then again to the
+  *node's*, making the tenant indistinguishable from the platform on the wire —
+  the one thing the eBPF VPC NAT exists to prevent. Requiring `poolRef` would
+  delete `cmd/gateway` outright; open (docs/north-south.md).

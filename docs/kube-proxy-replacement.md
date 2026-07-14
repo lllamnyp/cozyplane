@@ -1,6 +1,15 @@
-# Kube-proxy replacement by importing Cilium's LB (design draft)
+# Kube-proxy replacement by importing Cilium's LB
 
-**Status: DRAFT — not implemented; sequenced second.** Review outcome
+**Status: BUILT.** `cozyplane-kpr` is the dev cluster's **only** service proxy —
+kube-proxy and Cilium are both gone. Socket-LB (increments 1–2), the net-0
+`svc_vips` per-packet fallback for clients socket-LB cannot reach (VM guests, raw
+sockets), and LoadBalancer/NodePort ingress all ship. Two things below did **not**
+survive contact with the code, and are corrected in place: the `svc_vips` feed does
+*not* come from Cilium's StateDB tables, and NodePort did *not* get its own
+`nodeports` map (it reuses the LB rows — see [lb-ingress.md](lb-ingress.md), which
+is the as-built account of ingress).
+
+The original review outcome
 (2026-07-06): [services-in-vpc.md](services-in-vpc.md) lands first — the
 net-scoped per-packet service NAT designed there is the foundation this
 draft's increment 3 builds on, and it settles review Q2 below (the feed is
@@ -230,7 +239,15 @@ Cilium's map ABI is not.
      so this half ships second; VM-guest ClusterIP is the hard KubeVirt blocker
      and ships first.
 
-   **Feeding `svc_vips` from cozyplane-kpr.** kpr reconciles the imported
+   **Feeding `svc_vips` from cozyplane-kpr.** *As built (`kpr/services.go`): kpr
+   **watches Services/EndpointSlices directly with plain client-go**, NOT Cilium's
+   `Table[Frontend]`/`Table[Backend]` — a self-contained boundary with no coupling
+   to Cilium's internal LB schema. Cilium's imported machinery serves ClusterIP
+   socket-LB only. And there is no `nodeports` map: NodePort reuses the same
+   `svc_vips` LB rows keyed by node address ([lb-ingress.md](lb-ingress.md)). The
+   original proposal follows.*
+
+   kpr reconciles the imported
    `Table[Frontend]`/`Table[Backend]` (or watches Services/EndpointSlices
    directly) into `svc_vips` at **net 0** (default-network ClusterIP) and into
    `nodeports`. Because kpr is a separate module it can't import the agent's
@@ -256,12 +273,12 @@ Cilium's map ABI is not.
 1. **Packaging** — separate `kpr/` Go module + `cozyplane-kpr` DaemonSet
    (proposed), or fold the attach into the agent and accept the dependency
    blast radius in one shared module?
-2. **Increment-3 boundary** — RESOLVED (increment-3 design pass, above): feed
-   from the StateDB tables into the **existing `svc_vips`** at net 0, reusing
-   `svc_forward`/`svc_return` — `overlay.c` never reads Cilium's lb maps. The
-   only new datapath is un-gating `svc_forward`/`svc_return` for net 0 and a
-   `from_uplink` NodePort DNAT; ownership of `svc_vips` is partitioned by net
-   (agent `!= 0`, kpr `== 0`).
+2. **Increment-3 boundary** — RESOLVED, but **not as proposed**. The feed into the
+   existing `svc_vips` at net 0 is right, and `overlay.c` indeed never reads
+   Cilium's lb maps — but it is fed by a **plain client-go watch on
+   Services/EndpointSlices** (`kpr/services.go`), not from Cilium's StateDB tables.
+   Reading the tables would have coupled us to Cilium's internal LB schema for no
+   gain. Ownership of `svc_vips` is partitioned by net (agent `!= 0`, kpr `== 0`).
 3. **Feature dial for v1** — plain random backend selection, or turn on
    maglev/affinity/topology from day one? (All come along for free in lbcell;
    the question is test surface, not code.)

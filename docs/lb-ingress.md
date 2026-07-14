@@ -93,8 +93,15 @@ Each node's kpr derives its rows from objects as written:
   translates fabric → VPC as for any north-south flow, but its client
   masquerade is **suppressed for pinned LB flows** — source preservation is
   the point, and the masquerade's only guarantee (reply returns through the
-  same node) already holds. `to_pod` sanctions the flow by its `svc_rev`
-  entry; SecurityGroups gate unconditionally at the DNAT point.
+  same node) already holds. `to_pod` sanctions the flow by its `svc_rev` entry.
+  **Two gates run at the DNAT point, in this order:** first `vpc_ingress[net]` —
+  LoadBalancer ingress into a VPC is **default-deny**, opened only by that VPC's
+  `VPCGateway` setting `ingress.loadBalancer` — and only past it does
+  `ns_sg_admit` apply the SecurityGroups. A VPC with no admitting gateway is
+  refused before SGs are consulted at all, and the refusal is counted in
+  `ns_denied[loadbalancer]`. Naming a VPC pod as a Service backend is no longer
+  enough to reach it: the tenant must have opened its own door
+  ([north-south.md](north-south.md) tenet 7).
 - **v6**: same composition; both families in scope (increment 2).
 
 ### `externalTrafficPolicy: Cluster` — DSR, still source-preserving
@@ -227,8 +234,12 @@ underlay must grant:
    overflowed the callee budget behind `from_uplink`). A VPC-pod backend is
    one `bridges` hop inside `lb_ingress`: the row carries the pod's fabric
    address, the DNAT goes straight to the VPC IP (never the bridge's client
-   masquerade — the reply exits this same node), SecurityGroups gate
-   unconditionally at the DNAT point (`ns_sg_admit`, the floating rule), the
+   masquerade — the reply exits this same node), the `vpc_ingress` default-deny
+   gate runs first and SecurityGroups (`ns_sg_admit`, the floating rule) second
+   — see above; that gate was added later, with `VPCGateway`, and it is what
+   makes LB ingress into a VPC a crossing the tenant *declared* rather than a
+   free ride. Metered and refused-counted per VPC by the `loadbalancer` door
+   (`ns_bytes`/`ns_packets`/`ns_denied`, in `lb_ingress` and `lb_return`). The
    `to_pod` isolation check admits the flow by its `svc_rev` pin (a lookup
    paid only by packets that would otherwise drop), and the pinned reply
    identity is the VPC IP so `lb_return` catches the tenant pod's answer

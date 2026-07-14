@@ -1,6 +1,11 @@
 # VM provisioning — metadata endpoint & guest autoconfiguration (design draft)
 
-**Status: DRAFT — not implemented.** Covers `design.md` §10 (the metadata door)
+**Status: Part 1 (guest v6 autoconfiguration) is BUILT** — the userspace RA
+responder (M=1) and the per-veth DHCPv6 server that hands out the pinned `/128`
+ship in the agent, closing issue #8 for addresses. **Parts 2–3 (the metadata
+endpoint and cloud-init wiring) remain DRAFT — not implemented.**
+
+Covers `design.md` §10 (the metadata door)
 and issue #8 (a v6 VM guest can't autoconfigure its address). One story: **a VM
 boots into a VPC and comes up fully configured with no manual steps**, matching
 what a cloud tenant expects.

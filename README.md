@@ -20,8 +20,8 @@ built-in replacement that imports Cilium's LB components is
 ## What works today
 
 - **Default/system pod network** over an eBPF Geneve overlay: cross-node
-  pod-to-pod, node↔pod, kubelet probes; coexists with kube-proxy / Cilium-KPR for
-  Services. Dual-stack (IPv4 + IPv6).
+  pod-to-pod, node↔pod, kubelet probes. Dual-stack (IPv4 + IPv6). It can coexist
+  with kube-proxy, but it no longer needs to — see Services, below.
 - **VPCs**: a namespaced `VPC` (its namespace is its owner); a pod attaches by
   annotation, gated default-deny by a `VPCBinding` in the pod's namespace. Same-VPC
   pods reach each other across nodes; a VPC pod can't initiate to anything outside
@@ -36,9 +36,30 @@ built-in replacement that imports Cilium's LB components is
   carries the hidden tenant VPC IP — the pod never sees the node/management network.
 - **VPC peering**: symmetric `VPCPeering` halves, native cross-VPC datapath, status
   controller.
-- **Egress**: an opt-in per-VPC NAT gateway (`spec.egress.natGateway`) for VPC↔internet.
-- **Floating IPs**: `ExternalPool` + `FloatingIP` give a Port a true public address
-  (inbound and outbound), advertised and NAT'd entirely in eBPF — no gateway pod.
+- **A declared north-south boundary**: a namespaced `VPCGateway` is the VPC's one
+  door (`nat.enabled` for egress, `ingress.loadBalancer` to admit inbound). Creating
+  one needs the `attach` verb on an `ExternalPool`, so an operator grants the pool
+  and the tenant opens its own door onto it — a tenant cannot grant itself internet.
+  Egress NAT runs **in eBPF at the pod's own veth**, so the VPC leaves the cluster
+  wearing **its own address**, not the node's, and there is no gateway pod in the
+  path. Every crossing is **metered** per VPC and per door
+  (`cozyplane_vpc_ns_{bytes,packets}_total`), and LoadBalancer ingress into a VPC is
+  **default-deny** until the gateway admits it.
+- **Floating IPs (EIPs)**: `FloatingIP` gives a Port a true public address, inbound
+  and outbound, NAT'd entirely in eBPF — no gateway pod. It is **delivered, not
+  advertised**: cozyplane attracts nothing. Something else puts the address on the
+  wire (a CCM, MetalLB, a static route, or an address configured on a node), and
+  whichever node it lands on delivers it — `from_uplink` runs at tc ingress, ahead
+  of the kernel's routing decision. The address is drawn from the VPC's
+  `VPCGateway`'s pool, so a VPC with no door gets no external address.
+- **Multi-tenancy in the API, not just the datapath**: aggregating
+  `cozyplane-tenant-edit`/`-view` ClusterRoles carry **only namespaced kinds**, so a
+  tenant structurally cannot enumerate what it does not own (a RoleBinding grants
+  nothing cluster-scoped); the CNI stamps a pod with `sdn.cozystack.io/vpc-ip` and
+  `-mac` so a tenant can learn its **own** address (`status.podIP` is the fabric IP,
+  a different network); and a plain `ResourceQuota` bounds it
+  (`count/vpcs.sdn.cozystack.io`, …), enforced by the aggregated apiserver.
+  **A namespace *is* the tenant.**
 - **IPv6 / dual-stack**: v6 VPCs ride the overlay (128-bit map keys, v4 stored in
   RFC 6052 NAT64 form); the fabric-IP family is decoupled from the VPC's, so a v6
   VPC runs even on a v4-only cluster.
@@ -59,24 +80,44 @@ built-in replacement that imports Cilium's LB components is
   `/128` — a bridge-bound VM guest learns its address, default route, and DNS
   server with no console access.
 
+- **All three policy layers**: `SecurityGroup` (intra-VPC, identity-selected),
+  upstream `NetworkPolicy` (the default network), and a cluster-scoped
+  `HostFirewall` (node ingress/egress) — all enforced in eBPF.
+  ([policy-layers.md](docs/policy-layers.md).)
+- **Services without kube-proxy**: `cozyplane-kpr` (Cilium's LB control plane +
+  socket-LB) is the only service proxy on the dev cluster — kube-proxy and Cilium
+  are both gone — plus LoadBalancer ingress and NodePort with the client source
+  preserved.
+
 See the [roadmap](docs/roadmap.md) and the [open issues](../../issues) for what's
-outstanding (network policy, DNS, netfilter-optional operation, and more).
+outstanding.
 
 ## Documentation
+
+Start with [design.md](docs/design.md) (the vision and the **design tenets**), then
+[internals.md](docs/internals.md) (the as-built datapath).
 
 | Doc | What it covers |
 |-----|----------------|
 | [docs/user-guide.md](docs/user-guide.md) | Install it, create a VPC, attach pods, verify, limitations |
 | [docs/internals.md](docs/internals.md) | How it works as-built (datapath, control flow, packet walks) and how the code is structured |
-| [docs/design.md](docs/design.md) | The architecture vision (three planes, dual-address bridge, identity) |
+| [docs/design.md](docs/design.md) | The architecture vision (three planes, dual-address bridge, identity) and the design tenets |
 | [docs/control-plane.md](docs/control-plane.md) | The aggregated-apiserver control-plane design |
-| [docs/live-migration.md](docs/live-migration.md) | VM live migration via persistent Ports (IP + MAC preservation) |
 | [docs/roadmap.md](docs/roadmap.md) | Checklist of what's built and what's outstanding, with open-issue index |
-| [docs/security-groups.md](docs/security-groups.md) | *Design draft* — intra-VPC network policy (security groups) |
+| [docs/north-south.md](docs/north-south.md) | The VPC's one declared boundary: `VPCGateway`, eBPF egress NAT identity, metering, and why cozyplane announces nothing |
+| [docs/multitenancy.md](docs/multitenancy.md) | The tenancy rules, each justified or dropped (a namespace *is* the tenant) |
+| [docs/live-migration.md](docs/live-migration.md) | VM live migration via persistent Ports (IP + MAC preservation) |
+| [docs/policy-layers.md](docs/policy-layers.md) | How the three policy layers compose, and the shared trust model |
+| [docs/security-groups.md](docs/security-groups.md) | Intra-VPC policy (security groups) |
+| [docs/network-policy.md](docs/network-policy.md) | Upstream `NetworkPolicy` on the default network |
+| [docs/host-firewall.md](docs/host-firewall.md) | The node-scoped `HostFirewall` |
+| [docs/services-in-vpc.md](docs/services-in-vpc.md) | Services inside a VPC (per-VPC VIPs, split-horizon DNS) |
+| [docs/kube-proxy-replacement.md](docs/kube-proxy-replacement.md) | Owning Services by importing Cilium's LB + socket-LB |
+| [docs/lb-ingress.md](docs/lb-ingress.md) | LoadBalancer ingress + NodePort (delivery only — cozyplane does not announce) |
+| [docs/api-groups.md](docs/api-groups.md) | The two API groups (`local.sdn` CRDs vs the aggregated `sdn`) |
+| [docs/floating-ha.md](docs/floating-ha.md) | Floating IPs: separating attraction from delivery |
 | [docs/vm-provisioning.md](docs/vm-provisioning.md) | *Design draft* — metadata endpoint & guest autoconfiguration |
 | [docs/cross-family.md](docs/cross-family.md) | *Design draft* — cross-family (v4↔v6) peering & north-south |
-| [docs/services-in-vpc.md](docs/services-in-vpc.md) | *Design draft* — Services inside a VPC (per-VPC VIPs, split-horizon DNS) |
-| [docs/kube-proxy-replacement.md](docs/kube-proxy-replacement.md) | *Design draft* — own Services by importing Cilium's LB + socket-LB |
 
 Contributor invariants (never reach for iptables in the datapath, 128-bit/NAT64
 address form, etc.) live in [CLAUDE.md](CLAUDE.md).
