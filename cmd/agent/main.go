@@ -368,8 +368,8 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	}
 	localFactory := localinformers.NewSharedInformerFactory(lc, 0)
 	nodeIPs := newNodeIPIndex()
-	// The floating-IP electorate (docs/floating-ha.md): who is Ready, and who can
-	// serve which pool's link. Fed by the same Node informer below.
+	// Who is Ready — the node set the VPC NAT port shards are derived from
+	// (docs/north-south.md § increment 2). Fed by the same Node informer below.
 	nodePools := newNodePoolIndex()
 
 	// A node's tunnel endpoint may arrive after the FabricIPs that reference it
@@ -487,9 +487,8 @@ func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.
 	factory := informers.NewSharedInformerFactory(client, 0)
 	nodeInformer := factory.Core().V1().Nodes().Informer()
 
-	// The floating-IP electorate (docs/floating-ha.md): readiness and the pools
-	// each node published as servable. Includes THIS node — a node is a candidate
-	// to announce its own addresses like any other.
+	// Node readiness, feeding the NAT shard partition. Includes THIS node: every
+	// agent must derive the same partition, so the set cannot exclude self.
 	poolApply := func(obj any) {
 		if node, ok := obj.(*corev1.Node); ok {
 			nodePools.set(node)

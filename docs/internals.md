@@ -461,52 +461,52 @@ conflict: the VIP is the movable kind and reallocates.
 
 ### Floating IPs (external north-south)
 
-Floating IPs are dual-family: a v4 address advertises via the `from_uplink`
-ARP responder, a v6 address via its NDP twin (`floating_ndp` answers Neighbor
-Solicitations with a solicited+override Advertisement carrying the uplink MAC;
-DAD probes are not answered). Both families share the same maps and the same
+**Cozyplane does not attract a floating address — it delivers one.** Something else
+puts the address on the wire (a CCM assigning it to a node's VNIC, MetalLB, a static
+route, or simply an address configured on a node); cozyplane's job starts when the
+packet arrives. There is no ARP/NDP responder, no announcer election and no
+gratuitous-ARP emitter: that layer existed and was **deleted**, because it was
+MetalLB's L2 mode reimplemented inside a CNI (`docs/floating-ha.md` §5,
+`docs/north-south.md` tenet 3).
+
+What makes that work is that **`from_uplink` runs at tc ingress, ahead of the
+kernel's routing decision**. So it does not matter *which* node the address was
+attracted to: whichever node sees the packet resolves the pod and delivers it,
+locally or over the overlay. A live migration therefore makes no L2 claim at all —
+the address does not move.
+
+Floating IPs are dual-family, and both families share the same maps and the same
 stateless model — inbound public→VPC DNAT preserving the client
-(`floating_forward`/`floating_forward6`), outbound VPC→public SNAT out the
-uplink (`floating_egress_snat`/`floating_egress_snat6`) — including the
-ICMP/ICMPv6 error embedded-header rewrites, so PMTU and traceroute work through
-a floating address in either family. When a node newly **wins** a floating
-address (the election in `docs/floating-ha.md`) it announces it — a burst of
-gratuitous ARPs, or unsolicited override Neighbor Advertisements, on the uplink —
-so external peers holding a warm cache for the previous announcer re-learn
-immediately instead of waiting out their cache. Note *wins*, not *hosts*: the pod
-moving between nodes does not change who announces, so a live migration makes no
-L2 claim at all.
+(`floating_forward`/`floating_forward6`), outbound VPC→public SNAT out the uplink
+(`floating_egress_snat`/`floating_egress_snat6`) — including the ICMP/ICMPv6 error
+embedded-header rewrites, so PMTU and traceroute work through a floating address in
+either family.
 
 The dual-address bridge above is *internal* north-south: a fabric IP reachable
 from the cluster's default overlay. A **floating IP** is the same idea turned
 outward — a routable public address, reachable from off-cluster, bound 1:1 to a
 tenant IP — realized as an **extension of the eBPF bridge, not the gateway**. No
 iptables, no gateway pod: it is the fabric bridge with an external address and
-the client-masquerade removed, so the tenant sees the *real* caller. The pieces:
+the client-masquerade removed, so the tenant sees the *real* caller. An address is
+drawn from the pool of the VPC's `VPCGateway`, so a VPC with no boundary has no
+external address (`docs/north-south.md`). The pieces:
 
 - **`floating` map** (`publicIP → {net, vpcIP}`), programmed by the agent on
   **every** node — the external-facing sibling of `bridges`. It says where an
-  address leads, not who owns it.
-- **`float_announce` map** (`publicIP → 1`), programmed only on the node **elected**
-  to advertise the address. Attraction and delivery are separate decisions
-  (`docs/floating-ha.md`): this map is the whole of the first one.
-- **Advertisement in `from_uplink` itself.** The address is announced with no
-  host-side state at all: `from_uplink`, already at the uplink ingress, answers
-  ARP for it. On an ARP *request* whose target is in `float_announce`, it rewrites
-  the frame into a *reply* in place (sender = the node's uplink MAC + the floating
-  IP, target = the requester) and reflects it back out the uplink. There is no
-  `ip addr`, no route, no proxy-ARP. (Proxy-ARP was a dead end: a floating IP is
-  drawn from an L2 the node already sits on, so the kernel treats it as same-link
-  and never proxies it — the MetalLB-L2 problem. Assigning a local `/32` worked but
-  made the reply a martian source; answering in eBPF avoids both.)
+  address leads, not who owns it. Cluster-wide precisely *because* any node may be
+  the one the address lands on.
 - **An uplink-ingress hook** (`from_uplink`). A tc program at the node uplink's
   ingress catches `client → publicIP` and `bpf_redirect`s it into the target's
   veth by identity (`locals[{net, vpcIP}]`) when the pod is local — and
   Geneve-encapsulates it to the pod's node (`remotes[{net, vpcIP}]`) when it is
-  not, since the announcer need not be the host. Either way it does *not* rewrite
-  the packet: the DNAT happens where the bridge's does, in
+  not, since **the node the address was attracted to need not be the host**. Either
+  way it does *not* rewrite the packet: the DNAT happens where the bridge's does, in
   `to_pod`. This mirrors the bridge exactly (`from_uplink` is to floating what
   `from_pod`/`from_overlay` are to the fabric bridge).
+  A packet that arrives by the second path needs one more thing: `from_overlay`'s VPC
+  branch probes `floating` **before** its `gateways` lookup, because a public inner
+  destination misses `locals` (keyed by VPC IP) and would otherwise be delivered
+  *into the VPC's gateway pod* — a mis-delivery, not a drop.
 - **`to_pod` does the inbound DNAT** (`floating_forward`, beside `bridge_forward`).
   It DNATs `publicIP → vpcIP` on the destination, keeping the external client as
   the source — *not* masqueraded to `169.254.1.1`. It is **stateless**: a plain
@@ -535,12 +535,21 @@ the client-masquerade removed, so the tenant sees the *real* caller. The pieces:
   gateway to work; if the VPC has none, its internal/DNS traffic is dropped like
   any gateway-less VPC's and it uses external DNS.
 
-**Inbound walk (external client → floatingIP → tenant pod B in VPC-X):**
-`client → floatingIP` arrives at B's node (its agent answered ARP) → `from_uplink`
+**Inbound walk (external client → floatingIP → tenant pod B in VPC-X), address
+attracted onto B's own node:** `client → floatingIP` arrives → `from_uplink`
 redirects it into B's veth (`locals[{X, B-ip}]`) → `to_pod`'s `floating_forward`
 DNATs it to `client → B-ip`, keeping the client source → B replies `B-ip → client`
 toward `169.254.1.1` → `from_pod` finds `floating_egress[{X, B-ip}]`, SNATs the
 source `B-ip → floatingIP`, and `redirect_neigh`s it out the uplink, unmasqueraded.
+
+**Inbound walk, address attracted onto some other node N:** `client → floatingIP`
+arrives at **N** → `from_uplink` misses `locals`, hits `remotes[{X, B-ip}]`, and
+Geneve-encapsulates the packet **verbatim** (public destination and client source
+both intact) to B's node → `from_overlay`'s floating probe resolves it to B and
+delivers into the veth → `to_pod` DNATs exactly as above, because it keys on the
+destination and has **no notion of provenance**. B's reply leaves **B's own node**
+directly (`floating_egress_snat`, sourced as the floating IP) and never touches N.
+That is DSR: N carries only the request half.
 
 **Outbound walk (B originates a connection to the internet):** identical from
 `from_pod` on — `floating_egress[{X, B-ip}]` hits, the destination is not
