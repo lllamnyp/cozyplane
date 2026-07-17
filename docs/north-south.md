@@ -167,20 +167,29 @@ not be in a CNI.
   from the other end. It works, which is why it survived this long.
 - **Hairpinning north-south through a gateway pod** — tenet 1.
 
-## 6a. Known regression: v6 VPC egress ([#15](../../issues/15))
+## 6a. v6 VPC egress: the black-hole (fixed) and the identity gap (open) ([#15](../../issues/15))
 
 **Increment 2's NAT is v4-only** (`vpc_nat_snat` opens with `if (p->is_v6) return
-NAT_MISS`), but the gateway controller deletes the gateway pod as soon as
-`status.natAddress` is set — and the pod is the *only* v6 egress path. So a v6 or
-dual-stack VPC with a **pooled** gateway loses v6 egress entirely: the packet skips the
-eBPF NAT, falls to the isolation block, reaches the gateway path, finds no
-`gateways[vni]` entry, and drops. Dual-stack hides it — v4 keeps working, so the VPC
-looks healthy.
+NAT_MISS`). The regression was that the gateway controller deleted the gateway pod as
+soon as `status.natAddress` was set — and the pod is the *only* v6 egress path — while
+`ensureNATAddress` was family-blind and could even hand a v6 VPC a v4 address. So a v6
+or dual-stack VPC with a **pooled** gateway lost v6 egress entirely: the packet skipped
+the eBPF NAT, fell to the isolation block, reached the gateway path, found no
+`gateways[vni]` entry, and dropped. Dual-stack hid it — v4 kept working, so the VPC
+looked healthy.
 
-Fix: gate the pod deletion on **family** (keep the pod when the VPC has a v6 CIDR), and
-make `ensureNATAddress` allocate an address of the VPC's own family rather than the
-first free one in the pool. **v6 VPC NAT is therefore the prerequisite for retiring
-`cmd/gateway`** — see the roadmap.
+**Fixed** (unit-tested): `ensureNATAddress` allocates a **v4** address (the only kind
+`vpc_nat_snat` can wear) and only for a VPC that has a v4 CIDR; the pod is kept whenever
+the VPC has a v6 CIDR. It composes because `from_pod` tries `vpc_nat_snat` **before** the
+isolation/gateway branch — on a dual-stack VPC, v4 takes the eBPF NAT and never reaches
+the pod, v6 falls through to it.
+
+**But the fix only restores the status quo, it does not satisfy tenet 8.** A v6/dual-stack
+VPC keeps its pod, and its v6 egress still launders into the node's address. Giving v6 its
+**own** egress identity — the v6 twin of `vpc_nat_snat` — is **v6 VPC NAT**, and it is the
+prerequisite for retiring `cmd/gateway` (the pod is the only v6 egress path in the tree).
+That is the reserved design, not a mechanical port: whether and how v6 gets a per-VPC
+identity is an operator call. See the roadmap.
 
 ## 7. Open questions
 

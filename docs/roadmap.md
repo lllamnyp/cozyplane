@@ -21,29 +21,33 @@ once the north-south arc closed (one declared boundary, metered, with the tenant
 own egress identity; cozyplane attracts nothing) and the multi-tenancy rules were
 built (a tenant persona, a tenant that can see itself, a ceiling).
 
-**Regression — shipped and broken, fix first**
+**Regression — the black-hole is fixed; the identity gap is the reserved design**
 
-0. **v6 VPC egress is dead when the `VPCGateway` has a `poolRef`** ([#15](../../issues/15)). `ensureNATAddress`
-   is **family-blind** (it takes `firstFreeAddress(pool.Spec.CIDRs, …)` and never looks
-   at the VPC's family, so a v6 VPC can even be handed a *v4* NAT address); the gateway
-   controller then deletes the gateway Deployment the moment `status.natAddress` is set;
-   no pod ⇒ no `.1` Port ⇒ **no `gateways[vni]` entry**. But `from_pod` guards the eBPF
-   NAT with `!p.is_v6` and `vpc_nat_snat` opens with `if (p->is_v6) return NAT_MISS`. So
-   a v6 packet skips the eBPF NAT, falls to the isolation block, reaches the gateway
-   path, **misses, and drops**. Before increment 2 this worked (dual-family gateway leg +
-   the v6 node masquerade). **Dual-stack is the nastiest case**: v4 keeps working through
-   the eBPF NAT so the VPC looks healthy while v6 silently blackholes.
-   **Fix:** gate the pod deletion on *family* — keep the gateway pod when the VPC has a
-   v6 CIDR. It composes, because `from_pod` tries `vpc_nat_snat` **before** the isolation
-   block: v4 takes the eBPF NAT and never reaches the pod, v6 falls through to the
-   gateway as before. And `ensureNATAddress` must allocate an address of the VPC's family.
-   **Uncaught because** the only v6-gateway-egress coverage is in `test/e2e.sh` — kind-only
-   *and* already broken (item 12); `vpc-e2e.sh` has one `VPCGateway` phase and it is v4.
-   Add a v6 gateway-egress phase there (§3, §4, §8).
-1. **v6 VPC NAT** ([#15](../../issues/15)) — the v6 twin of `vpc_nat_snat`, plus a v6 pool/shard story. **This is
-   the prerequisite for retiring `cmd/gateway`** (item 6): the gateway pod is currently
-   the *only* v6 VPC egress path in the tree, so "require `poolRef` and delete the pod"
-   cannot happen until this lands. Not previously tracked anywhere (§3, §4).
+0. **[x] v6 VPC egress no longer black-holes with a pooled `VPCGateway`** ([#15](../../issues/15); unit-tested).
+   The bug: `ensureNATAddress` was **family-blind** (it took `firstFreeAddress(pool.Spec.
+   CIDRs, …)` and never looked at the VPC's family, so a v6 VPC could be handed a *v4*
+   NAT address); the gateway controller then deleted the gateway Deployment the moment
+   `status.natAddress` was set; no pod ⇒ no `.1` Port ⇒ **no `gateways[vni]` entry**. But
+   `from_pod` guards the eBPF NAT with `!p.is_v6`, so a v6 packet skipped it, fell to the
+   isolation block, reached the gateway path, **missed, and dropped**. Dual-stack was the
+   nastiest case — v4 kept working, so the VPC looked healthy while v6 silently blackholed.
+   **Fixed** by gating on *family*: `ensureNATAddress` now allocates a **v4** address (the
+   only kind `vpc_nat_snat` can wear) and only for a VPC that has a v4 CIDR; the pod is
+   kept whenever the VPC has a v6 CIDR. It composes, because `from_pod` tries
+   `vpc_nat_snat` **before** the isolation block — on a dual-stack VPC, v4 takes the eBPF
+   NAT and never reaches the pod, v6 falls through to it. So a v6/dual-stack VPC now keeps
+   its pod and **launders its v6 egress into the node's address** (tenet 8) — that is the
+   status quo restored, not the tenet satisfied. Closing that is item 1.
+   Still open: a **v6 gateway-egress phase in `vpc-e2e.sh`** (the controller logic is
+   unit-tested, but real-cluster v6 egress is only covered by the kind-only, already-broken
+   `test/e2e.sh`, item 14) (§3, §8).
+1. **v6 VPC NAT — the reserved design** ([#15](../../issues/15)). The v6 twin of
+   `vpc_nat_snat`, plus a v6 pool/shard story, so a v6 VPC wears **its own** egress
+   identity instead of laundering through the pod (tenet 8, symmetric with v4). **This is
+   the prerequisite for retiring `cmd/gateway`** (item 7): the gateway pod is currently the
+   only v6 VPC egress path in the tree, so "require `poolRef` and delete the pod" cannot
+   happen until this lands. Carries an open design question — the v4/v6 asymmetry — that is
+   an operator call, not a mechanical port (§3, §4).
 
 **Features**
 

@@ -91,12 +91,19 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if gw == nil || !gw.Spec.NAT.Enabled {
 		return ctrl.Result{}, r.deleteGateways(ctx, vpc.Namespace, vpc.Name)
 	}
-	// A gateway with a NAT identity is realized in eBPF — SNAT at the pod's own
-	// veth, straight out the uplink (docs/north-south.md § increment 2). No pod, no
-	// hairpin, no per-VPC single point of failure, and the tenant's traffic wears
-	// its own address instead of the node's. The pod remains only for a gateway
-	// with no pool to draw an identity from, and goes away with it.
-	if gw.Status.NATAddress != "" {
+	// A gateway with a NAT identity has its v4 egress realized in eBPF — SNAT at
+	// the pod's own veth, straight out the uplink (docs/north-south.md § increment
+	// 2). No pod for that: no hairpin, no per-VPC SPOF, and the tenant's v4 traffic
+	// wears its own address instead of the node's.
+	//
+	// But vpc_nat_snat is v4-only, so a VPC with a v6 CIDR still needs the gateway
+	// pod for its v6 egress until v6 VPC NAT lands (docs/north-south.md §6a, #15).
+	// This composes: from_pod tries vpc_nat_snat BEFORE the isolation/gateway
+	// branch, so on a dual-stack VPC v4 takes the eBPF NAT and never reaches the
+	// pod, while v6 falls through to it. Delete the pod only for a pure-v4 VPC that
+	// has its eBPF identity; keep it whenever the VPC has v6 (or has no identity,
+	// the pool-less fallback above).
+	if gw.Status.NATAddress != "" && !cidrsHaveV6(vpc.Spec.CIDRs) {
 		return ctrl.Result{}, r.deleteGateways(ctx, vpc.Namespace, vpc.Name)
 	}
 	if vpc.Status.VNI == 0 {

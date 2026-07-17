@@ -64,6 +64,27 @@ func natGateway(ns, name, vpcName string) *sdnv1alpha1.VPCGateway {
 	}
 }
 
+// dualStackVPC has both a v4 and a v6 CIDR. Its v4 egress is realized in eBPF
+// (vpc_nat_snat), but its v6 egress still needs the gateway pod until v6 VPC NAT
+// lands (docs/north-south.md §6a, #15).
+func dualStackVPC(ns, name string, vni int32) *sdnv1alpha1.VPC {
+	return &sdnv1alpha1.VPC{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec:       sdnv1alpha1.VPCSpec{CIDRs: []string{"10.10.0.0/24", "fd00:10::/64"}},
+		Status:     sdnv1alpha1.VPCStatus{VNI: vni},
+	}
+}
+
+// natGatewayWithAddr is a gateway that has already been given its eBPF egress
+// identity by the VPCGateway controller. For a pure-v4 VPC that means the pod is
+// retired; for a VPC with v6 the pod must survive for the v6 half.
+func natGatewayWithAddr(ns, name, vpcName, addr string) *sdnv1alpha1.VPCGateway {
+	gw := natGateway(ns, name, vpcName)
+	gw.Spec.PoolRef = sdnv1alpha1.ExternalPoolRef{Name: "pool"}
+	gw.Status.NATAddress = addr
+	return gw
+}
+
 func gatewayReconciler(c client.Client) *GatewayReconciler {
 	return &GatewayReconciler{
 		Client: c,
@@ -165,6 +186,44 @@ func TestGatewayDeletedOnDisableAndVPCDeletion(t *testing.T) {
 	err = c.Get(ctx, types.NamespacedName{Namespace: "cozy-cozyplane", Name: "cozyplane-gateway-100"}, &appsv1.Deployment{})
 	if !apierrors.IsNotFound(err) {
 		t.Errorf("deployment should be deleted with its VPC, got %v", err)
+	}
+}
+
+// A pure-v4 VPC that has been given its eBPF NAT identity keeps NO pod: vpc_nat_snat
+// handles its egress.
+func TestGatewayDeletedForV4VPCWithNATIdentity(t *testing.T) {
+	scheme := gatewayScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(egressVPC("team-a", "vpc-a", 100, true), natGatewayWithAddr("team-a", "door", "vpc-a", "203.0.113.5")).
+		Build()
+	r := gatewayReconciler(c)
+
+	key := types.NamespacedName{Namespace: "team-a", Name: "vpc-a"}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	err := c.Get(context.Background(), types.NamespacedName{Namespace: "cozy-cozyplane", Name: "cozyplane-gateway-100"}, &appsv1.Deployment{})
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("a v4 VPC with an eBPF identity must have no gateway pod, got %v", err)
+	}
+}
+
+// #15 regression: a VPC with a v6 CIDR keeps its gateway pod even after being given
+// a (v4) eBPF NAT identity — the pod is the only v6 egress path until v6 VPC NAT
+// lands. Deleting it here black-holes v6 (dual-stack hides it: v4 keeps working).
+func TestGatewayKeptForV6VPCWithNATIdentity(t *testing.T) {
+	scheme := gatewayScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(dualStackVPC("team-a", "vpc-a", 100), natGatewayWithAddr("team-a", "door", "vpc-a", "203.0.113.5")).
+		Build()
+	r := gatewayReconciler(c)
+
+	key := types.NamespacedName{Namespace: "team-a", Name: "vpc-a"}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "cozy-cozyplane", Name: "cozyplane-gateway-100"}, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("a dual-stack VPC must keep its gateway pod for v6 egress (#15), but it was gone: %v", err)
 	}
 }
 

@@ -91,7 +91,7 @@ func (r *VPCGatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// indistinguishable from the platform on the wire (docs/north-south.md, tenet 8).
 	natAddr := ""
 	if exclusive && poolOK && gw.Spec.NAT.Enabled && gw.Spec.PoolRef.Name != "" {
-		a, err := r.ensureNATAddress(ctx, gw)
+		a, err := r.ensureNATAddress(ctx, gw, vpc)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -159,14 +159,26 @@ func (r *VPCGatewayReconciler) conflictingGateway(ctx context.Context, gw *sdnv1
 	return "", nil
 }
 
-// ensureNATAddress allocates (and keeps) the VPC's egress address from its pool.
-// FloatingIPs draw from the same pools, so both allocators must see each other's
-// claims — a VPC must never egress as an address some pod is also floating on.
-func (r *VPCGatewayReconciler) ensureNATAddress(ctx context.Context, gw *sdnv1alpha1.VPCGateway) (string, error) {
+// ensureNATAddress allocates (and keeps) the VPC's eBPF egress identity from its
+// pool. FloatingIPs draw from the same pools, so both allocators must see each
+// other's claims — a VPC must never egress as an address some pod is also floating
+// on.
+//
+// The identity is a **v4** address, and only a VPC with a v4 CIDR gets one:
+// vpc_nat_snat is v4-only (bpf/overlay.c), so a v4 address is the only kind it can
+// wear, and a pure-v6 VPC has no v4 traffic for it to NAT. A VPC with no v4 family
+// gets "" here and keeps the gateway pod for its v6 egress until v6 VPC NAT lands
+// (docs/north-south.md §6a, #15). Handing a v6 VPC a v4 identity would delete its
+// pod and black-hole its v6 traffic — the regression this guards against.
+func (r *VPCGatewayReconciler) ensureNATAddress(ctx context.Context, gw *sdnv1alpha1.VPCGateway, vpc *sdnv1alpha1.VPC) (string, error) {
+	if !cidrsHaveV4(vpc.Spec.CIDRs) {
+		return "", nil
+	}
 	pool := &sdnv1alpha1.ExternalPool{}
 	if err := r.Get(ctx, types.NamespacedName{Name: gw.Spec.PoolRef.Name}, pool); err != nil {
 		return "", nil
 	}
+	poolV4 := cidrsV4(pool.Spec.CIDRs)
 
 	used := map[string]bool{}
 	var fips sdnv1alpha1.FloatingIPList
@@ -193,10 +205,10 @@ func (r *VPCGatewayReconciler) ensureNATAddress(ctx context.Context, gw *sdnv1al
 	}
 
 	// Sticky: a VPC's egress identity should not move under its live flows.
-	if cur := gw.Status.NATAddress; cur != "" && addrInCIDRs(pool.Spec.CIDRs, cur) && !used[cur] {
+	if cur := gw.Status.NATAddress; cur != "" && addrInCIDRs(poolV4, cur) && !used[cur] {
 		return cur, nil
 	}
-	return firstFreeAddress(pool.Spec.CIDRs, used), nil
+	return firstFreeAddress(poolV4, used), nil
 }
 
 func setGWCondition(status *sdnv1alpha1.VPCGatewayStatus, condType string, ok bool, reason, msg string) {

@@ -302,6 +302,40 @@ func addrInCIDRs(cidrs []string, ip string) bool {
 	return false
 }
 
+// cidrsHaveV4 / cidrsHaveV6 report whether any CIDR is of that family. The eBPF
+// VPC NAT is v4-only (bpf/overlay.c: vpc_nat_snat guards !p.is_v6), so these
+// decide whether a VPC gets an eBPF egress identity (v4) or must keep the gateway
+// pod for its v6 egress until v6 VPC NAT lands (docs/north-south.md §6a, #15).
+func cidrsHaveV4(cidrs []string) bool {
+	for _, c := range cidrs {
+		if p, err := netip.ParsePrefix(c); err == nil && p.Addr().Is4() {
+			return true
+		}
+	}
+	return false
+}
+
+func cidrsHaveV6(cidrs []string) bool {
+	for _, c := range cidrs {
+		if p, err := netip.ParsePrefix(c); err == nil && p.Addr().Is6() && !p.Addr().Is4In6() {
+			return true
+		}
+	}
+	return false
+}
+
+// cidrsV4 keeps only the v4 CIDRs, so the eBPF NAT identity is drawn from an
+// address family vpc_nat_snat can actually use.
+func cidrsV4(cidrs []string) []string {
+	out := make([]string, 0, len(cidrs))
+	for _, c := range cidrs {
+		if p, err := netip.ParsePrefix(c); err == nil && p.Addr().Is4() {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // firstFreeAddress returns the lowest address across the CIDRs that is not in
 // used, or "" when all are taken.
 func firstFreeAddress(cidrs []string, used map[string]bool) string {
