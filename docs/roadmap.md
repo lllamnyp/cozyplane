@@ -43,9 +43,10 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
    absent (eBPF NAT). Still open: a **v6 gateway-egress phase in `vpc-e2e.sh`** (the controller logic is
    unit-tested, but real-cluster v6 egress is only covered by the kind-only, already-broken
    `test/e2e.sh`, item 14) (§3, §8).
-1. **[x] v6 VPC NAT — a per-family egress identity** ([#15](../../issues/15); unit-tested;
-   verifier + allocation + pod-retirement checked; end-to-end v6 egress needs a v6-uplink
-   cluster). A VPC now wears a v4 address for its v4 egress **and** a v6 address for its v6
+1. **[x] v6 VPC NAT — a per-family egress identity** ([#15](../../issues/15); unit-tested + **dev4-validated**:
+   the agent loaded the new datapath (verifier gate passed on the Talos 6.x kernel), a
+   dual-stack VPC drew both a v4 and v6 identity and **shed its gateway pod entirely**, and
+   every agent programmed both addresses; end-to-end v6 egress needs a v6-uplink cluster). A VPC now wears a v4 address for its v4 egress **and** a v6 address for its v6
    egress: `vpc_nat` holds both (`ip`/`ip6`), `vpc_nat_snat6`/`vpc_nat_reverse6` mirror the
    v4 twins, `ensureNATAddress` allocates per family into `status.natAddress`/`natAddress6`,
    and the gateway pod is retired once **every** family the VPC has is served in eBPF. The

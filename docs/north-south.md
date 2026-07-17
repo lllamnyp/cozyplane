@@ -211,7 +211,9 @@ pool that covers every family a VPC uses.
 > which a v4-only cluster (the dev cluster) does not have — so end-to-end v6 egress is
 > validated only where a v6 fabric exists. On a v4-only cluster the controller
 > allocation, the pod retirement, the map programming, and the **verifier load of the
-> new datapath** are the coverage.
+> new datapath** are the coverage — all **dev4-validated**: a dual-stack VPC drew a v4
+> and a v6 identity and shed its gateway pod, on agents that loaded the new datapath
+> with no verifier error.
 
 ## 7. Open questions
 
