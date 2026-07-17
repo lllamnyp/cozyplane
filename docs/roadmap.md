@@ -23,7 +23,7 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
 
 **Regression — the black-hole is fixed; the identity gap is the reserved design**
 
-0. **[x] v6 VPC egress no longer black-holes with a pooled `VPCGateway`** ([#15](../../issues/15); unit-tested).
+0. **[x] v6 VPC egress no longer black-holes with a pooled `VPCGateway`** ([#15](../../issues/15); unit-tested + **dev4-validated**).
    The bug: `ensureNATAddress` was **family-blind** (it took `firstFreeAddress(pool.Spec.
    CIDRs, …)` and never looked at the VPC's family, so a v6 VPC could be handed a *v4*
    NAT address); the gateway controller then deleted the gateway Deployment the moment
@@ -38,7 +38,9 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
    NAT and never reaches the pod, v6 falls through to it. So a v6/dual-stack VPC now keeps
    its pod and **launders its v6 egress into the node's address** (tenet 8) — that is the
    status quo restored, not the tenet satisfied. Closing that is item 1.
-   Still open: a **v6 gateway-egress phase in `vpc-e2e.sh`** (the controller logic is
+   Dev4 before/after (same objects, only the controller image rolled): a dual-stack VPC's
+   gateway pod went **ABSENT → PRESENT** (v6 path restored) while a pure-v4 VPC's stayed
+   absent (eBPF NAT). Still open: a **v6 gateway-egress phase in `vpc-e2e.sh`** (the controller logic is
    unit-tested, but real-cluster v6 egress is only covered by the kind-only, already-broken
    `test/e2e.sh`, item 14) (§3, §8).
 1. **v6 VPC NAT — the reserved design** ([#15](../../issues/15)). The v6 twin of

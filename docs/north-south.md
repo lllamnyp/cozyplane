@@ -178,7 +178,7 @@ the eBPF NAT, fell to the isolation block, reached the gateway path, found no
 `gateways[vni]` entry, and dropped. Dual-stack hid it — v4 kept working, so the VPC
 looked healthy.
 
-**Fixed** (unit-tested): `ensureNATAddress` allocates a **v4** address (the only kind
+**Fixed** (unit-tested + dev4-validated): `ensureNATAddress` allocates a **v4** address (the only kind
 `vpc_nat_snat` can wear) and only for a VPC that has a v4 CIDR; the pod is kept whenever
 the VPC has a v6 CIDR. It composes because `from_pod` tries `vpc_nat_snat` **before** the
 isolation/gateway branch — on a dual-stack VPC, v4 takes the eBPF NAT and never reaches
