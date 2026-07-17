@@ -45,11 +45,12 @@ its own.
   `KUBE-FORWARD` chain — and on a cozyplane cluster there *is* no kube-proxy, so that
   installs nothing. Adding an nft NAT table back would reverse the direction the
   project has been travelling.
-- **Two proxies would claim the same Service.** `cozyplane-kpr` does not honour
-  `service.kubernetes.io/service-proxy-name` at all today. So the day cozyplane ships
-  next to cozy-proxy, kpr programs the Service into `svc_vips`/`lb_ingress` while
-  cozy-proxy writes nft rules for the same address. **Honouring that label is a
-  correctness fix kpr owes regardless of this feature** (see §6).
+- **Two proxies must not claim the same Service.** Until increment 0, `cozyplane-kpr`
+  did not honour `service.kubernetes.io/service-proxy-name` in its net-0 reconciler, so
+  next to cozy-proxy it would program the Service into `svc_vips`/`lb_ingress` while
+  cozy-proxy wrote nft rules for the same address. **Fixed (increment 0, done):** both
+  of kpr's Service paths now skip a Service delegated to another proxy. This was a
+  correctness fix kpr owed regardless of this feature.
 
 So: supersede, not coexist.
 
@@ -227,9 +228,14 @@ permissive here as the cozy-proxy cluster it replaces — no more, no less.
 
 ## 8. Increments
 
-0. **kpr honours `service.kubernetes.io/service-proxy-name`** — skip Services
-   delegated elsewhere, claim the names we answer to. Independently a correctness fix;
-   without it kpr and any other proxy fight over the same Service.
+0. **[x] kpr honours `service.kubernetes.io/service-proxy-name`** — done. Both of
+   kpr's Service paths now agree via the shared `--k8s-service-proxy-name` flag:
+   Cilium's LB reflector already applied it (its default excludes labelled Services),
+   and cozyplane's net-0 `svc_vips` reconciler now filters the same way — empty (the
+   default) manages only Services *without* the label, so a Service delegated to
+   another proxy is skipped and kpr never double-programs what cozy-proxy owns. A
+   non-empty value claims that name (the hook the rest of this design needs). This was
+   the independent correctness fix; without it kpr fought any other proxy in the cluster.
 1. **Egress identity.** The `ports` flag bit and the `srcnet == 0` relaxation in
    `from_pod`, plus the net-0 `floating_egress` rows. A net-0 pod behind a managed
    Service now leaves the cluster **as its public address**. This is the half that

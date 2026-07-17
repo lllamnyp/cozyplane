@@ -11,6 +11,54 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// kpr must skip a Service delegated to another proxy (the service-proxy-name
+// label), so it never double-programs what cozy-proxy owns (docs/public-ip.md).
+func TestHandledByProxy(t *testing.T) {
+	labelled := func(v string) *corev1.Service {
+		return &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{serviceProxyNameLabel: v}}}
+	}
+	unlabelled := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "web"}}
+
+	cases := []struct {
+		name      string
+		svc       *corev1.Service
+		proxyName string
+		want      bool
+	}{
+		{"default proxy owns unlabelled", unlabelled, "", true},
+		{"default proxy skips a delegated Service", labelled("cozy-proxy"), "", false},
+		{"named proxy owns its own label", labelled("cozyplane"), "cozyplane", true},
+		{"named proxy skips another's label", labelled("cozy-proxy"), "cozyplane", false},
+		{"named proxy skips unlabelled", unlabelled, "cozyplane", false},
+	}
+	for _, c := range cases {
+		if got := handledByProxy(c.svc, c.proxyName); got != c.want {
+			t.Errorf("%s: handledByProxy = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// The filter is enforced in computeService: a delegated Service yields no rows,
+// so apply() prunes any it previously owned.
+func TestComputeServiceSkipsDelegated(t *testing.T) {
+	svc := lbSvc(corev1.ServiceExternalTrafficPolicyCluster,
+		corev1.LoadBalancerIngress{IP: "203.0.113.9"})
+	svc.Labels = map[string]string{serviceProxyNameLabel: "cozy-proxy"}
+	// A default-proxy kpr (empty name) must produce nothing for it.
+	if rows, _ := computeRows(svc, slice("node-a", ""), "node-a", nil, false); len(rows) == 0 {
+		t.Fatal("test setup: an unfiltered delegated LB Service should still produce rows")
+	}
+	r := &vipReconciler{serviceProxyName: ""}
+	rows, srcs, err := r.computeService(svc)
+	if err != nil {
+		t.Fatalf("computeService: %v", err)
+	}
+	if len(rows) != 0 || len(srcs) != 0 {
+		t.Errorf("delegated Service must yield no rows, got %d rows, %d srcs", len(rows), len(srcs))
+	}
+}
+
 func lbSvc(etp corev1.ServiceExternalTrafficPolicy, ingress ...corev1.LoadBalancerIngress) *corev1.Service {
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"},

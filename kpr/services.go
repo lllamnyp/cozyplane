@@ -135,6 +135,13 @@ type vipReconciler struct {
 	// (docs/lb-ingress.md). Off, Cluster rows degrade to node-local backends.
 	clusterDSR bool
 
+	// serviceProxyName is the service.kubernetes.io/service-proxy-name value this
+	// kpr answers to. Empty (the default) = manage only Services WITHOUT the label,
+	// exactly as Cilium's LB reflector does with an empty --k8s-service-proxy-name;
+	// so a Service delegated to another proxy (e.g. cozy-proxy) is skipped and kpr
+	// does not fight it over the same object (docs/public-ip.md, docs/kube-proxy-replacement.md).
+	serviceProxyName string
+
 	// owned indexes the net-0 keys this process wrote, per service ("ns/name" →
 	// key → last-written value). It is what makes pruning scan-free: a service's
 	// reconcile diffs desired against owned[svc] and never iterates the map.
@@ -157,7 +164,7 @@ type vipReconciler struct {
 // write the same keys (this owns net 0, socket-LB uses Cilium's own maps).
 // nodeName (the node this kpr instance runs on) scopes LB-ingress rows;
 // clusterDSR is the strictly-opt-in etp: Cluster DSR gate.
-func runServiceVIPs(ctx context.Context, pinDir, nodeName string, clusterDSR bool, logger *slog.Logger) error {
+func runServiceVIPs(ctx context.Context, pinDir, nodeName string, clusterDSR bool, serviceProxyName string, logger *slog.Logger) error {
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
 		return fmt.Errorf("in-cluster config: %w", err)
@@ -230,13 +237,14 @@ func runServiceVIPs(ctx context.Context, pinDir, nodeName string, clusterDSR boo
 		epsLister: epsInformer.Lister(),
 		queue: workqueue.NewTypedRateLimitingQueue(
 			workqueue.DefaultTypedControllerRateLimiter[string]()),
-		logger:     logger,
-		nodeName:   nodeName,
-		clusterDSR: clusterDSR,
-		owned:      map[string]map[svcKey]svcVal{},
-		lbsrc:      lbsrc,
-		ownedSrc:   map[string]map[lbSrcKey]uint8{},
-		nodeAddrs:  nodeAddrs,
+		logger:           logger,
+		nodeName:         nodeName,
+		clusterDSR:       clusterDSR,
+		serviceProxyName: serviceProxyName,
+		owned:            map[string]map[svcKey]svcVal{},
+		lbsrc:            lbsrc,
+		ownedSrc:         map[string]map[lbSrcKey]uint8{},
+		nodeAddrs:        nodeAddrs,
 	}
 
 	_, _ = svcInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -392,12 +400,37 @@ func isMapKeyNotExist(err error) bool {
 	return errors.Is(err, ebpf.ErrKeyNotExist)
 }
 
+// serviceProxyNameLabel is the upstream label that delegates a Service to a
+// non-default proxy. kube-proxy — and Cilium's LB reflector — skip a Service that
+// carries it (unless its value is the proxy's own name).
+const serviceProxyNameLabel = "service.kubernetes.io/service-proxy-name"
+
+// handledByProxy reports whether THIS kpr should manage svc, per the upstream
+// service-proxy-name contract — the same rule Cilium's LB reflector applies, so
+// both of kpr's Service paths agree:
+//
+//	proxyName == ""  -> manage Services WITHOUT the label (the default proxy)
+//	proxyName == "X" -> manage ONLY Services labelled service-proxy-name=X
+//
+// A Service delegated to a different proxy (e.g. cozy-proxy) is skipped, so kpr
+// does not double-program a Service another proxy owns.
+func handledByProxy(svc *corev1.Service, proxyName string) bool {
+	v, has := svc.Labels[serviceProxyNameLabel]
+	if proxyName == "" {
+		return !has
+	}
+	return has && v == proxyName
+}
+
 // computeService builds the desired net-0 svc_vips entries for one service.
-// A nil svc (deleted), ExternalName, headless, or backend-less service yields
-// an empty set — apply() then prunes whatever was owned.
+// A nil svc (deleted), ExternalName, headless, backend-less, or one delegated to
+// another proxy yields an empty set — apply() then prunes whatever was owned.
 func (r *vipReconciler) computeService(svc *corev1.Service) (map[svcKey]svcVal, map[lbSrcKey]uint8, error) {
 	if svc == nil || svc.Spec.Type == corev1.ServiceTypeExternalName {
 		return nil, nil, nil
+	}
+	if !handledByProxy(svc, r.serviceProxyName) {
+		return nil, nil, nil // delegated to another proxy: not ours to program
 	}
 	sel := labels.SelectorFromSet(labels.Set{discoveryv1.LabelServiceName: svc.Name})
 	slices, err := r.epsLister.EndpointSlices(svc.Namespace).List(sel)

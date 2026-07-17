@@ -81,8 +81,9 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
    net-0 VM a real public address (all ports in, and egress *as that address*) with
    [cozy-proxy](https://github.com/cozystack/cozy-proxy)'s nftables 1:1 NAT. Cozyplane
    takes over the default network, so that has to go — and it cannot coexist: it is
-   nft, and `cozyplane-kpr` doesn't honour `service.kubernetes.io/service-proxy-name`,
-   so today both would claim the same Service. The capability is **already in the
+   nft, against the pure-eBPF invariant. (**Increment 0 done:** `cozyplane-kpr` now
+   honours `service.kubernetes.io/service-proxy-name`, so it no longer fights another
+   proxy over the same Service.) The capability is **already in the
    datapath** — it is the EIP path, which is net-scoped and merely declines to run at
    net 0 (`from_pod` guards the egress SNAT with `if (srcnet && !dstnet)`). Drop-in:
    the same Service + label + `wholeIP` annotation, **no new kind**. The real

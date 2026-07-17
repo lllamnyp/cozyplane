@@ -130,8 +130,22 @@ func main() {
 	if !clusterDSR {
 		logger.Info("CLUSTER_DSR off: externalTrafficPolicy Cluster degrades to node-local delivery")
 	}
+	// The net-0 reconciler honours the SAME service-proxy-name as Cilium's LB
+	// reflector — read the shared --k8s-service-proxy-name flag (registered by
+	// daemonk8s) so both paths agree on which Services kpr owns. Empty (default)
+	// skips any Service delegated to another proxy, so kpr never fights cozy-proxy
+	// over the same object (docs/public-ip.md).
+	serviceProxyName := ""
+	if f := pflag.CommandLine.Lookup("k8s-service-proxy-name"); f != nil {
+		serviceProxyName = f.Value.String()
+	}
+	if serviceProxyName == "" {
+		logger.Info("service-proxy-name empty: managing only Services without the service.kubernetes.io/service-proxy-name label")
+	} else {
+		logger.Info("managing only Services with the given service-proxy-name", "name", serviceProxyName)
+	}
 	go func() {
-		if err := runServiceVIPs(context.Background(), pinDir, nodeName, clusterDSR, logger); err != nil {
+		if err := runServiceVIPs(context.Background(), pinDir, nodeName, clusterDSR, serviceProxyName, logger); err != nil {
 			logger.Error("svc_vips reconciler exited", "err", err)
 		}
 	}()
