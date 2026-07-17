@@ -75,14 +75,19 @@ func dualStackVPC(ns, name string, vni int32) *sdnv1alpha1.VPC {
 	}
 }
 
-// natGatewayWithAddr is a gateway that has already been given its eBPF egress
-// identity by the VPCGateway controller. For a pure-v4 VPC that means the pod is
-// retired; for a VPC with v6 the pod must survive for the v6 half.
-func natGatewayWithAddr(ns, name, vpcName, addr string) *sdnv1alpha1.VPCGateway {
+// natGatewayWithAddrs is a gateway already given its eBPF egress identities (v4
+// and/or v6) by the VPCGateway controller. The pod is retired only once every
+// family the VPC has is covered (docs/north-south.md §6a).
+func natGatewayWithAddrs(ns, name, vpcName, v4, v6 string) *sdnv1alpha1.VPCGateway {
 	gw := natGateway(ns, name, vpcName)
 	gw.Spec.PoolRef = sdnv1alpha1.ExternalPoolRef{Name: "pool"}
-	gw.Status.NATAddress = addr
+	gw.Status.NATAddress = v4
+	gw.Status.NATAddress6 = v6
 	return gw
+}
+
+func natGatewayWithAddr(ns, name, vpcName, addr string) *sdnv1alpha1.VPCGateway {
+	return natGatewayWithAddrs(ns, name, vpcName, addr, "")
 }
 
 func gatewayReconciler(c client.Client) *GatewayReconciler {
@@ -224,6 +229,49 @@ func TestGatewayKeptForV6VPCWithNATIdentity(t *testing.T) {
 	}
 	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "cozy-cozyplane", Name: "cozyplane-gateway-100"}, &appsv1.Deployment{}); err != nil {
 		t.Fatalf("a dual-stack VPC must keep its gateway pod for v6 egress (#15), but it was gone: %v", err)
+	}
+}
+
+// v6 VPC NAT (docs/north-south.md §6a): a dual-stack VPC with BOTH a v4 and a v6
+// eBPF identity retires the pod — every family is served in eBPF now.
+func TestGatewayDeletedForDualStackWithBothIdentities(t *testing.T) {
+	scheme := gatewayScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(dualStackVPC("team-a", "vpc-a", 100),
+			natGatewayWithAddrs("team-a", "door", "vpc-a", "203.0.113.5", "2001:db8::5")).
+		Build()
+	r := gatewayReconciler(c)
+
+	key := types.NamespacedName{Namespace: "team-a", Name: "vpc-a"}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	err := c.Get(context.Background(), types.NamespacedName{Namespace: "cozy-cozyplane", Name: "cozyplane-gateway-100"}, &appsv1.Deployment{})
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("a dual-stack VPC with both eBPF identities must have no pod, got %v", err)
+	}
+}
+
+// A pure-v6 VPC with its own v6 identity also retires the pod.
+func TestGatewayDeletedForV6VPCWithV6Identity(t *testing.T) {
+	scheme := gatewayScheme(t)
+	v6vpc := &sdnv1alpha1.VPC{
+		ObjectMeta: metav1.ObjectMeta{Name: "vpc-a", Namespace: "team-a"},
+		Spec:       sdnv1alpha1.VPCSpec{CIDRs: []string{"fd00:10::/64"}},
+		Status:     sdnv1alpha1.VPCStatus{VNI: 100},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(v6vpc, natGatewayWithAddrs("team-a", "door", "vpc-a", "", "2001:db8::5")).
+		Build()
+	r := gatewayReconciler(c)
+
+	key := types.NamespacedName{Namespace: "team-a", Name: "vpc-a"}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	err := c.Get(context.Background(), types.NamespacedName{Namespace: "cozy-cozyplane", Name: "cozyplane-gateway-100"}, &appsv1.Deployment{})
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("a v6 VPC with its v6 eBPF identity must have no pod, got %v", err)
 	}
 }
 

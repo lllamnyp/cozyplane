@@ -89,18 +89,19 @@ func (r *VPCGatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// The VPC's egress identity: an address of its OWN, from its own pool. Without
 	// one, its traffic is SNATed to the node's address and the tenant is
 	// indistinguishable from the platform on the wire (docs/north-south.md, tenet 8).
-	natAddr := ""
+	natAddr, natAddr6 := "", ""
 	if exclusive && poolOK && gw.Spec.NAT.Enabled && gw.Spec.PoolRef.Name != "" {
-		a, err := r.ensureNATAddress(ctx, gw, vpc)
+		v4, v6, err := r.ensureNATAddress(ctx, gw, vpc)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		natAddr = a
+		natAddr, natAddr6 = v4, v6
 	}
 
 	status := sdnv1alpha1.VPCGatewayStatus{
-		Phase:      sdnv1alpha1.VPCGatewayPhasePending,
-		NATAddress: natAddr,
+		Phase:       sdnv1alpha1.VPCGatewayPhasePending,
+		NATAddress:  natAddr,
+		NATAddress6: natAddr6,
 	}
 	setGWCondition(&status, sdnv1alpha1.VPCGatewayConditionVPCResolved, vpcOK,
 		"VPCResolved", "spec.vpcRef names a VPC in this namespace")
@@ -170,20 +171,22 @@ func (r *VPCGatewayReconciler) conflictingGateway(ctx context.Context, gw *sdnv1
 // gets "" here and keeps the gateway pod for its v6 egress until v6 VPC NAT lands
 // (docs/north-south.md §6a, #15). Handing a v6 VPC a v4 identity would delete its
 // pod and black-hole its v6 traffic — the regression this guards against.
-func (r *VPCGatewayReconciler) ensureNATAddress(ctx context.Context, gw *sdnv1alpha1.VPCGateway, vpc *sdnv1alpha1.VPC) (string, error) {
-	if !cidrsHaveV4(vpc.Spec.CIDRs) {
-		return "", nil
+func (r *VPCGatewayReconciler) ensureNATAddress(ctx context.Context, gw *sdnv1alpha1.VPCGateway, vpc *sdnv1alpha1.VPC) (v4, v6 string, err error) {
+	haveV4, haveV6 := cidrsHaveV4(vpc.Spec.CIDRs), cidrsHaveV6(vpc.Spec.CIDRs)
+	if !haveV4 && !haveV6 {
+		return "", "", nil
 	}
 	pool := &sdnv1alpha1.ExternalPool{}
 	if err := r.Get(ctx, types.NamespacedName{Name: gw.Spec.PoolRef.Name}, pool); err != nil {
-		return "", nil
+		return "", "", nil
 	}
-	poolV4 := cidrsV4(pool.Spec.CIDRs)
 
+	// Every address in flight, across both families: FloatingIPs and other
+	// gateways' NAT identities all draw from the same pools, so no two may collide.
 	used := map[string]bool{}
 	var fips sdnv1alpha1.FloatingIPList
 	if err := r.List(ctx, &fips); err != nil {
-		return "", fmt.Errorf("list floatingips: %w", err)
+		return "", "", fmt.Errorf("list floatingips: %w", err)
 	}
 	for i := range fips.Items {
 		if a := fips.Items[i].Status.Address; a != "" {
@@ -192,23 +195,34 @@ func (r *VPCGatewayReconciler) ensureNATAddress(ctx context.Context, gw *sdnv1al
 	}
 	var gws sdnv1alpha1.VPCGatewayList
 	if err := r.List(ctx, &gws); err != nil {
-		return "", fmt.Errorf("list vpcgateways: %w", err)
+		return "", "", fmt.Errorf("list vpcgateways: %w", err)
 	}
 	for i := range gws.Items {
 		g := &gws.Items[i]
 		if g.Namespace == gw.Namespace && g.Name == gw.Name {
 			continue
 		}
-		if a := g.Status.NATAddress; a != "" {
-			used[a] = true
+		for _, a := range []string{g.Status.NATAddress, g.Status.NATAddress6} {
+			if a != "" {
+				used[a] = true
+			}
 		}
 	}
 
-	// Sticky: a VPC's egress identity should not move under its live flows.
-	if cur := gw.Status.NATAddress; cur != "" && addrInCIDRs(poolV4, cur) && !used[cur] {
-		return cur, nil
+	// One family's identity: sticky (do not move under live flows) if the current
+	// address is still a valid, free pool address of that family; else the lowest free.
+	pick := func(want bool, cur string, cidrs []string) string {
+		if !want {
+			return ""
+		}
+		if cur != "" && addrInCIDRs(cidrs, cur) && !used[cur] {
+			return cur
+		}
+		return firstFreeAddress(cidrs, used)
 	}
-	return firstFreeAddress(poolV4, used), nil
+	v4 = pick(haveV4, gw.Status.NATAddress, cidrsV4(pool.Spec.CIDRs))
+	v6 = pick(haveV6, gw.Status.NATAddress6, cidrsV6(pool.Spec.CIDRs))
+	return v4, v6, nil
 }
 
 func setGWCondition(status *sdnv1alpha1.VPCGatewayStatus, condType string, ok bool, reason, msg string) {

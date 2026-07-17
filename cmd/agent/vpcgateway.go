@@ -76,14 +76,14 @@ func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFa
 			log.Error("read vpc_nat map", "err", err)
 			return
 		}
-		for vni, addr := range wantNAT {
+		for vni, id := range wantNAT {
 			if selfShard >= 0 {
 				base, span, ok := datapath.NATShardFor(selfShard)
 				if !ok {
 					log.Warn("more nodes than NAT port shards; this node cannot NAT",
 						"node", selfName, "index", selfShard, "shards", datapath.NATShards)
-				} else if err := mgr.SetVPCNAT(vni, addr, base, span); err != nil {
-					log.Error("set vpc nat", "vni", vni, "addr", addr, "err", err)
+				} else if err := mgr.SetVPCNAT(vni, id.V4, id.V6, base, span); err != nil {
+					log.Error("set vpc nat", "vni", vni, "v4", id.V4, "v6", id.V6, "err", err)
 					continue
 				}
 			}
@@ -104,8 +104,16 @@ func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFa
 				if ip == nil {
 					continue
 				}
-				if err := mgr.SetNATOwner(addr, uint16(i), ip); err != nil {
-					log.Error("set nat owner", "addr", addr, "shard", i, "err", err)
+				// One shard table per family: a reply arrives addressed to the v4
+				// or the v6 identity, and each demuxes through nat_owner by its own
+				// address.
+				for _, addr := range []string{id.V4, id.V6} {
+					if addr == "" {
+						continue
+					}
+					if err := mgr.SetNATOwner(addr, uint16(i), ip); err != nil {
+						log.Error("set nat owner", "addr", addr, "shard", i, "err", err)
+					}
 				}
 			}
 			// Nothing here ATTRACTS the address (docs/north-south.md, tenet 3):
@@ -113,20 +121,24 @@ func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFa
 			// static route, an address configured on a node. Whichever node it
 			// lands on, from_uplink un-NATs the reply or forwards it to the node
 			// whose shard owns the flow, so delivery does not care.
-			if curNAT[vni] != addr {
-				log.Info("VPC egresses as its own address", "vni", vni, "nat", addr)
+			if curNAT[vni] != id {
+				log.Info("VPC egresses as its own address", "vni", vni, "v4", id.V4, "v6", id.V6)
 			}
 		}
-		for vni, addr := range curNAT {
+		for vni, id := range curNAT {
 			if _, ok := wantNAT[vni]; !ok {
-				if err := mgr.DelVPCNAT(vni, addr); err != nil {
+				if err := mgr.DelVPCNAT(vni, id.V4, id.V6); err != nil {
 					log.Error("del vpc nat", "vni", vni, "err", err)
 					continue
 				}
 				for i := range datapath.NATShards {
-					_ = mgr.DelNATOwner(addr, uint16(i))
+					for _, addr := range []string{id.V4, id.V6} {
+						if addr != "" {
+							_ = mgr.DelNATOwner(addr, uint16(i))
+						}
+					}
 				}
-				log.Info("VPC lost its egress identity", "vni", vni, "nat", addr)
+				log.Info("VPC lost its egress identity", "vni", vni, "v4", id.V4, "v6", id.V6)
 			}
 		}
 
@@ -197,20 +209,21 @@ func desiredVPCIngress(gws []*sdnv1alpha1.VPCGateway, vpcs []*sdnv1alpha1.VPC) m
 }
 
 // desiredVPCNAT is the set of VNIs with an allocated egress identity, keyed to the
-// address their traffic wears on the wire. A VPC's boundary is its OLDEST gateway.
-func desiredVPCNAT(gws []*sdnv1alpha1.VPCGateway, vpcs []*sdnv1alpha1.VPC) map[uint32]string {
+// address(es) their traffic wears on the wire — a v4 and/or a v6 (docs/north-south.md
+// §6a). A VPC's boundary is its OLDEST gateway.
+func desiredVPCNAT(gws []*sdnv1alpha1.VPCGateway, vpcs []*sdnv1alpha1.VPC) map[uint32]datapath.NATIdentity {
 	byNS := map[string][]sdnv1alpha1.VPCGateway{}
 	for _, g := range gws {
 		byNS[g.Namespace] = append(byNS[g.Namespace], *g)
 	}
-	out := map[uint32]string{}
+	out := map[uint32]datapath.NATIdentity{}
 	for _, vpc := range vpcs {
 		if vpc.Status.VNI == 0 {
 			continue
 		}
 		gw := sdnv1alpha1.EffectiveGateway(byNS[vpc.Namespace], vpc.Name)
-		if gw != nil && gw.Spec.NAT.Enabled && gw.Status.NATAddress != "" {
-			out[uint32(vpc.Status.VNI)] = gw.Status.NATAddress
+		if gw != nil && gw.Spec.NAT.Enabled && (gw.Status.NATAddress != "" || gw.Status.NATAddress6 != "") {
+			out[uint32(vpc.Status.VNI)] = datapath.NATIdentity{V4: gw.Status.NATAddress, V6: gw.Status.NATAddress6}
 		}
 	}
 	return out

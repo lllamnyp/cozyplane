@@ -167,29 +167,51 @@ not be in a CNI.
   from the other end. It works, which is why it survived this long.
 - **Hairpinning north-south through a gateway pod** — tenet 1.
 
-## 6a. v6 VPC egress: the black-hole (fixed) and the identity gap (open) ([#15](../../issues/15))
+## 6a. v6 VPC NAT — a per-family egress identity ([#15](../../issues/15))
 
-**Increment 2's NAT is v4-only** (`vpc_nat_snat` opens with `if (p->is_v6) return
-NAT_MISS`). The regression was that the gateway controller deleted the gateway pod as
-soon as `status.natAddress` was set — and the pod is the *only* v6 egress path — while
+Increment 2's NAT was v4-only, and that produced first a regression, then this feature.
+
+**The regression (fixed).** The gateway controller deleted the gateway pod as soon as
+`status.natAddress` was set — and the pod was the *only* v6 egress path — while
 `ensureNATAddress` was family-blind and could even hand a v6 VPC a v4 address. So a v6
 or dual-stack VPC with a **pooled** gateway lost v6 egress entirely: the packet skipped
-the eBPF NAT, fell to the isolation block, reached the gateway path, found no
-`gateways[vni]` entry, and dropped. Dual-stack hid it — v4 kept working, so the VPC
-looked healthy.
+the v4-only eBPF NAT, fell to the isolation block, found no `gateways[vni]` entry, and
+dropped. Dual-stack hid it — v4 kept working, so the VPC looked healthy.
 
-**Fixed** (unit-tested + dev4-validated): `ensureNATAddress` allocates a **v4** address (the only kind
-`vpc_nat_snat` can wear) and only for a VPC that has a v4 CIDR; the pod is kept whenever
-the VPC has a v6 CIDR. It composes because `from_pod` tries `vpc_nat_snat` **before** the
-isolation/gateway branch — on a dual-stack VPC, v4 takes the eBPF NAT and never reaches
-the pod, v6 falls through to it.
+**The feature: v6 gets its own identity, symmetric with v4.** A VPC now wears a v4
+address for its v4 egress *and* a v6 address for its v6 egress — **one boundary, two
+addresses**. The reserved "asymmetry" is resolved by treating the families identically:
 
-**But the fix only restores the status quo, it does not satisfy tenet 8.** A v6/dual-stack
-VPC keeps its pod, and its v6 egress still launders into the node's address. Giving v6 its
-**own** egress identity — the v6 twin of `vpc_nat_snat` — is **v6 VPC NAT**, and it is the
-prerequisite for retiring `cmd/gateway` (the pod is the only v6 egress path in the tree).
-That is the reserved design, not a mechanical port: whether and how v6 gets a per-VPC
-identity is an operator call. See the roadmap.
+- **`vpc_nat` holds both** — `struct vpc_nat { ip; ip6; port_base; port_span }`, one
+  entry per VPC. `nat_of` (addr → net) and `nat_owner` ({addr, shard} → node) were
+  already `addr128`-keyed, so the whole reverse path is family-agnostic as-is. The
+  **port shards are shared**: a v4 and a v6 flow can hold the same gw_port because the
+  ct tables are `addr128`-keyed and the reverse demux keys on the NAT address's family
+  — exactly how the v4/v6 cluster masquerade already shares `MASQ_PORT_BASE`.
+- **`vpc_nat_snat6` / `vpc_nat_reverse6`** mirror the v4 twins on the v6 path: SNAT the
+  pod's source to the VPC's v6 address at `from_pod`, un-NAT (or shard-forward) the
+  reply at `from_uplink` / `from_overlay`.
+- **Allocation is per family.** `ensureNATAddress` draws a v4 address for a VPC with a
+  v4 CIDR *and* a v6 address for one with a v6 CIDR, each from the pool's matching
+  family — into `status.natAddress` and `status.natAddress6`.
+- **The pod is retired once every family the VPC has is served in eBPF.** A family the
+  pool cannot cover (e.g. a v6 VPC with a v4-only pool) keeps the pod for that family;
+  a fully-covered VPC has no pod at all. This *is* the tenet-8 goal, now reached for
+  both families: no laundering, no per-VPC SPOF.
+
+**It composes with the fix**: `from_pod` tries `vpc_nat_snat6` **before** the
+isolation/gateway branch, so a covered v6 family never reaches the pod; an uncovered
+one falls through to it exactly as before.
+
+**The prerequisite this unblocks:** with v6 no longer dependent on the pod once its
+pool covers it, retiring `cmd/gateway` (roadmap item 7) reduces to requiring a
+pool that covers every family a VPC uses.
+
+> **Validation ceiling.** The full path needs a v6 *uplink* to reach the v6 internet,
+> which a v4-only cluster (the dev cluster) does not have — so end-to-end v6 egress is
+> validated only where a v6 fabric exists. On a v4-only cluster the controller
+> allocation, the pod retirement, the map programming, and the **verifier load of the
+> new datapath** are the coverage.
 
 ## 7. Open questions
 

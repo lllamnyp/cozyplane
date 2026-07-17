@@ -44,33 +44,66 @@ func NATShardFor(nodeIndex int) (base, span uint32, ok bool) {
 	return NATPortBase + uint32(nodeIndex)*NATShardSpan, NATShardSpan, true
 }
 
-// SetVPCNAT gives a VPC its egress identity on THIS node: the address its traffic
-// wears on the wire, and this node's slice of the port space.
-func (m *Manager) SetVPCNAT(net_ uint32, natIP string, portBase, portSpan uint32) error {
-	ip, err := addr128Str(natIP)
-	if err != nil {
-		return fmt.Errorf("nat address: %w", err)
+// NATIdentity is a VPC's egress addresses, one per family. Either may be empty:
+// a VPC egresses each family it has for which the pool could provide an address,
+// and keeps the gateway pod for a family that has none (docs/north-south.md §6a).
+type NATIdentity struct {
+	V4, V6 string
+}
+
+// optAddr128 parses an address, or returns a zero addr128 for "" — a family the VPC
+// does not egress in eBPF. The datapath reads a zero ip6 as "no v6 identity".
+func optAddr128(s string) (overlayAddr128, error) {
+	if s == "" {
+		return overlayAddr128{}, nil
 	}
-	v := overlayVpcNat{Ip: ip, PortBase: portBase, PortSpan: portSpan}
+	return addr128Str(s)
+}
+
+// SetVPCNAT gives a VPC its egress identity on THIS node: the address(es) its
+// traffic wears on the wire (a v4 and/or a v6), and this node's slice of the port
+// space (shared across families).
+func (m *Manager) SetVPCNAT(net_ uint32, natIP4, natIP6 string, portBase, portSpan uint32) error {
+	ip4, err := optAddr128(natIP4)
+	if err != nil {
+		return fmt.Errorf("nat v4 address: %w", err)
+	}
+	ip6, err := optAddr128(natIP6)
+	if err != nil {
+		return fmt.Errorf("nat v6 address: %w", err)
+	}
+	v := overlayVpcNat{Ip: ip4, Ip6: ip6, PortBase: portBase, PortSpan: portSpan}
 	if err := m.objs.VpcNat.Put(net_, &v); err != nil {
 		return fmt.Errorf("set vpc_nat for net %d: %w", net_, err)
 	}
-	// And the reverse direction's first question: whose address is this?
-	if err := m.objs.NatOf.Put(&ip, net_); err != nil {
-		return fmt.Errorf("set nat_of for %s: %w", natIP, err)
+	// The reverse direction's first question: whose address is this? One entry per
+	// family, since a reply arrives addressed to one of them.
+	for _, ip := range []struct {
+		a  overlayAddr128
+		on bool
+	}{{ip4, natIP4 != ""}, {ip6, natIP6 != ""}} {
+		if !ip.on {
+			continue
+		}
+		if err := m.objs.NatOf.Put(&ip.a, net_); err != nil {
+			return fmt.Errorf("set nat_of for net %d: %w", net_, err)
+		}
 	}
 	return nil
 }
 
-// DelVPCNAT removes a VPC's egress identity (idempotent).
-func (m *Manager) DelVPCNAT(net_ uint32, natIP string) error {
+// DelVPCNAT removes a VPC's egress identity, both families (idempotent).
+func (m *Manager) DelVPCNAT(net_ uint32, natIP4, natIP6 string) error {
 	if err := m.objs.VpcNat.Delete(net_); err != nil && !isNotExist(err) {
 		return fmt.Errorf("del vpc_nat for net %d: %w", net_, err)
 	}
-	if natIP != "" {
-		if ip, err := addr128Str(natIP); err == nil {
+	for _, s := range []string{natIP4, natIP6} {
+		if s == "" {
+			continue
+		}
+		if ip, err := addr128Str(s); err == nil {
 			if err := m.objs.NatOf.Delete(&ip); err != nil && !isNotExist(err) {
-				return fmt.Errorf("del nat_of for %s: %w", natIP, err)
+				return fmt.Errorf("del nat_of for %s: %w", s, err)
 			}
 		}
 	}
@@ -121,14 +154,23 @@ func (m *Manager) DelNATOwner(natIP string, shard uint16) error {
 	return nil
 }
 
-// VPCNATs returns the nets that currently have an egress identity here.
-func (m *Manager) VPCNATs() (map[uint32]string, error) {
-	out := map[uint32]string{}
+// VPCNATs returns the nets that currently have an egress identity here, both
+// families, so the agent can diff against the desired state.
+func (m *Manager) VPCNATs() (map[uint32]NATIdentity, error) {
+	out := map[uint32]NATIdentity{}
 	var net_ uint32
 	var v overlayVpcNat
+	zero := overlayAddr128{}
 	it := m.objs.VpcNat.Iterate()
 	for it.Next(&net_, &v) {
-		out[net_] = addr128ToIP(v.Ip).String()
+		id := NATIdentity{}
+		if v.Ip != zero {
+			id.V4 = addr128ToIP(v.Ip).String()
+		}
+		if v.Ip6 != zero {
+			id.V6 = addr128ToIP(v.Ip6).String()
+		}
+		out[net_] = id
 	}
 	return out, it.Err()
 }

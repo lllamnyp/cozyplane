@@ -96,13 +96,20 @@ type VPCGatewaySpec struct {
 
 // VPCGatewayStatus is the observed state of a VPCGateway.
 type VPCGatewayStatus struct {
-	// NATAddress is the address this VPC's egress wears on the wire — allocated
-	// from spec.poolRef, and the tenant's OWN identity. Without it a VPC's traffic
-	// is SNATed to the node's address and is indistinguishable from the platform's
-	// (docs/north-south.md, tenet 8). Empty means no NAT identity: the VPC has no
-	// pool, and its egress falls back to the legacy gateway pod.
+	// NATAddress is the v4 address this VPC's v4 egress wears on the wire —
+	// allocated from spec.poolRef, and the tenant's OWN identity. Without it a VPC's
+	// v4 traffic is SNATed to the node's address and is indistinguishable from the
+	// platform's (docs/north-south.md, tenet 8). Empty means the VPC has no v4 CIDR,
+	// or the pool has no v4 range; its v4 egress (if any) falls back to the pod.
 	// +optional
 	NATAddress string `json:"natAddress,omitempty"`
+
+	// NATAddress6 is the v6 counterpart: the address this VPC's v6 egress wears
+	// (docs/north-south.md §6a). Each family gets its own eBPF identity when the
+	// pool can provide it; a family with none keeps the gateway pod. The pod is
+	// retired only once every family the VPC has is served in eBPF.
+	// +optional
+	NATAddress6 string `json:"natAddress6,omitempty"`
 
 	// Phase is the lifecycle phase.
 	// +optional

@@ -324,12 +324,22 @@ func cidrsHaveV6(cidrs []string) bool {
 	return false
 }
 
-// cidrsV4 keeps only the v4 CIDRs, so the eBPF NAT identity is drawn from an
-// address family vpc_nat_snat can actually use.
+// cidrsV4 / cidrsV6 keep only one family's CIDRs, so a NAT identity is drawn from
+// an address family the matching eBPF SNAT (vpc_nat_snat / vpc_nat_snat6) can use.
 func cidrsV4(cidrs []string) []string {
 	out := make([]string, 0, len(cidrs))
 	for _, c := range cidrs {
 		if p, err := netip.ParsePrefix(c); err == nil && p.Addr().Is4() {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func cidrsV6(cidrs []string) []string {
+	out := make([]string, 0, len(cidrs))
+	for _, c := range cidrs {
+		if p, err := netip.ParsePrefix(c); err == nil && p.Addr().Is6() && !p.Addr().Is4In6() {
 			out = append(out, c)
 		}
 	}

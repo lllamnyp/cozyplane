@@ -265,7 +265,7 @@ func schema_cozyplane_api_sdn_v1alpha1_ExternalPoolSpec(ref common.ReferenceCall
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "ExternalPoolSpec is the specification of a pool of externally-routable addresses that FloatingIPs are allocated from.",
+				Description: "ExternalPoolSpec is the specification of a pool of externally-routable addresses that FloatingIPs are allocated from. DEPRECATED — on its way out (docs/north-south.md §9).\n\nAn ExternalPool is a hand-written list of CIDRs that NOTHING ROUTES. Cozyplane allocates addresses out of it (firstFreeAddress, for both a VPCGateway's NAT identity and every FloatingIP) and nothing attracts what it allocates: tenet 3 (\"the CNI does not announce\") was only half-applied — we deleted the announcer and kept the allocator. An address that is allocated but not attracted exists in etcd and nowhere on the wire.\n\nThe replacement is a platform-allocated, platform-ATTRACTED claim (a PublicIPClaim), referenced instead of a pool. The `attach` verb's grant moves onto the claim — it must, since a bare Service would let anyone who can create a Service mint a public address.\n\nDo not build new surface on this type.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"cidrs": {
@@ -2182,7 +2182,14 @@ func schema_cozyplane_api_sdn_v1alpha1_VPCGatewayStatus(ref common.ReferenceCall
 				Properties: map[string]spec.Schema{
 					"natAddress": {
 						SchemaProps: spec.SchemaProps{
-							Description: "NATAddress is the address this VPC's egress wears on the wire — allocated from spec.poolRef, and the tenant's OWN identity. Without it a VPC's traffic is SNATed to the node's address and is indistinguishable from the platform's (docs/north-south.md, tenet 8). Empty means no NAT identity: the VPC has no pool, and its egress falls back to the legacy gateway pod.",
+							Description: "NATAddress is the v4 address this VPC's v4 egress wears on the wire — allocated from spec.poolRef, and the tenant's OWN identity. Without it a VPC's v4 traffic is SNATed to the node's address and is indistinguishable from the platform's (docs/north-south.md, tenet 8). Empty means the VPC has no v4 CIDR, or the pool has no v4 range; its v4 egress (if any) falls back to the pod.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"natAddress6": {
+						SchemaProps: spec.SchemaProps{
+							Description: "NATAddress6 is the v6 counterpart: the address this VPC's v6 egress wears (docs/north-south.md §6a). Each family gets its own eBPF identity when the pool can provide it; a family with none keeps the gateway pod. The pod is retired only once every family the VPC has is served in eBPF.",
 							Type:        []string{"string"},
 							Format:      "",
 						},

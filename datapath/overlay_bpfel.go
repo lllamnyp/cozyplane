@@ -311,6 +311,7 @@ type overlayVpcCounter struct {
 type overlayVpcNat struct {
 	_        structs.HostLayout
 	Ip       overlayAddr128
+	Ip6      overlayAddr128
 	PortBase uint32
 	PortSpan uint32
 }

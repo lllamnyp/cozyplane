@@ -91,19 +91,20 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if gw == nil || !gw.Spec.NAT.Enabled {
 		return ctrl.Result{}, r.deleteGateways(ctx, vpc.Namespace, vpc.Name)
 	}
-	// A gateway with a NAT identity has its v4 egress realized in eBPF — SNAT at
-	// the pod's own veth, straight out the uplink (docs/north-south.md § increment
-	// 2). No pod for that: no hairpin, no per-VPC SPOF, and the tenant's v4 traffic
-	// wears its own address instead of the node's.
+	// A gateway realizes each family's egress in eBPF (vpc_nat_snat / vpc_nat_snat6)
+	// when the pool could give that family an address — SNAT at the pod's own veth,
+	// no pod, no hairpin, no per-VPC SPOF, the tenant's own identity on the wire
+	// (docs/north-south.md §6a). The gateway pod survives ONLY as the fallback for a
+	// family with no eBPF identity: a VPC family the pool cannot serve.
 	//
-	// But vpc_nat_snat is v4-only, so a VPC with a v6 CIDR still needs the gateway
-	// pod for its v6 egress until v6 VPC NAT lands (docs/north-south.md §6a, #15).
-	// This composes: from_pod tries vpc_nat_snat BEFORE the isolation/gateway
-	// branch, so on a dual-stack VPC v4 takes the eBPF NAT and never reaches the
-	// pod, while v6 falls through to it. Delete the pod only for a pure-v4 VPC that
-	// has its eBPF identity; keep it whenever the VPC has v6 (or has no identity,
-	// the pool-less fallback above).
-	if gw.Status.NATAddress != "" && !cidrsHaveV6(vpc.Spec.CIDRs) {
+	// So retire the pod once EVERY family the VPC has is covered in eBPF. This
+	// composes: from_pod tries vpc_nat_snat{,6} BEFORE the isolation/gateway branch,
+	// so a covered family never reaches the pod; an uncovered family falls through
+	// to it. The pool-less case (no identity at all) keeps the pod for both families.
+	v4Covered := !cidrsHaveV4(vpc.Spec.CIDRs) || gw.Status.NATAddress != ""
+	v6Covered := !cidrsHaveV6(vpc.Spec.CIDRs) || gw.Status.NATAddress6 != ""
+	haveIdentity := gw.Status.NATAddress != "" || gw.Status.NATAddress6 != ""
+	if v4Covered && v6Covered && haveIdentity {
 		return ctrl.Result{}, r.deleteGateways(ctx, vpc.Namespace, vpc.Name)
 	}
 	if vpc.Status.VNI == 0 {

@@ -44,8 +44,8 @@ func vpcWithCIDRs(ns, name string, vni int32, cidrs ...string) *sdnv1alpha1.VPC 
 }
 
 // reconcileGatewayAddr runs the VPCGateway controller once and returns the
-// allocated egress identity (status.NATAddress).
-func reconcileGatewayAddr(t *testing.T, objs ...client.Object) string {
+// allocated egress identities (status.NATAddress, status.NATAddress6).
+func reconcileGatewayAddr(t *testing.T, objs ...client.Object) (v4, v6 string) {
 	t.Helper()
 	scheme := gatewayScheme(t)
 	c := fake.NewClientBuilder().WithScheme(scheme).
@@ -61,41 +61,51 @@ func reconcileGatewayAddr(t *testing.T, objs ...client.Object) string {
 	if err := c.Get(context.Background(), key, gw); err != nil {
 		t.Fatalf("get gateway: %v", err)
 	}
-	return gw.Status.NATAddress
+	return gw.Status.NATAddress, gw.Status.NATAddress6
 }
 
-// The eBPF NAT identity is v4, so a v4 VPC draws a v4 address from the pool.
+// A v4 VPC draws a v4 identity and no v6 one.
 func TestNATAddressV4VPC(t *testing.T) {
-	got := reconcileGatewayAddr(t,
+	v4, v6 := reconcileGatewayAddr(t,
 		vpcWithCIDRs("team-a", "vpc-a", 100, "10.10.0.0/24"),
 		pooledGateway("team-a", "door", "vpc-a", "pool"),
 		pool("pool", "203.0.113.0/24"))
-	if got != "203.0.113.0" {
-		t.Errorf("v4 VPC NAT address = %q, want 203.0.113.0", got)
+	if v4 != "203.0.113.0" || v6 != "" {
+		t.Errorf("v4 VPC identity = (%q, %q), want (203.0.113.0, \"\")", v4, v6)
 	}
 }
 
-// #15: a pure-v6 VPC gets NO eBPF identity — vpc_nat_snat cannot serve it — so the
-// gateway pod is kept for its v6 egress. Handing it a v4 address here would delete
-// the pod and black-hole v6.
-func TestNATAddressV6VPCGetsNone(t *testing.T) {
-	got := reconcileGatewayAddr(t,
+// A pure-v6 VPC with a v6 pool now gets its OWN v6 identity — v6 VPC NAT
+// (docs/north-south.md §6a). It no longer launders through the gateway pod.
+func TestNATAddressV6VPCGetsV6(t *testing.T) {
+	v4, v6 := reconcileGatewayAddr(t,
+		vpcWithCIDRs("team-a", "vpc-a", 100, "fd00:10::/64"),
+		pooledGateway("team-a", "door", "vpc-a", "pool"),
+		pool("pool", "2001:db8::/64"))
+	if v4 != "" || v6 != "2001:db8::" {
+		t.Errorf("v6 VPC identity = (%q, %q), want (\"\", 2001:db8::)", v4, v6)
+	}
+}
+
+// A v6 VPC with only a v4 pool gets no identity — the pool cannot serve its family,
+// so it keeps the gateway pod (the #15 safety, preserved).
+func TestNATAddressV6VPCV4PoolGetsNone(t *testing.T) {
+	v4, v6 := reconcileGatewayAddr(t,
 		vpcWithCIDRs("team-a", "vpc-a", 100, "fd00:10::/64"),
 		pooledGateway("team-a", "door", "vpc-a", "pool"),
 		pool("pool", "203.0.113.0/24"))
-	if got != "" {
-		t.Errorf("v6 VPC must get no eBPF NAT identity, got %q", got)
+	if v4 != "" || v6 != "" {
+		t.Errorf("v6 VPC with a v4-only pool must get no identity, got (%q, %q)", v4, v6)
 	}
 }
 
-// A dual-stack VPC draws a v4 identity (for its v4 egress), even when the pool's
-// lowest range is v6 — the identity must be a family vpc_nat_snat can wear.
-func TestNATAddressDualStackDrawsV4(t *testing.T) {
-	got := reconcileGatewayAddr(t,
+// A dual-stack VPC with a dual-family pool draws one identity of EACH family.
+func TestNATAddressDualStackDrawsBoth(t *testing.T) {
+	v4, v6 := reconcileGatewayAddr(t,
 		vpcWithCIDRs("team-a", "vpc-a", 100, "10.10.0.0/24", "fd00:10::/64"),
 		pooledGateway("team-a", "door", "vpc-a", "pool"),
 		pool("pool", "2001:db8::/64", "203.0.113.0/24"))
-	if got != "203.0.113.0" {
-		t.Errorf("dual-stack VPC NAT address = %q, want the v4 203.0.113.0", got)
+	if v4 != "203.0.113.0" || v6 != "2001:db8::" {
+		t.Errorf("dual-stack identity = (%q, %q), want (203.0.113.0, 2001:db8::)", v4, v6)
 	}
 }

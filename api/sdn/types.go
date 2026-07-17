@@ -89,10 +89,12 @@ type VPCGatewaySpec struct {
 
 // VPCGatewayStatus is the observed state of a VPCGateway.
 type VPCGatewayStatus struct {
-	// NATAddress is the VPC's own egress identity, allocated from its pool.
+	// NATAddress is the VPC's own v4 egress identity, allocated from its pool.
 	NATAddress string
-	Phase      VPCGatewayPhase
-	Conditions []metav1.Condition
+	// NATAddress6 is the v6 counterpart (docs/north-south.md §6a).
+	NATAddress6 string
+	Phase       VPCGatewayPhase
+	Conditions  []metav1.Condition
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object

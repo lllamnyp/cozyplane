@@ -33,6 +33,21 @@ package v1alpha1
 // the L2 responder it implied was MetalLB reimplemented inside one.
 // ExternalPoolSpec is the specification of a pool of externally-routable
 // addresses that FloatingIPs are allocated from.
+// DEPRECATED — on its way out (docs/north-south.md §9).
+//
+// An ExternalPool is a hand-written list of CIDRs that NOTHING ROUTES. Cozyplane
+// allocates addresses out of it (firstFreeAddress, for both a VPCGateway's NAT
+// identity and every FloatingIP) and nothing attracts what it allocates: tenet 3
+// ("the CNI does not announce") was only half-applied — we deleted the announcer and
+// kept the allocator. An address that is allocated but not attracted exists in etcd
+// and nowhere on the wire.
+//
+// The replacement is a platform-allocated, platform-ATTRACTED claim (a
+// PublicIPClaim), referenced instead of a pool. The `attach` verb's grant moves onto
+// the claim — it must, since a bare Service would let anyone who can create a Service
+// mint a public address.
+//
+// Do not build new surface on this type.
 type ExternalPoolSpecApplyConfiguration struct {
 	// CIDRs are the address ranges the pool hands out.
 	CIDRs []string `json:"cidrs,omitempty"`

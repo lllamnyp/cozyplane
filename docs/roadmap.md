@@ -37,19 +37,23 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
    `vpc_nat_snat` **before** the isolation block — on a dual-stack VPC, v4 takes the eBPF
    NAT and never reaches the pod, v6 falls through to it. So a v6/dual-stack VPC now keeps
    its pod and **launders its v6 egress into the node's address** (tenet 8) — that is the
-   status quo restored, not the tenet satisfied. Closing that is item 1.
+   status quo restored; **tenet 8 for v6 is now satisfied by item 1 (v6 VPC NAT, below)**.
    Dev4 before/after (same objects, only the controller image rolled): a dual-stack VPC's
    gateway pod went **ABSENT → PRESENT** (v6 path restored) while a pure-v4 VPC's stayed
    absent (eBPF NAT). Still open: a **v6 gateway-egress phase in `vpc-e2e.sh`** (the controller logic is
    unit-tested, but real-cluster v6 egress is only covered by the kind-only, already-broken
    `test/e2e.sh`, item 14) (§3, §8).
-1. **v6 VPC NAT — the reserved design** ([#15](../../issues/15)). The v6 twin of
-   `vpc_nat_snat`, plus a v6 pool/shard story, so a v6 VPC wears **its own** egress
-   identity instead of laundering through the pod (tenet 8, symmetric with v4). **This is
-   the prerequisite for retiring `cmd/gateway`** (item 7): the gateway pod is currently the
-   only v6 VPC egress path in the tree, so "require `poolRef` and delete the pod" cannot
-   happen until this lands. Carries an open design question — the v4/v6 asymmetry — that is
-   an operator call, not a mechanical port (§3, §4).
+1. **[x] v6 VPC NAT — a per-family egress identity** ([#15](../../issues/15); unit-tested;
+   verifier + allocation + pod-retirement checked; end-to-end v6 egress needs a v6-uplink
+   cluster). A VPC now wears a v4 address for its v4 egress **and** a v6 address for its v6
+   egress: `vpc_nat` holds both (`ip`/`ip6`), `vpc_nat_snat6`/`vpc_nat_reverse6` mirror the
+   v4 twins, `ensureNATAddress` allocates per family into `status.natAddress`/`natAddress6`,
+   and the gateway pod is retired once **every** family the VPC has is served in eBPF. The
+   reserved v4/v6 asymmetry is resolved by treating the families identically — a family the
+   pool cannot cover keeps the pod, a fully-covered VPC has none (§3, §6a). **`nat_of` and
+   `nat_owner` were already `addr128`-keyed, so only `vpc_nat` grew a second address and the
+   port shards are shared** (the v4/v6 masquerade precedent). This **unblocks retiring
+   `cmd/gateway`** (item 7): it reduces to requiring a pool that covers every family.
 
 **Features**
 
@@ -104,7 +108,8 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
    for it, and that pod's egress is SNATed to its fabric IP and then re-SNATed by
    the cluster masquerade to the **node's** — precisely the tenet-8 violation
    increment 2 set out to end. `cmd/gateway` and its netns iptables are therefore
-   still in the tree and still reachable. Decide: require `poolRef` when
+   still in the tree and still reachable. **v6 no longer blocks this** (item 1 gave v6 its
+   own eBPF identity), so it reduces to: require `poolRef` when
    `nat.enabled` (and delete `cmd/gateway`, the gateway controller's Deployment
    path, and the last netfilter outside `firewall.go`), or keep the pool-less door
    and say in writing why a tenant may wear the platform's identity. Leaning

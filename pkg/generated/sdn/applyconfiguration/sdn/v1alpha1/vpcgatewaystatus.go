@@ -28,12 +28,17 @@ import (
 //
 // VPCGatewayStatus is the observed state of a VPCGateway.
 type VPCGatewayStatusApplyConfiguration struct {
-	// NATAddress is the address this VPC's egress wears on the wire — allocated
-	// from spec.poolRef, and the tenant's OWN identity. Without it a VPC's traffic
-	// is SNATed to the node's address and is indistinguishable from the platform's
-	// (docs/north-south.md, tenet 8). Empty means no NAT identity: the VPC has no
-	// pool, and its egress falls back to the legacy gateway pod.
+	// NATAddress is the v4 address this VPC's v4 egress wears on the wire —
+	// allocated from spec.poolRef, and the tenant's OWN identity. Without it a VPC's
+	// v4 traffic is SNATed to the node's address and is indistinguishable from the
+	// platform's (docs/north-south.md, tenet 8). Empty means the VPC has no v4 CIDR,
+	// or the pool has no v4 range; its v4 egress (if any) falls back to the pod.
 	NATAddress *string `json:"natAddress,omitempty"`
+	// NATAddress6 is the v6 counterpart: the address this VPC's v6 egress wears
+	// (docs/north-south.md §6a). Each family gets its own eBPF identity when the
+	// pool can provide it; a family with none keeps the gateway pod. The pod is
+	// retired only once every family the VPC has is served in eBPF.
+	NATAddress6 *string `json:"natAddress6,omitempty"`
 	// Phase is the lifecycle phase.
 	Phase *sdnv1alpha1.VPCGatewayPhase `json:"phase,omitempty"`
 	// Conditions is the detailed state.
@@ -51,6 +56,14 @@ func VPCGatewayStatus() *VPCGatewayStatusApplyConfiguration {
 // If called multiple times, the NATAddress field is set to the value of the last call.
 func (b *VPCGatewayStatusApplyConfiguration) WithNATAddress(value string) *VPCGatewayStatusApplyConfiguration {
 	b.NATAddress = &value
+	return b
+}
+
+// WithNATAddress6 sets the NATAddress6 field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the NATAddress6 field is set to the value of the last call.
+func (b *VPCGatewayStatusApplyConfiguration) WithNATAddress6(value string) *VPCGatewayStatusApplyConfiguration {
+	b.NATAddress6 = &value
 	return b
 }
 
