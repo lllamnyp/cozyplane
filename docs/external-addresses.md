@@ -272,7 +272,7 @@ cozyplane's job is a datapath keyed on an address it was handed. Nothing more.
    through it (`from_uplink` DNAT + overlay + reverse SNAT). Inbound and its
    replies work end-to-end; pod-*initiated* egress-as-floating still needs a
    VPCGateway on the VPC (unchanged by this increment).
-2. **[code done] VPCGateway NAT identity → owned Service(s).** The gateway owns one
+2. **[done, dev4-validated] VPCGateway NAT identity → owned Service(s).** The gateway owns one
    `service-proxy-name: cozyplane` `type: LoadBalancer` Service **per family** its VPC has
    (`ipFamilies: [IPv4]`/`[IPv6]`, `SingleStack`, `etp: Cluster`, node-ports off), reads
    each `status.loadBalancer.ingress` into `status.natAddress`/`natAddress6`, and
@@ -282,6 +282,10 @@ cozyplane's job is a datapath keyed on an address it was handed. Nothing more.
    fallback holds: a family with no assigned address keeps the gateway pod.
    `spec.poolRef` deprecated/ignored; the cross-resource used-address de-dup retires
    (MetalLB owns allocation, one Service per address).
+   *dev4 e2e:* a NAT-enabled VPCGateway drew `natAddress` from its owned Service; a VPC
+   pod egressing to an on-VLAN host was seen as that address (SNAT), and the reply
+   round-tripped (HTTP 200) — the self-addressed EndpointSlice made MetalLB advertise
+   it, so `vpc_nat_reverse` could un-NAT the return.
 3. **Delete `ExternalPool`** + the allocator once nothing draws from it.
 4. **Reservation (`addressClaimRef`)** — when `IPAddressClaim` lands: the pin field, the
    claim-owns-the-Service / object-contributes-endpoints binding, the one-Service

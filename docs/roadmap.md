@@ -77,9 +77,9 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
    **The eBPF does not change at all.** Increments: **FloatingIP→Service (done,
    dev4-validated end-to-end: an external OCI VM on the node VLAN reached a VPC pod
    via its FloatingIP, MetalLB allocating + advertising the address off a synthesized
-   EndpointSlice)**, **NAT identity→Service (code done — the VPCGateway owns one
-   `type: LoadBalancer` Service per family, self-addressed ready EndpointSlice so
-   MetalLB advertises even under `etp: Cluster`; the #15 pod fallback holds)**, delete
+   EndpointSlice)**, **NAT identity→Service (done, dev4-validated — a VPC pod egressed
+   as its VPCGateway's owned-Service NAT address and the reply round-tripped via the
+   self-addressed EndpointSlice + `vpc_nat_reverse`; the #15 pod fallback holds)**, delete
    `ExternalPool`, then reservation when the claim lands (§3).
 3. **Public IPs on the default network — supersede cozy-proxy** ([#14](../../issues/14)) —
    **[public-ip.md](public-ip.md)** (design, awaiting review). Cozystack today gives a
