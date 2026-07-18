@@ -30,12 +30,17 @@ type FloatingIPSpecApplyConfiguration struct {
 	VPCRef *LocalVPCRefApplyConfiguration `json:"vpcRef,omitempty"`
 	// Target is the tenant IP within the VPC that the floating address binds to.
 	Target *string `json:"target,omitempty"`
-	// PoolRef selects the ExternalPool to allocate from. Empty selects the
-	// default pool.
+	// LoadBalancerClass selects which load-balancer implementation allocates and
+	// attracts the address (Kubernetes' generic `Service.spec.loadBalancerClass`).
+	// Empty uses the cluster's default. cozyplane allocates nothing itself — it
+	// owns a `Service type: LoadBalancer` and consumes the address that
+	// implementation assigns (docs/external-addresses.md).
+	LoadBalancerClass *string `json:"loadBalancerClass,omitempty"`
+	// PoolRef and Address are DEPRECATED — cozyplane no longer allocates from an
+	// ExternalPool (docs/external-addresses.md). Retained until ExternalPool is
+	// deleted; ignored by the controller.
 	PoolRef *ExternalPoolRefApplyConfiguration `json:"poolRef,omitempty"`
-	// Address optionally requests a specific address from the pool; empty lets
-	// the controller pick a free one.
-	Address *string `json:"address,omitempty"`
+	Address *string                            `json:"address,omitempty"`
 }
 
 // FloatingIPSpecApplyConfiguration constructs a declarative configuration of the FloatingIPSpec type for use with
@@ -57,6 +62,14 @@ func (b *FloatingIPSpecApplyConfiguration) WithVPCRef(value *LocalVPCRefApplyCon
 // If called multiple times, the Target field is set to the value of the last call.
 func (b *FloatingIPSpecApplyConfiguration) WithTarget(value string) *FloatingIPSpecApplyConfiguration {
 	b.Target = &value
+	return b
+}
+
+// WithLoadBalancerClass sets the LoadBalancerClass field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the LoadBalancerClass field is set to the value of the last call.
+func (b *FloatingIPSpecApplyConfiguration) WithLoadBalancerClass(value string) *FloatingIPSpecApplyConfiguration {
+	b.LoadBalancerClass = &value
 	return b
 }
 

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/netip"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,24 +29,25 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
 )
 
-// FloatingIPReconciler allocates an externally-routable address from an
-// ExternalPool to a FloatingIP and surfaces readiness in its status. The address
-// is reserved permanently, but the binding is Ready — and, downstream, the
-// address advertised and programmed — only while the target tenant IP belongs to
-// a live Port (a running pod). Without a live target there is no node to
-// advertise from, so the address stays reserved but silent (TargetLive=False)
-// rather than black-holing traffic. A FloatingIP needs no egress gateway: the
-// datapath maps the address straight to the tenant IP in the eBPF bridge.
+// FloatingIPReconciler gives a FloatingIP an externally-routable address by owning
+// a delegated `Service type: LoadBalancer` — the cluster's LB implementation
+// allocates and attracts the address, every proxy skips its datapath
+// (`service-proxy-name`), and cozyplane consumes `status.loadBalancer.ingress` and
+// programs the floating datapath. cozyplane allocates and attracts nothing
+// (docs/external-addresses.md).
 //
-// Allocation reads committed allocations from other FloatingIPs' status; leader
-// election serializes the writer, so a plain list-and-pick is race-free. A
-// dedicated per-address claim object (à la Port) is a later hardening step.
+// The binding is Ready — and the agent programs the datapath — only while the
+// target tenant IP belongs to a live Port (a running pod); without one the address
+// is held (on the Service) but the binding stays Pending rather than black-holing.
+// The address (via a claim) surviving deletion/reservation is the additive claim
+// layer, not built here.
 type FloatingIPReconciler struct {
 	client.Client
 
@@ -54,10 +56,12 @@ type FloatingIPReconciler struct {
 
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=floatingips,verbs=get;list;watch
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=floatingips/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=sdn.cozystack.io,resources=externalpools,verbs=get;list;watch
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=ports,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 
-// Reconcile allocates an address and computes the FloatingIP's phase/conditions.
+// Reconcile owns the FloatingIP's Service (its allocation+attraction vehicle),
+// reads the address the LB implementation assigned, and computes phase/conditions.
+// cozyplane allocates and attracts nothing (docs/external-addresses.md).
 func (r *FloatingIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -66,51 +70,47 @@ func (r *FloatingIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	pool := r.resolvePool(ctx, fip)
-
-	// The address is advertised from, and delivered to, the node hosting the
-	// target's Port. A live Port means a running pod holds the target IP — so it
-	// is the readiness gate. We never touch the VPC or a gateway.
+	// The address is delivered to the node hosting the target's Port. A live Port
+	// means a running pod holds the target IP — the readiness gate.
 	targetLive := r.targetHasLivePort(ctx, fip)
 
-	// A floating IP is a BIJECTION, and only the forward half of it is keyed by
-	// the public address; the reverse half (floating_egress) is keyed by the
-	// target's {net, VPC IP} alone. So two FloatingIPs on one target do not
-	// coexist — the second overwrites the first's egress entry, and the first
-	// address silently stops working: its client gets a SYN-ACK sourced from the
-	// second address and drops it. Nothing in the datapath can detect this, so the
-	// conflict is refused here. First writer wins (oldest, then by name for a
-	// same-timestamp tie); the loser stays Pending and is never programmed.
+	// A floating IP is a BIJECTION, and only the forward half is keyed by the public
+	// address; the reverse half (floating_egress) is keyed by the target's {net, VPC
+	// IP} alone. So two FloatingIPs on one target do not coexist — the second
+	// overwrites the first's egress entry and the first address silently stops
+	// working. The datapath cannot detect this, so the conflict is refused here.
+	// First writer wins (oldest, then by name); the loser gets no Service and stays
+	// Pending.
 	conflict := r.conflictingFIP(ctx, fip)
 	exclusive := conflict == ""
 
+	// The address comes from a Service this FloatingIP owns: a type: LoadBalancer
+	// carrying service-proxy-name, so every proxy skips its datapath while the
+	// cluster's LB implementation allocates and attracts the address. A losing
+	// binding gets no Service — an address it could never program is a leak.
+	var svc *corev1.Service
+	var err error
+	if exclusive {
+		svc, err = r.ensureService(ctx, fip)
+	} else {
+		err = r.deleteOwnedService(ctx, fip)
+	}
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	address := ingressAddress(svc)
+	addressAssigned := address != ""
+
 	status := sdnv1alpha1.FloatingIPStatus{
 		Phase:   sdnv1alpha1.FloatingIPPhasePending,
-		Address: fip.Status.Address,
+		Address: address,
 	}
 
-	addressAssigned := false
-	switch {
-	case !exclusive:
-		// Do not even allocate: an address held by a binding that can never be
-		// programmed is just a leak.
-		status.Address = ""
-	case pool != nil:
-		addr, err := r.ensureAddress(ctx, fip, pool)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		status.Address = addr
-		addressAssigned = addr != ""
-	default:
-		// Without a resolvable pool the previously-held address is meaningless.
-		status.Address = ""
-	}
-
-	setFIPCondition(&status, sdnv1alpha1.FloatingIPConditionPoolResolved, pool != nil,
-		"PoolResolved", "the referenced (or single default) ExternalPool exists")
+	setFIPCondition(&status, sdnv1alpha1.FloatingIPConditionServiceReady, svc != nil,
+		"ServiceReady", "the owned LoadBalancer Service exists")
 	setFIPCondition(&status, sdnv1alpha1.FloatingIPConditionAddressAssigned, addressAssigned,
-		"AddressAssigned", "an address was allocated from the pool")
+		"AddressAssigned", "the load-balancer implementation assigned an address")
 	setFIPCondition(&status, sdnv1alpha1.FloatingIPConditionTargetLive, targetLive,
 		"TargetLive", "the target tenant IP belongs to a running pod's Port")
 	if exclusive {
@@ -121,7 +121,7 @@ func (r *FloatingIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			"TargetConflict", fmt.Sprintf("FloatingIP %q already binds target %s; a target takes exactly one floating address", conflict, fip.Spec.Target))
 	}
 
-	if pool != nil && addressAssigned && targetLive && exclusive {
+	if svc != nil && addressAssigned && targetLive && exclusive {
 		status.Phase = sdnv1alpha1.FloatingIPPhaseReady
 	}
 
@@ -144,96 +144,98 @@ func (r *FloatingIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	return ctrl.Result{}, nil
 }
 
-// resolvePool returns the ExternalPool this FloatingIP allocates from: the one
-// named in spec.poolRef, or — when unset — the single pool if exactly one
-// exists. Returns nil when the reference is missing or the default is ambiguous.
-// resolvePool returns the ExternalPool this FloatingIP draws from — the pool of
-// its VPC's GATEWAY (docs/north-south.md § increment 3).
-//
-// A floating IP is an EIP: an address on the VPC's boundary, associated with a
-// Port. So it comes out of the boundary's pool, and a VPC with no gateway gets no
-// external address at all — which is tenet 7 ("nothing crosses by default") read
-// from the other side, and it makes the `attach` verb on the pool govern EVERY
-// address a tenant can wear, not just its NAT identity.
-//
-// spec.poolRef still wins when set, for the case of a pool an operator granted
-// directly; but the gateway is the answer when it is not.
-func (r *FloatingIPReconciler) resolvePool(ctx context.Context, fip *sdnv1alpha1.FloatingIP) *sdnv1alpha1.ExternalPool {
-	name := fip.Spec.PoolRef.Name
-	if name == "" {
-		var gws sdnv1alpha1.VPCGatewayList
-		if err := r.List(ctx, &gws, client.InNamespace(fip.Namespace)); err != nil {
-			return nil
-		}
-		gw := sdnv1alpha1.EffectiveGateway(gws.Items, fip.Spec.VPCRef.Name)
-		if gw == nil {
-			return nil // no boundary: no address
-		}
-		name = gw.Spec.PoolRef.Name
-	}
-	if name == "" {
-		return nil
-	}
-	pool := &sdnv1alpha1.ExternalPool{}
-	if err := r.Get(ctx, types.NamespacedName{Name: name}, pool); err != nil {
-		return nil
-	}
-	return pool
-}
+// The labels on a FloatingIP's owned Service (docs/external-addresses.md).
+const (
+	// serviceProxyNameLabel delegates a Service away from the default proxy —
+	// every proxy (kube-proxy, Cilium, cozyplane-kpr) skips a Service that has it.
+	serviceProxyNameLabel = "service.kubernetes.io/service-proxy-name"
+	// serviceProxyNameValue marks a Service whose datapath cozyplane owns. It must
+	// NOT be a name cozyplane-kpr is configured to claim (kpr stays the default
+	// proxy, --k8s-service-proxy-name empty, so it skips this Service).
+	serviceProxyNameValue = "cozyplane"
+	// floatingIPLabel links an owned Service back to its FloatingIP. The Service
+	// uses generateName, so cozyplane finds its own Service by this label.
+	floatingIPLabel = "sdn.cozystack.io/floating-ip"
+)
 
-// ensureAddress returns the address bound to this FloatingIP, allocating one if
-// needed. A valid existing assignment is sticky. A specific spec.address is
-// honoured when in-range and free; otherwise the lowest free address is picked.
-// Returns "" (stay Pending) when nothing is available.
-func (r *FloatingIPReconciler) ensureAddress(ctx context.Context, fip *sdnv1alpha1.FloatingIP, pool *sdnv1alpha1.ExternalPool) (string, error) {
-	used, err := r.usedAddresses(ctx, fip)
-	if err != nil {
-		return "", err
+// ownedService returns the Service this FloatingIP owns (by label + controller
+// owner-ref), or nil if it has none.
+func (r *FloatingIPReconciler) ownedService(ctx context.Context, fip *sdnv1alpha1.FloatingIP) (*corev1.Service, error) {
+	var list corev1.ServiceList
+	if err := r.List(ctx, &list, client.InNamespace(fip.Namespace),
+		client.MatchingLabels{floatingIPLabel: fip.Name}); err != nil {
+		return nil, fmt.Errorf("list floating services: %w", err)
 	}
-
-	// Keep the current assignment if it is still in-range and unclaimed.
-	if cur := fip.Status.Address; cur != "" && addrInCIDRs(pool.Spec.CIDRs, cur) && !used[cur] {
-		return cur, nil
-	}
-	// A specifically requested address, if available.
-	if want := fip.Spec.Address; want != "" {
-		if addrInCIDRs(pool.Spec.CIDRs, want) && !used[want] {
-			return want, nil
-		}
-		return "", nil
-	}
-	return firstFreeAddress(pool.Spec.CIDRs, used), nil
-}
-
-// usedAddresses is the set of addresses currently assigned to other
-// FloatingIPs (cluster-wide — pools are cluster-scoped).
-func (r *FloatingIPReconciler) usedAddresses(ctx context.Context, self *sdnv1alpha1.FloatingIP) (map[string]bool, error) {
-	var list sdnv1alpha1.FloatingIPList
-	if err := r.List(ctx, &list); err != nil {
-		return nil, fmt.Errorf("list floatingips: %w", err)
-	}
-	used := make(map[string]bool, len(list.Items))
 	for i := range list.Items {
-		f := &list.Items[i]
-		if f.Namespace == self.Namespace && f.Name == self.Name {
-			continue
-		}
-		if f.Status.Address != "" {
-			used[f.Status.Address] = true
+		if metav1.IsControlledBy(&list.Items[i], fip) {
+			return &list.Items[i], nil
 		}
 	}
-	// A VPC's NAT identity comes out of the SAME pools (docs/north-south.md), so a
-	// floating address must not be handed an address a gateway already egresses as.
-	var gws sdnv1alpha1.VPCGatewayList
-	if err := r.List(ctx, &gws); err != nil {
-		return nil, fmt.Errorf("list vpcgateways: %w", err)
+	return nil, nil
+}
+
+// ensureService returns the FloatingIP's owned Service, creating it if absent. The
+// Service is the allocation+attraction vehicle only: cozyplane owns the datapath,
+// so it is selectorless and its port is a placeholder. `etp: Cluster` announces the
+// address unconditionally (delivery is node-agnostic — from_uplink is at tc ingress).
+func (r *FloatingIPReconciler) ensureService(ctx context.Context, fip *sdnv1alpha1.FloatingIP) (*corev1.Service, error) {
+	svc, err := r.ownedService(ctx, fip)
+	if err != nil || svc != nil {
+		return svc, err
 	}
-	for i := range gws.Items {
-		if a := gws.Items[i].Status.NATAddress; a != "" {
-			used[a] = true
+	svc = &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: fip.Name + "-",
+			Namespace:    fip.Namespace,
+			Labels: map[string]string{
+				serviceProxyNameLabel: serviceProxyNameValue,
+				floatingIPLabel:       fip.Name,
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Type:                          corev1.ServiceTypeLoadBalancer,
+			ExternalTrafficPolicy:         corev1.ServiceExternalTrafficPolicyCluster,
+			AllocateLoadBalancerNodePorts: new(false),
+			Ports:                         []corev1.ServicePort{{Name: "placeholder", Port: 1, Protocol: corev1.ProtocolTCP}},
+		},
+	}
+	if fip.Spec.LoadBalancerClass != "" {
+		svc.Spec.LoadBalancerClass = new(fip.Spec.LoadBalancerClass)
+	}
+	if err := controllerutil.SetControllerReference(fip, svc, r.Scheme); err != nil {
+		return nil, err
+	}
+	if err := r.Create(ctx, svc); err != nil {
+		return nil, fmt.Errorf("create floating service: %w", err)
+	}
+	return svc, nil
+}
+
+// deleteOwnedService removes the FloatingIP's Service — a losing (non-exclusive)
+// binding must hold no address.
+func (r *FloatingIPReconciler) deleteOwnedService(ctx context.Context, fip *sdnv1alpha1.FloatingIP) error {
+	svc, err := r.ownedService(ctx, fip)
+	if err != nil || svc == nil {
+		return err
+	}
+	if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete floating service: %w", err)
+	}
+	return nil
+}
+
+// ingressAddress returns the address the LB implementation assigned to the Service,
+// or "" if none yet.
+func ingressAddress(svc *corev1.Service) string {
+	if svc == nil {
+		return ""
+	}
+	for _, ing := range svc.Status.LoadBalancer.Ingress {
+		if ing.IP != "" {
+			return ing.IP
 		}
 	}
-	return used, nil
+	return ""
 }
 
 // targetHasLivePort reports whether a Port realizes the FloatingIP's target IP
@@ -395,10 +397,9 @@ func fipStatusEqual(a, b sdnv1alpha1.FloatingIPStatus) bool {
 func (r *FloatingIPReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&sdnv1alpha1.FloatingIP{}).
+		Owns(&corev1.Service{}). // re-reconcile when the owned Service's LB ingress is filled
 		Watches(&sdnv1alpha1.Port{}, handler.EnqueueRequestsFromMapFunc(r.mapPortToFloatingIPs)).
-		Watches(&sdnv1alpha1.ExternalPool{}, handler.EnqueueRequestsFromMapFunc(r.mapPoolToFloatingIPs)).
 		Watches(&sdnv1alpha1.FloatingIP{}, handler.EnqueueRequestsFromMapFunc(r.mapToPendingFloatingIPs)).
-		Watches(&sdnv1alpha1.VPCGateway{}, handler.EnqueueRequestsFromMapFunc(r.mapGatewayToFloatingIPs)).
 		Named("floatingip").
 		Complete(r)
 }
@@ -426,27 +427,6 @@ func (r *FloatingIPReconciler) mapPortToFloatingIPs(ctx context.Context, obj cli
 	return reqs
 }
 
-// mapPoolToFloatingIPs enqueues FloatingIPs that resolve to the changed pool —
-// those naming it explicitly, plus those relying on the single default pool.
-func (r *FloatingIPReconciler) mapPoolToFloatingIPs(ctx context.Context, obj client.Object) []ctrl.Request {
-	pool, ok := obj.(*sdnv1alpha1.ExternalPool)
-	if !ok {
-		return nil
-	}
-	var list sdnv1alpha1.FloatingIPList
-	if err := r.List(ctx, &list); err != nil {
-		return nil
-	}
-	var reqs []ctrl.Request
-	for i := range list.Items {
-		f := &list.Items[i]
-		if f.Spec.PoolRef.Name == "" || f.Spec.PoolRef.Name == pool.Name {
-			reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: f.Namespace, Name: f.Name}})
-		}
-	}
-	return reqs
-}
-
 // mapToPendingFloatingIPs enqueues every not-yet-Ready FloatingIP when any
 // FloatingIP changes: a delete (or an address change) may have freed an address
 // a Pending binding is waiting for.
@@ -463,24 +443,4 @@ func (r *FloatingIPReconciler) mapToPendingFloatingIPs(ctx context.Context, obj 
 		}
 	}
 	return reqs
-}
-
-// mapGatewayToFloatingIPs re-drives a VPC's floating addresses when its boundary
-// changes: the gateway is where their pool comes from.
-func (r *FloatingIPReconciler) mapGatewayToFloatingIPs(ctx context.Context, obj client.Object) []ctrl.Request {
-	gw, ok := obj.(*sdnv1alpha1.VPCGateway)
-	if !ok {
-		return nil
-	}
-	var list sdnv1alpha1.FloatingIPList
-	if err := r.List(ctx, &list, client.InNamespace(gw.Namespace)); err != nil {
-		return nil
-	}
-	var out []ctrl.Request
-	for i := range list.Items {
-		if list.Items[i].Spec.VPCRef.Name == gw.Spec.VPCRef.Name {
-			out = append(out, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(&list.Items[i])})
-		}
-	}
-	return out
 }

@@ -374,12 +374,12 @@ type FloatingIPSpec struct {
 	// Target is the tenant IP within the VPC that the floating address binds to.
 	Target string
 
-	// PoolRef selects the ExternalPool to allocate from. Empty selects the
-	// default pool.
-	PoolRef ExternalPoolRef
+	// LoadBalancerClass selects which LB implementation allocates+attracts the
+	// address (docs/external-addresses.md). Empty = cluster default.
+	LoadBalancerClass string
 
-	// Address optionally requests a specific address from the pool; empty lets
-	// the controller pick a free one.
+	// PoolRef and Address are DEPRECATED (docs/external-addresses.md); ignored.
+	PoolRef ExternalPoolRef
 	Address string
 }
 

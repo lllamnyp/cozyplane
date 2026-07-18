@@ -344,7 +344,7 @@ func schema_cozyplane_api_sdn_v1alpha1_FloatingIP(ref common.ReferenceCallback) 
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "FloatingIP binds an externally-routable address from an ExternalPool to a single workload inside a VPC (the OpenStack floating-IP model). It is the bidirectional counterpart to the egress-only NAT gateway.",
+				Description: "FloatingIP binds an externally-routable address to a single workload inside a VPC (the OpenStack floating-IP model). The address comes from an owned `Service type: LoadBalancer` (docs/external-addresses.md); the FloatingIP is the bidirectional counterpart to the egress-only NAT gateway.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
@@ -458,18 +458,24 @@ func schema_cozyplane_api_sdn_v1alpha1_FloatingIPSpec(ref common.ReferenceCallba
 							Format:      "",
 						},
 					},
+					"loadBalancerClass": {
+						SchemaProps: spec.SchemaProps{
+							Description: "LoadBalancerClass selects which load-balancer implementation allocates and attracts the address (Kubernetes' generic `Service.spec.loadBalancerClass`). Empty uses the cluster's default. cozyplane allocates nothing itself — it owns a `Service type: LoadBalancer` and consumes the address that implementation assigns (docs/external-addresses.md).",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
 					"poolRef": {
 						SchemaProps: spec.SchemaProps{
-							Description: "PoolRef selects the ExternalPool to allocate from. Empty selects the default pool.",
+							Description: "PoolRef and Address are DEPRECATED — cozyplane no longer allocates from an ExternalPool (docs/external-addresses.md). Retained until ExternalPool is deleted; ignored by the controller.",
 							Default:     map[string]interface{}{},
 							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolRef"),
 						},
 					},
 					"address": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Address optionally requests a specific address from the pool; empty lets the controller pick a free one.",
-							Type:        []string{"string"},
-							Format:      "",
+							Type:   []string{"string"},
+							Format: "",
 						},
 					},
 				},

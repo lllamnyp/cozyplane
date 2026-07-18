@@ -25,8 +25,9 @@ import (
 type FloatingIPPhase string
 
 const (
-	// FloatingIPPhasePending means the FloatingIP has no address assigned yet
-	// (pool exhausted, requested address taken, or not yet reconciled).
+	// FloatingIPPhasePending means the FloatingIP has no usable binding yet — the
+	// owned Service has no address, the target has no live Port, or another
+	// FloatingIP already binds the target.
 	FloatingIPPhasePending FloatingIPPhase = "Pending"
 	// FloatingIPPhaseReady means an address is assigned and the binding is
 	// programmed in the datapath.
@@ -35,11 +36,12 @@ const (
 
 // Condition types surfaced in FloatingIP status.
 const (
-	// FloatingIPConditionPoolResolved is True when the referenced (or default)
-	// ExternalPool exists and could be selected.
-	FloatingIPConditionPoolResolved = "PoolResolved"
-	// FloatingIPConditionAddressAssigned is True when an address has been
-	// allocated from the pool to this binding.
+	// FloatingIPConditionServiceReady is True when the owned Service exists (the
+	// allocation+attraction vehicle, docs/external-addresses.md).
+	FloatingIPConditionServiceReady = "ServiceReady"
+	// FloatingIPConditionAddressAssigned is True when the load-balancer
+	// implementation has assigned an address to the owned Service
+	// (status.loadBalancer.ingress).
 	FloatingIPConditionAddressAssigned = "AddressAssigned"
 	// FloatingIPConditionTargetLive is True when the target tenant IP belongs to
 	// a live Port — a running pod on some node. Without a live target the address
@@ -66,13 +68,19 @@ type FloatingIPSpec struct {
 	// Target is the tenant IP within the VPC that the floating address binds to.
 	Target string `json:"target"`
 
-	// PoolRef selects the ExternalPool to allocate from. Empty selects the
-	// default pool.
+	// LoadBalancerClass selects which load-balancer implementation allocates and
+	// attracts the address (Kubernetes' generic `Service.spec.loadBalancerClass`).
+	// Empty uses the cluster's default. cozyplane allocates nothing itself — it
+	// owns a `Service type: LoadBalancer` and consumes the address that
+	// implementation assigns (docs/external-addresses.md).
+	// +optional
+	LoadBalancerClass string `json:"loadBalancerClass,omitempty"`
+
+	// PoolRef and Address are DEPRECATED — cozyplane no longer allocates from an
+	// ExternalPool (docs/external-addresses.md). Retained until ExternalPool is
+	// deleted; ignored by the controller.
 	// +optional
 	PoolRef ExternalPoolRef `json:"poolRef,omitempty"`
-
-	// Address optionally requests a specific address from the pool; empty lets
-	// the controller pick a free one.
 	// +optional
 	Address string `json:"address,omitempty"`
 }
@@ -104,9 +112,10 @@ type FloatingIPStatus struct {
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// FloatingIP binds an externally-routable address from an ExternalPool to a
-// single workload inside a VPC (the OpenStack floating-IP model). It is the
-// bidirectional counterpart to the egress-only NAT gateway.
+// FloatingIP binds an externally-routable address to a single workload inside a
+// VPC (the OpenStack floating-IP model). The address comes from an owned
+// `Service type: LoadBalancer` (docs/external-addresses.md); the FloatingIP is
+// the bidirectional counterpart to the egress-only NAT gateway.
 type FloatingIP struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

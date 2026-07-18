@@ -29,6 +29,13 @@ import (
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
 )
 
+func pool(name string, cidrs ...string) *sdnv1alpha1.ExternalPool {
+	return &sdnv1alpha1.ExternalPool{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec:       sdnv1alpha1.ExternalPoolSpec{CIDRs: cidrs},
+	}
+}
+
 func pooledGateway(ns, name, vpcName, poolName string) *sdnv1alpha1.VPCGateway {
 	gw := natGateway(ns, name, vpcName)
 	gw.Spec.PoolRef = sdnv1alpha1.ExternalPoolRef{Name: poolName}

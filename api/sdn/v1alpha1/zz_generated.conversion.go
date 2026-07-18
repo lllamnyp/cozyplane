@@ -777,6 +777,7 @@ func autoConvert_v1alpha1_FloatingIPSpec_To_sdn_FloatingIPSpec(in *FloatingIPSpe
 		return err
 	}
 	out.Target = in.Target
+	out.LoadBalancerClass = in.LoadBalancerClass
 	if err := Convert_v1alpha1_ExternalPoolRef_To_sdn_ExternalPoolRef(&in.PoolRef, &out.PoolRef, s); err != nil {
 		return err
 	}
@@ -794,6 +795,7 @@ func autoConvert_sdn_FloatingIPSpec_To_v1alpha1_FloatingIPSpec(in *sdn.FloatingI
 		return err
 	}
 	out.Target = in.Target
+	out.LoadBalancerClass = in.LoadBalancerClass
 	if err := Convert_sdn_ExternalPoolRef_To_v1alpha1_ExternalPoolRef(&in.PoolRef, &out.PoolRef, s); err != nil {
 		return err
 	}

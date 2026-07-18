@@ -27,9 +27,10 @@ import (
 // FloatingIPApplyConfiguration represents a declarative configuration of the FloatingIP type for use
 // with apply.
 //
-// FloatingIP binds an externally-routable address from an ExternalPool to a
-// single workload inside a VPC (the OpenStack floating-IP model). It is the
-// bidirectional counterpart to the egress-only NAT gateway.
+// FloatingIP binds an externally-routable address to a single workload inside a
+// VPC (the OpenStack floating-IP model). The address comes from an owned
+// `Service type: LoadBalancer` (docs/external-addresses.md); the FloatingIP is
+// the bidirectional counterpart to the egress-only NAT gateway.
 type FloatingIPApplyConfiguration struct {
 	v1.TypeMetaApplyConfiguration    `json:",inline"`
 	*v1.ObjectMetaApplyConfiguration `json:"metadata,omitempty"`
