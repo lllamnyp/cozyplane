@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -84,6 +85,21 @@ func ownedFloatingService(t *testing.T, c client.Client, ns, fip string) *corev1
 	if err := c.List(context.Background(), &list, client.InNamespace(ns),
 		client.MatchingLabels{floatingIPLabel: fip}); err != nil {
 		t.Fatalf("list services: %v", err)
+	}
+	if len(list.Items) == 0 {
+		return nil
+	}
+	return &list.Items[0]
+}
+
+// ownedEndpointSlice returns the EndpointSlice cozyplane synthesized for a
+// FloatingIP's Service (backs the LB advertisement), or nil.
+func ownedEndpointSlice(t *testing.T, c client.Client, ns, fip string) *discoveryv1.EndpointSlice {
+	t.Helper()
+	var list discoveryv1.EndpointSliceList
+	if err := c.List(context.Background(), &list, client.InNamespace(ns),
+		client.MatchingLabels{floatingIPLabel: fip}); err != nil {
+		t.Fatalf("list endpointslices: %v", err)
 	}
 	if len(list.Items) == 0 {
 		return nil
@@ -204,5 +220,50 @@ func TestFloatingIPConflictLoserGetsNoService(t *testing.T) {
 	}
 	if svc := ownedFloatingService(t, c, "team-a", "web"); svc == nil {
 		t.Error("the winner must own its Service")
+	}
+}
+
+// The owned Service is selectorless, so cozyplane synthesizes its EndpointSlice.
+// MetalLB advertises the address only while a ready endpoint exists, so the
+// endpoint's Ready condition must track the live Port: ready with a live target,
+// not-ready without (address held but dark).
+func TestFloatingIPEndpointSliceTracksLiveness(t *testing.T) {
+	// Live target: one ready endpoint, addressed at the target IP, on its node.
+	c := fipClient(t,
+		livePort("team-a", "vpc-a", "10.0.0.5", "node-1"),
+		floatingIP("team-a", "web", "vpc-a", "10.0.0.5"),
+	)
+	reconcileFIP(t, c, "team-a", "web")
+
+	eps := ownedEndpointSlice(t, c, "team-a", "web")
+	if eps == nil {
+		t.Fatal("no EndpointSlice synthesized for the owned Service")
+	}
+	if eps.Labels[discoveryv1.LabelServiceName] == "" {
+		t.Error("EndpointSlice must carry kubernetes.io/service-name so the LB implementation finds it")
+	}
+	if len(eps.Endpoints) != 1 {
+		t.Fatalf("want exactly one endpoint, got %d", len(eps.Endpoints))
+	}
+	ep := eps.Endpoints[0]
+	if len(ep.Addresses) != 1 || ep.Addresses[0] != "10.0.0.5" {
+		t.Errorf("endpoint addresses = %v, want [10.0.0.5] (the target)", ep.Addresses)
+	}
+	if ep.Conditions.Ready == nil || !*ep.Conditions.Ready {
+		t.Error("endpoint must be Ready while the target Port is live (so MetalLB advertises)")
+	}
+	if ep.NodeName == nil || *ep.NodeName != "node-1" {
+		t.Errorf("endpoint nodeName = %v, want node-1 (the target's node)", ep.NodeName)
+	}
+
+	// No live target: the endpoint must go not-Ready (address held, not advertised).
+	c2 := fipClient(t, floatingIP("team-a", "web", "vpc-a", "10.0.0.5")) // no Port
+	reconcileFIP(t, c2, "team-a", "web")
+	eps2 := ownedEndpointSlice(t, c2, "team-a", "web")
+	if eps2 == nil || len(eps2.Endpoints) != 1 {
+		t.Fatal("expected a single (not-ready) endpoint even without a live target")
+	}
+	if r := eps2.Endpoints[0].Conditions.Ready; r != nil && *r {
+		t.Error("endpoint must be not-Ready without a live target (address held but dark)")
 	}
 }

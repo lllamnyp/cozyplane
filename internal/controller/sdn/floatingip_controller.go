@@ -22,6 +22,7 @@ import (
 	"net/netip"
 
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -58,6 +59,7 @@ type FloatingIPReconciler struct {
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=floatingips/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=ports,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile owns the FloatingIP's Service (its allocation+attraction vehicle),
 // reads the address the LB implementation assigned, and computes phase/conditions.
@@ -71,8 +73,10 @@ func (r *FloatingIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	// The address is delivered to the node hosting the target's Port. A live Port
-	// means a running pod holds the target IP — the readiness gate.
-	targetLive := r.targetHasLivePort(ctx, fip)
+	// means a running pod holds the target IP — the readiness gate. The node also
+	// backs the owned Service's synthesized endpoint (below).
+	targetNode := r.targetLiveNode(ctx, fip)
+	targetLive := targetNode != ""
 
 	// A floating IP is a BIJECTION, and only the forward half is keyed by the public
 	// address; the reverse half (floating_egress) is keyed by the target's {net, VPC
@@ -92,8 +96,17 @@ func (r *FloatingIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	var err error
 	if exclusive {
 		svc, err = r.ensureService(ctx, fip)
+		// The LB implementation announces the address only while the owned Service
+		// has a ready endpoint (MetalLB gates L2/BGP advertisement on endpoints —
+		// verified on dev4). The Service is selectorless, so cozyplane synthesizes
+		// one endpoint, ready iff the target Port is live: this makes announcement
+		// track liveness (address held but dark when the target is gone), matching
+		// the datapath, which only delivers to a live target.
+		if err == nil && svc != nil {
+			err = r.ensureEndpointSlice(ctx, svc, fip, targetNode)
+		}
 	} else {
-		err = r.deleteOwnedService(ctx, fip)
+		err = r.deleteOwnedService(ctx, fip) // its owned EndpointSlice cascades with it
 	}
 	if err != nil {
 		return ctrl.Result{}, err
@@ -224,6 +237,86 @@ func (r *FloatingIPReconciler) deleteOwnedService(ctx context.Context, fip *sdnv
 	return nil
 }
 
+// ensureEndpointSlice reconciles the single EndpointSlice that backs the owned
+// (selectorless) Service. The endpoint exists only to trigger the LB
+// implementation's advertisement — MetalLB (and BGP peers generally) advertise a
+// LoadBalancer address only while the Service has a ready endpoint; delivery
+// itself is cozyplane's eBPF datapath, not this endpoint (every proxy skips the
+// Service via service-proxy-name). The endpoint's address is the target tenant IP
+// and its Ready condition tracks the live Port: no live target ⇒ not Ready ⇒ the
+// address is allocated but not advertised (held but dark). nodeName carries the
+// target's node so a future externalTrafficPolicy: Local can pin advertisement to
+// it (source-IP preservation). The slice is owner-ref'd to the Service, so it is
+// garbage-collected when the Service is (loser path, or FloatingIP deletion).
+func (r *FloatingIPReconciler) ensureEndpointSlice(ctx context.Context, svc *corev1.Service, fip *sdnv1alpha1.FloatingIP, node string) error {
+	addr, err := netip.ParseAddr(fip.Spec.Target)
+	if err != nil {
+		// An unparseable target cannot back an endpoint; leave none (the address
+		// stays dark) rather than write an invalid slice.
+		return nil
+	}
+	addrType := discoveryv1.AddressTypeIPv4
+	if addr.Is6() && !addr.Is4In6() {
+		addrType = discoveryv1.AddressTypeIPv6
+	}
+
+	ep := discoveryv1.Endpoint{
+		Addresses:  []string{fip.Spec.Target},
+		Conditions: discoveryv1.EndpointConditions{Ready: new(node != "")},
+	}
+	if node != "" {
+		ep.NodeName = new(node)
+	}
+	desiredPorts := []discoveryv1.EndpointPort{{
+		Name:     new("placeholder"),
+		Port:     new(int32(1)),
+		Protocol: new(corev1.ProtocolTCP),
+	}}
+
+	key := client.ObjectKey{Namespace: svc.Namespace, Name: svc.Name}
+	existing := &discoveryv1.EndpointSlice{}
+	switch err := r.Get(ctx, key, existing); {
+	case apierrors.IsNotFound(err):
+		slice := &discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      svc.Name,
+				Namespace: svc.Namespace,
+				Labels: map[string]string{
+					discoveryv1.LabelServiceName: svc.Name,
+					discoveryv1.LabelManagedBy:   serviceProxyNameValue,
+					floatingIPLabel:              fip.Name,
+				},
+			},
+			AddressType: addrType,
+			Endpoints:   []discoveryv1.Endpoint{ep},
+			Ports:       desiredPorts,
+		}
+		if err := controllerutil.SetControllerReference(svc, slice, r.Scheme); err != nil {
+			return err
+		}
+		if err := r.Create(ctx, slice); err != nil {
+			return fmt.Errorf("create endpointslice: %w", err)
+		}
+		return nil
+	case err != nil:
+		return fmt.Errorf("get endpointslice: %w", err)
+	}
+
+	// AddressType is immutable; a family change (target edited) needs a recreate.
+	if existing.AddressType != addrType {
+		if err := r.Delete(ctx, existing); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete endpointslice for family change: %w", err)
+		}
+		return r.ensureEndpointSlice(ctx, svc, fip, node)
+	}
+	existing.Endpoints = []discoveryv1.Endpoint{ep}
+	existing.Ports = desiredPorts
+	if err := r.Update(ctx, existing); err != nil {
+		return fmt.Errorf("update endpointslice: %w", err)
+	}
+	return nil
+}
+
 // ingressAddress returns the address the LB implementation assigned to the Service,
 // or "" if none yet.
 func ingressAddress(svc *corev1.Service) string {
@@ -238,14 +331,15 @@ func ingressAddress(svc *corev1.Service) string {
 	return ""
 }
 
-// targetHasLivePort reports whether a Port realizes the FloatingIP's target IP
-// in its VPC — i.e. a running pod holds that tenant IP on some node. Ports are
-// cluster-scoped; their VPCRef namespace is the VPC owner's, which for a
-// FloatingIP's local vpcRef is the FloatingIP's own namespace.
-func (r *FloatingIPReconciler) targetHasLivePort(ctx context.Context, fip *sdnv1alpha1.FloatingIP) bool {
+// targetLiveNode returns the node whose Port realizes the FloatingIP's target IP
+// in its VPC — i.e. a running pod holds that tenant IP there — or "" when no live
+// Port exists (the liveness gate is closed). Ports are cluster-scoped; their
+// VPCRef namespace is the VPC owner's, which for a FloatingIP's local vpcRef is
+// the FloatingIP's own namespace.
+func (r *FloatingIPReconciler) targetLiveNode(ctx context.Context, fip *sdnv1alpha1.FloatingIP) string {
 	var list sdnv1alpha1.PortList
 	if err := r.List(ctx, &list); err != nil {
-		return false
+		return ""
 	}
 	for i := range list.Items {
 		p := &list.Items[i]
@@ -253,10 +347,10 @@ func (r *FloatingIPReconciler) targetHasLivePort(ctx context.Context, fip *sdnv1
 			p.Spec.VPCRef.Name == fip.Spec.VPCRef.Name &&
 			p.Spec.IP == fip.Spec.Target &&
 			p.Spec.Node != "" {
-			return true
+			return p.Spec.Node
 		}
 	}
-	return false
+	return ""
 }
 
 // conflictingFIP returns the name of another FloatingIP that already binds this
@@ -391,9 +485,10 @@ func fipStatusEqual(a, b sdnv1alpha1.FloatingIPStatus) bool {
 }
 
 // SetupWithManager registers the reconciler. A FloatingIP must re-reconcile when
-// a Port appears or disappears for its target IP (the liveness gate), when any
-// ExternalPool changes (pool CIDRs), and when another FloatingIP changes (an
-// address may have freed up).
+// its owned Service changes (the LB implementation fills in the ingress address),
+// when a Port appears or disappears for its target IP (the liveness gate, which
+// drives the endpoint's Ready condition), and when another FloatingIP changes (a
+// target may have freed up).
 func (r *FloatingIPReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&sdnv1alpha1.FloatingIP{}).

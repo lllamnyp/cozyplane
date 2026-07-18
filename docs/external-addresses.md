@@ -236,19 +236,23 @@ cozyplane's job is a datapath keyed on an address it was handed. Nothing more.
 
 0. **[done] kpr honours `service-proxy-name`** ([public-ip.md](public-ip.md) increment
    0). The enabling primitive — proxies skip a delegated Service.
-1. **[code done] FloatingIP → owned Service.** The controller renders + owns a
-   selectorless `service-proxy-name: cozyplane` `type: LoadBalancer` Service
-   (`generateName: <fip>-`, `etp: Cluster`, node-ports off), reads
-   `status.loadBalancer.ingress` into `status.address`, and gates Ready on
-   {Service exists, address assigned, target Port live, target exclusive}. The
+1. **[code done] FloatingIP → owned Service (+ synthesized EndpointSlice).** The
+   controller renders + owns a selectorless `service-proxy-name: cozyplane`
+   `type: LoadBalancer` Service (`generateName: <fip>-`, `etp: Cluster`, node-ports
+   off), reads `status.loadBalancer.ingress` into `status.address`, and gates Ready
+   on {Service exists, address assigned, target Port live, target exclusive}. The
    agent still programs the datapath from `status.address`; `spec.poolRef`/`address`
    are deprecated/ignored (kept until ExternalPool is deleted). Dynamic only — no
    claim yet.
-   *Open (e2e):* delivery is node-agnostic (`from_uplink` DNATs on any node), so
-   the Service carries no endpoints. If the LB implementation refuses to **announce**
-   a backend-less Service (MetalLB may), the controller must synthesize an
-   EndpointSlice (a ready endpoint on the target's node) to steer the
-   announcement. Decide this against the real MetalLB on dev4, not blind.
+   Because the Service is selectorless, cozyplane also synthesizes its single
+   EndpointSlice: **verified on dev4, MetalLB advertises a LoadBalancer address only
+   while the Service has a ready endpoint** (a backend-less Service is allocated an
+   IP but never ARP-answered). The endpoint's address is the target tenant IP, its
+   `nodeName` is the target's node (so a later `etp: Local` can pin advertisement
+   there for source-IP preservation), and its `Ready` condition tracks the live
+   Port — so advertisement follows liveness (held-but-dark when the target is gone),
+   matching the datapath. Delivery is still the eBPF datapath, never this endpoint
+   (every proxy skips the Service via `service-proxy-name`).
 2. **VPCGateway NAT identity → owned Service.** The same, backend-less + `etp: Cluster`.
 3. **Delete `ExternalPool`** + the allocator once nothing draws from it.
 4. **Reservation (`addressClaimRef`)** — when `IPAddressClaim` lands: the pin field, the
