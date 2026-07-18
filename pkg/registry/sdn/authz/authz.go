@@ -47,9 +47,8 @@ func CheckVPCVerb(ctx context.Context, auth authorizer.Authorizer, verb, namespa
 // CheckResourceVerb is the general form: a virtual verb on any resource in this
 // group. Cozyplane uses it wherever holding one object must not imply the right
 // to consume another — a VPC you may see but not bind (`export`), a VPC you may
-// not peer with (`peer`), an ExternalPool you may not draw addresses from
-// (`attach`). The pattern is always the same: the escalation is refused at the
-// aggregated apiserver, which admission webhooks never see.
+// not peer with (`peer`). The pattern is always the same: the escalation is
+// refused at the aggregated apiserver, which admission webhooks never see.
 //
 // `kind` is only used to phrase the error.
 func CheckResourceVerb(ctx context.Context, auth authorizer.Authorizer, verb, resource, kind, namespace, name string, path *field.Path) *field.Error {

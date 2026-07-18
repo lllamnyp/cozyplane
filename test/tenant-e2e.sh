@@ -75,7 +75,7 @@ phase "the tenant persona exists at all"
 phase "R2: a tenant enumerates nothing it does not own"
 # The cluster-scoped kinds. These are the leak: one `list ports` hands over every
 # tenant's pod names, VPC addresses, MACs and node placement.
-for r in ports servicevips externalpools hostfirewalls; do
+for r in ports servicevips hostfirewalls; do
   cannot list "$r" "$TA" \
     && pass "a tenant CANNOT list $r (cluster-scoped — unreachable from a RoleBinding)" \
     || fail "a tenant CAN list $r — the fleet's topology is readable"
@@ -96,12 +96,6 @@ cannot get secrets "$TA" "$B" \
 cannot create hostfirewalls "$TA" \
   && pass "a tenant CANNOT create a HostFirewall (operator-only)" \
   || fail "a tenant CAN create a HostFirewall"
-cannot create externalpools "$TA" \
-  && pass "a tenant CANNOT mint an ExternalPool (it may open a door, not what is behind it)" \
-  || fail "a tenant CAN create an ExternalPool"
-cannot attach externalpools "$TA" \
-  && pass "a tenant does NOT hold 'attach' on a pool by default (it is an operator's grant)" \
-  || fail "a tenant holds 'attach' without being granted it"
 
 # ---------------------------------------------------------------------------
 phase "R1: a tenant can learn the identity of its own workload"

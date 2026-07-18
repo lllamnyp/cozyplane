@@ -28,10 +28,6 @@ type FakeSdnV1alpha1 struct {
 	*testing.Fake
 }
 
-func (c *FakeSdnV1alpha1) ExternalPools() v1alpha1.ExternalPoolInterface {
-	return newFakeExternalPools(c)
-}
-
 func (c *FakeSdnV1alpha1) FloatingIPs(namespace string) v1alpha1.FloatingIPInterface {
 	return newFakeFloatingIPs(c, namespace)
 }

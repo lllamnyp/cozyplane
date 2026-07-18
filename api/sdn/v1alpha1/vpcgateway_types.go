@@ -25,8 +25,7 @@ type VPCGatewayPhase string
 
 const (
 	// VPCGatewayPhasePending means the door is declared but not yet usable —
-	// the VPC or the pool has not resolved, or another gateway already owns
-	// this VPC.
+	// the VPC has not resolved, or another gateway already owns this VPC.
 	VPCGatewayPhasePending VPCGatewayPhase = "Pending"
 	// VPCGatewayPhaseReady means the boundary is realized.
 	VPCGatewayPhaseReady VPCGatewayPhase = "Ready"
@@ -89,12 +88,6 @@ type VPCGatewaySpec struct {
 	// +optional
 	LoadBalancerClass string `json:"loadBalancerClass,omitempty"`
 
-	// PoolRef is DEPRECATED — the NAT identity now comes from an owned Service, not an
-	// ExternalPool (docs/external-addresses.md). Retained until ExternalPool is
-	// deleted; ignored by the controller.
-	// +optional
-	PoolRef ExternalPoolRef `json:"poolRef,omitempty"`
-
 	// NAT configures many-to-one egress.
 	// +optional
 	NAT VPCGatewayNAT `json:"nat,omitempty"`
@@ -137,7 +130,6 @@ type VPCGatewayStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="VPC",type=string,JSONPath=`.spec.vpcRef.name`
-// +kubebuilder:printcolumn:name="Pool",type=string,JSONPath=`.spec.poolRef.name`
 // +kubebuilder:printcolumn:name="NAT",type=boolean,JSONPath=`.spec.nat.enabled`
 // +kubebuilder:printcolumn:name="NATAddress",type=string,JSONPath=`.status.natAddress`
 // +kubebuilder:printcolumn:name="LB",type=boolean,JSONPath=`.spec.ingress.loadBalancer`
@@ -154,9 +146,9 @@ type VPCGatewayStatus struct {
 // no way out (no NAT egress) and no way in (no LoadBalancer ingress), and the
 // bytes that cross have nothing to be attributed to.
 //
-// A VPC has exactly one. Creating a gateway is the tenant's act; the pool it
-// draws from is the operator's grant, enforced by the "attach" verb on the
-// ExternalPool — the same shape as VPCBinding's "export" and VPCPeering's "peer".
+// A VPC has exactly one. Creating a gateway is the tenant's act; who may mint the
+// public address it draws is Service RBAC + the allocator's own scoping
+// (docs/external-addresses.md §8).
 type VPCGateway struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

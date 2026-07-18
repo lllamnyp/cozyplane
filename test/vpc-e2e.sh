@@ -299,35 +299,22 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-phase "EIP: the platform attracts, cozyplane delivers"
-# docs/north-south.md, tenet 3. Cozyplane announces NOTHING now — no ARP responder,
-# no gratuitous ARP, no election. Something else must make the fabric hand the
-# address to a node; here we do what a CCM would do and simply configure it on one.
+phase "EIP: the platform allocates and attracts, cozyplane delivers"
+# docs/external-addresses.md. A FloatingIP owns a delegated Service
+# (type: LoadBalancer, service-proxy-name) — the cluster's LB implementation
+# allocates the address into status.loadBalancer.ingress and attracts it;
+# cozyplane only consumes and delivers. This e2e plays BOTH platform roles: it
+# writes the Service's ingress (what MetalLB's allocator would do) and
+# configures the address on a node (what its L2 advertisement would achieve).
 #
 # The decisive case is the ASYMMETRIC one, and it is what makes tenet 3 payable at
 # all: the address is attracted to node X, the pod lives on node Y, the client sits
 # on node Z. Delivery does not care, because from_uplink runs at tc INGRESS — ahead
 # of the kernel's routing decision — so whichever node the packet lands on resolves
 # the pod through `floating` and reaches it over the overlay.
-#
-# A FloatingIP is an EIP under the VPC's gateway now, so the VPC needs a boundary
-# for the address to exist at all.
 if [ -z "${FLOAT_CIDR:-}" ]; then
   skip "EIP delivery (set FLOAT_CIDR=<spare on-link range> to run it)"
 else
-  apply <<EOF
-apiVersion: sdn.cozystack.io/v1alpha1
-kind: ExternalPool
-metadata: {name: e2e-float}
-spec: {cidrs: ["$FLOAT_CIDR"]}
----
-apiVersion: sdn.cozystack.io/v1alpha1
-kind: VPCGateway
-metadata: {name: door, namespace: $NS}
-spec:
-  vpcRef: {name: va}
-  poolRef: {name: e2e-float}
-EOF
   apply <<EOF
 apiVersion: sdn.cozystack.io/v1alpha1
 kind: FloatingIP
@@ -336,16 +323,35 @@ spec:
   vpcRef: {name: va}
   target: "$A1"
 EOF
-  EIP=""
+  # The allocation vehicle: the FloatingIP mints one delegated Service.
+  FSVC=""
   for _ in $(seq 1 20); do
-    EIP=$($K -n "$NS" get floatingip fip-a1 -o jsonpath='{.status.address}' 2>/dev/null)
-    [ -n "$EIP" ] && break
+    FSVC=$($K -n "$NS" get svc -l sdn.cozystack.io/floating-ip=fip-a1 -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    [ -n "$FSVC" ] && break
     sleep 3
   done
-  if [ -z "$EIP" ]; then
-    fail "the EIP got no address (a FloatingIP draws from its VPC gateway's pool)"
+  if [ -z "$FSVC" ]; then
+    fail "the FloatingIP minted no delegated Service (docs/external-addresses.md)"
   else
-    pass "an EIP draws its address from the VPC's gateway pool ($EIP)"
+    PROXYNAME=$($K -n "$NS" get svc "$FSVC" -o jsonpath="{.metadata.labels['service\.kubernetes\.io/service-proxy-name']}" 2>/dev/null)
+    [ "$PROXYNAME" = "cozyplane" ] \
+      && pass "the FloatingIP owns a delegated Service ($FSVC, service-proxy-name=cozyplane)" \
+      || fail "the owned Service is not delegated (service-proxy-name='$PROXYNAME')"
+
+    # Play the allocator: assign an address from FLOAT_CIDR into the LB ingress.
+    BASE=${FLOAT_CIDR%/*}
+    EIP="${BASE%.*}.$(( ${BASE##*.} + 10 ))"
+    $K -n "$NS" patch svc "$FSVC" --subresource=status --type=merge \
+      -p "{\"status\":{\"loadBalancer\":{\"ingress\":[{\"ip\":\"$EIP\"}]}}}" >/dev/null
+    GOTADDR=""
+    for _ in $(seq 1 20); do
+      GOTADDR=$($K -n "$NS" get floatingip fip-a1 -o jsonpath='{.status.address}' 2>/dev/null)
+      [ "$GOTADDR" = "$EIP" ] && break
+      sleep 3
+    done
+    [ "$GOTADDR" = "$EIP" ] \
+      && pass "the FloatingIP consumed the LB-assigned address ($EIP)" \
+      || fail "the FloatingIP did not consume the assigned address (got '$GOTADDR', want $EIP)"
 
     # Attract it the way a platform would: put it on a node. Pick a node that is
     # NEITHER the pod's host NOR the client, so the triangle is genuine.
@@ -409,12 +415,11 @@ EOF
     [ -z "$DUP" ] && break
     sleep 2
   done
-  [ -z "$DUP" ] \
-    && pass "a second EIP on an already-bound target is refused (it would hijack the first's egress)" \
-    || fail "a second EIP on the same target was allocated $DUP"
+  DUPSVC=$($K -n "$NS" get svc -l sdn.cozystack.io/floating-ip=fip-dup -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+  [ -z "$DUP" ] && [ -z "$DUPSVC" ] \
+    && pass "a second EIP on an already-bound target is refused (no Service, no address — it would hijack the first's egress)" \
+    || fail "a second EIP on the same target got svc='$DUPSVC' addr='$DUP'"
   $K -n "$NS" delete floatingip --all >/dev/null 2>&1
-  $K -n "$NS" delete vpcgateway door >/dev/null 2>&1
-  $K delete externalpool e2e-float >/dev/null 2>&1
 fi
 
 # ---------------------------------------------------------------------------

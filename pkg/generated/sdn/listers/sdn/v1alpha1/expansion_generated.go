@@ -18,10 +18,6 @@ limitations under the License.
 
 package v1alpha1
 
-// ExternalPoolListerExpansion allows custom methods to be added to
-// ExternalPoolLister.
-type ExternalPoolListerExpansion interface{}
-
 // FloatingIPListerExpansion allows custom methods to be added to
 // FloatingIPLister.
 type FloatingIPListerExpansion interface{}

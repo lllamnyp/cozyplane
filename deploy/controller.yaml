@@ -54,17 +54,14 @@ rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcpeerings/status"]
     verbs: ["get", "update", "patch"]
-  # FloatingIPs: allocate an address from a pool and gate readiness on a live
-  # target Port (needs ExternalPools + Ports read; Ports granted above).
+  # FloatingIPs: own the delegated LoadBalancer Service that sources the address
+  # and gate readiness on a live target Port (docs/external-addresses.md).
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["floatingips"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["floatingips/status"]
     verbs: ["get", "update", "patch"]
-  - apiGroups: ["sdn.cozystack.io"]
-    resources: ["externalpools"]
-    verbs: ["get", "list", "watch"]
   # ServiceVIPs: materialize one per attached Service, allocate the VIP,
   # resolve backends from Services/EndpointSlices (services-in-vpc.md).
   - apiGroups: ["sdn.cozystack.io"]
@@ -73,12 +70,16 @@ rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["servicevips/status"]
     verbs: ["get", "update", "patch"]
+  # Services: read for ServiceVIP backend resolution; write for the delegated
+  # LoadBalancer Services FloatingIPs and VPCGateways own (external-addresses.md).
   - apiGroups: [""]
     resources: ["services"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # EndpointSlices: read for backend resolution; write for the synthesized ones
+  # that make the LB implementation advertise (ready-endpoint rule).
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # VirtualMachineInstances: the migration controller reads status.nodeName /
   # status.migrationState as the cutover signal (the Kube-OVN model). Optional —
   # only present when KubeVirt is installed; the controller degrades to the

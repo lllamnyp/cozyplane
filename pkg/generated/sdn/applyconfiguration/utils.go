@@ -32,14 +32,6 @@ import (
 func ForKind(kind schema.GroupVersionKind) interface{} {
 	switch kind {
 	// Group=sdn.cozystack.io, Version=v1alpha1
-	case v1alpha1.SchemeGroupVersion.WithKind("ExternalPool"):
-		return &sdnv1alpha1.ExternalPoolApplyConfiguration{}
-	case v1alpha1.SchemeGroupVersion.WithKind("ExternalPoolRef"):
-		return &sdnv1alpha1.ExternalPoolRefApplyConfiguration{}
-	case v1alpha1.SchemeGroupVersion.WithKind("ExternalPoolSpec"):
-		return &sdnv1alpha1.ExternalPoolSpecApplyConfiguration{}
-	case v1alpha1.SchemeGroupVersion.WithKind("ExternalPoolStatus"):
-		return &sdnv1alpha1.ExternalPoolStatusApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("FloatingIP"):
 		return &sdnv1alpha1.FloatingIPApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("FloatingIPSpec"):

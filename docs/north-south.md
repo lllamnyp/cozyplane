@@ -100,15 +100,17 @@ stack was never involved.
 ## 3. The model
 
 **`VPCGateway`** (a namespaced kind — built) declares the VPC's
-north-south boundary: whether the VPC may reach the internet at all, which
-`ExternalPool` its NAT identity is drawn from, the egress policy, and the counters
-every crossing increments. Behind that one declaration sit three mechanisms:
+north-south boundary: whether the VPC may reach the internet at all, the NAT
+identity its egress wears (drawn from owned delegated LoadBalancer Services —
+[external-addresses.md](external-addresses.md) §5), the egress policy, and the
+counters every crossing increments. Behind that one declaration sit three
+mechanisms:
 
-> **`ExternalPool` is on its way out — see §9.** It is a hand-written list of CIDRs
-> that nothing routes: cozyplane allocates out of it and *nothing attracts* what it
-> allocates. The pool becomes a reference to a platform-allocated, platform-attracted
-> **claim**. Read §3 with that in mind; the mechanisms below are unaffected, because
-> the datapath never cared who picked the address.
+> **`ExternalPool` is gone — see §9 and external-addresses.md.** It was a
+> hand-written list of CIDRs that nothing routed: cozyplane allocated out of it and
+> *nothing attracted* what it allocated. Every external address now arrives via a
+> delegated Service the owning object mints. The mechanisms below are unaffected,
+> because the datapath never cared who picked the address.
 
 **NAT gateway — many-to-one egress.** A VPC's pods reach the internet SNATed to an
 address the *VPC* owns, drawn from its pool. This should be **eBPF at the uplink**,
@@ -133,14 +135,17 @@ the boundary rather than waved through.
   `floating_ndp`, `AnnounceAddress`, the announcer election: a MetalLB L2
   implementation living inside a CNI. Deleted (increment 3).
 - **The per-VPC gateway pod** — replaced by eBPF SNAT with a per-VPC identity
-  (increment 2), **for a gateway that has a pool**. It is not gone from the tree: a
-  `nat.enabled` gateway with **no `poolRef`** has no identity to wear, so it still
-  gets a pod, and that pod still carries the netns firewall — and still launders the
-  tenant into the node's address, which is the tenet-8 violation increment 2 exists
-  to end. Requiring `poolRef` would delete `cmd/gateway` outright. **Open** (§7).
-- **`ExternalPool.spec.advertisement`** (`L2 | BGP`) — dead code that stayed dead.
-- **`FloatingIP` as a top-level, self-sufficient object** — it is an EIP under a
-  gateway (increment 3).
+  (increment 2), **for a family with an assigned NAT address**. It is not gone from
+  the tree: a family whose owned LoadBalancer Service has no assigned address (no
+  LB implementation, or one that cannot serve the family) has no identity to wear,
+  so it still gets a pod, and that pod still carries the netns firewall — and still
+  launders the tenant into the node's address, the tenet-8 violation increment 2
+  exists to end. Deleting `cmd/gateway` means requiring an LB implementation.
+  **Open** (§7).
+- **The pool's `advertisement` field** (`L2 | BGP`) — dead code that stayed dead.
+- **`FloatingIP`'s self-allocation** — it briefly drew from its VPC's gateway's
+  pool (increment 3); with pools deleted it mints its own delegated Service and
+  the LB implementation allocates ([external-addresses.md](external-addresses.md)).
 
 ## 5. What survives from the floating-HA work
 
@@ -224,7 +229,8 @@ pool that covers every family a VPC uses.
 - ~~**Who attracts an EIP, concretely?**~~ and ~~**does an EIP's ingress half
   survive?**~~ — **both answered in §9.** Short version: nobody attracts it today,
   because we only half-applied tenet 3. The answer is that cozyplane must stop
-  *allocating* external addresses too, and `ExternalPool` is retired.
+  *allocating* external addresses too, and `ExternalPool` is retired — **done**,
+  the kind is deleted ([external-addresses.md](external-addresses.md) §9).
 - **Per-VPC NAT port-pool sizing and exhaustion** — the node masquerade's pool is
   shared; a per-VPC pool needs its own accounting and a story for what happens when
   a tenant exhausts it.
@@ -273,12 +279,12 @@ Not a commitment; the order the pieces actually depend on each other.
    that anyone reasoning about "who can reach a VPC pod" must remember the socket-LB
    shortcut exists.
 1. **`VPCGateway`: the boundary object — DONE 2026-07-13.** A namespaced kind
-   naming its VPC and an `ExternalPool`, with `nat.enabled` and
-   `ingress.loadBalancer`. Creating one requires the **`attach` verb on the pool** —
-   the same escalation gate as `VPCBinding`'s `export` and `VPCPeering`'s `peer`,
-   enforced in the aggregated registry. That closes a real hole: `VPC.spec.egress.
-   natGateway` was a **bool on an object the tenant owns**, so a tenant granted
-   *itself* internet. The field is deleted.
+   naming its VPC, with `nat.enabled` and `ingress.loadBalancer`. It originally
+   also named an `ExternalPool` gated by an `attach` verb; with pools deleted
+   ([external-addresses.md](external-addresses.md)) address governance moved to
+   Service RBAC + the allocator's scoping. What the object still closes: `VPC.spec.
+   egress.natGateway` was a **bool on an object the tenant owns**, so a tenant
+   granted *itself* internet. The field is deleted.
 
    A VPC has exactly one boundary — the **oldest** gateway (`EffectiveGateway`),
    which lives in the API package precisely because three things must agree on it
@@ -385,7 +391,7 @@ Not a commitment; the order the pieces actually depend on each other.
    2026-07-14.** Gone: `float_announce`, `floating_arp`, `floating_ndp`,
    `responder_mac`, `AnnounceAddress` (and its GARP/NA emitters), the announcer
    election and its rendezvous hash, the node pool-eligibility annotation, the
-   `--floating-ha` flag, and `ExternalPool.spec.advertisement`. Cozyplane attracts
+   `--floating-ha` flag, and the pool's `advertisement` field. Cozyplane attracts
    nothing.
 
    **Something else must.** Because `from_uplink` sits at tc ingress — ahead of the

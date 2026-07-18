@@ -420,7 +420,7 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		watchPeerings(ctx, factory, mgr, log)
 		watchGateways(ctx, factory, mgr, nodeName, log)
 		watchFloatingIPs(ctx, factory, mgr, log)
-		go ensurePoolUplinks(ctx, sdnClient, mgr, log)
+		watchServiceUplinks(ctx, client, mgr, log)
 		watchServiceVIPs(ctx, factory, mgr, log)
 		watchSecurityGroups(ctx, factory, mgr, log)
 		if err := watchHostFirewalls(ctx, factory, client, mgr, nodeName, log); err != nil {
@@ -1107,39 +1107,50 @@ func desiredGateways(ports []*sdnv1alpha1.Port, selfName string) map[uint32]gate
 	return desired
 }
 
-// ensurePoolUplinks keeps the datapath serving every ExternalPool's link on
-// EVERY node. LB/NodePort frontends (docs/lb-ingress.md) arrive wherever the
-// provider attracts them — the pool's L2 — including on nodes that host no
-// floating-IP target, and an etp: Cluster DSR reply must leave by that same
-// link (found live: a MetalLB-announced LB IP black-holed on a node whose
-// only VLAN attach trigger was a local FloatingIP). The floating machinery
-// configured the link per programmed address; pools make it unconditional.
-// Poll-based: pools are tiny, near-static, and EnsureFloatingUplink is
-// idempotent.
-func ensurePoolUplinks(ctx context.Context, client sdnclientset.Interface, mgr *datapath.Manager, log *slog.Logger) {
-	for {
-		pools, err := client.SdnV1alpha1().ExternalPools().List(ctx, metav1.ListOptions{})
+// watchServiceUplinks keeps the datapath serving the link that carries every
+// LoadBalancer ingress address, on EVERY node. LB/NodePort frontends
+// (docs/lb-ingress.md) arrive wherever the provider attracts them — including
+// on nodes that host no floating-IP target, and an etp: Cluster DSR reply must
+// leave by that same link (found live: a MetalLB-announced LB IP black-holed on
+// a node whose only VLAN attach trigger was a local FloatingIP). ExternalPool
+// CIDRs used to make the attach unconditional; with pools retired
+// (docs/external-addresses.md §9) the trigger is the addresses that actually
+// exist: every `status.loadBalancer.ingress` IP, plus floating addresses
+// (watchFloatingIPs) and VPC NAT identities (watchVPCGateways). The FIB decides
+// which link serves each one; EnsureFloatingUplink is idempotent.
+func watchServiceUplinks(ctx context.Context, client kubernetes.Interface, mgr *datapath.Manager, log *slog.Logger) {
+	factory := informers.NewSharedInformerFactory(client, 0)
+	svcs := factory.Core().V1().Services()
+
+	resync := func() {
+		list, err := svcs.Lister().List(labels.Everything())
 		if err != nil {
-			log.Warn("list externalpools", "err", err)
-		} else {
-			for _, p := range pools.Items {
-				for _, cidr := range p.Spec.CIDRs {
-					ip, _, err := net.ParseCIDR(cidr)
-					if err != nil {
-						continue
-					}
-					if err := mgr.EnsureFloatingUplink(ip.String()); err != nil {
-						log.Warn("ensure pool uplink", "pool", p.Name, "cidr", cidr, "err", err)
-					}
+			log.Warn("list services for uplinks", "err", err)
+			return
+		}
+		for _, s := range list {
+			for _, ing := range s.Status.LoadBalancer.Ingress {
+				if ing.IP == "" {
+					continue
+				}
+				if err := mgr.EnsureFloatingUplink(ing.IP); err != nil {
+					log.Warn("ensure LB uplink", "service", s.Namespace+"/"+s.Name, "ip", ing.IP, "err", err)
 				}
 			}
 		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(30 * time.Second):
-		}
 	}
+	onAny := cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(any) { resync() },
+		UpdateFunc: func(_, newObj any) { resync() },
+		DeleteFunc: func(any) { resync() },
+	}
+	_, _ = svcs.Informer().AddEventHandler(onAny)
+	factory.Start(ctx.Done())
+	go func() {
+		if cache.WaitForCacheSync(ctx.Done(), svcs.Informer().HasSynced) {
+			resync()
+		}
+	}()
 }
 
 // watchFloatingIPs programs the publicIP -> {net, VPC IP} mapping on EVERY node,

@@ -45,7 +45,6 @@ func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFa
 	nodes *nodePoolIndex, nodeIPs *nodeIPIndex, selfName, selfIP string, log *slog.Logger) {
 	gws := factory.Sdn().V1alpha1().VPCGateways()
 	vpcs := factory.Sdn().V1alpha1().VPCs()
-	pools := factory.Sdn().V1alpha1().ExternalPools()
 
 	var mu sync.Mutex
 	resync := func() {
@@ -77,6 +76,19 @@ func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFa
 			return
 		}
 		for vni, id := range wantNAT {
+			// The FIB decides which link serves the identity: on a multi-NIC node
+			// the address may live on a non-default link (an OCI VLAN), where
+			// from_uplink must attach for vpc_nat_reverse to see the replies.
+			// Pools used to trigger this unconditionally; now the address itself
+			// does (docs/external-addresses.md §9).
+			for _, addr := range []string{id.V4, id.V6} {
+				if addr == "" {
+					continue
+				}
+				if err := mgr.EnsureFloatingUplink(addr); err != nil {
+					log.Warn("ensure NAT uplink", "vni", vni, "addr", addr, "err", err)
+				}
+			}
 			if selfShard >= 0 {
 				base, span, ok := datapath.NATShardFor(selfShard)
 				if !ok {
@@ -173,15 +185,13 @@ func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFa
 		DeleteFunc: func(any) { resync() },
 	}
 	_, _ = gws.Informer().AddEventHandler(onAny)
-	_, _ = pools.Informer().AddEventHandler(onAny)
 	// The node set decides both the port shards and the announcer.
 	nodes.onChange(resync)
 	// VPCs too: the gate is keyed by VNI, which the VPC's status carries.
 	_, _ = vpcs.Informer().AddEventHandler(onAny)
 
 	go func() {
-		if cache.WaitForCacheSync(ctx.Done(), gws.Informer().HasSynced, vpcs.Informer().HasSynced,
-			pools.Informer().HasSynced) {
+		if cache.WaitForCacheSync(ctx.Done(), gws.Informer().HasSynced, vpcs.Informer().HasSynced) {
 			resync()
 		}
 	}()

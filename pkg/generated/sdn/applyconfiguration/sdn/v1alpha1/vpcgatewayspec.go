@@ -32,10 +32,6 @@ type VPCGatewaySpecApplyConfiguration struct {
 	// address family and consumes the address that implementation assigns
 	// (docs/external-addresses.md §5).
 	LoadBalancerClass *string `json:"loadBalancerClass,omitempty"`
-	// PoolRef is DEPRECATED — the NAT identity now comes from an owned Service, not an
-	// ExternalPool (docs/external-addresses.md). Retained until ExternalPool is
-	// deleted; ignored by the controller.
-	PoolRef *ExternalPoolRefApplyConfiguration `json:"poolRef,omitempty"`
 	// NAT configures many-to-one egress.
 	NAT *VPCGatewayNATApplyConfiguration `json:"nat,omitempty"`
 	// Ingress configures what may enter the VPC from outside.
@@ -61,14 +57,6 @@ func (b *VPCGatewaySpecApplyConfiguration) WithVPCRef(value *LocalVPCRefApplyCon
 // If called multiple times, the LoadBalancerClass field is set to the value of the last call.
 func (b *VPCGatewaySpecApplyConfiguration) WithLoadBalancerClass(value string) *VPCGatewaySpecApplyConfiguration {
 	b.LoadBalancerClass = &value
-	return b
-}
-
-// WithPoolRef sets the PoolRef field in the declarative configuration to the given value
-// and returns the receiver, so that objects can be built by chaining "With" function invocations.
-// If called multiple times, the PoolRef field is set to the value of the last call.
-func (b *VPCGatewaySpecApplyConfiguration) WithPoolRef(value *ExternalPoolRefApplyConfiguration) *VPCGatewaySpecApplyConfiguration {
-	b.PoolRef = value
 	return b
 }
 

@@ -148,7 +148,8 @@ winner, was the sole ARP/NDP gate, and the winner emitted a spaced GARP/NA burst
 attracting traffic; attraction is a fabric concern, and every fabric already has an
 answer for it. So `float_announce`, `floating_arp`, `floating_ndp`, `AnnounceAddress`,
 the election, the node eligibility annotation, the `--floating-ha` flag and
-`ExternalPool.spec.advertisement` are all gone.
+the pool's `advertisement` field are all gone (as, later, is `ExternalPool`
+itself — [external-addresses.md](external-addresses.md) §9).
 
 **BGP — the natural next step from an elected announcer — is rejected, not deferred**
 ([north-south.md](north-south.md) §6). The practical tell came first: it could not be
@@ -168,8 +169,9 @@ This is not a new requirement: it is exactly the property `etp: Cluster` DSR alr
 needs ([lb-ingress.md](lb-ingress.md): *"the fleet-wide LB-IP spoof permission it
 needs is an underlay property"*), and it is validated on a real cluster — the
 asymmetric client/attractor/backend triangle over an OCI VLAN. The agent configures
-every node to serve every `ExternalPool`'s link for precisely this reason
-(`ensurePoolUplinks`).
+every node to serve the link carrying every address that actually exists — floating
+addresses, NAT identities, LB ingress IPs — for precisely this reason
+([external-addresses.md](external-addresses.md) §9).
 
 Where the underlay refuses, the honest answer is to attract the address **onto the
 pod's own node** (a static assignment), which collapses §4's remote arm into the

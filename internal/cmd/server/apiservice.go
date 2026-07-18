@@ -44,6 +44,8 @@ const (
 // sdnPlurals are the group's resources — the bootstrap CRDs named
 // "<plural>.sdn.cozystack.io". Keep in step with internal/setup/sdn's storage
 // map; a missing entry just leaves one CRD behind (and its OpenAPI collision).
+// "externalpools" is retired (docs/external-addresses.md) but stays listed so a
+// stale bootstrap CRD is still cleaned up rather than resurrecting the kind.
 var sdnPlurals = []string{
 	"vpcs", "vpcbindings", "vpcpeerings", "vpcgateways", "ports", "externalpools",
 	"floatingips", "servicevips", "securitygroups", "hostfirewalls",

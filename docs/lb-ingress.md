@@ -154,10 +154,12 @@ pointer OR (`r1 |= r0`), which the verifier prohibits — a scalar
 `remote = (l == NULL)` inside one branch is the fix; **(b)** the frontend's
 link was only configured where a local FloatingIP existed, so a
 MetalLB-announced LB IP black-holed on backend-less nodes — the agent now
-ensures the attach (and the DSR reply's exit config) for **every
-`ExternalPool`'s link on every node**, poll-driven and idempotent, with
-`externalpools` read RBAC added. Consequence for operators: the LB range's
-link must carry a cozyplane `ExternalPool` (or be the default-route link).
+ensures the attach (and the DSR reply's exit config) on **every node for the
+link carrying every `status.loadBalancer.ingress` address** (a Services watch;
+[external-addresses.md](external-addresses.md) §9 — `ExternalPool` CIDRs
+carried this before the kind was deleted). Consequence for operators: the LB
+range must be on-link on some node interface (or routed via the default-route
+link).
 Validated on the dev cluster as a fully asymmetric triangle — client on one
 node, MetalLB announcing from a second (backend-less) node, backend on a
 third: raw SYNs (an in-cluster client's socket-LB bypass) came back as
@@ -299,6 +301,7 @@ already does.
 
 - **Address allocation / IPAM, LB provisioning, and traffic attraction**
   (ARP/NDP announcement, BGP, cloud LB config) — the LB implementation's
-  job: CCM, MetalLB, appliance, or operator. cozyplane never writes Service
-  status. (`ExternalPool` remains FloatingIP-only.)
+  job: CCM, MetalLB, appliance, or operator. cozyplane never writes *foreign*
+  Service status (it owns the Services it mints for FloatingIP/NAT identities —
+  [external-addresses.md](external-addresses.md)).
 - Anything tenant-facing beyond the standard Service object.

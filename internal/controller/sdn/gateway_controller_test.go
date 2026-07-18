@@ -80,7 +80,6 @@ func dualStackVPC(ns, name string, vni int32) *sdnv1alpha1.VPC {
 // family the VPC has is covered (docs/north-south.md §6a).
 func natGatewayWithAddrs(ns, name, vpcName, v4, v6 string) *sdnv1alpha1.VPCGateway {
 	gw := natGateway(ns, name, vpcName)
-	gw.Spec.PoolRef = sdnv1alpha1.ExternalPoolRef{Name: "pool"}
 	gw.Status.NATAddress = v4
 	gw.Status.NATAddress6 = v6
 	return gw

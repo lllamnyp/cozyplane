@@ -25,7 +25,7 @@ existing CRD-stored objects, export them first and re-apply after — the CRD
 store is not visible through the aggregated server:
 
 ```sh
-kubectl get vpcs,ports,vpcbindings,vpcpeerings,securitygroups,floatingips,servicevips,externalpools -A -o yaml > sdn-backup.yaml
+kubectl get vpcs,ports,vpcbindings,vpcpeerings,securitygroups,floatingips,servicevips -A -o yaml > sdn-backup.yaml
 helm install cozyplane-apiserver ./chart/cozyplane-apiserver -n cozyplane-system
 kubectl apply -f sdn-backup.yaml
 kubectl -n <cozyplane-namespace> rollout restart deploy/cozyplane-controller ds/cozyplane-agent

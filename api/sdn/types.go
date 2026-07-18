@@ -85,15 +85,13 @@ type VPCGatewaySpec struct {
 	// LoadBalancerClass selects which LB implementation allocates+attracts the NAT
 	// identity (docs/external-addresses.md §5).
 	LoadBalancerClass string
-	// PoolRef is DEPRECATED (docs/external-addresses.md); ignored.
-	PoolRef ExternalPoolRef
-	NAT     VPCGatewayNAT
-	Ingress VPCGatewayIngress
+	NAT               VPCGatewayNAT
+	Ingress           VPCGatewayIngress
 }
 
 // VPCGatewayStatus is the observed state of a VPCGateway.
 type VPCGatewayStatus struct {
-	// NATAddress is the VPC's own v4 egress identity, allocated from its pool.
+	// NATAddress is the VPC's own v4 egress identity, read from its owned Service.
 	NATAddress string
 	// NATAddress6 is the v6 counterpart (docs/north-south.md §6a).
 	NATAddress6 string
@@ -296,61 +294,12 @@ type Port struct {
 	Status PortStatus
 }
 
-// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
-
-// ExternalPoolList is a list of ExternalPool objects.
-type ExternalPoolList struct {
-	metav1.TypeMeta
-	metav1.ListMeta
-
-	Items []ExternalPool
-}
-
-// ExternalPoolSpec is the specification of a pool of externally-routable
-// addresses that FloatingIPs are allocated from.
-type ExternalPoolSpec struct {
-	// CIDRs are the address ranges the pool hands out.
-	CIDRs []string
-}
-
-// ExternalPoolStatus is the observed state of an ExternalPool.
-type ExternalPoolStatus struct {
-	// Allocated is the number of addresses currently bound to FloatingIPs.
-	Allocated int32
-
-	// Available is the number of addresses still free in the pool.
-	Available int32
-
-	// Conditions represent the latest available observations.
-	Conditions []metav1.Condition
-}
-
-// +genclient
-// +genclient:nonNamespaced
-// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
-
-// ExternalPool is a cluster-scoped, admin-defined range of externally-routable
-// addresses. FloatingIPs claim addresses from a pool; a pool is the equivalent
-// of MetalLB's IPAddressPool.
-type ExternalPool struct {
-	metav1.TypeMeta
-	metav1.ObjectMeta
-
-	Spec   ExternalPoolSpec
-	Status ExternalPoolStatus
-}
-
-// ExternalPoolRef references an ExternalPool by name (pools are cluster-scoped).
-type ExternalPoolRef struct {
-	Name string
-}
-
 // FloatingIPPhase is the lifecycle phase of a FloatingIP.
 type FloatingIPPhase string
 
 const (
 	// FloatingIPPhasePending means the FloatingIP has no address assigned yet
-	// (pool exhausted, requested address taken, or not yet reconciled).
+	// (no address assigned, no live target, or a conflicting binding).
 	FloatingIPPhasePending FloatingIPPhase = "Pending"
 	// FloatingIPPhaseReady means an address is assigned and the binding is
 	// programmed in the datapath.
@@ -381,10 +330,6 @@ type FloatingIPSpec struct {
 	// LoadBalancerClass selects which LB implementation allocates+attracts the
 	// address (docs/external-addresses.md). Empty = cluster default.
 	LoadBalancerClass string
-
-	// PoolRef and Address are DEPRECATED (docs/external-addresses.md); ignored.
-	PoolRef ExternalPoolRef
-	Address string
 }
 
 // FloatingIPStatus is the observed state of a FloatingIP.
@@ -402,7 +347,7 @@ type FloatingIPStatus struct {
 // +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
-// FloatingIP binds an externally-routable address from an ExternalPool to a
+// FloatingIP binds an externally-routable address (from its owned Service) to a
 // single workload inside a VPC (the OpenStack floating-IP model). It is the
 // bidirectional counterpart to the egress-only NAT gateway.
 type FloatingIP struct {

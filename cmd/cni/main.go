@@ -440,9 +440,9 @@ func addGatewayLeg(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, pod
 		return fmt.Errorf("get vpc %s/%s: %w", vpcNS, vpcName, err)
 	}
 	// The VPC's owner must have opened a door: a VPCGateway naming this VPC, with
-	// NAT enabled. Not a field on the VPC any more — opening one onto an
-	// ExternalPool is the operator's grant (docs/north-south.md). The VPC's
-	// boundary is its OLDEST gateway; a second one realizes nothing.
+	// NAT enabled. Not a field on the VPC any more — the boundary is a separate,
+	// grantable object (docs/north-south.md). The VPC's boundary is its OLDEST
+	// gateway; a second one realizes nothing.
 	gws, err := client.SdnV1alpha1().VPCGateways(vpcNS).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("list vpcgateways in %s: %w", vpcNS, err)

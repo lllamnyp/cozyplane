@@ -37,9 +37,9 @@ import (
 // no way out (no NAT egress) and no way in (no LoadBalancer ingress), and the
 // bytes that cross have nothing to be attributed to.
 //
-// A VPC has exactly one. Creating a gateway is the tenant's act; the pool it
-// draws from is the operator's grant, enforced by the "attach" verb on the
-// ExternalPool — the same shape as VPCBinding's "export" and VPCPeering's "peer".
+// A VPC has exactly one. Creating a gateway is the tenant's act; who may mint the
+// public address it draws is Service RBAC + the allocator's own scoping
+// (docs/external-addresses.md §8).
 type VPCGatewayApplyConfiguration struct {
 	v1.TypeMetaApplyConfiguration    `json:",inline"`
 	*v1.ObjectMetaApplyConfiguration `json:"metadata,omitempty"`

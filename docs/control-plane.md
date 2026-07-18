@@ -22,7 +22,7 @@ The split is by concern, not by serving mechanism:
   default-network pods and therefore needs this layer first.
 - **`sdn.cozystack.io`** — the aggregated apiserver, only, never CRDs. `VPC`,
   `VPCBinding`, `VPCPeering`, `VPCGateway`, `Port`, `SecurityGroup`,
-  `HostFirewall`, `ServiceVIP`, `FloatingIP`, `ExternalPool`.
+  `HostFirewall`, `ServiceVIP`, `FloatingIP`.
 
 Disjoint kinds, so disjoint paths, so the collision cannot occur. What this
 deleted: APIService adoption, the `automanaged`-label fight with the CRD
@@ -143,34 +143,31 @@ Two tiers: **declarative** (authored by tenants/operators, desired state) and
   annotation. A pod may reference several.
 - **`VPCPeering`**, **`GatewayPolicy`** — cross-VPC and the controlled doors
   (DNS/metadata/API/egress) from `design.md` §10.
-- **`VPCGateway`** — `{ vpcRef, poolRef?, nat.enabled, ingress.loadBalancer }`. A
-  VPC's **one** north-south boundary, and the object that replaced
+- **`VPCGateway`** — `{ vpcRef, loadBalancerClass?, nat.enabled, ingress.loadBalancer }`.
+  A VPC's **one** north-south boundary, and the object that replaced
   `VPC.spec.egress.natGateway` — a bool on an object the tenant owned, so a tenant
-  could grant *itself* internet. Creating one requires the **`attach`** verb on the
-  referenced `ExternalPool` (the `export`/`peer` escalation-gate pattern): the
-  operator grants the pool, the tenant opens its own door onto it. `status.natAddress`
-  carries the address the VPC wears on the way out. A VPC has exactly one boundary
-  (the oldest gateway wins). See [north-south.md](north-south.md).
-- **`ExternalPool`** (cluster-scoped) — `{ cidrs[] }`. An admin-defined range of
-  externally-routable addresses; the MetalLB IPAddressPool analog, minus the
-  announcement — **cozyplane attracts nothing**, so there is no `advertisement`
-  field to configure. `status` tracks allocation counts.
-  **DEPRECATED** ([north-south.md](north-south.md) §9): the pool is a CIDR list that
-  nothing routes — cozyplane allocates out of it and nothing attracts what it
-  allocates. It is replaced by a reference to a platform-allocated, platform-attracted
-  **claim**, which also carries the `attach` grant. Do not build new surface on it.
+  could grant *itself* internet. Its NAT identity comes from owned delegated
+  `Service type: LoadBalancer` objects, one per address family
+  ([external-addresses.md](external-addresses.md) §5) — who may mint an address is
+  Service RBAC + the allocator's scoping, not a cozyplane verb. `status.natAddress`
+  / `natAddress6` carry the addresses the VPC wears on the way out. A VPC has
+  exactly one boundary (the oldest gateway wins). See [north-south.md](north-south.md).
+  (`ExternalPool`, the old admin-defined CIDR list both this and FloatingIP drew
+  from, is **deleted** — external-addresses.md §9.)
 - **`HostFirewall`** (cluster-scoped, operator-only) — `{ nodeSelector,
   ingress[] (cidr/except → proto/port) }`. Ingress policy for the nodes
   themselves — the node-scoped sibling of NetworkPolicy (net-0 pods) and
   SecurityGroup (VPC ports). [host-firewall.md](host-firewall.md).
-- **`FloatingIP`** — `{ vpcRef (local), target (tenant IP), poolRef?, address? }`.
-  Binds one pool address 1:1 to a workload in a VPC, source-preserving (the
-  ingress door in `design.md` §10). `status` carries the assigned `address` +
-  `phase`. The address is reserved permanently, but the binding is `Ready` (and
-  the address advertised + programmed) only while its `target` is a **live Port**
-  — a running pod to advertise from and deliver to; no live target ⇒ reserved but
-  silent. It needs no egress gateway (the NAT is in the eBPF bridge, not the
-  gateway).
+- **`FloatingIP`** — `{ vpcRef (local), target (tenant IP), loadBalancerClass? }`.
+  Binds one externally-routable address 1:1 to a workload in a VPC,
+  source-preserving (the ingress door in `design.md` §10). The address comes from
+  an owned delegated `Service type: LoadBalancer` — the LB implementation
+  allocates + attracts, cozyplane consumes `status.loadBalancer.ingress`
+  ([external-addresses.md](external-addresses.md)). `status` carries the assigned
+  `address` + `phase`; the binding is `Ready` (and the address advertised via the
+  synthesized EndpointSlice + programmed) only while its `target` is a **live
+  Port** — no live target ⇒ address held but dark. It needs no egress gateway
+  (the NAT is in the eBPF bridge, not the gateway).
 
 ### Realized
 

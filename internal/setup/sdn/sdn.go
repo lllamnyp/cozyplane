@@ -22,7 +22,6 @@ import (
 	sdnopenapi "github.com/lllamnyp/cozyplane/pkg/generated/sdn/openapi"
 	defaultregistry "github.com/lllamnyp/cozyplane/pkg/registry"
 	"github.com/lllamnyp/cozyplane/pkg/registry/sdn/claim"
-	externalpoolstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/externalpool"
 	floatingipstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/floatingip"
 	hostfirewallstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/hostfirewall"
 	portstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/port"
@@ -65,15 +64,11 @@ func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOpt
 	if err != nil {
 		panic(err)
 	}
-	vpcGatewayREST, vpcGatewayStatusREST, err := vpcgatewaystorage.NewREST(scheme, restOptionsGetter, auth)
+	vpcGatewayREST, vpcGatewayStatusREST, err := vpcgatewaystorage.NewREST(scheme, restOptionsGetter)
 	if err != nil {
 		panic(err)
 	}
 	vpcPeeringREST, vpcPeeringStatusREST, err := vpcpeeringstorage.NewREST(scheme, restOptionsGetter, auth)
-	if err != nil {
-		panic(err)
-	}
-	externalPoolREST, externalPoolStatusREST, err := externalpoolstorage.NewREST(scheme, restOptionsGetter)
 	if err != nil {
 		panic(err)
 	}
@@ -114,8 +109,6 @@ func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOpt
 	v1alpha1storage["vpcgateways/status"] = vpcGatewayStatusREST
 	v1alpha1storage["vpcpeerings"] = vpcPeeringREST
 	v1alpha1storage["vpcpeerings/status"] = vpcPeeringStatusREST
-	v1alpha1storage["externalpools"] = externalPoolREST
-	v1alpha1storage["externalpools/status"] = externalPoolStatusREST
 	v1alpha1storage["floatingips"] = floatingIPREST
 	v1alpha1storage["floatingips/status"] = floatingIPStatusREST
 	v1alpha1storage["servicevips"] = serviceVIPREST

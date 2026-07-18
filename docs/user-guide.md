@@ -62,7 +62,7 @@ Build and load the image, then apply the manifests in order.
 
 **The tenant API is not CRDs.** cozyplane serves two API groups, and this trips
 people up: `local.sdn.cozystack.io` (just `FabricIP`) is a CRD, but the tenant kinds
-— `VPC`, `VPCBinding`, `VPCGateway`, `Port`, `FloatingIP`, `ExternalPool`,
+— `VPC`, `VPCBinding`, `VPCGateway`, `Port`, `FloatingIP`,
 `SecurityGroup`, … — live in `sdn.cozystack.io`, which is served **only by the
 aggregated apiserver**. Skip that component and every example below fails with
 `no matches for kind "VPC"`. (Why the groups are disjoint: [api-groups.md](api-groups.md).)
@@ -301,9 +301,8 @@ Notes:
 
 By default a VPC is a **closed island**: no way out, and no way in. Its
 north-south boundary is a separate object — a `VPCGateway`
-([docs/north-south.md](north-south.md)) — because opening a door onto an
-`ExternalPool` is the *operator's* grant, not something a tenant takes by
-flipping a field on a VPC it owns:
+([docs/north-south.md](north-south.md)) — not a field on a VPC the tenant could
+flip on itself:
 
 ```yaml
 apiVersion: sdn.cozystack.io/v1alpha1
@@ -311,32 +310,37 @@ kind: VPCGateway
 metadata: {name: door, namespace: team-a}
 spec:
   vpcRef: {name: vpc-a}
-  poolRef: {name: public}      # requires the "attach" verb on the pool
   nat:
     enabled: true              # outbound for pods with no floating address
   ingress:
     loadBalancer: false        # may a Service type=LB land on this VPC's pods?
+  # loadBalancerClass: ...    # optional; which LB implementation assigns the NAT address
 ```
+
+The gateway's egress identity comes from delegated `Service type: LoadBalancer`
+objects it owns, one per address family — the cluster's LB implementation (e.g.
+MetalLB) allocates and attracts the address, and who may mint one is Service RBAC
+plus the allocator's own scoping ([external-addresses.md](external-addresses.md)).
 
 A VPC has **exactly one** boundary (the oldest gateway wins), and everything
 that crosses it is counted per VPC and per door — `cozyplane_vpc_ns_bytes_total`.
 
-**With a `poolRef` (the example above), there is no gateway pod.** Egress is
+**With NAT addresses assigned, there is no gateway pod.** Egress is
 realized in eBPF at each pod's own veth: the VPC's off-net traffic is SNATed
-straight out the uplink to `status.natAddress` — **an address of the VPC's own**,
-drawn from the pool. It is distributed across nodes (each node draws ports from its
+straight out the uplink to `status.natAddress` / `natAddress6` — **an address of
+the VPC's own**, assigned by the LB implementation. It is distributed across nodes (each node draws ports from its
 own shard of the address), so there is no hairpin, no single conntrack point, and no
 per-VPC single point of failure. Cluster-internal destinations are still refused;
 cluster DNS still works, because the split-horizon resolver serves VPC pods directly
 and never needed a pod to proxy it.
 
-Only a `nat.enabled` gateway with **no `poolRef`** still spawns a per-VPC **gateway
-pod** (a default-network pod with a second leg on the VPC's reserved `.1`), which
+Only a family with **no assigned NAT address** (no LB implementation, or one that
+cannot serve that family) still spawns a per-VPC **gateway pod** (a default-network pod with a second leg on the VPC's reserved `.1`), which
 forwards under a default-deny filter: internet forwarded, cluster DNS on `:53`
 allowed, everything else cluster-internal dropped. That path has no address of its
 own, so its egress is masqueraded to the gateway pod's fabric address and then again
 to the **node's** — meaning the tenant is indistinguishable from the platform on the
-wire. Prefer a pool.
+wire. Run an LB implementation.
 
 ```bash
 kubectl exec app-1 -- ping -c2 1.1.1.1          # works
@@ -375,9 +379,11 @@ DNS) is unaffected — only internet egress takes the public IP. Its *delivery* 
 not route through the gateway: the address maps straight to the tenant IP in the
 eBPF datapath.
 
-Its *address*, though, comes from the VPC's gateway. **A VPC with no `VPCGateway`
-gets no floating address at all** — the `attach` verb on the pool is what governs
-every address a tenant can wear, so create the gateway (above) first.
+Its *address* comes from a delegated `Service type: LoadBalancer` the FloatingIP
+owns: the cluster's LB implementation allocates it (and attracts it), cozyplane
+consumes `status.loadBalancer.ingress` and delivers
+([external-addresses.md](external-addresses.md)). Who may mint an address is
+Service RBAC + the allocator's own scoping.
 
 > **cozyplane does not announce the address.** It *delivers* it. Something else must
 > attract it to a node — a CCM assigning it to a VNIC, MetalLB, a static route, or
@@ -385,36 +391,25 @@ every address a tenant can wear, so create the gateway (above) first.
 > it, because the uplink hook runs at tc ingress, ahead of the kernel's routing
 > decision. There is no ARP/NDP responder and no BGP speaker here, by design.
 
-An operator defines a pool of routable addresses once, cluster-wide:
-
-```yaml
-apiVersion: sdn.cozystack.io/v1alpha1
-kind: ExternalPool
-metadata: {name: public}
-spec:
-  cidrs: ["203.0.113.0/24"]
-```
-
-A tenant then claims one for a workload in their VPC:
+A tenant binds one to a workload in their VPC:
 
 ```yaml
 apiVersion: sdn.cozystack.io/v1alpha1
 kind: FloatingIP
 metadata: {name: web, namespace: team-a}
 spec:
-  vpcRef: {name: vpc-a}      # a VPC in this namespace
-  target: 10.0.0.5           # the tenant IP to expose
-  # poolRef: {name: public}  # optional; defaults to this VPC's VPCGateway's pool
-                             # (no gateway => no pool => no address, ever)
-  # address: 203.0.113.7     # optional; a specific address, else lowest free
+  vpcRef: {name: vpc-a}        # a VPC in this namespace
+  target: 10.0.0.5             # the tenant IP to expose
+  # loadBalancerClass: ...    # optional; which LB implementation assigns the address
 ```
 
-The address is **reserved** as soon as the binding is created, but it is only
-advertised and made reachable while the `target` IP belongs to a **live Port** —
-a running pod. That gives the datapath a node to advertise the address from and
-deliver to, and it means the address follows the pod across reschedules. Until a
-pod is actually running with the target IP, the binding holds its address but
-stays `Pending` — the address is yours, just not yet announced:
+cozyplane mints the delegated Service; the LB implementation assigns the address
+into its `status.loadBalancer.ingress`, and the FloatingIP consumes it. The
+address is advertised (cozyplane synthesizes the Service's EndpointSlice, whose
+readiness is what makes e.g. MetalLB announce) and made reachable only while the
+`target` IP belongs to a **live Port** — a running pod. The address follows the
+pod across reschedules; until a pod actually runs with the target IP, the binding
+holds its address but stays `Pending` — held, just not yet announced:
 
 ```bash
 kubectl -n team-a get floatingip web
@@ -423,9 +418,10 @@ kubectl -n team-a get floatingip web
 
 kubectl -n team-a get floatingip web -o \
   jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}'
-# PoolResolved=True
+# ServiceReady=True
 # AddressAssigned=True
 # TargetLive=False           <- no running pod has 10.0.0.5 in vpc-a yet
+# TargetExclusive=True
 ```
 
 Start a pod with `10.0.0.5` in `vpc-a` and the binding goes `Ready`. Binding a
@@ -455,12 +451,12 @@ These are prototype constraints, not permanent:
   opens outbound; `ingress.loadBalancer` admits a `Service type=LB` onto its pods.
   Still missing: per-destination *egress* policy beyond SecurityGroups, and a
   metadata endpoint ([vm-provisioning.md](vm-provisioning.md)).
-- **The single-pod gateway is gone — unless you skip the pool.** A gateway with a
-  `poolRef` has no pod at all (eBPF SNAT at each pod's veth, state on the pod's own
-  node). A `nat.enabled` gateway with *no* pool still gets one pod per VPC (Recreate
-  strategy): a node failure or image roll interrupts that VPC's egress until it
-  reschedules, and established flows don't survive the move (conntrack is in the
-  pod). Give the gateway a pool.
+- **The single-pod gateway is gone — unless no NAT address is assigned.** A
+  gateway whose families all have LB-assigned addresses has no pod at all (eBPF
+  SNAT at each pod's veth, state on the pod's own node). A family with no assigned
+  address still gets one pod per VPC (Recreate strategy): a node failure or image
+  roll interrupts that VPC's egress until it reschedules, and established flows
+  don't survive the move (conntrack is in the pod). Run an LB implementation.
 - **All three policy layers exist**: `SecurityGroup` (within and across peered
   VPCs), upstream `NetworkPolicy` (the default network) and `HostFirewall` (nodes).
   A `VPCPeering` no longer opens two VPCs to each other completely — SecurityGroups

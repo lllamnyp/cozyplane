@@ -37,12 +37,13 @@ replaces kube-ovn for VPC networking, and it can own Services too: `cozyplane-kp
 - **VPC peering**: symmetric `VPCPeering` halves, native cross-VPC datapath, status
   controller.
 - **A declared north-south boundary**: a namespaced `VPCGateway` is the VPC's one
-  door (`nat.enabled` for egress, `ingress.loadBalancer` to admit inbound). Creating
-  one needs the `attach` verb on an `ExternalPool`, so an operator grants the pool
-  and the tenant opens its own door onto it — a tenant cannot grant itself internet.
-  Egress NAT runs **in eBPF at the pod's own veth**, so the VPC leaves the cluster
-  wearing **its own address**, not the node's, and there is no gateway pod in the
-  path. Every crossing is **metered** per VPC and per door
+  door (`nat.enabled` for egress, `ingress.loadBalancer` to admit inbound). Its
+  egress identity rides delegated `Service type: LoadBalancer` objects the gateway
+  owns — the cluster's LB implementation allocates and attracts the address, and
+  who may mint one is Service RBAC + the allocator's scoping
+  (docs/external-addresses.md). Egress NAT runs **in eBPF at the pod's own veth**,
+  so the VPC leaves the cluster wearing **its own address**, not the node's, and
+  there is no gateway pod in the path. Every crossing is **metered** per VPC and per door
   (`cozyplane_vpc_ns_{bytes,packets}_total`), and LoadBalancer ingress into a VPC is
   **default-deny** until the gateway admits it.
 - **Floating IPs (EIPs)**: `FloatingIP` gives a Port a true public address, inbound
@@ -133,7 +134,7 @@ cmd/agent/      node agent DaemonSet (loads datapath, watches Nodes/VPCs/Ports/�
 cmd/sdn-controller/  controllers: VNI assignment, peering, floating IPs, live-migration cutover/GC
 cmd/apiserver/  aggregated API server — serves the sdn.cozystack.io API
 cmd/gateway/    per-VPC egress NAT gateway
-api/sdn/        API types: VPC, Port, VPCBinding, VPCPeering, ExternalPool, FloatingIP
+api/sdn/        API types: VPC, Port, VPCBinding, VPCPeering, FloatingIP, SecurityGroup, …
 internal/       apiserver wiring (internal/cmd, internal/setup) + controllers
 pkg/apiserver/  aggregated apiserver framework
 pkg/registry/   REST storage for the apiserver

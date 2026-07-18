@@ -357,34 +357,32 @@ check_ok "vpc-c gateway Ready despite the stale .1 claim (GC freed it)" \
 check "c1(vpc-c, egress on) -> internet 1.1.1.1" "" bash -c "$K -n team-a exec c1 -- ping -c2 -W3 1.1.1.1 >/dev/null 2>&1 && echo"
 
 phase "v6 floating IP: NDP advertisement, stateless DNAT, EIP egress"
-# The v6 twin of the floating phase: the pool sits inside the kind network's
-# on-link ULA /64, so the external client resolves the address by NDP — which
-# only works if from_uplink's floating_ndp answers the solicitation.
+# The v6 twin of the floating phase: the address sits inside the kind network's
+# on-link ULA /64. Cozyplane answers no NDP — the e2e attracts by configuring
+# the address on a node, whose kernel then answers the solicitation.
 KNET6=$(docker network inspect kind -f '{{range .IPAM.Config}}{{.Subnet}}
 {{end}}' 2>/dev/null | grep : | head -1)
 V6PFX=${KNET6%%::*}
 FIP6="${V6PFX}:f10a::10"
 V6A2IP=$(vpcip v6a2)
-docker run -d --rm --name nacap --network kind nicolaka/netshoot \
-  sh -c "tcpdump -lnni eth0 icmp6 > /tmp/cap.txt 2>&1" >/dev/null 2>&1
-sleep 2
 $K apply -f - >/dev/null <<EOF
-apiVersion: sdn.cozystack.io/v1alpha1
-kind: ExternalPool
-metadata: {name: e2e-pub6}
-spec: {cidrs: ["${V6PFX}:f10a::/96"], advertisement: L2}
----
 apiVersion: sdn.cozystack.io/v1alpha1
 kind: FloatingIP
 metadata: {name: v6a2-fip, namespace: team-a}
-spec: {vpcRef: {name: vpc6a}, target: "$V6A2IP", address: "$FIP6", poolRef: {name: e2e-pub6}}
+spec: {vpcRef: {name: vpc6a}, target: "$V6A2IP"}
 EOF
+FSVC6=""; for _ in $(seq 1 15); do
+  FSVC6=$($K -n team-a get svc -l sdn.cozystack.io/floating-ip=v6a2-fip -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  [ -n "$FSVC6" ] && break; sleep 2
+done
+[ -n "$FSVC6" ] && pass "v6a2-fip minted its delegated Service ($FSVC6)" || fail "v6a2-fip minted no delegated Service"
+$K -n team-a patch svc "$FSVC6" --subresource=status --type=merge \
+  -p "{\"status\":{\"loadBalancer\":{\"ingress\":[{\"ip\":\"$FIP6\"}]}}}" >/dev/null 2>&1
 $K -n team-a wait --for=jsonpath='{.status.phase}'=Ready floatingip/v6a2-fip --timeout=30s >/dev/null 2>&1
 check "v6a2-fip Ready with $FIP6" "Ready" $K -n team-a get floatingip v6a2-fip -o jsonpath='{.status.phase}'
-sleep 3
-na=$(docker exec nacap grep -ciE "neighbor advertisement.*tgt is $FIP6" /tmp/cap.txt 2>/dev/null)
-docker rm -f nacap >/dev/null 2>&1
-[ "${na:-0}" -ge 1 ] && pass "unsolicited NA announced $FIP6 on programming" || fail "unsolicited NA announced $FIP6 on programming (saw ${na:-0})"
+ATTNODE6=$(kind get nodes --name "$CLUSTER" 2>/dev/null | head -1)
+docker exec "$ATTNODE6" ip -6 addr add "$FIP6/128" dev eth0 nodad 2>/dev/null
+sleep 2
 got6=""; for _ in $(seq 1 12); do got6=$(docker run --rm --network kind curlimages/curl:8.11.0 -s -m3 -g "http://[$FIP6]/" 2>/dev/null | tr -d '[:space:]'); [ "$got6" = "v6a2" ] && break; sleep 2; done
 [ "$got6" = "v6a2" ] && pass "external v6 client -> [$FIP6] reaches v6a2 (NDP + DNAT)" || fail "external v6 client -> [$FIP6] reaches v6a2 (got '$got6')"
 gotp6=""; for _ in $(seq 1 8); do docker run --rm --network kind busybox:1.36 ping -6 -c1 -W2 "$FIP6" >/dev/null 2>&1 && { gotp6=ok; break; }; sleep 2; done
@@ -709,36 +707,37 @@ check "cz($W) -> $CYIP reaches cy($W2) (stale local pruned, remote wins)" "cy" h
 
 phase "floating IP: external ingress, source-preserving"
 # Bind a public IP to a1's VPC IP; an off-cluster client (a container on the
-# kind L2, off the overlay) must reach a1 through it. Exercises from_uplink ->
-# to_pod floating DNAT -> pod, the source-preserving reply, and ARP advertisement
-# from a1's node. The public IP is drawn from the kind subnet's high /24 (kind's
-# DHCP allocates low), so the client resolves it by ARP on the shared bridge.
+# kind L2, off the overlay) must reach a1 through it. Exercises the delegated
+# Service (docs/external-addresses.md), from_uplink -> to_pod floating DNAT ->
+# pod, and the source-preserving reply. Cozyplane neither allocates nor
+# attracts: the e2e plays the allocator (patches the owned Service's LB
+# ingress) and the attractor (configures the address on a node, whose kernel
+# then answers ARP on the kind bridge). The public IP is drawn from the kind
+# subnet's high /24 (kind's DHCP allocates low).
 KNET=$(docker network inspect kind -f '{{range .IPAM.Config}}{{.Subnet}}{{"\n"}}{{end}}' 2>/dev/null | grep -v : | head -1)
 KPFX=$(echo "${KNET:-172.18.0.0/16}" | cut -d. -f1-2)
 FIP="${KPFX}.240.10"
 A1IP=$(vpcip a1)
-# Watch for the gratuitous ARP the agent emits when the address becomes local
-# (the nudge that fixes external L2 caches when a floating IP moves nodes).
-docker run -d --rm --name garpcap --network kind nicolaka/netshoot \
-  sh -c "tcpdump -lnni eth0 arp > /tmp/cap.txt 2>&1" >/dev/null 2>&1
-sleep 2
 $K apply -f - >/dev/null <<EOF
-apiVersion: sdn.cozystack.io/v1alpha1
-kind: ExternalPool
-metadata: {name: e2e-pub}
-spec: {cidrs: ["${KPFX}.240.0/24"], advertisement: L2}
----
 apiVersion: sdn.cozystack.io/v1alpha1
 kind: FloatingIP
 metadata: {name: a1-fip, namespace: team-a}
-spec: {vpcRef: {name: vpc-a}, target: "$A1IP", address: "$FIP", poolRef: {name: e2e-pub}}
+spec: {vpcRef: {name: vpc-a}, target: "$A1IP"}
 EOF
+FSVC=""; for _ in $(seq 1 15); do
+  FSVC=$($K -n team-a get svc -l sdn.cozystack.io/floating-ip=a1-fip -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  [ -n "$FSVC" ] && break; sleep 2
+done
+[ -n "$FSVC" ] && pass "a1-fip minted its delegated Service ($FSVC)" || fail "a1-fip minted no delegated Service"
+$K -n team-a patch svc "$FSVC" --subresource=status --type=merge \
+  -p "{\"status\":{\"loadBalancer\":{\"ingress\":[{\"ip\":\"$FIP\"}]}}}" >/dev/null 2>&1
 $K -n team-a wait --for=jsonpath='{.status.phase}'=Ready floatingip/a1-fip --timeout=30s >/dev/null 2>&1
 check "a1-fip Ready with $FIP" "Ready" $K -n team-a get floatingip a1-fip -o jsonpath='{.status.phase}'
-sleep 3
-garp=$(docker exec garpcap grep -cE "Request who-has $FIP .*tell $FIP" /tmp/cap.txt 2>/dev/null)
-docker rm -f garpcap >/dev/null 2>&1
-[ "${garp:-0}" -ge 1 ] && pass "gratuitous ARP announced $FIP on programming" || fail "gratuitous ARP announced $FIP on programming (saw ${garp:-0})"
+# Attract as the platform would: the address on a node's uplink (any node —
+# from_uplink delivers from wherever the fabric hands the packet over).
+ATTNODE=$(kind get nodes --name "$CLUSTER" 2>/dev/null | head -1)
+docker exec "$ATTNODE" ip addr add "$FIP/32" dev eth0 2>/dev/null
+sleep 2
 # External client: a throwaway container on the kind network, not a cluster node.
 extget() { docker run --rm --network kind curlimages/curl:8.11.0 -s -m3 "$1" 2>/dev/null; }
 got=""; for _ in $(seq 1 12); do got=$(extget "http://$FIP/" | tr -d '[:space:]'); [ "$got" = "a1" ] && break; sleep 2; done

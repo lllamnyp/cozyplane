@@ -229,6 +229,18 @@ Services, not cozyplane's to special-case.
 **Removed:** the `ExternalPool` kind; `firstFreeAddress`; `ensureNATAddress`'s
 allocation; `FloatingIP.spec.poolRef`; `VPCGateway.spec.poolRef`; the `attach` verb.
 
+**Replaced, not dropped — the pool's second job.** Pools also told the agent *which
+L2 links every node must serve*: `ensurePoolUplinks` attached `from_uplink` to the
+link covering each pool CIDR on every node, because an LB frontend or NAT reply
+arrives wherever the fabric attracts it — including nodes hosting no floating
+target (found live: a MetalLB-announced LB IP black-holed on a node with no local
+attach trigger). With pools gone, the trigger derives from the **addresses that
+actually exist**, each ensured on every node via the FIB (`EnsureFloatingUplink`):
+floating addresses (`watchFloatingIPs`, already), VPC NAT identities
+(`watchVPCGateways`), and LB `status.loadBalancer.ingress` IPs (a Services watch).
+Strictly better than pools: exactly the links carrying real addresses, no CIDR
+list to keep in sync.
+
 **Unchanged — this is the tell that the boundary is right:** the eBPF datapath. `floating`,
 `floating_forward`, `floating_egress_snat`, `vpc_nat`, `vpc_nat_snat{,6}`,
 `vpc_nat_reverse{,6}` all key on an address that arrives from somewhere and never cared
@@ -286,7 +298,10 @@ cozyplane's job is a datapath keyed on an address it was handed. Nothing more.
    pod egressing to an on-VLAN host was seen as that address (SNAT), and the reply
    round-tripped (HTTP 200) — the self-addressed EndpointSlice made MetalLB advertise
    it, so `vpc_nat_reverse` could un-NAT the return.
-3. **Delete `ExternalPool`** + the allocator once nothing draws from it.
+3. **[done] Delete `ExternalPool`** + the allocator. The kind, its aggregated
+   storage, the `attach` verb, and both deprecated `poolRef` fields are gone; the
+   pool's uplink-attach job moved to the addresses that exist (§9); the e2e floating
+   phases play the allocator by patching the owned Service's LB ingress.
 4. **Reservation (`addressClaimRef`)** — when `IPAddressClaim` lands: the pin field, the
    claim-owns-the-Service / object-contributes-endpoints binding, the one-Service
    invariant. Additive; nothing above changes.

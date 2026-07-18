@@ -322,11 +322,13 @@ rather than anything on the gateway: it is the fabric bridge (`fabricIP ↔ vpcI
 delivered by identity) turned outward, with an external address and the
 client-masquerade removed.
 
-- **Two resources, the MetalLB split.** An admin defines an `ExternalPool` (a
-  cluster-scoped range of routable addresses); a tenant creates a `FloatingIP`
-  binding one address from a pool 1:1 to a tenant IP in a VPC. Operator owns the
-  pool, tenant claims an address — and the `attach` verb on the pool is the grant
-  that makes that a real boundary rather than a naming convention.
+- **The address rides a delegated Service.** A tenant creates a `FloatingIP`
+  binding one externally-routable address 1:1 to a tenant IP in a VPC. The
+  FloatingIP owns a `Service type: LoadBalancer` carrying `service-proxy-name`:
+  the cluster's LB implementation (MetalLB, a CCM) allocates and attracts the
+  address, every proxy skips the Service's datapath, and cozyplane consumes
+  `status.loadBalancer.ingress` and delivers. Who may mint an address is Service
+  RBAC + the allocator's own scoping ([external-addresses.md](external-addresses.md)).
 - **eBPF, distributed, no gateway.** A `floating` map (`publicIP → {net, vpcIP}`)
   is DNAT'd inbound at a tc uplink hook and reversed on the reply in `from_pod`
   — no iptables, no gateway pod. Overlapping CIDRs isolate for free because

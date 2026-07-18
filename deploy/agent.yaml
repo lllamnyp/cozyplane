@@ -12,9 +12,8 @@ metadata:
 rules:
   # The agent learns every node's addresses and readiness from Node objects, and
   # patches its OWN node with what only its FIB knows: the address host traffic
-  # sources from (cozyplane.io/node-addresses) and the ExternalPools whose link it
-  # can serve (cozyplane.io/external-pools — the floating-IP electorate,
-  # docs/floating-ha.md). Without `patch` both are silently best-effort no-ops.
+  # sources from (cozyplane.io/node-addresses). Without `patch` it is a silent
+  # best-effort no-op.
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch", "patch"]
@@ -80,12 +79,6 @@ rules:
   # for those whose target Port is on this node.
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["floatingips"]
-    verbs: ["get", "list", "watch"]
-  # ExternalPools: the agent ensures the datapath serves every pool's link on
-  # every node — LB/NodePort frontends arrive wherever the provider attracts
-  # them, and a DSR reply must leave by that link (docs/lb-ingress.md).
-  - apiGroups: ["sdn.cozystack.io"]
-    resources: ["externalpools"]
     verbs: ["get", "list", "watch"]
   # ServiceVIPs: the agent programs the svc_vips datapath map from them, the
   # resolver answers attached ClusterIP services with the VIP, and the CNI

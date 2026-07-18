@@ -32,11 +32,6 @@ import (
 
 func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenAPIDefinition {
 	return map[string]common.OpenAPIDefinition{
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPool":            schema_cozyplane_api_sdn_v1alpha1_ExternalPool(ref),
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolList":        schema_cozyplane_api_sdn_v1alpha1_ExternalPoolList(ref),
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolRef":         schema_cozyplane_api_sdn_v1alpha1_ExternalPoolRef(ref),
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolSpec":        schema_cozyplane_api_sdn_v1alpha1_ExternalPoolSpec(ref),
-		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolStatus":      schema_cozyplane_api_sdn_v1alpha1_ExternalPoolStatus(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.FloatingIP":              schema_cozyplane_api_sdn_v1alpha1_FloatingIP(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.FloatingIPList":          schema_cozyplane_api_sdn_v1alpha1_FloatingIPList(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.FloatingIPSpec":          schema_cozyplane_api_sdn_v1alpha1_FloatingIPSpec(ref),
@@ -142,201 +137,6 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		runtime.TypeMeta{}.OpenAPIModelName():                                    schema_k8sio_apimachinery_pkg_runtime_TypeMeta(ref),
 		runtime.Unknown{}.OpenAPIModelName():                                     schema_k8sio_apimachinery_pkg_runtime_Unknown(ref),
 		version.Info{}.OpenAPIModelName():                                        schema_k8sio_apimachinery_pkg_version_Info(ref),
-	}
-}
-
-func schema_cozyplane_api_sdn_v1alpha1_ExternalPool(ref common.ReferenceCallback) common.OpenAPIDefinition {
-	return common.OpenAPIDefinition{
-		Schema: spec.Schema{
-			SchemaProps: spec.SchemaProps{
-				Description: "ExternalPool is a cluster-scoped, admin-defined range of externally-routable addresses. FloatingIPs claim addresses from a pool; a pool is the equivalent of MetalLB's IPAddressPool.",
-				Type:        []string{"object"},
-				Properties: map[string]spec.Schema{
-					"kind": {
-						SchemaProps: spec.SchemaProps{
-							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
-							Type:        []string{"string"},
-							Format:      "",
-						},
-					},
-					"apiVersion": {
-						SchemaProps: spec.SchemaProps{
-							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
-							Type:        []string{"string"},
-							Format:      "",
-						},
-					},
-					"metadata": {
-						SchemaProps: spec.SchemaProps{
-							Default: map[string]interface{}{},
-							Ref:     ref(v1.ObjectMeta{}.OpenAPIModelName()),
-						},
-					},
-					"spec": {
-						SchemaProps: spec.SchemaProps{
-							Default: map[string]interface{}{},
-							Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolSpec"),
-						},
-					},
-					"status": {
-						SchemaProps: spec.SchemaProps{
-							Default: map[string]interface{}{},
-							Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolStatus"),
-						},
-					},
-				},
-			},
-		},
-		Dependencies: []string{
-			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolSpec", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolStatus", v1.ObjectMeta{}.OpenAPIModelName()},
-	}
-}
-
-func schema_cozyplane_api_sdn_v1alpha1_ExternalPoolList(ref common.ReferenceCallback) common.OpenAPIDefinition {
-	return common.OpenAPIDefinition{
-		Schema: spec.Schema{
-			SchemaProps: spec.SchemaProps{
-				Description: "ExternalPoolList contains a list of ExternalPool.",
-				Type:        []string{"object"},
-				Properties: map[string]spec.Schema{
-					"kind": {
-						SchemaProps: spec.SchemaProps{
-							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
-							Type:        []string{"string"},
-							Format:      "",
-						},
-					},
-					"apiVersion": {
-						SchemaProps: spec.SchemaProps{
-							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
-							Type:        []string{"string"},
-							Format:      "",
-						},
-					},
-					"metadata": {
-						SchemaProps: spec.SchemaProps{
-							Default: map[string]interface{}{},
-							Ref:     ref(v1.ListMeta{}.OpenAPIModelName()),
-						},
-					},
-					"items": {
-						SchemaProps: spec.SchemaProps{
-							Type: []string{"array"},
-							Items: &spec.SchemaOrArray{
-								Schema: &spec.Schema{
-									SchemaProps: spec.SchemaProps{
-										Default: map[string]interface{}{},
-										Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPool"),
-									},
-								},
-							},
-						},
-					},
-				},
-				Required: []string{"items"},
-			},
-		},
-		Dependencies: []string{
-			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPool", v1.ListMeta{}.OpenAPIModelName()},
-	}
-}
-
-func schema_cozyplane_api_sdn_v1alpha1_ExternalPoolRef(ref common.ReferenceCallback) common.OpenAPIDefinition {
-	return common.OpenAPIDefinition{
-		Schema: spec.Schema{
-			SchemaProps: spec.SchemaProps{
-				Description: "ExternalPoolRef references an ExternalPool by name (pools are cluster-scoped).",
-				Type:        []string{"object"},
-				Properties: map[string]spec.Schema{
-					"name": {
-						SchemaProps: spec.SchemaProps{
-							Description: "Name is the ExternalPool name.",
-							Type:        []string{"string"},
-							Format:      "",
-						},
-					},
-				},
-			},
-		},
-	}
-}
-
-func schema_cozyplane_api_sdn_v1alpha1_ExternalPoolSpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
-	return common.OpenAPIDefinition{
-		Schema: spec.Schema{
-			SchemaProps: spec.SchemaProps{
-				Description: "ExternalPoolSpec is the specification of a pool of externally-routable addresses that FloatingIPs are allocated from. DEPRECATED — on its way out (docs/north-south.md §9).\n\nAn ExternalPool is a hand-written list of CIDRs that NOTHING ROUTES. Cozyplane allocates addresses out of it (firstFreeAddress, for both a VPCGateway's NAT identity and every FloatingIP) and nothing attracts what it allocates: tenet 3 (\"the CNI does not announce\") was only half-applied — we deleted the announcer and kept the allocator. An address that is allocated but not attracted exists in etcd and nowhere on the wire.\n\nThe replacement is a platform-allocated, platform-ATTRACTED claim (a PublicIPClaim), referenced instead of a pool. The `attach` verb's grant moves onto the claim — it must, since a bare Service would let anyone who can create a Service mint a public address.\n\nDo not build new surface on this type.",
-				Type:        []string{"object"},
-				Properties: map[string]spec.Schema{
-					"cidrs": {
-						SchemaProps: spec.SchemaProps{
-							Description: "CIDRs are the address ranges the pool hands out.",
-							Type:        []string{"array"},
-							Items: &spec.SchemaOrArray{
-								Schema: &spec.Schema{
-									SchemaProps: spec.SchemaProps{
-										Default: "",
-										Type:    []string{"string"},
-										Format:  "",
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-}
-
-func schema_cozyplane_api_sdn_v1alpha1_ExternalPoolStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
-	return common.OpenAPIDefinition{
-		Schema: spec.Schema{
-			SchemaProps: spec.SchemaProps{
-				Description: "ExternalPoolStatus is the observed state of an ExternalPool.",
-				Type:        []string{"object"},
-				Properties: map[string]spec.Schema{
-					"allocated": {
-						SchemaProps: spec.SchemaProps{
-							Description: "Allocated is the number of addresses currently bound to FloatingIPs.",
-							Type:        []string{"integer"},
-							Format:      "int32",
-						},
-					},
-					"available": {
-						SchemaProps: spec.SchemaProps{
-							Description: "Available is the number of addresses still free in the pool.",
-							Type:        []string{"integer"},
-							Format:      "int32",
-						},
-					},
-					"conditions": {
-						VendorExtensible: spec.VendorExtensible{
-							Extensions: spec.Extensions{
-								"x-kubernetes-list-map-keys": []interface{}{
-									"type",
-								},
-								"x-kubernetes-list-type": "map",
-							},
-						},
-						SchemaProps: spec.SchemaProps{
-							Description: "Conditions represent the latest available observations.",
-							Type:        []string{"array"},
-							Items: &spec.SchemaOrArray{
-								Schema: &spec.Schema{
-									SchemaProps: spec.SchemaProps{
-										Default: map[string]interface{}{},
-										Ref:     ref(v1.Condition{}.OpenAPIModelName()),
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-		Dependencies: []string{
-			v1.Condition{}.OpenAPIModelName()},
 	}
 }
 
@@ -465,25 +265,12 @@ func schema_cozyplane_api_sdn_v1alpha1_FloatingIPSpec(ref common.ReferenceCallba
 							Format:      "",
 						},
 					},
-					"poolRef": {
-						SchemaProps: spec.SchemaProps{
-							Description: "PoolRef and Address are DEPRECATED — cozyplane no longer allocates from an ExternalPool (docs/external-addresses.md). Retained until ExternalPool is deleted; ignored by the controller.",
-							Default:     map[string]interface{}{},
-							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolRef"),
-						},
-					},
-					"address": {
-						SchemaProps: spec.SchemaProps{
-							Type:   []string{"string"},
-							Format: "",
-						},
-					},
 				},
 				Required: []string{"vpcRef", "target"},
 			},
 		},
 		Dependencies: []string{
-			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolRef", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalVPCRef"},
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalVPCRef"},
 	}
 }
 
@@ -2003,7 +1790,7 @@ func schema_cozyplane_api_sdn_v1alpha1_VPCGateway(ref common.ReferenceCallback) 
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "VPCGateway is a VPC's north-south boundary: the one place where its traffic to and from the outside world is declared, permitted and counted (docs/north-south.md).\n\nIt is a boundary, not a hop. Packets are not detoured through it — enforcement stays in the datapath's eBPF hooks, exactly where it already is. What the gateway does is give that enforcement an owner: without one, a VPC has no way out (no NAT egress) and no way in (no LoadBalancer ingress), and the bytes that cross have nothing to be attributed to.\n\nA VPC has exactly one. Creating a gateway is the tenant's act; the pool it draws from is the operator's grant, enforced by the \"attach\" verb on the ExternalPool — the same shape as VPCBinding's \"export\" and VPCPeering's \"peer\".",
+				Description: "VPCGateway is a VPC's north-south boundary: the one place where its traffic to and from the outside world is declared, permitted and counted (docs/north-south.md).\n\nIt is a boundary, not a hop. Packets are not detoured through it — enforcement stays in the datapath's eBPF hooks, exactly where it already is. What the gateway does is give that enforcement an owner: without one, a VPC has no way out (no NAT egress) and no way in (no LoadBalancer ingress), and the bytes that cross have nothing to be attributed to.\n\nA VPC has exactly one. Creating a gateway is the tenant's act; who may mint the public address it draws is Service RBAC + the allocator's own scoping (docs/external-addresses.md §8).",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
@@ -2156,13 +1943,6 @@ func schema_cozyplane_api_sdn_v1alpha1_VPCGatewaySpec(ref common.ReferenceCallba
 							Format:      "",
 						},
 					},
-					"poolRef": {
-						SchemaProps: spec.SchemaProps{
-							Description: "PoolRef is DEPRECATED — the NAT identity now comes from an owned Service, not an ExternalPool (docs/external-addresses.md). Retained until ExternalPool is deleted; ignored by the controller.",
-							Default:     map[string]interface{}{},
-							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolRef"),
-						},
-					},
 					"nat": {
 						SchemaProps: spec.SchemaProps{
 							Description: "NAT configures many-to-one egress.",
@@ -2182,7 +1962,7 @@ func schema_cozyplane_api_sdn_v1alpha1_VPCGatewaySpec(ref common.ReferenceCallba
 			},
 		},
 		Dependencies: []string{
-			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolRef", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalVPCRef", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayIngress", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayNAT"},
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalVPCRef", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayIngress", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayNAT"},
 	}
 }
 

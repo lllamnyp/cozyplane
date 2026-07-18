@@ -21,12 +21,10 @@ import (
 	"errors"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
-	"github.com/lllamnyp/cozyplane/pkg/registry/sdn/authz"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/names"
@@ -58,29 +56,16 @@ func SelectableFields(obj *sdn.VPCGateway) fields.Set {
 	return generic.ObjectMetaFieldsSet(&obj.ObjectMeta, true)
 }
 
-// AttachVerb is the virtual verb on the referenced ExternalPool that gates
-// creating a VPCGateway onto it. A pool is a scarce, cluster-scoped, billable
-// resource: the operator owns it and grants it, and the tenant then opens its own
-// VPC's door onto what it was given. Without this, a tenant could grant itself
-// internet access — which is exactly what `VPC.spec.egress.natGateway` used to
-// let it do (docs/north-south.md).
-//
-// The same escalation gate as VPCBinding's `export` and VPCPeering's `peer`, and
-// enforced in the same place: the aggregated apiserver, which admission webhooks
-// never see.
-const AttachVerb = "attach"
-
 type vpcGatewayStrategy struct {
 	runtime.ObjectTyper
 	names.NameGenerator
-	authz authorizer.Authorizer
 }
 
-// NewStrategy creates and returns a vpcGatewayStrategy instance.
-// NewStrategy builds the strategy. auth is the delegated authorizer for the
-// peer-verb check; nil skips it (CRD mode, where the VAP twin enforces).
-func NewStrategy(typer runtime.ObjectTyper, auth authorizer.Authorizer) vpcGatewayStrategy {
-	return vpcGatewayStrategy{typer, names.SimpleNameGenerator, auth}
+// NewStrategy creates and returns a vpcGatewayStrategy instance. The gateway
+// needs no escalation gate anymore: who may mint the public address it draws is
+// Service RBAC + the allocator's scoping (docs/external-addresses.md §8).
+func NewStrategy(typer runtime.ObjectTyper) vpcGatewayStrategy {
+	return vpcGatewayStrategy{typer, names.SimpleNameGenerator}
 }
 
 func (vpcGatewayStrategy) NamespaceScoped() bool {
@@ -108,13 +93,6 @@ func (s vpcGatewayStrategy) Validate(ctx context.Context, obj runtime.Object) fi
 	if gw.Spec.VPCRef.Name == "" {
 		errs = append(errs, field.Required(specPath.Child("vpcRef", "name"), "the VPC name is required"))
 	}
-	// Drawing from a pool is the operator's grant, not the tenant's to take.
-	if len(errs) == 0 && gw.Spec.PoolRef.Name != "" {
-		if err := authz.CheckResourceVerb(ctx, s.authz, AttachVerb, "externalpools", "ExternalPool",
-			"", gw.Spec.PoolRef.Name, specPath.Child("poolRef")); err != nil {
-			errs = append(errs, err)
-		}
-	}
 	return errs
 }
 
@@ -135,13 +113,7 @@ func (vpcGatewayStrategy) Canonicalize(obj runtime.Object) {
 }
 
 func (s vpcGatewayStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
-	// Retargeting poolRef needs a fresh attach check; everything else (the
-	// controller's status/finalizer writes) passes unchecked.
-	newG, oldG := obj.(*sdn.VPCGateway), old.(*sdn.VPCGateway)
-	if newG.Spec.PoolRef == oldG.Spec.PoolRef {
-		return field.ErrorList{}
-	}
-	return s.Validate(ctx, obj)
+	return field.ErrorList{}
 }
 
 // WarningsOnUpdate returns warnings for the given update.

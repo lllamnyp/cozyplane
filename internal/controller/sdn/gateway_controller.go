@@ -79,9 +79,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, fmt.Errorf("fetch VPC: %w", err)
 	}
 
-	// The door is a VPCGateway now, not a field on the VPC: opening one onto an
-	// ExternalPool is the operator's grant, and a tenant must not be able to give
-	// itself internet by flipping a bool on an object it owns (docs/north-south.md).
+	// The door is a VPCGateway now, not a field on the VPC: the boundary is a
+	// separate, grantable object, and a tenant must not be able to give itself
+	// internet by flipping a bool on an object it owns (docs/north-south.md).
 	// The VPC's boundary is its OLDEST gateway; a second one realizes nothing.
 	var gws sdnv1alpha1.VPCGatewayList
 	if err := r.List(ctx, &gws, client.InNamespace(vpc.Namespace)); err != nil {

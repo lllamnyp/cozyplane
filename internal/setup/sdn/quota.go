@@ -68,8 +68,8 @@ import (
 // bound. Each becomes `count/<resource>.sdn.cozystack.io`.
 var quotableResources = []string{
 	"vpcs",        // and therefore VNIs — a globally-shared keyspace
-	"vpcgateways", // each may hold a NAT address out of a pool
-	"floatingips", // each holds an address out of a pool
+	"vpcgateways", // each may hold NAT addresses (via owned LB Services)
+	"floatingips", // each holds an address (via an owned LB Service)
 	"securitygroups",
 	"vpcpeerings",
 	"vpcbindings",

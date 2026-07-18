@@ -75,14 +75,6 @@ type FloatingIPSpec struct {
 	// implementation assigns (docs/external-addresses.md).
 	// +optional
 	LoadBalancerClass string `json:"loadBalancerClass,omitempty"`
-
-	// PoolRef and Address are DEPRECATED — cozyplane no longer allocates from an
-	// ExternalPool (docs/external-addresses.md). Retained until ExternalPool is
-	// deleted; ignored by the controller.
-	// +optional
-	PoolRef ExternalPoolRef `json:"poolRef,omitempty"`
-	// +optional
-	Address string `json:"address,omitempty"`
 }
 
 // FloatingIPStatus is the observed state of a FloatingIP.

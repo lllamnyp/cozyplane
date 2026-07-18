@@ -27,7 +27,7 @@ import (
 // with apply.
 //
 // A VPC's way OUT (and in) is not declared here: it is a VPCGateway, which is a
-// separate object because opening a door onto an ExternalPool is the operator's
+// separate object because opening a north-south door is the operator's
 // grant, not the tenant's to take (docs/north-south.md).
 // VPCStatus is the observed state of a VPC.
 type VPCStatusApplyConfiguration struct {

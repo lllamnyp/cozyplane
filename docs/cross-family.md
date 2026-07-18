@@ -90,8 +90,8 @@ again).
 - **#9** needs no new API: it's implied by a v6 VPC pod having a v4 fabric IP.
   A flag or automatic-when-v4-fabric-present. (Review Q1.)
 - **Cross-family peering** extends `VPCPeering`: when the two VPCs differ in
-  family, the peering references a **v4 pool** (`ExternalPool`-like, but
-  cluster-internal) for the v6 side's aliases, and the controller allocates a v4
+  family, the peering references a **v4 alias range** (an admin-defined,
+  cluster-internal CIDR list) for the v6 side's aliases, and the controller allocates a v4
   alias per v6 Port that a v4 peer might address. Asymmetric by nature — worth a
   hard look at whether it's worth the complexity vs. "peer within a family."
   (Review Q2.)

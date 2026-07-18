@@ -36,11 +36,6 @@ type FloatingIPSpecApplyConfiguration struct {
 	// owns a `Service type: LoadBalancer` and consumes the address that
 	// implementation assigns (docs/external-addresses.md).
 	LoadBalancerClass *string `json:"loadBalancerClass,omitempty"`
-	// PoolRef and Address are DEPRECATED — cozyplane no longer allocates from an
-	// ExternalPool (docs/external-addresses.md). Retained until ExternalPool is
-	// deleted; ignored by the controller.
-	PoolRef *ExternalPoolRefApplyConfiguration `json:"poolRef,omitempty"`
-	Address *string                            `json:"address,omitempty"`
 }
 
 // FloatingIPSpecApplyConfiguration constructs a declarative configuration of the FloatingIPSpec type for use with
@@ -70,21 +65,5 @@ func (b *FloatingIPSpecApplyConfiguration) WithTarget(value string) *FloatingIPS
 // If called multiple times, the LoadBalancerClass field is set to the value of the last call.
 func (b *FloatingIPSpecApplyConfiguration) WithLoadBalancerClass(value string) *FloatingIPSpecApplyConfiguration {
 	b.LoadBalancerClass = &value
-	return b
-}
-
-// WithPoolRef sets the PoolRef field in the declarative configuration to the given value
-// and returns the receiver, so that objects can be built by chaining "With" function invocations.
-// If called multiple times, the PoolRef field is set to the value of the last call.
-func (b *FloatingIPSpecApplyConfiguration) WithPoolRef(value *ExternalPoolRefApplyConfiguration) *FloatingIPSpecApplyConfiguration {
-	b.PoolRef = value
-	return b
-}
-
-// WithAddress sets the Address field in the declarative configuration to the given value
-// and returns the receiver, so that objects can be built by chaining "With" function invocations.
-// If called multiple times, the Address field is set to the value of the last call.
-func (b *FloatingIPSpecApplyConfiguration) WithAddress(value string) *FloatingIPSpecApplyConfiguration {
-	b.Address = &value
 	return b
 }

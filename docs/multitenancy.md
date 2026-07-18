@@ -115,12 +115,14 @@ An **operator** debugging a tenant is a different persona with different rules
 
 **Keep** — already true, and worth stating so it stays true.
 
-A tenant creates its own `VPCGateway` (its VPC's boundary). But the `ExternalPool`
-it draws from is a scarce, cluster-scoped, billable resource, and drawing from one
-requires the **`attach`** verb — an operator's grant. Same shape as `VPCBinding`'s
-`export` and `VPCPeering`'s `peer`: the tenant acts, the operator grants, and the
-escalation is refused at the aggregated apiserver, which admission webhooks never
-see.
+A tenant creates its own `VPCGateway` (its VPC's boundary). But the external
+address behind it is scarce and billable, and minting one is governed outside
+cozyplane: the address rides a delegated `Service type: LoadBalancer`
+([external-addresses.md](external-addresses.md) §8), so "who may mint" is Service
+RBAC plus the allocator's own scoping (e.g. MetalLB's `serviceAllocation`). The
+same *shape* survives in `VPCBinding`'s `export` and `VPCPeering`'s `peer`: the
+tenant acts, the operator grants, and the escalation is refused at the aggregated
+apiserver, which admission webhooks never see.
 
 The general form: **a tenant may always act inside its own namespace; anything that
 consumes a shared resource, or reaches into another namespace, is a grant.**
@@ -164,7 +166,7 @@ label. **Cozyplane learns tenancy from no platform.**
 
 ### R9. Operators are not tenants.
 
-**Keep.** `HostFirewall`, `ExternalPool`, and quotas are operator-only, and no
+**Keep.** `HostFirewall` and quotas are operator-only, and no
 tenant role includes them. An operator may read cluster-scoped objects (that is
 what R2 protects *from tenants*, not from the platform). The two personas get two
 role sets, and no rule quietly serves both.
