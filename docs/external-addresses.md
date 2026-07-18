@@ -236,7 +236,7 @@ cozyplane's job is a datapath keyed on an address it was handed. Nothing more.
 
 0. **[done] kpr honours `service-proxy-name`** ([public-ip.md](public-ip.md) increment
    0). The enabling primitive — proxies skip a delegated Service.
-1. **[code done] FloatingIP → owned Service (+ synthesized EndpointSlice).** The
+1. **[done, dev4-validated] FloatingIP → owned Service (+ synthesized EndpointSlice).** The
    controller renders + owns a selectorless `service-proxy-name: cozyplane`
    `type: LoadBalancer` Service (`generateName: <fip>-`, `etp: Cluster`, node-ports
    off), reads `status.loadBalancer.ingress` into `status.address`, and gates Ready
@@ -253,6 +253,12 @@ cozyplane's job is a datapath keyed on an address it was handed. Nothing more.
    Port — so advertisement follows liveness (held-but-dark when the target is gone),
    matching the datapath. Delivery is still the eBPF datapath, never this endpoint
    (every proxy skips the Service via `service-proxy-name`).
+   *dev4 e2e:* a MetalLB pool on the node VLAN + a FloatingIP on a VPC pod →
+   `status.address` gets the VLAN IP, MetalLB ARP-answers it, and a genuinely
+   external host on the VLAN (an OCI VM, not a cluster node) reaches the pod
+   through it (`from_uplink` DNAT + overlay + reverse SNAT). Inbound and its
+   replies work end-to-end; pod-*initiated* egress-as-floating still needs a
+   VPCGateway on the VPC (unchanged by this increment).
 2. **VPCGateway NAT identity → owned Service.** The same, backend-less + `etp: Cluster`.
 3. **Delete `ExternalPool`** + the allocator once nothing draws from it.
 4. **Reservation (`addressClaimRef`)** — when `IPAddressClaim` lands: the pin field, the

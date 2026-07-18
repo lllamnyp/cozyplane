@@ -74,8 +74,11 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
    a FloatingIP binds by adding an EndpointSlice + datapath, never a rival Service).
    `FloatingIP` **survives** as the binding/datapath object; `ExternalPool` and the
    `attach` verb retire; governance moves to Service RBAC + the allocator's scoping.
-   **The eBPF does not change at all.** Increments: FloatingIP→Service (unblocked now),
-   NAT identity→Service, delete `ExternalPool`, then reservation when the claim lands (§3).
+   **The eBPF does not change at all.** Increments: **FloatingIP→Service (done,
+   dev4-validated end-to-end: an external OCI VM on the node VLAN reached a VPC pod
+   via its FloatingIP, MetalLB allocating + advertising the address off a synthesized
+   EndpointSlice)**, NAT identity→Service, delete `ExternalPool`, then reservation when
+   the claim lands (§3).
 3. **Public IPs on the default network — supersede cozy-proxy** ([#14](../../issues/14)) —
    **[public-ip.md](public-ip.md)** (design, awaiting review). Cozystack today gives a
    net-0 VM a real public address (all ports in, and egress *as that address*) with
