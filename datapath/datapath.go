@@ -17,6 +17,8 @@ limitations under the License.
 package datapath
 
 import (
+	"sync"
+
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -40,6 +42,13 @@ type Manager struct {
 	uplinkMAC     net.HardwareAddr
 	// The floating uplink, when floating addresses live on a different link
 	// than the default route (EnsureFloatingUplink); zero = same as uplink.
+	// floatMu serializes EnsureFloatingUplink: it is called from several
+	// watchers (floating addresses, NAT identities, LB ingress IPs) that fire
+	// on the same event cascade, and attachTCX's remove-pin/attach/pin sequence
+	// is not concurrency-safe — a losing caller's pin removal can destroy the
+	// winner's freshly pinned link (found live: every node lost its eth1
+	// from_uplink attach the moment three watchers raced).
+	floatMu       sync.Mutex
 	floatIfindex  int
 	floatMAC      net.HardwareAddr
 	recreatedPins []string

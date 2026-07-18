@@ -58,6 +58,10 @@ func (m *Manager) EnsureFloatingUplink(publicIP string) error {
 	if r.Gw != nil || r.LinkIndex == 0 || r.LinkIndex == m.uplinkIfindex {
 		return nil // routed pool, or already the default uplink
 	}
+	// Serialized: several watchers call this on the same event cascade, and a
+	// concurrent attach would tear down the winner's pinned link (see floatMu).
+	m.floatMu.Lock()
+	defer m.floatMu.Unlock()
 	if m.floatIfindex == r.LinkIndex {
 		return nil // already configured this run
 	}
