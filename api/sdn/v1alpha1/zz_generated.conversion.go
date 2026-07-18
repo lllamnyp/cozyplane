@@ -1768,6 +1768,7 @@ func autoConvert_v1alpha1_VPCGatewaySpec_To_sdn_VPCGatewaySpec(in *VPCGatewaySpe
 	if err := Convert_v1alpha1_LocalVPCRef_To_sdn_LocalVPCRef(&in.VPCRef, &out.VPCRef, s); err != nil {
 		return err
 	}
+	out.LoadBalancerClass = in.LoadBalancerClass
 	if err := Convert_v1alpha1_ExternalPoolRef_To_sdn_ExternalPoolRef(&in.PoolRef, &out.PoolRef, s); err != nil {
 		return err
 	}
@@ -1789,6 +1790,7 @@ func autoConvert_sdn_VPCGatewaySpec_To_v1alpha1_VPCGatewaySpec(in *sdn.VPCGatewa
 	if err := Convert_sdn_LocalVPCRef_To_v1alpha1_LocalVPCRef(&in.VPCRef, &out.VPCRef, s); err != nil {
 		return err
 	}
+	out.LoadBalancerClass = in.LoadBalancerClass
 	if err := Convert_sdn_ExternalPoolRef_To_v1alpha1_ExternalPoolRef(&in.PoolRef, &out.PoolRef, s); err != nil {
 		return err
 	}

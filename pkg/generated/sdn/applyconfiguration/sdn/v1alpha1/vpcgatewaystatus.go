@@ -28,16 +28,18 @@ import (
 //
 // VPCGatewayStatus is the observed state of a VPCGateway.
 type VPCGatewayStatusApplyConfiguration struct {
-	// NATAddress is the v4 address this VPC's v4 egress wears on the wire —
-	// allocated from spec.poolRef, and the tenant's OWN identity. Without it a VPC's
-	// v4 traffic is SNATed to the node's address and is indistinguishable from the
-	// platform's (docs/north-south.md, tenet 8). Empty means the VPC has no v4 CIDR,
-	// or the pool has no v4 range; its v4 egress (if any) falls back to the pod.
+	// NATAddress is the v4 address this VPC's v4 egress wears on the wire — read from
+	// the gateway's owned v4 LoadBalancer Service (docs/external-addresses.md §5), and
+	// the tenant's OWN identity. Without it a VPC's v4 traffic is SNATed to the node's
+	// address and is indistinguishable from the platform's (docs/north-south.md, tenet
+	// 8). Empty means the VPC has no v4 CIDR, or the LB implementation assigned no v4
+	// address; its v4 egress (if any) falls back to the pod.
 	NATAddress *string `json:"natAddress,omitempty"`
 	// NATAddress6 is the v6 counterpart: the address this VPC's v6 egress wears
-	// (docs/north-south.md §6a). Each family gets its own eBPF identity when the
-	// pool can provide it; a family with none keeps the gateway pod. The pod is
-	// retired only once every family the VPC has is served in eBPF.
+	// (docs/north-south.md §6a), read from the gateway's owned v6 LoadBalancer Service.
+	// Each family gets its own eBPF identity when the LB implementation can assign one;
+	// a family with none keeps the gateway pod. The pod is retired only once every
+	// family the VPC has is served in eBPF.
 	NATAddress6 *string `json:"natAddress6,omitempty"`
 	// Phase is the lifecycle phase.
 	Phase *sdnv1alpha1.VPCGatewayPhase `json:"phase,omitempty"`

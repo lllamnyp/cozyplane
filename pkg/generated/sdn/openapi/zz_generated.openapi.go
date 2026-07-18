@@ -2149,9 +2149,16 @@ func schema_cozyplane_api_sdn_v1alpha1_VPCGatewaySpec(ref common.ReferenceCallba
 							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalVPCRef"),
 						},
 					},
+					"loadBalancerClass": {
+						SchemaProps: spec.SchemaProps{
+							Description: "LoadBalancerClass selects which load-balancer implementation allocates and attracts the VPC's NAT identity (Kubernetes' generic `Service.spec.loadBalancerClass`). Empty uses the cluster's default. cozyplane allocates nothing itself — the gateway owns a `Service type: LoadBalancer` per address family and consumes the address that implementation assigns (docs/external-addresses.md §5).",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
 					"poolRef": {
 						SchemaProps: spec.SchemaProps{
-							Description: "PoolRef is the ExternalPool the VPC's outside-facing addresses are drawn from — its NAT identity, and the floating addresses bound to its ports. Creating a VPCGateway requires the \"attach\" verb on this pool: pools are a scarce, cluster-scoped, billable resource, so an operator grants one and a tenant opens its own door onto it.",
+							Description: "PoolRef is DEPRECATED — the NAT identity now comes from an owned Service, not an ExternalPool (docs/external-addresses.md). Retained until ExternalPool is deleted; ignored by the controller.",
 							Default:     map[string]interface{}{},
 							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.ExternalPoolRef"),
 						},
@@ -2188,14 +2195,14 @@ func schema_cozyplane_api_sdn_v1alpha1_VPCGatewayStatus(ref common.ReferenceCall
 				Properties: map[string]spec.Schema{
 					"natAddress": {
 						SchemaProps: spec.SchemaProps{
-							Description: "NATAddress is the v4 address this VPC's v4 egress wears on the wire — allocated from spec.poolRef, and the tenant's OWN identity. Without it a VPC's v4 traffic is SNATed to the node's address and is indistinguishable from the platform's (docs/north-south.md, tenet 8). Empty means the VPC has no v4 CIDR, or the pool has no v4 range; its v4 egress (if any) falls back to the pod.",
+							Description: "NATAddress is the v4 address this VPC's v4 egress wears on the wire — read from the gateway's owned v4 LoadBalancer Service (docs/external-addresses.md §5), and the tenant's OWN identity. Without it a VPC's v4 traffic is SNATed to the node's address and is indistinguishable from the platform's (docs/north-south.md, tenet 8). Empty means the VPC has no v4 CIDR, or the LB implementation assigned no v4 address; its v4 egress (if any) falls back to the pod.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
 					},
 					"natAddress6": {
 						SchemaProps: spec.SchemaProps{
-							Description: "NATAddress6 is the v6 counterpart: the address this VPC's v6 egress wears (docs/north-south.md §6a). Each family gets its own eBPF identity when the pool can provide it; a family with none keeps the gateway pod. The pod is retired only once every family the VPC has is served in eBPF.",
+							Description: "NATAddress6 is the v6 counterpart: the address this VPC's v6 egress wears (docs/north-south.md §6a), read from the gateway's owned v6 LoadBalancer Service. Each family gets its own eBPF identity when the LB implementation can assign one; a family with none keeps the gateway pod. The pod is retired only once every family the VPC has is served in eBPF.",
 							Type:        []string{"string"},
 							Format:      "",
 						},

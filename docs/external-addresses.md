@@ -134,15 +134,22 @@ comes back *addressed to it*, and that reply must be attracted to a node for
 attraction as a FloatingIP — it rides a Service too. It differs in two ways, neither
 being "no Service":
 
-1. **Backend-less ⇒ `etp: Cluster`.** There is no single target to hang an EndpointSlice
-   on — the replies fan out by port shard across nodes. So its Service announces
-   **unconditionally** from the speaker (`etp: Cluster`), and cozyplane demuxes: the
-   reply lands on whichever node attracts the address, `from_uplink` there runs
-   `vpc_nat_reverse`, the port's shard names the owning node, and the packet is
-   forwarded over the overlay to it. This is exactly what `vpc_nat_reverse` already
-   does — "the reply arrives at whichever node attracts the address; the port says who
-   owns the flow." So a backend-less `etp: Cluster` Service on the speaker node is
-   sufficient, and the reply path is unchanged.
+1. **`etp: Cluster`, with a self-addressed endpoint.** There is no single target pod to
+   hang an EndpointSlice on — the replies fan out by port shard across nodes — so the
+   Service is `etp: Cluster` and cozyplane demuxes: the reply lands on whichever node
+   attracts the address, `from_uplink` there runs `vpc_nat_reverse`, the port's shard
+   names the owning node, and the packet is forwarded over the overlay to it. This is
+   exactly what `vpc_nat_reverse` already does — "the reply arrives at whichever node
+   attracts the address; the port says who owns the flow."
+   The one thing this Service still needs is a **ready endpoint**: MetalLB (verified at
+   increment 1) advertises a LoadBalancer address only while its Service has one —
+   `etp: Cluster` does **not** exempt it (the earlier "announces unconditionally"
+   assumption was wrong). Since there is no target, cozyplane synthesizes a single
+   endpoint that is a pure **advertisement trigger**, not a delivery target: its address
+   is the assigned NAT address itself and it is `Ready` whenever the gateway is the VPC's
+   legitimate (exclusive) boundary. Nothing dials it — every proxy skips the Service via
+   `service-proxy-name`, and the real reverse path is `vpc_nat_reverse`. The endpoint
+   exists only to flip MetalLB's advertise gate; the reply path is unchanged.
 2. **Prefers reservation.** A VPC's egress identity churning under live flows is bad,
    so the NAT identity is the strong candidate for a **claim** (§7) rather than a
    dynamic address. That is a preference for stability, satisfied by the claim layer —
@@ -150,7 +157,13 @@ being "no Service":
 
 The `VPCGateway` owns this Service the way a FloatingIP owns its own; `spec.poolRef`
 becomes an `addressClaimRef`, and `status.natAddress` / `natAddress6` are read back
-from the Service (or claim), not allocated.
+from the Service (or claim), not allocated. Because the eBPF NAT is per-family
+(`vpc_nat_snat` v4, `vpc_nat_snat6` v6) and an address is single-family, a dual-stack
+VPC's gateway owns **one Service per family** it has (`ipFamilies: [IPv4]` / `[IPv6]`,
+`SingleStack`), each yielding one identity — the same per-family split the pooled
+allocator already made (#15). A family the cluster cannot serve a LoadBalancer for
+(e.g. an IPv6 VPC on a v4-only cluster) simply gets no address, and that family keeps
+the gateway pod — the #15 fallback, unchanged.
 
 ## 6. Attraction rides the fabric — `etp` is not a default
 
@@ -259,7 +272,16 @@ cozyplane's job is a datapath keyed on an address it was handed. Nothing more.
    through it (`from_uplink` DNAT + overlay + reverse SNAT). Inbound and its
    replies work end-to-end; pod-*initiated* egress-as-floating still needs a
    VPCGateway on the VPC (unchanged by this increment).
-2. **VPCGateway NAT identity → owned Service.** The same, backend-less + `etp: Cluster`.
+2. **[code done] VPCGateway NAT identity → owned Service(s).** The gateway owns one
+   `service-proxy-name: cozyplane` `type: LoadBalancer` Service **per family** its VPC has
+   (`ipFamilies: [IPv4]`/`[IPv6]`, `SingleStack`, `etp: Cluster`, node-ports off), reads
+   each `status.loadBalancer.ingress` into `status.natAddress`/`natAddress6`, and
+   synthesizes a self-addressed ready EndpointSlice per Service so MetalLB advertises
+   (§5 — `etp: Cluster` is not exempt from the ready-endpoint rule). The pod reconciler
+   and agent are unchanged (they still read `status.natAddress{,6}`), so the #15 pod
+   fallback holds: a family with no assigned address keeps the gateway pod.
+   `spec.poolRef` deprecated/ignored; the cross-resource used-address de-dup retires
+   (MetalLB owns allocation, one Service per address).
 3. **Delete `ExternalPool`** + the allocator once nothing draws from it.
 4. **Reservation (`addressClaimRef`)** — when `IPAddressClaim` lands: the pin field, the
    claim-owns-the-Service / object-contributes-endpoints binding, the one-Service

@@ -25,11 +25,16 @@ package v1alpha1
 type VPCGatewaySpecApplyConfiguration struct {
 	// VPCRef is the VPC this gateway is the boundary of, in this namespace.
 	VPCRef *LocalVPCRefApplyConfiguration `json:"vpcRef,omitempty"`
-	// PoolRef is the ExternalPool the VPC's outside-facing addresses are drawn
-	// from — its NAT identity, and the floating addresses bound to its ports.
-	// Creating a VPCGateway requires the "attach" verb on this pool: pools are a
-	// scarce, cluster-scoped, billable resource, so an operator grants one and a
-	// tenant opens its own door onto it.
+	// LoadBalancerClass selects which load-balancer implementation allocates and
+	// attracts the VPC's NAT identity (Kubernetes' generic
+	// `Service.spec.loadBalancerClass`). Empty uses the cluster's default. cozyplane
+	// allocates nothing itself — the gateway owns a `Service type: LoadBalancer` per
+	// address family and consumes the address that implementation assigns
+	// (docs/external-addresses.md §5).
+	LoadBalancerClass *string `json:"loadBalancerClass,omitempty"`
+	// PoolRef is DEPRECATED — the NAT identity now comes from an owned Service, not an
+	// ExternalPool (docs/external-addresses.md). Retained until ExternalPool is
+	// deleted; ignored by the controller.
 	PoolRef *ExternalPoolRefApplyConfiguration `json:"poolRef,omitempty"`
 	// NAT configures many-to-one egress.
 	NAT *VPCGatewayNATApplyConfiguration `json:"nat,omitempty"`
@@ -48,6 +53,14 @@ func VPCGatewaySpec() *VPCGatewaySpecApplyConfiguration {
 // If called multiple times, the VPCRef field is set to the value of the last call.
 func (b *VPCGatewaySpecApplyConfiguration) WithVPCRef(value *LocalVPCRefApplyConfiguration) *VPCGatewaySpecApplyConfiguration {
 	b.VPCRef = value
+	return b
+}
+
+// WithLoadBalancerClass sets the LoadBalancerClass field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the LoadBalancerClass field is set to the value of the last call.
+func (b *VPCGatewaySpecApplyConfiguration) WithLoadBalancerClass(value string) *VPCGatewaySpecApplyConfiguration {
+	b.LoadBalancerClass = &value
 	return b
 }
 

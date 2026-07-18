@@ -384,20 +384,6 @@ func (r *FloatingIPReconciler) conflictingFIP(ctx context.Context, fip *sdnv1alp
 	return ""
 }
 
-// addrInCIDRs reports whether ip parses and falls within any of the CIDRs.
-func addrInCIDRs(cidrs []string, ip string) bool {
-	a, err := netip.ParseAddr(ip)
-	if err != nil {
-		return false
-	}
-	for _, c := range cidrs {
-		if p, err := netip.ParsePrefix(c); err == nil && p.Contains(a) {
-			return true
-		}
-	}
-	return false
-}
-
 // cidrsHaveV4 / cidrsHaveV6 report whether any CIDR is of that family. The eBPF
 // VPC NAT is v4-only (bpf/overlay.c: vpc_nat_snat guards !p.is_v6), so these
 // decide whether a VPC gets an eBPF egress identity (v4) or must keep the gateway
@@ -418,45 +404,6 @@ func cidrsHaveV6(cidrs []string) bool {
 		}
 	}
 	return false
-}
-
-// cidrsV4 / cidrsV6 keep only one family's CIDRs, so a NAT identity is drawn from
-// an address family the matching eBPF SNAT (vpc_nat_snat / vpc_nat_snat6) can use.
-func cidrsV4(cidrs []string) []string {
-	out := make([]string, 0, len(cidrs))
-	for _, c := range cidrs {
-		if p, err := netip.ParsePrefix(c); err == nil && p.Addr().Is4() {
-			out = append(out, c)
-		}
-	}
-	return out
-}
-
-func cidrsV6(cidrs []string) []string {
-	out := make([]string, 0, len(cidrs))
-	for _, c := range cidrs {
-		if p, err := netip.ParsePrefix(c); err == nil && p.Addr().Is6() && !p.Addr().Is4In6() {
-			out = append(out, c)
-		}
-	}
-	return out
-}
-
-// firstFreeAddress returns the lowest address across the CIDRs that is not in
-// used, or "" when all are taken.
-func firstFreeAddress(cidrs []string, used map[string]bool) string {
-	for _, c := range cidrs {
-		p, err := netip.ParsePrefix(c)
-		if err != nil {
-			continue
-		}
-		for addr := p.Masked().Addr(); p.Contains(addr); addr = addr.Next() {
-			if s := addr.String(); !used[s] {
-				return s
-			}
-		}
-	}
-	return ""
 }
 
 func setFIPCondition(status *sdnv1alpha1.FloatingIPStatus, condType string, ok bool, reason, message string) {

@@ -37,9 +37,12 @@ const (
 	// VPCGatewayConditionVPCResolved is True when spec.vpcRef names a VPC in
 	// this namespace.
 	VPCGatewayConditionVPCResolved = "VPCResolved"
-	// VPCGatewayConditionPoolResolved is True when spec.poolRef names an
-	// existing ExternalPool.
-	VPCGatewayConditionPoolResolved = "PoolResolved"
+	// VPCGatewayConditionNATReady is True when NAT egress needs no identity
+	// (disabled), or every address family the VPC has that the cluster can serve a
+	// LoadBalancer for has an assigned NAT address (docs/external-addresses.md §5).
+	// A family the cluster cannot serve keeps the gateway pod (#15) and does not
+	// hold this False.
+	VPCGatewayConditionNATReady = "NATReady"
 	// VPCGatewayConditionExclusive is False when another VPCGateway already
 	// binds this VPC. A VPC has exactly ONE boundary — that is what makes
 	// "everything crosses it" a checkable property and the per-VPC counters
@@ -77,11 +80,18 @@ type VPCGatewaySpec struct {
 	// VPCRef is the VPC this gateway is the boundary of, in this namespace.
 	VPCRef LocalVPCRef `json:"vpcRef"`
 
-	// PoolRef is the ExternalPool the VPC's outside-facing addresses are drawn
-	// from — its NAT identity, and the floating addresses bound to its ports.
-	// Creating a VPCGateway requires the "attach" verb on this pool: pools are a
-	// scarce, cluster-scoped, billable resource, so an operator grants one and a
-	// tenant opens its own door onto it.
+	// LoadBalancerClass selects which load-balancer implementation allocates and
+	// attracts the VPC's NAT identity (Kubernetes' generic
+	// `Service.spec.loadBalancerClass`). Empty uses the cluster's default. cozyplane
+	// allocates nothing itself — the gateway owns a `Service type: LoadBalancer` per
+	// address family and consumes the address that implementation assigns
+	// (docs/external-addresses.md §5).
+	// +optional
+	LoadBalancerClass string `json:"loadBalancerClass,omitempty"`
+
+	// PoolRef is DEPRECATED — the NAT identity now comes from an owned Service, not an
+	// ExternalPool (docs/external-addresses.md). Retained until ExternalPool is
+	// deleted; ignored by the controller.
 	// +optional
 	PoolRef ExternalPoolRef `json:"poolRef,omitempty"`
 
@@ -96,18 +106,20 @@ type VPCGatewaySpec struct {
 
 // VPCGatewayStatus is the observed state of a VPCGateway.
 type VPCGatewayStatus struct {
-	// NATAddress is the v4 address this VPC's v4 egress wears on the wire —
-	// allocated from spec.poolRef, and the tenant's OWN identity. Without it a VPC's
-	// v4 traffic is SNATed to the node's address and is indistinguishable from the
-	// platform's (docs/north-south.md, tenet 8). Empty means the VPC has no v4 CIDR,
-	// or the pool has no v4 range; its v4 egress (if any) falls back to the pod.
+	// NATAddress is the v4 address this VPC's v4 egress wears on the wire — read from
+	// the gateway's owned v4 LoadBalancer Service (docs/external-addresses.md §5), and
+	// the tenant's OWN identity. Without it a VPC's v4 traffic is SNATed to the node's
+	// address and is indistinguishable from the platform's (docs/north-south.md, tenet
+	// 8). Empty means the VPC has no v4 CIDR, or the LB implementation assigned no v4
+	// address; its v4 egress (if any) falls back to the pod.
 	// +optional
 	NATAddress string `json:"natAddress,omitempty"`
 
 	// NATAddress6 is the v6 counterpart: the address this VPC's v6 egress wears
-	// (docs/north-south.md §6a). Each family gets its own eBPF identity when the
-	// pool can provide it; a family with none keeps the gateway pod. The pod is
-	// retired only once every family the VPC has is served in eBPF.
+	// (docs/north-south.md §6a), read from the gateway's owned v6 LoadBalancer Service.
+	// Each family gets its own eBPF identity when the LB implementation can assign one;
+	// a family with none keeps the gateway pod. The pod is retired only once every
+	// family the VPC has is served in eBPF.
 	// +optional
 	NATAddress6 string `json:"natAddress6,omitempty"`
 

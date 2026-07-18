@@ -62,9 +62,9 @@ const (
 
 // Condition types surfaced in VPCGateway status.
 const (
-	VPCGatewayConditionVPCResolved  = "VPCResolved"
-	VPCGatewayConditionPoolResolved = "PoolResolved"
-	VPCGatewayConditionExclusive    = "Exclusive"
+	VPCGatewayConditionVPCResolved = "VPCResolved"
+	VPCGatewayConditionNATReady    = "NATReady"
+	VPCGatewayConditionExclusive   = "Exclusive"
 )
 
 // VPCGatewayNAT configures many-to-one egress for pods with no address of their own.
@@ -81,7 +81,11 @@ type VPCGatewayIngress struct {
 
 // VPCGatewaySpec declares a VPC's north-south boundary.
 type VPCGatewaySpec struct {
-	VPCRef  LocalVPCRef
+	VPCRef LocalVPCRef
+	// LoadBalancerClass selects which LB implementation allocates+attracts the NAT
+	// identity (docs/external-addresses.md §5).
+	LoadBalancerClass string
+	// PoolRef is DEPRECATED (docs/external-addresses.md); ignored.
 	PoolRef ExternalPoolRef
 	NAT     VPCGatewayNAT
 	Ingress VPCGatewayIngress
