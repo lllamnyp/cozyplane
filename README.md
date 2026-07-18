@@ -104,6 +104,7 @@ Start with [design.md](docs/design.md) (the vision and the **design tenets**), t
 | [docs/control-plane.md](docs/control-plane.md) | The aggregated-apiserver control-plane design |
 | [docs/roadmap.md](docs/roadmap.md) | Checklist of what's built and what's outstanding, with open-issue index |
 | [docs/north-south.md](docs/north-south.md) | The VPC's one declared boundary: `VPCGateway`, eBPF egress NAT identity, metering, and why cozyplane announces nothing |
+| [docs/external-addresses.md](docs/external-addresses.md) | *Design* — how external addresses are sourced (a delegated Service); cozyplane allocates/attracts/reserves none |
 | [docs/multitenancy.md](docs/multitenancy.md) | The tenancy rules, each justified or dropped (a namespace *is* the tenant) |
 | [docs/live-migration.md](docs/live-migration.md) | VM live migration via persistent Ports (IP + MAC preservation) |
 | [docs/policy-layers.md](docs/policy-layers.md) | How the three policy layers compose, and the shared trust model |

@@ -58,24 +58,24 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
 
 **Features**
 
-2. **Retire `ExternalPool`; an external address comes from a claim** —
-   **[north-south.md](north-south.md) §9** (decided, not built). Tenet 3 was only
-   half-applied: increment 3 deleted the announcer, but cozyplane still **allocates**
-   external addresses (`firstFreeAddress` over `ExternalPool.spec.cidrs`, for both the
-   `VPCGateway`'s NAT identity and every `FloatingIP`) — and **nothing attracts what it
-   allocates**. An `ExternalPool` is a hand-written CIDR list that nothing routes; the
-   e2e says so itself (*"here we do what a CCM would do and simply configure it on
-   one"*). Pinning the address onto a Service does **not** bridge it: MetalLB's
-   `autoAssign: false` does not reserve, so it stays the allocator of record and can
-   hand the same address to another Service. The fix is to finish the tenet —
-   **cozyplane does not allocate either** — and consume a platform-allocated,
-   platform-attracted **`PublicIPClaim`** ([community#35](https://github.com/cozystack/community/pull/35)).
-   Consequences: the `attach` grant moves onto the claim (it must — a bare Service would
-   reopen R10); a pod references a **claim, not an address**, which makes
-   `FloatingIP.spec.target` identity-shaped and "one target, one address" structural;
-   and **`FloatingIP` as a kind is likely superseded** by a pod annotation naming a
-   claim. **The eBPF does not change at all** — the maps key on an address that arrives
-   from somewhere and never cared who picked it (§1, §3).
+2. **Retire `ExternalPool`; an external address comes from a delegated Service** —
+   **[external-addresses.md](external-addresses.md)** (design, converged). cozyplane
+   allocates external addresses today (`firstFreeAddress` over `ExternalPool.spec.cidrs`)
+   and **nothing attracts what it allocates** — the pool is a CIDR list nothing routes.
+   The fix: cozyplane sources **no** address. A `FloatingIP` owns a
+   `Service type: LoadBalancer` labelled `service-proxy-name: cozyplane`; the
+   allocator/fabric allocates + attracts (the same contract LoadBalancer ingress already
+   lives by), every proxy skips the datapath (the kpr fix, done), and cozyplane consumes
+   `status.loadBalancer.ingress` and delivers. A `VPCGateway`'s NAT identity owns a
+   **backend-less** such Service (`etp: Cluster`; its replies still need attracting via
+   `vpc_nat_reverse`). Reservation (`IPAddressClaim`,
+   [community#35](https://github.com/cozystack/community/pull/35)) is an **optional**
+   layer, held to a **one-Service-per-address** invariant (the claim owns the Service,
+   a FloatingIP binds by adding an EndpointSlice + datapath, never a rival Service).
+   `FloatingIP` **survives** as the binding/datapath object; `ExternalPool` and the
+   `attach` verb retire; governance moves to Service RBAC + the allocator's scoping.
+   **The eBPF does not change at all.** Increments: FloatingIP→Service (unblocked now),
+   NAT identity→Service, delete `ExternalPool`, then reservation when the claim lands (§3).
 3. **Public IPs on the default network — supersede cozy-proxy** ([#14](../../issues/14)) —
    **[public-ip.md](public-ip.md)** (design, awaiting review). Cozystack today gives a
    net-0 VM a real public address (all ports in, and egress *as that address*) with
