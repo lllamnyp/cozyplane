@@ -85,10 +85,12 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
    deprecated `poolRef` fields are gone; the pool's second job, triggering the
    uplink attach on every node, is now derived from the addresses that exist:
    floating, NAT identities, and LB ingress IPs via a Services watch)**, then
-   **reservation (code done)** against the implemented address-controller
-   (`IPAddressClaim`, `local.sdn.cozystack.io`): `addressClaimName` fields copied
-   into the association annotation on the owned Service(s) — a pure pass-through,
-   fully functional with the mechanism absent (§3).
+   **reservation (done, dev4-validated with the full stack — address-controller +
+   metallb-iad + MetalLB + cozyplane: a FloatingIP naming a claim wore exactly the
+   reserved address, survived delete-and-rebind with the same address, and was
+   externally reachable throughout)**: `addressClaimName` fields copied into the
+   association annotation on the owned Service(s) — a pure pass-through, fully
+   functional with the mechanism absent (§3). **The arc is complete.**
 3. **Public IPs on the default network — supersede cozy-proxy** ([#14](../../issues/14)) —
    **[public-ip.md](public-ip.md)** (design, awaiting review). Cozystack today gives a
    net-0 VM a real public address (all ports in, and egress *as that address*) with

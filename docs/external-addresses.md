@@ -318,9 +318,17 @@ cozyplane's job is a datapath keyed on an address it was handed. Nothing more.
    storage, the `attach` verb, and both deprecated `poolRef` fields are gone; the
    pool's uplink-attach job moved to the addresses that exist (§9); the e2e floating
    phases play the allocator by patching the owned Service's LB ingress.
-4. **[code done] Reservation (`addressClaimName`)** — against the implemented
-   address-controller (§7): `FloatingIP.spec.addressClaimName` and
+4. **[done, dev4-validated] Reservation (`addressClaimName`)** — against the
+   implemented address-controller (§7): `FloatingIP.spec.addressClaimName` and
    `VPCGateway.spec.nat.addressClaimName{,6}` are copied into the association
    annotation on the owned Service(s); the driver pins, cozyplane consumes the
    ingress unchanged. A pure pass-through — additive, opaque, and fully functional
    with the mechanism absent (no claim ⇒ auto-assign).
+   *dev4 e2e, full stack (address-controller + metallb-iad + MetalLB + cozyplane):*
+   a claim bound a reserved address from an `IPAddressClass` range; a FloatingIP
+   naming it went Ready with exactly that address and an external VLAN host reached
+   the pod through it; deleting the FloatingIP left the claim `Bound` (reserved,
+   inert — zero cozyplane leftovers) and a recreated FloatingIP got the **same**
+   address back, reachable again — the AWS-EIP round trip. Found and fixed in the
+   process: `DelFloating` clobbered the egress entry of a reassigned live target
+   (the claim handoff's transient auto-assign → pin move exposed it).
