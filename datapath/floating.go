@@ -148,7 +148,13 @@ func (m *Manager) SetFloating(publicIP, vpcIP string, net_ uint32) error {
 
 // DelFloating removes a public IP from both directions of the floating map
 // (idempotent). The reverse entry is keyed by {net, VPC IP}, recovered from the
-// forward entry.
+// forward entry — and deleted only while it still points at THIS public IP.
+// When a live target's address is reassigned (the LB implementation re-pins it —
+// e.g. a claim's driver moving the pin onto a fresh Service), the watcher sets
+// the new address before removing the stale one, so the egress entry already
+// maps the target to the NEW address; deleting it blindly would sever the
+// reply path (found live on dev4: every SYN-ACK left unSNAT'd and the claimed
+// address black-holed).
 func (m *Manager) DelFloating(publicIP string) error {
 	pub, err := addr128Str(publicIP)
 	if err != nil {
@@ -156,7 +162,11 @@ func (m *Manager) DelFloating(publicIP string) error {
 	}
 	var ep overlayBridgeEp
 	if err := m.objs.Floating.Lookup(&pub, &ep); err == nil {
-		_ = m.objs.FloatingEgress.Delete(&overlayLocalKey{Net: ep.Net, Ip: ep.VpcIp})
+		key := overlayLocalKey{Net: ep.Net, Ip: ep.VpcIp}
+		var cur overlayAddr128
+		if err := m.objs.FloatingEgress.Lookup(&key, &cur); err == nil && cur == pub {
+			_ = m.objs.FloatingEgress.Delete(&key)
+		}
 	}
 	if err := m.objs.Floating.Delete(&pub); err != nil && !isNotExist(err) {
 		return fmt.Errorf("del floating %s: %w", publicIP, err)
