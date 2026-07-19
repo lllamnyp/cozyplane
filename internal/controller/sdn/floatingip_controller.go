@@ -169,7 +169,37 @@ const (
 	// floatingIPLabel links an owned Service back to its FloatingIP. The Service
 	// uses generateName, so cozyplane finds its own Service by this label.
 	floatingIPLabel = "sdn.cozystack.io/floating-ip"
+
+	// addressClaimAnnotation is the address-controller's association contract
+	// (docs/external-addresses.md §7): set on a Service, it names an
+	// IPAddressClaim in the Service's own namespace whose reserved address the
+	// claim's driver should pin onto the Service. cozyplane writes only this
+	// backend-agnostic key — never a provider's raw pin — and takes no dependency
+	// on the claim CRDs (the mechanism is optional; absent, the LB implementation
+	// auto-assigns). Mirrors ServiceClaimAnnotation in
+	// github.com/lllamnyp/address-controller api/v1alpha1/well_known.go, the
+	// authority for this value.
+	addressClaimAnnotation = "local.sdn.cozystack.io/ip-address-claim"
 )
+
+// reconcileClaimAnnotation makes the Service's association annotation match the
+// desired claim name ("" = no association). Returns true if the Service object
+// was modified and needs an Update.
+func reconcileClaimAnnotation(svc *corev1.Service, claim string) bool {
+	current := svc.Annotations[addressClaimAnnotation]
+	if current == claim {
+		return false
+	}
+	if claim == "" {
+		delete(svc.Annotations, addressClaimAnnotation)
+		return true
+	}
+	if svc.Annotations == nil {
+		svc.Annotations = map[string]string{}
+	}
+	svc.Annotations[addressClaimAnnotation] = claim
+	return true
+}
 
 // ownedService returns the Service this FloatingIP owns (by label + controller
 // owner-ref), or nil if it has none.
@@ -193,8 +223,19 @@ func (r *FloatingIPReconciler) ownedService(ctx context.Context, fip *sdnv1alpha
 // address unconditionally (delivery is node-agnostic — from_uplink is at tc ingress).
 func (r *FloatingIPReconciler) ensureService(ctx context.Context, fip *sdnv1alpha1.FloatingIP) (*corev1.Service, error) {
 	svc, err := r.ownedService(ctx, fip)
-	if err != nil || svc != nil {
-		return svc, err
+	if err != nil {
+		return nil, err
+	}
+	if svc != nil {
+		// Reservation (docs/external-addresses.md §7): keep the association
+		// annotation in step with spec.addressClaimName; the claim's driver
+		// does the pinning.
+		if reconcileClaimAnnotation(svc, fip.Spec.AddressClaimName) {
+			if err := r.Update(ctx, svc); err != nil {
+				return nil, fmt.Errorf("update floating service annotations: %w", err)
+			}
+		}
+		return svc, nil
 	}
 	svc = &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -215,6 +256,7 @@ func (r *FloatingIPReconciler) ensureService(ctx context.Context, fip *sdnv1alph
 	if fip.Spec.LoadBalancerClass != "" {
 		svc.Spec.LoadBalancerClass = new(fip.Spec.LoadBalancerClass)
 	}
+	reconcileClaimAnnotation(svc, fip.Spec.AddressClaimName)
 	if err := controllerutil.SetControllerReference(fip, svc, r.Scheme); err != nil {
 		return nil, err
 	}

@@ -75,6 +75,17 @@ type FloatingIPSpec struct {
 	// implementation assigns (docs/external-addresses.md).
 	// +optional
 	LoadBalancerClass string `json:"loadBalancerClass,omitempty"`
+
+	// AddressClaimName names an IPAddressClaim (local.sdn.cozystack.io, the
+	// address-controller) in this namespace whose reserved address this FloatingIP
+	// should wear. cozyplane only copies it into the claim contract's association
+	// annotation on the owned Service — the claim's driver pins the address there,
+	// and cozyplane consumes `status.loadBalancer.ingress` exactly as in the
+	// dynamic case (docs/external-addresses.md §7). Empty means dynamic: the LB
+	// implementation auto-assigns, and the address lives for this object's
+	// lifetime rather than the claim's.
+	// +optional
+	AddressClaimName string `json:"addressClaimName,omitempty"`
 }
 
 // FloatingIPStatus is the observed state of a FloatingIP.

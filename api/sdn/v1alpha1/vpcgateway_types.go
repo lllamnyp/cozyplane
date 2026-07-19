@@ -58,6 +58,18 @@ type VPCGatewayNAT struct {
 	// masqueraded to an address of the VPC's own.
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
+
+	// AddressClaimName / AddressClaimName6 name single-family IPAddressClaims
+	// (local.sdn.cozystack.io, the address-controller) in this namespace whose
+	// reserved addresses the VPC's v4 / v6 egress should wear. One claim per
+	// family, because association is one-claim-one-Service and the gateway owns
+	// one single-family Service per family (docs/external-addresses.md §7).
+	// cozyplane only copies each into the association annotation on that family's
+	// owned Service; empty means dynamic (the LB implementation auto-assigns).
+	// +optional
+	AddressClaimName string `json:"addressClaimName,omitempty"`
+	// +optional
+	AddressClaimName6 string `json:"addressClaimName6,omitempty"`
 }
 
 // VPCGatewayIngress configures what may enter the VPC from outside.

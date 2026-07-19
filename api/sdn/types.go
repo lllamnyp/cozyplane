@@ -70,6 +70,10 @@ const (
 // VPCGatewayNAT configures many-to-one egress for pods with no address of their own.
 type VPCGatewayNAT struct {
 	Enabled bool
+	// AddressClaimName / AddressClaimName6: per-family IPAddressClaim names for a
+	// reserved NAT identity (docs/external-addresses.md §7); empty = dynamic.
+	AddressClaimName  string
+	AddressClaimName6 string
 }
 
 // VPCGatewayIngress configures what may enter the VPC from outside.
@@ -330,6 +334,10 @@ type FloatingIPSpec struct {
 	// LoadBalancerClass selects which LB implementation allocates+attracts the
 	// address (docs/external-addresses.md). Empty = cluster default.
 	LoadBalancerClass string
+
+	// AddressClaimName names an IPAddressClaim in this namespace whose reserved
+	// address this FloatingIP wears (docs/external-addresses.md §7); empty = dynamic.
+	AddressClaimName string
 }
 
 // FloatingIPStatus is the observed state of a FloatingIP.

@@ -1,8 +1,9 @@
 # External addresses — cozyplane sources none of them
 
-**Status: DESIGN — not implemented.** Supersedes [north-south.md](north-south.md) §9,
-unifies with [public-ip.md](public-ip.md), and defines the contract the platform's
-address-reservation work (`IPAddressClaim`, cozystack/community#35) builds against.
+**Status: BUILT** (increments 0–4, §11; 1–3 dev4-validated). Supersedes
+[north-south.md](north-south.md) §9, unifies with [public-ip.md](public-ip.md), and
+defines the contract the platform's address-reservation work (the address-controller,
+`IPAddressClaim` — cozystack/community#35) and cozyplane build against together.
 
 Every routable address a VPC wears — a `FloatingIP`, a `VPCGateway`'s NAT identity —
 is today **allocated by cozyplane** out of an `ExternalPool` (`firstFreeAddress`) and
@@ -70,14 +71,15 @@ provider knowledge:
 | `status.loadBalancer.ingress` | the allocated + attracted address | **cozyplane** |
 
 `loadBalancerClass` is the agnostic "which fabric mechanism" selector; the pinning of
-a *reserved* address (§7) is delegated through an opaque claim reference, never a
-provider annotation cozyplane writes. **cozyplane's entire outward surface is: create
-a generic LB Service, read one status field.**
+a *reserved* address (§7) is delegated through one backend-agnostic annotation on the
+owned Service — the claim contract's, never a provider's (the driver translates it
+into the backend's raw pin). **cozyplane's entire outward surface is: create a
+generic LB Service, read one status field.**
 
 ## 4. FloatingIP — an EIP, sourced by a Service it owns
 
 `FloatingIP` survives as the tenant-facing **binding + datapath** object. `spec.poolRef`
-and `spec.address` are removed; an optional `addressClaimRef` (§7) replaces them.
+and `spec.address` are removed; an optional `addressClaimName` (§7) replaces them.
 
 ```yaml
 apiVersion: sdn.cozystack.io/v1alpha1
@@ -87,10 +89,9 @@ spec:
   vpcRef: {name: vpc-a}
   target: 10.90.0.5                  # the VPC IP / Port this fronts
   loadBalancerClass: metallb         # optional; which allocator
-  addressClaimRef: {name: my-eip}    # optional; empty ⇒ dynamic (§7)
+  addressClaimName: my-eip           # optional; empty ⇒ dynamic (§7)
 status:
   address: 203.0.113.7               # read back from the owned Service
-  serviceRef: {name: web-eip-x7k2}   # the owned Service (generateName)
 ```
 
 The controller renders a Service the FloatingIP **owns**:
@@ -155,9 +156,9 @@ being "no Service":
    dynamic address. That is a preference for stability, satisfied by the claim layer —
    not a structural difference.
 
-The `VPCGateway` owns this Service the way a FloatingIP owns its own; `spec.poolRef`
-becomes an `addressClaimRef`, and `status.natAddress` / `natAddress6` are read back
-from the Service (or claim), not allocated. Because the eBPF NAT is per-family
+The `VPCGateway` owns this Service the way a FloatingIP owns its own;
+`status.natAddress` / `natAddress6` are read back from the Services, not allocated,
+and reservation is per family (`nat.addressClaimName` / `nat.addressClaimName6`, §7). Because the eBPF NAT is per-family
 (`vpc_nat_snat` v4, `vpc_nat_snat6` v6) and an address is single-family, a dual-stack
 VPC's gateway owns **one Service per family** it has (`ipFamilies: [IPv4]` / `[IPv6]`,
 `SingleStack`), each yielding one identity — the same per-family split the pooled
@@ -180,40 +181,54 @@ the reason `etp: Cluster` DSR source-preservation is opt-in (`CLUSTER_DSR`,
   target-less egress identity is harder to attract on a restrictive bare-metal fabric
   than an EIP with a target is.
 
-## 7. Reservation — the claim layer, and the one-Service invariant
+## 7. Reservation — the claim layer
 
-`IPAddressClaim` (cozystack/community#35) is the **reservation** layer, orthogonal to
-attraction and strictly optional. Its whole interaction with cozyplane is one spec
-field (`FloatingIP.spec.addressClaimRef`) and one status value
-(`IPAddressClaim.status.address`).
+`IPAddressClaim` is implemented: the **address-controller**
+(`local.sdn.cozystack.io` — deliberately cozyplane's CRD group; these are facets of
+one theme) is the PVC/PV/StorageClass split for addresses. An `IPAddress` (cluster)
+**is** the reservation — a ledger object, one per IP; an `IPAddressClaim`
+(namespaced) binds one, or one per family; an `IPAddressClass` names the per-class
+driver that provisions. The core never touches a Service.
 
-**The invariant that makes this safe: at most one Service per address, ever.** Two
-Services claiming one IP is IP-sharing, which MetalLB permits only conditionally
-(`metallb.io/allow-shared-ip` + matching ports) and other allocators refuse. So the
-reservation is **never** "a dummy Service holding the IP plus a second Service trying
-to use it." Instead:
+Reservation is orthogonal to attraction and **strictly optional**: cozyplane
+functions identically with or without the mechanism installed. Without a claim there
+is simply no guarantee of a specific address — the LB implementation auto-assigns.
 
-- **Dynamic (no `addressClaimRef`):** the FloatingIP/VPCGateway owns its one ephemeral
-  Service. The address lives for the **object's** lifetime; deleting it releases the
-  address.
-- **Reserved (`addressClaimRef` set):** the **claim** owns the one thing that holds the
-  address, and *how* it holds it is the claim's backend-specific private business that
-  cozyplane never sees:
-  - **bare metal (MetalLB):** a single backend-less Service (there is no non-Service
-    reservation on MetalLB); `etp: Cluster` keeps it announced, or — on a fabric that
-    won't allow that — the address is reserved but off the wire until bound, which is
-    correct (an unassociated EIP routes nowhere).
-  - **cloud:** a native reserved address (an EIP), no Service at all.
-  A FloatingIP binding a claim does **not** mint a second Service. It binds by
-  contributing *separate objects* — an **EndpointSlice** at the target's fabric IP
-  (which drives `etp: Local` attraction onto the target's node when the fabric needs
-  it) and the **datapath** programming. On unbind, cozyplane drops its EndpointSlice
-  and datapath; the reservation stays, the address is held. The address lives for the
-  **claim's** lifetime and survives the FloatingIP — the AWS-EIP semantics.
+**Association** — attaching a bound address to a workload — is the driver's job,
+through one backend-agnostic annotation on the *consumer's own* Service:
+`local.sdn.cozystack.io/ip-address-claim: <claim>` (a claim in the Service's own
+namespace). The driver translates it into the backend's raw pin (MetalLB: an
+`autoAssign: false` pool over the class range, plus `metallb.io/loadBalancerIPs` on
+the Service) and enforces **one claim, one workload**. Deleting the Service un-pins;
+the address stays `Bound` — reserved, inert. Deleting the *claim* is what releases
+the address, via its reclaim policy.
 
-So the rule is one line: **whoever holds the longest-lived stake owns the single
-Service — the claim if reserved, the object if dynamic — and binding is
-add-an-endpoint-plus-datapath, never add-a-Service.**
+This dissolves the hazard the reservation design used to defend against ("a dummy
+Service holding the IP plus a second Service trying to use it"): **a reservation is
+never a Service**, so there is no IP to share, and the earlier claim-owns-the-Service
+/ object-contributes-endpoints choreography is gone with it. What remains:
+
+- **Dynamic (no `addressClaimName`):** the FloatingIP/VPCGateway owns its one
+  Service; the LB implementation auto-assigns; the address lives for the object's
+  lifetime.
+- **Reserved (`addressClaimName` set):** the **same** owned Service, plus the one
+  annotation. The driver pins the claim's address onto it, and cozyplane consumes
+  `status.loadBalancer.ingress` exactly as in the dynamic case — reserved and
+  dynamic are one code path. The address lives for the **claim's** lifetime and
+  survives the FloatingIP — the AWS-EIP semantics.
+- **Per family:** association is one-claim-one-Service and the gateway's Services
+  are single-family, so the NAT identity takes one single-family claim per family
+  (`nat.addressClaimName` / `nat.addressClaimName6`).
+
+Two independent gates, each in its right place: the **claim** governs reservation;
+the **EndpointSlice readiness** governs announcement (held-but-dark when the target
+dies). Neither knows about the other.
+
+cozyplane's entire claim surface is that annotation, written as an opaque string —
+no dependency on the claim CRDs, no informer, no module import (the repos are
+private and the API alpha; a Go import would couple builds). The annotation key
+mirrors the address-controller's `well_known.go` constant, with the authority named
+at the mirror.
 
 ## 8. Governance moves off cozyplane
 
@@ -251,7 +266,8 @@ who picked it. This is an API and control-plane change with **zero** datapath ch
 - cozyplane **allocates** no address (the allocator does).
 - cozyplane **attracts** no address (the allocator/fabric does).
 - cozyplane **reserves** no address (the claim layer does).
-- cozyplane **shares** no address across two Services (the one-Service invariant).
+- cozyplane **shares** no address across two Services (one owned Service per
+  address; the driver's one-claim-one-workload rule guards the reserved case).
 - cozyplane **knows no backend** (MetalLB vs cloud vs anything is behind
   `loadBalancerClass` and the claim).
 
@@ -302,6 +318,9 @@ cozyplane's job is a datapath keyed on an address it was handed. Nothing more.
    storage, the `attach` verb, and both deprecated `poolRef` fields are gone; the
    pool's uplink-attach job moved to the addresses that exist (§9); the e2e floating
    phases play the allocator by patching the owned Service's LB ingress.
-4. **Reservation (`addressClaimRef`)** — when `IPAddressClaim` lands: the pin field, the
-   claim-owns-the-Service / object-contributes-endpoints binding, the one-Service
-   invariant. Additive; nothing above changes.
+4. **[code done] Reservation (`addressClaimName`)** — against the implemented
+   address-controller (§7): `FloatingIP.spec.addressClaimName` and
+   `VPCGateway.spec.nat.addressClaimName{,6}` are copied into the association
+   annotation on the owned Service(s); the driver pins, cozyplane consumes the
+   ingress unchanged. A pure pass-through — additive, opaque, and fully functional
+   with the mechanism absent (no claim ⇒ auto-assign).

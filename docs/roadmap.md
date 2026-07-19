@@ -68,10 +68,11 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
    lives by), every proxy skips the datapath (the kpr fix, done), and cozyplane consumes
    `status.loadBalancer.ingress` and delivers. A `VPCGateway`'s NAT identity owns a
    **backend-less** such Service (`etp: Cluster`; its replies still need attracting via
-   `vpc_nat_reverse`). Reservation (`IPAddressClaim`,
+   `vpc_nat_reverse`). Reservation (the address-controller's `IPAddressClaim`,
    [community#35](https://github.com/cozystack/community/pull/35)) is an **optional**
-   layer, held to a **one-Service-per-address** invariant (the claim owns the Service,
-   a FloatingIP binds by adding an EndpointSlice + datapath, never a rival Service).
+   layer: a reservation is an `IPAddress` ledger object, never a Service; binding is
+   one association annotation on the consumer's own Service, and the driver enforces
+   one claim, one workload (external-addresses.md §7).
    `FloatingIP` **survives** as the binding/datapath object; `ExternalPool` and the
    `attach` verb retire; governance moves to Service RBAC + the allocator's scoping.
    **The eBPF does not change at all.** Increments: **FloatingIP→Service (done,
@@ -84,7 +85,10 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
    deprecated `poolRef` fields are gone; the pool's second job, triggering the
    uplink attach on every node, is now derived from the addresses that exist:
    floating, NAT identities, and LB ingress IPs via a Services watch)**, then
-   reservation when the claim lands (§3).
+   **reservation (code done)** against the implemented address-controller
+   (`IPAddressClaim`, `local.sdn.cozystack.io`): `addressClaimName` fields copied
+   into the association annotation on the owned Service(s) — a pure pass-through,
+   fully functional with the mechanism absent (§3).
 3. **Public IPs on the default network — supersede cozy-proxy** ([#14](../../issues/14)) —
    **[public-ip.md](public-ip.md)** (design, awaiting review). Cozystack today gives a
    net-0 VM a real public address (all ports in, and egress *as that address*) with

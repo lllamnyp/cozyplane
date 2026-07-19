@@ -401,7 +401,19 @@ spec:
   vpcRef: {name: vpc-a}        # a VPC in this namespace
   target: 10.0.0.5             # the tenant IP to expose
   # loadBalancerClass: ...    # optional; which LB implementation assigns the address
+  # addressClaimName: my-eip  # optional; a reserved address (see below)
 ```
+
+Without `addressClaimName` the address is **dynamic**: the LB implementation
+auto-assigns one, and it lives for the FloatingIP's lifetime. To keep an address
+across FloatingIPs (the AWS-EIP model), reserve it first with an `IPAddressClaim`
+(`local.sdn.cozystack.io`, the address-controller — if your platform ships it; it
+is optional) and name the claim in `addressClaimName`. cozyplane then marks its
+owned Service for the claim's driver, which pins the reserved address onto it;
+deleting the FloatingIP releases nothing — the address stays reserved by the
+claim, ready for the next binding. A `VPCGateway`'s NAT identity reserves the
+same way, one single-family claim per family
+(`spec.nat.addressClaimName` / `addressClaimName6`).
 
 cozyplane mints the delegated Service; the LB implementation assigns the address
 into its `status.loadBalancer.ingress`, and the FloatingIP consumes it. The

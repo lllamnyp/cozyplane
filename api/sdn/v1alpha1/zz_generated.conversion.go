@@ -610,6 +610,7 @@ func autoConvert_v1alpha1_FloatingIPSpec_To_sdn_FloatingIPSpec(in *FloatingIPSpe
 	}
 	out.Target = in.Target
 	out.LoadBalancerClass = in.LoadBalancerClass
+	out.AddressClaimName = in.AddressClaimName
 	return nil
 }
 
@@ -624,6 +625,7 @@ func autoConvert_sdn_FloatingIPSpec_To_v1alpha1_FloatingIPSpec(in *sdn.FloatingI
 	}
 	out.Target = in.Target
 	out.LoadBalancerClass = in.LoadBalancerClass
+	out.AddressClaimName = in.AddressClaimName
 	return nil
 }
 
@@ -1570,6 +1572,8 @@ func Convert_sdn_VPCGatewayList_To_v1alpha1_VPCGatewayList(in *sdn.VPCGatewayLis
 
 func autoConvert_v1alpha1_VPCGatewayNAT_To_sdn_VPCGatewayNAT(in *VPCGatewayNAT, out *sdn.VPCGatewayNAT, s conversion.Scope) error {
 	out.Enabled = in.Enabled
+	out.AddressClaimName = in.AddressClaimName
+	out.AddressClaimName6 = in.AddressClaimName6
 	return nil
 }
 
@@ -1580,6 +1584,8 @@ func Convert_v1alpha1_VPCGatewayNAT_To_sdn_VPCGatewayNAT(in *VPCGatewayNAT, out 
 
 func autoConvert_sdn_VPCGatewayNAT_To_v1alpha1_VPCGatewayNAT(in *sdn.VPCGatewayNAT, out *VPCGatewayNAT, s conversion.Scope) error {
 	out.Enabled = in.Enabled
+	out.AddressClaimName = in.AddressClaimName
+	out.AddressClaimName6 = in.AddressClaimName6
 	return nil
 }
 

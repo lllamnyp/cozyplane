@@ -28,6 +28,15 @@ type VPCGatewayNATApplyConfiguration struct {
 	// Enabled opens outbound access for VPC pods that hold no floating address,
 	// masqueraded to an address of the VPC's own.
 	Enabled *bool `json:"enabled,omitempty"`
+	// AddressClaimName / AddressClaimName6 name single-family IPAddressClaims
+	// (local.sdn.cozystack.io, the address-controller) in this namespace whose
+	// reserved addresses the VPC's v4 / v6 egress should wear. One claim per
+	// family, because association is one-claim-one-Service and the gateway owns
+	// one single-family Service per family (docs/external-addresses.md §7).
+	// cozyplane only copies each into the association annotation on that family's
+	// owned Service; empty means dynamic (the LB implementation auto-assigns).
+	AddressClaimName  *string `json:"addressClaimName,omitempty"`
+	AddressClaimName6 *string `json:"addressClaimName6,omitempty"`
 }
 
 // VPCGatewayNATApplyConfiguration constructs a declarative configuration of the VPCGatewayNAT type for use with
@@ -41,5 +50,21 @@ func VPCGatewayNAT() *VPCGatewayNATApplyConfiguration {
 // If called multiple times, the Enabled field is set to the value of the last call.
 func (b *VPCGatewayNATApplyConfiguration) WithEnabled(value bool) *VPCGatewayNATApplyConfiguration {
 	b.Enabled = &value
+	return b
+}
+
+// WithAddressClaimName sets the AddressClaimName field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the AddressClaimName field is set to the value of the last call.
+func (b *VPCGatewayNATApplyConfiguration) WithAddressClaimName(value string) *VPCGatewayNATApplyConfiguration {
+	b.AddressClaimName = &value
+	return b
+}
+
+// WithAddressClaimName6 sets the AddressClaimName6 field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the AddressClaimName6 field is set to the value of the last call.
+func (b *VPCGatewayNATApplyConfiguration) WithAddressClaimName6(value string) *VPCGatewayNATApplyConfiguration {
+	b.AddressClaimName6 = &value
 	return b
 }

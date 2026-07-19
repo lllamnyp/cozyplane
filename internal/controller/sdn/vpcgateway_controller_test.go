@@ -232,6 +232,46 @@ func TestGatewayNonExclusiveLoserOwnsNoService(t *testing.T) {
 	_ = loser
 }
 
+// Reservation is per family (docs/external-addresses.md §7): each per-family
+// claim name lands as the association annotation on exactly that family's Service.
+func TestGatewayPerFamilyClaimAnnotations(t *testing.T) {
+	gw := natGateway("team-a", "door", "vpc-a")
+	gw.Spec.NAT.AddressClaimName = "egress-v4"
+	gw.Spec.NAT.AddressClaimName6 = "egress-v6"
+	c := gwClient(t,
+		vpcWithCIDRs("team-a", "vpc-a", 100, "10.10.0.0/24", "fd00:10::/64"), gw)
+	reconcileGateway(t, c, "team-a", "door")
+
+	v4 := natServiceForFamily(t, c, "team-a", "door", "IPv4")
+	v6 := natServiceForFamily(t, c, "team-a", "door", "IPv6")
+	if v4 == nil || v6 == nil {
+		t.Fatal("expected one NAT Service per family")
+	}
+	if got := v4.Annotations[addressClaimAnnotation]; got != "egress-v4" {
+		t.Errorf("v4 Service annotation = %q, want egress-v4", got)
+	}
+	if got := v6.Annotations[addressClaimAnnotation]; got != "egress-v6" {
+		t.Errorf("v6 Service annotation = %q, want egress-v6", got)
+	}
+
+	// Clearing one family's claim removes only that family's annotation.
+	got := &sdnv1alpha1.VPCGateway{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: "door"}, got); err != nil {
+		t.Fatalf("get gateway: %v", err)
+	}
+	got.Spec.NAT.AddressClaimName6 = ""
+	if err := c.Update(context.Background(), got); err != nil {
+		t.Fatalf("update gateway: %v", err)
+	}
+	reconcileGateway(t, c, "team-a", "door")
+	if _, ok := natServiceForFamily(t, c, "team-a", "door", "IPv6").Annotations[addressClaimAnnotation]; ok {
+		t.Error("v6 annotation must be removed when its claim name is cleared")
+	}
+	if got := natServiceForFamily(t, c, "team-a", "door", "IPv4").Annotations[addressClaimAnnotation]; got != "egress-v4" {
+		t.Errorf("v4 annotation must survive the v6 clear, got %q", got)
+	}
+}
+
 // NAT disabled: no identity Service at all.
 func TestGatewayNATDisabledOwnsNoService(t *testing.T) {
 	gw := natGateway("team-a", "door", "vpc-a")

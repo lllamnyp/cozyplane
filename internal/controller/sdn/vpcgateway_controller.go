@@ -36,8 +36,9 @@ import (
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
 )
 
-// VPCGatewayReconciler owns a VPCGateway's status: does its VPC exist, does its
-// pool exist, and is it the VPC's *only* gateway (docs/north-south.md).
+// VPCGatewayReconciler owns a VPCGateway's status: does its VPC exist, is it the
+// VPC's *only* gateway, and what NAT identity did its owned Services draw
+// (docs/north-south.md; docs/external-addresses.md §5).
 //
 // It realizes nothing itself. The gateway pod is GatewayReconciler's job, the
 // LoadBalancer-ingress gate is the agent's, and the counters are the datapath's —
@@ -217,6 +218,15 @@ func familyLabelValue(f corev1.IPFamily) string {
 	return "IPv4"
 }
 
+// natClaimFor returns the per-family IPAddressClaim name the gateway's spec
+// reserves for this family's NAT identity ("" = dynamic; external-addresses.md §7).
+func natClaimFor(gw *sdnv1alpha1.VPCGateway, f corev1.IPFamily) string {
+	if f == corev1.IPv6Protocol {
+		return gw.Spec.NAT.AddressClaimName6
+	}
+	return gw.Spec.NAT.AddressClaimName
+}
+
 func familyShort(f corev1.IPFamily) string {
 	if f == corev1.IPv6Protocol {
 		return "v6"
@@ -251,6 +261,16 @@ func (r *VPCGatewayReconciler) ensureNATFamilyService(ctx context.Context, gw *s
 	if err != nil {
 		return "", err
 	}
+	if svc != nil {
+		// Reservation (docs/external-addresses.md §7): keep the association
+		// annotation in step with the per-family claim name; the claim's driver
+		// does the pinning.
+		if reconcileClaimAnnotation(svc, natClaimFor(gw, f)) {
+			if err := r.Update(ctx, svc); err != nil {
+				return "", fmt.Errorf("update NAT service annotations: %w", err)
+			}
+		}
+	}
 	if svc == nil {
 		svc = &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{
@@ -274,6 +294,7 @@ func (r *VPCGatewayReconciler) ensureNATFamilyService(ctx context.Context, gw *s
 		if gw.Spec.LoadBalancerClass != "" {
 			svc.Spec.LoadBalancerClass = new(gw.Spec.LoadBalancerClass)
 		}
+		reconcileClaimAnnotation(svc, natClaimFor(gw, f))
 		if err := controllerutil.SetControllerReference(gw, svc, r.Scheme); err != nil {
 			return "", err
 		}

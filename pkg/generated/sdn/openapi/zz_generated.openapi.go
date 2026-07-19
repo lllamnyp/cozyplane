@@ -265,6 +265,13 @@ func schema_cozyplane_api_sdn_v1alpha1_FloatingIPSpec(ref common.ReferenceCallba
 							Format:      "",
 						},
 					},
+					"addressClaimName": {
+						SchemaProps: spec.SchemaProps{
+							Description: "AddressClaimName names an IPAddressClaim (local.sdn.cozystack.io, the address-controller) in this namespace whose reserved address this FloatingIP should wear. cozyplane only copies it into the claim contract's association annotation on the owned Service — the claim's driver pins the address there, and cozyplane consumes `status.loadBalancer.ingress` exactly as in the dynamic case (docs/external-addresses.md §7). Empty means dynamic: the LB implementation auto-assigns, and the address lives for this object's lifetime rather than the claim's.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
 				},
 				Required: []string{"vpcRef", "target"},
 			},
@@ -1914,6 +1921,19 @@ func schema_cozyplane_api_sdn_v1alpha1_VPCGatewayNAT(ref common.ReferenceCallbac
 							Description: "Enabled opens outbound access for VPC pods that hold no floating address, masqueraded to an address of the VPC's own.",
 							Type:        []string{"boolean"},
 							Format:      "",
+						},
+					},
+					"addressClaimName": {
+						SchemaProps: spec.SchemaProps{
+							Description: "AddressClaimName / AddressClaimName6 name single-family IPAddressClaims (local.sdn.cozystack.io, the address-controller) in this namespace whose reserved addresses the VPC's v4 / v6 egress should wear. One claim per family, because association is one-claim-one-Service and the gateway owns one single-family Service per family (docs/external-addresses.md §7). cozyplane only copies each into the association annotation on that family's owned Service; empty means dynamic (the LB implementation auto-assigns).",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"addressClaimName6": {
+						SchemaProps: spec.SchemaProps{
+							Type:   []string{"string"},
+							Format: "",
 						},
 					},
 				},

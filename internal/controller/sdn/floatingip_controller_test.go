@@ -223,6 +223,52 @@ func TestFloatingIPConflictLoserGetsNoService(t *testing.T) {
 	}
 }
 
+// Reservation (docs/external-addresses.md §7): spec.addressClaimName is copied
+// into the claim contract's association annotation on the owned Service — created
+// with it, updated when it changes, removed when cleared. cozyplane never reads
+// the claim itself (the mechanism is optional and may be absent entirely).
+func TestFloatingIPClaimAnnotationLifecycle(t *testing.T) {
+	fip := floatingIP("team-a", "web", "vpc-a", "10.0.0.5")
+	fip.Spec.AddressClaimName = "my-eip"
+	c := fipClient(t, livePort("team-a", "vpc-a", "10.0.0.5", "node-1"), fip)
+
+	reconcileFIP(t, c, "team-a", "web")
+	svc := ownedFloatingService(t, c, "team-a", "web")
+	if svc == nil {
+		t.Fatal("no Service created")
+	}
+	if got := svc.Annotations[addressClaimAnnotation]; got != "my-eip" {
+		t.Errorf("association annotation = %q, want my-eip", got)
+	}
+
+	// Re-target the reservation: the annotation follows the spec.
+	got := &sdnv1alpha1.FloatingIP{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: "web"}, got); err != nil {
+		t.Fatalf("get fip: %v", err)
+	}
+	got.Spec.AddressClaimName = "other-eip"
+	if err := c.Update(context.Background(), got); err != nil {
+		t.Fatalf("update fip: %v", err)
+	}
+	reconcileFIP(t, c, "team-a", "web")
+	if got := ownedFloatingService(t, c, "team-a", "web").Annotations[addressClaimAnnotation]; got != "other-eip" {
+		t.Errorf("after re-target, annotation = %q, want other-eip", got)
+	}
+
+	// Clear it: back to dynamic, the annotation is removed.
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: "web"}, got); err != nil {
+		t.Fatalf("get fip: %v", err)
+	}
+	got.Spec.AddressClaimName = ""
+	if err := c.Update(context.Background(), got); err != nil {
+		t.Fatalf("update fip: %v", err)
+	}
+	reconcileFIP(t, c, "team-a", "web")
+	if _, ok := ownedFloatingService(t, c, "team-a", "web").Annotations[addressClaimAnnotation]; ok {
+		t.Error("annotation must be removed when spec.addressClaimName is cleared")
+	}
+}
+
 // The owned Service is selectorless, so cozyplane synthesizes its EndpointSlice.
 // MetalLB advertises the address only while a ready endpoint exists, so the
 // endpoint's Ready condition must track the live Port: ready with a live target,

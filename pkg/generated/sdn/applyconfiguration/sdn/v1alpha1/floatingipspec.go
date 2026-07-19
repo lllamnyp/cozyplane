@@ -36,6 +36,15 @@ type FloatingIPSpecApplyConfiguration struct {
 	// owns a `Service type: LoadBalancer` and consumes the address that
 	// implementation assigns (docs/external-addresses.md).
 	LoadBalancerClass *string `json:"loadBalancerClass,omitempty"`
+	// AddressClaimName names an IPAddressClaim (local.sdn.cozystack.io, the
+	// address-controller) in this namespace whose reserved address this FloatingIP
+	// should wear. cozyplane only copies it into the claim contract's association
+	// annotation on the owned Service — the claim's driver pins the address there,
+	// and cozyplane consumes `status.loadBalancer.ingress` exactly as in the
+	// dynamic case (docs/external-addresses.md §7). Empty means dynamic: the LB
+	// implementation auto-assigns, and the address lives for this object's
+	// lifetime rather than the claim's.
+	AddressClaimName *string `json:"addressClaimName,omitempty"`
 }
 
 // FloatingIPSpecApplyConfiguration constructs a declarative configuration of the FloatingIPSpec type for use with
@@ -65,5 +74,13 @@ func (b *FloatingIPSpecApplyConfiguration) WithTarget(value string) *FloatingIPS
 // If called multiple times, the LoadBalancerClass field is set to the value of the last call.
 func (b *FloatingIPSpecApplyConfiguration) WithLoadBalancerClass(value string) *FloatingIPSpecApplyConfiguration {
 	b.LoadBalancerClass = &value
+	return b
+}
+
+// WithAddressClaimName sets the AddressClaimName field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the AddressClaimName field is set to the value of the last call.
+func (b *FloatingIPSpecApplyConfiguration) WithAddressClaimName(value string) *FloatingIPSpecApplyConfiguration {
+	b.AddressClaimName = &value
 	return b
 }
