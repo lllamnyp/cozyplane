@@ -838,12 +838,37 @@ rebooted to clear bpffs ([#7](../../issues/7)). The agent now handles it:
 - **Rebuild + re-attach at every agent start.** The agent walks the `cph*`/`cpg*`
   links: parses the alias and re-`Put`s the `ports` and `locals` entries;
   re-derives a VPC pod's `bridges` entry from the veth's scope-link fabric route
-  (the one host route whose destination is not a pod address); then swaps both
-  tcx links to the freshly pinned programs **attach-new-then-rename-pin**, so
-  there is never an unfiltered window on the veth. Running this unconditionally
+  (the one host route whose destination is not a pod address); then points both
+  tcx links at the freshly pinned programs. The link is **adopted and its program
+  swapped in place** (`Link.Update`), never replaced by a second link, so there is
+  never an unfiltered window *and* never a second generation — see "one link per
+  hook" below. Running this unconditionally
   (not just after an ABI break) also closes a second gap: previously an existing
   pod kept executing the *previous release's* program until the pod was
   recreated.
+- **One link per hook — the datapath must never run two generations.** tcx is a
+  program *list*: attaching a second link at a hook does not replace the first,
+  it queues behind it, and the **older link runs first**. The agent therefore
+  never attaches on top of itself. `ensureTCX` queries what is already attached
+  at `(ifindex, direction)`, adopts the cozyplane link it finds and `Update`s its
+  program to the current one, detaches any further cozyplane links, and only
+  attaches fresh when the hook carries none of ours. Foreign tcx links (Cilium's)
+  are identified by program name and left strictly alone.
+
+  This replaces an assumption that proved false in the field: that removing a
+  tcx link's bpffs pin drops its last reference and detaches it. On Linux 6.8 it
+  does; on 6.18 (Talos) it does **not**. An agent rollout there left the previous
+  generation attached at `from_uplink`, `from_overlay` and every pre-existing
+  pod veth, ahead of the new one and reading map objects nothing updated any
+  more — a datapath split in half. `DetachVeth` (CNI DEL) asks the kernel to
+  detach for the same reason, rather than only unlinking the pin.
+  See [bringup-field-notes.md](bringup-field-notes.md) §9.
+
+- **The program pins are swapped, not re-made.** `cozyplane_from_pod` /
+  `cozyplane_to_pod` are pinned **pin-aside-then-rename**, so the path is never
+  absent. The CNI plugin opens them on every ADD, and a remove-then-pin gap is
+  not theoretical: it failed ~250 sandbox creations during one agent rollout.
+
 - **The one-release gap.** A veth without the alias (created by a pre-alias CNI)
   cannot be rebuilt; after an ABI break such pods need a restart, and the agent
   logs each one. On a compatible restart they are unaffected — state lives in the

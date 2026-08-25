@@ -91,14 +91,15 @@ func (m *Manager) Load(vni uint32) error {
 		return fmt.Errorf("load bpf objects: %w", err)
 	}
 
-	progPath := filepath.Join(PinRoot, progPinName)
-	_ = os.Remove(progPath)
-	if err := m.objs.CozyplaneFromPod.Pin(progPath); err != nil {
+	// Swap these pins atomically (pin-aside, rename over) rather than
+	// remove-then-pin. The CNI plugin opens them on every ADD, and the gap in
+	// between is not theoretical: on dev4 an agent rollout put ~250 pods through
+	// `open pinned from_pod program: no such file or directory`, each retry
+	// burning a fabric address. A rename never leaves the path absent.
+	if err := pinProgram(m.objs.CozyplaneFromPod, filepath.Join(PinRoot, progPinName)); err != nil {
 		return fmt.Errorf("pin from_pod program: %w", err)
 	}
-	toPodPath := filepath.Join(PinRoot, toPodPinName)
-	_ = os.Remove(toPodPath)
-	if err := m.objs.CozyplaneToPod.Pin(toPodPath); err != nil {
+	if err := pinProgram(m.objs.CozyplaneToPod, filepath.Join(PinRoot, toPodPinName)); err != nil {
 		return fmt.Errorf("pin to_pod program: %w", err)
 	}
 

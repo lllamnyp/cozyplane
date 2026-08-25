@@ -294,3 +294,73 @@ visible from Prometheus instead of being inferred from a coroner's report.
 small RSS, do not look for a leak. `container_memory_rss` **cannot** see BPF maps;
 `container_memory_working_set_bytes` **can**. Compare the two — a large gap *is* the
 diagnosis. See [internals.md](internals.md) §6a.
+
+## 9. An agent rollout splits the datapath in two (FIXED)
+
+**2026-08-25, dev4 (Talos, kernel 6.18.38).** The platform install stalled:
+`failed calling webhook "webhook.cert-manager.io" … context deadline exceeded`,
+and the webhook pod was pingable from its own node but not from any other.
+
+**Not** the aggregated-API gap, and not a missing map entry — `remotes`,
+`node_remotes` and `locals` were complete and correct on all three nodes. The
+fault was that **two complete generations of the eBPF programs were attached at
+every hook**:
+
+```
+eth0(8)        tcx/ingress cozyplane_from_uplink  prog_id 73  link_id 3    <- loaded 12:40
+eth0(8)        tcx/ingress cozyplane_from_uplink  prog_id 168 link_id 19   <- loaded 13:52
+cozyplane0(10) tcx/ingress cozyplane_from_overlay prog_id 71  link_id 1
+cozyplane0(10) tcx/ingress cozyplane_from_overlay prog_id 166 link_id 17
+```
+
+Same program `tag` (identical bytecode — not a code change), but **disjoint
+`map_ids`**. The agent only ever writes the new map set; the old programs only
+read the old one, frozen at the moment the previous agent started. tcx runs
+links in attach order, so the *stale* program ran first and its terminal
+verdicts won.
+
+**Root cause.** `attachTCX` did remove-pin → attach → pin, on the assumption that
+"losing its pin drops the old link's last reference and detaches it". On 6.8
+that holds. On 6.18 it does not: the old link stayed attached with no pin and no
+open fd. `reattachTCX` (rebuild) and `DetachVeth` (CNI DEL) rested on the same
+assumption.
+
+**The symptom is an inversion, and it is diagnostic.** The old generation knew
+only the pods that existed when it loaded:
+
+| target | from a host netns | from a remote pod |
+|---|---|---|
+| pod that predates the rollout (coredns) | works | **fails** |
+| pod created after the rollout (webhook, and any new pod) | **fails** | works |
+
+Same-node stayed fine throughout, because default-network same-node delivery is
+deliberately left to the kernel — it touches neither generation's maps. That is
+why the pod looked healthy from its own node. The apiserver is hostNetwork, so
+calling a webhook is exactly the broken leg.
+
+**Fix.** One link per hook, enforced rather than assumed: `ensureTCX` adopts the
+cozyplane link already at a hook and swaps its program in place (`Link.Update`),
+detaches any extras, and attaches fresh only where none of ours exists.
+`DetachVeth` asks the kernel to detach. See [internals.md](internals.md) §6a.
+The fix also *heals* an already-split node on rollout — no reboot needed.
+
+**Two smaller bugs fell out of the same incident.**
+
+- The rollout's re-pin gap failed ~250 sandbox creations with
+  `open pinned from_pod program: no such file or directory`. Program pins are now
+  swapped pin-aside-then-rename, so the path is never absent.
+- Every one of those failed ADDs **leaked its fabric address**. `releaseFabricIPs`
+  used `DeleteCollection`, but `deletecollection` is a distinct RBAC verb from
+  `delete` and the plugin's SA holds only the latter — so the release was 403'd
+  and the error discarded. One cert-manager pod burned 100 addresses across
+  kubelet's retries. It now lists-then-deletes (verbs the SA provably has), and a
+  failed release is folded into the ADD error so it surfaces in the
+  `FailedCreatePodSandBox` event instead of being invisible. A claim leaked while
+  its pod still *lives* is invisible to the controller's GC forever, which is why
+  this could accumulate silently.
+
+**If you take one thing from this note:** kind cannot see this class of bug.
+Its nodes share the laptop's kernel (6.8), where pin removal *does* detach. Any
+assumption about BPF object lifetime needs checking on the target kernel — and
+"one link per hook" is now asserted by construction rather than inferred from
+refcount behaviour.

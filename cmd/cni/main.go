@@ -259,7 +259,13 @@ func addDefault(args *skel.CmdArgs, conf *NetConf) (result *current.Result, err 
 	}
 	defer func() {
 		if err != nil {
-			releaseFabricIPs(lc, podUID)
+			// Surface a failed release in the ADD error itself: it becomes the
+			// FailedCreatePodSandBox event, which is the only place an operator
+			// would ever see that kubelet's retries are burning addresses.
+			if rerr := releaseFabricIPs(lc, podUID); rerr != nil {
+				err = fmt.Errorf("%w (releasing the fabric IP claim also failed: %v — "+
+					"the address leaks until the pod is deleted)", err, rerr)
+			}
 		}
 	}()
 
@@ -347,7 +353,13 @@ func addVPC(args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, p
 	}
 	defer func() {
 		if err != nil {
-			releaseFabricIPs(lc, podUID)
+			// Surface a failed release in the ADD error itself: it becomes the
+			// FailedCreatePodSandBox event, which is the only place an operator
+			// would ever see that kubelet's retries are burning addresses.
+			if rerr := releaseFabricIPs(lc, podUID); rerr != nil {
+				err = fmt.Errorf("%w (releasing the fabric IP claim also failed: %v — "+
+					"the address leaks until the pod is deleted)", err, rerr)
+			}
 		}
 	}()
 	fabricIP := fabricIPs[0]

@@ -479,9 +479,10 @@ func advertiseNodeAddrs(ctx context.Context, client kubernetes.Interface, nodeNa
 // the overlay the true source survives and the destination node gates it.
 func nodeAddresses(node *corev1.Node) []net.IP { return npNodeAddresses(node) }
 
-// watchNodes starts a Node informer that mirrors every other node's pod CIDR
-// into the remotes map, and every other node's addresses into node_remotes. It
-// blocks until the cache is synced.
+// watchNodes starts a Node informer that indexes every other node's tunnel
+// endpoint and mirrors their addresses into node_remotes. It blocks until the
+// cache is synced. (Pod delivery is keyed per address by watchFabricIPs; nothing
+// here reads `spec.podCIDR` any more — see docs/api-groups.md.)
 func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.Manager, selfName string,
 	nodeIPs *nodeIPIndex, nodePools *nodePoolIndex, fabricResync func(), log *slog.Logger) error {
 	factory := informers.NewSharedInformerFactory(client, 0)
@@ -507,8 +508,14 @@ func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.
 	}
 
 	apply := func(obj any) {
+		// No PodCIDR condition here, deliberately. The pool is FLAT
+		// (docs/api-groups.md): `spec.podCIDR` is not read any more, so gating
+		// on it only meant that a cluster without the node-ipam controller got
+		// an EMPTY nodeIPs index and an EMPTY node_remotes map — no delivery
+		// entry for any pod, and every cross-node flow black-holed. kind always
+		// assigns podCIDRs, so no e2e could see it.
 		node, ok := obj.(*corev1.Node)
-		if !ok || node.Name == selfName || node.Spec.PodCIDR == "" {
+		if !ok || node.Name == selfName {
 			return
 		}
 		ip := internalIP(node)
@@ -537,7 +544,7 @@ func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.
 		UpdateFunc: func(_, newObj any) { apply(newObj) },
 		DeleteFunc: func(obj any) {
 			node, ok := obj.(*corev1.Node)
-			if !ok || node.Name == selfName || node.Spec.PodCIDR == "" {
+			if !ok || node.Name == selfName {
 				return
 			}
 			for _, addr := range nodeAddresses(node) {

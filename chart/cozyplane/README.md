@@ -19,7 +19,8 @@ for the tenancy model.
 - Kubernetes >= 1.30 (the `export` ValidatingAdmissionPolicy; set
   `exportPolicy.enabled=false` for older clusters).
 - A Linux kernel with BTF (`/sys/kernel/btf/vmlinux`), 5.10+.
-- Each node has `spec.podCIDR` set.
+- No per-node `spec.podCIDR` requirement: the fabric pool is flat and cluster-wide
+  (`--cluster-cidr`), so cozyplane works with or without the node-ipam controller.
 
 ## Install
 
