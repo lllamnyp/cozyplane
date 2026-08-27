@@ -193,6 +193,12 @@ Two tiers: **declarative** (authored by tenants/operators, desired state) and
 > do not exist** — a VPC carries its CIDRs directly, a pod attaches by annotation +
 > `VPCBinding`, and the VPC's door is the shipped **`VPCGateway`**. Treat the
 > unbuilt three as vocabulary from `design.md` §10, not as API.
+>
+> `NetworkAttachment` is not merely unbuilt but **deliberately dropped**: several
+> attachments per pod are declared by a JSON-list annotation, not by an object, and
+> the grant that lets one of them forward is a field on `VPCBinding` — the object
+> that already carries the `export`-gated grant. A template CRD can be layered on
+> later without changing the CNI. See [multi-attach.md](multi-attach.md).
 
 ### Declarative
 
