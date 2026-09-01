@@ -48,6 +48,11 @@ const (
 	// unambiguous. The older gateway wins; the loser stays Pending and realizes
 	// nothing (docs/north-south.md).
 	VPCGatewayConditionExclusive = "Exclusive"
+	// VPCGatewayConditionApplianceResolved is True when spec.appliance selects
+	// exactly one live workload holding a Port in this VPC, and that Port has
+	// been made the VPC's door. False (with the reason in the message) when the
+	// selector matches nothing, or matches a workload with no Port here yet.
+	VPCGatewayConditionApplianceResolved = "ApplianceResolved"
 )
 
 // VPCGatewayNAT configures many-to-one egress for pods with no address of their
@@ -107,9 +112,43 @@ type VPCGatewaySpec struct {
 	// Ingress configures what may enter the VPC from outside.
 	// +optional
 	Ingress VPCGatewayIngress `json:"ingress,omitempty"`
+
+	// Appliance names a workload of the tenant's own that IS this VPC's door —
+	// a firewall or router attached to several VPCs (docs/multi-attach.md).
+	//
+	// Off-VPC traffic from a VPC pod is delivered to gateways[vni] with its
+	// original destination intact, so whatever holds that entry receives the
+	// VPC's egress by construction and may route it on. Until now only
+	// cozyplane's own gateway pod could hold it — claimed by addGatewayLeg,
+	// restricted to the agent's namespace and to the VPC's reserved .1 — which
+	// left no way to say "my appliance is the door".
+	//
+	// Setting it does NOT give the appliance the right to emit a source it does
+	// not own; that is the separate, export-gated VPCBinding.allowForwarding
+	// grant. Being the door means receiving; forwarding means sending. A
+	// firewall wants both, and they are granted by different people.
+	//
+	// When set, the controller points the VPC's gateway at the selected
+	// workload's Port in this VPC and spawns no gateway pod of its own.
+	// +optional
+	Appliance *VPCGatewayAppliance `json:"appliance,omitempty"`
 }
 
 // VPCGatewayStatus is the observed state of a VPCGateway.
+// VPCGatewayAppliance selects the tenant workload that serves as the VPC's door.
+type VPCGatewayAppliance struct {
+	// PodSelector selects the appliance pod. A selector rather than a name
+	// because the workload is normally a Deployment or a VM whose pod name
+	// changes underneath it; the door must survive that.
+	PodSelector metav1.LabelSelector `json:"podSelector"`
+
+	// Namespace is where to look for it. Empty means the VPCGateway's own
+	// namespace, which is the ordinary case — the appliance belongs to the
+	// tenant that owns the VPC.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+}
+
 type VPCGatewayStatus struct {
 	// NATAddress is the v4 address this VPC's v4 egress wears on the wire — read from
 	// the gateway's owned v4 LoadBalancer Service (docs/external-addresses.md §5), and
@@ -127,6 +166,13 @@ type VPCGatewayStatus struct {
 	// family the VPC has is served in eBPF.
 	// +optional
 	NATAddress6 string `json:"natAddress6,omitempty"`
+
+	// AppliancePort is the Port currently serving as the VPC's door when
+	// spec.appliance is set — the cluster-scoped Port name, so an operator can
+	// see WHICH leg of a multi-attached appliance was chosen. Empty when no
+	// appliance is declared or none could be resolved.
+	// +optional
+	AppliancePort string `json:"appliancePort,omitempty"`
 
 	// Phase is the lifecycle phase.
 	// +optional

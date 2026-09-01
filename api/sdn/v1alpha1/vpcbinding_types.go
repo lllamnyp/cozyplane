@@ -25,6 +25,25 @@ import (
 type VPCBindingSpec struct {
 	// VPCRef is the VPC being made usable, identified by owner namespace + name.
 	VPCRef VPCRef `json:"vpcRef"`
+
+	// AllowForwarding lets a pod attached under this binding emit packets whose
+	// source address is not its own — what a router, firewall or NFV workload
+	// bridging two VPCs must do (docs/multi-attach.md).
+	//
+	// It is a GRANT, and it lives here rather than on the pod for a reason.
+	// from_pod runs a source-address RPF check per interface: the source must
+	// resolve, in `locals`, to the very veth it was emitted on. A pod's
+	// SecurityGroup identity is keyed on that source IP, so lifting the check
+	// hands the workload the ability to impersonate ANY member of the VPC and
+	// inherit its groups. That is the capability AWS spells
+	// `sourceDestCheck: false`, and it belongs to whoever owns the network.
+	//
+	// A VPCBinding is created by whoever holds the `export` verb on the
+	// referenced VPC — the VPC's owner, not the tenant consuming it — so the
+	// grant sits at the right level of authority and is visible in RBAC instead
+	// of living in an operator's head.
+	// +optional
+	AllowForwarding bool `json:"allowForwarding,omitempty"`
 }
 
 // +genclient

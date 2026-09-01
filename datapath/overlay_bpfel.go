@@ -82,6 +82,25 @@ type overlayFloatNet struct {
 	Mask uint32
 }
 
+type overlayFlowKey struct {
+	_      structs.HostLayout
+	Srcnet uint32
+	Dstnet uint32
+	Src    overlayAddr128
+	Dst    overlayAddr128
+	Sport  uint16
+	Dport  uint16
+	Proto  uint8
+	Pad    [3]uint8
+}
+
+type overlayFlowScratchVal struct {
+	_   structs.HostLayout
+	K   overlayFlowKey
+	Fl  uint8
+	Pad [7]uint8
+}
+
 type overlayGwEntry struct {
 	_      structs.HostLayout
 	GwIp   overlayAddr128
@@ -330,6 +349,10 @@ const (
 	overlayMapFloatUplinkMac        = "float_uplink_mac"
 	overlayMapFloating              = "floating"
 	overlayMapFloatingEgress        = "floating_egress"
+	overlayMapFlowEvents            = "flow_events"
+	overlayMapFlowLost              = "flow_lost"
+	overlayMapFlowScratch           = "flow_scratch"
+	overlayMapFlowSeen              = "flow_seen"
 	overlayMapGateways              = "gateways"
 	overlayMapHfAllow               = "hf_allow"
 	overlayMapHfCt                  = "hf_ct"
@@ -448,6 +471,10 @@ type overlayMapSpecs struct {
 	FloatUplinkMac *ebpf.MapSpec `ebpf:"float_uplink_mac"`
 	Floating       *ebpf.MapSpec `ebpf:"floating"`
 	FloatingEgress *ebpf.MapSpec `ebpf:"floating_egress"`
+	FlowEvents     *ebpf.MapSpec `ebpf:"flow_events"`
+	FlowLost       *ebpf.MapSpec `ebpf:"flow_lost"`
+	FlowScratch    *ebpf.MapSpec `ebpf:"flow_scratch"`
+	FlowSeen       *ebpf.MapSpec `ebpf:"flow_seen"`
 	Gateways       *ebpf.MapSpec `ebpf:"gateways"`
 	HfAllow        *ebpf.MapSpec `ebpf:"hf_allow"`
 	HfCt           *ebpf.MapSpec `ebpf:"hf_ct"`
@@ -528,6 +555,10 @@ type overlayMaps struct {
 	FloatUplinkMac *ebpf.Map `ebpf:"float_uplink_mac"`
 	Floating       *ebpf.Map `ebpf:"floating"`
 	FloatingEgress *ebpf.Map `ebpf:"floating_egress"`
+	FlowEvents     *ebpf.Map `ebpf:"flow_events"`
+	FlowLost       *ebpf.Map `ebpf:"flow_lost"`
+	FlowScratch    *ebpf.Map `ebpf:"flow_scratch"`
+	FlowSeen       *ebpf.Map `ebpf:"flow_seen"`
 	Gateways       *ebpf.Map `ebpf:"gateways"`
 	HfAllow        *ebpf.Map `ebpf:"hf_allow"`
 	HfCt           *ebpf.Map `ebpf:"hf_ct"`
@@ -584,6 +615,10 @@ func (m *overlayMaps) Close() error {
 		m.FloatUplinkMac,
 		m.Floating,
 		m.FloatingEgress,
+		m.FlowEvents,
+		m.FlowLost,
+		m.FlowScratch,
+		m.FlowSeen,
 		m.Gateways,
 		m.HfAllow,
 		m.HfCt,

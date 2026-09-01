@@ -92,6 +92,7 @@ func main() {
 		masqMode      string
 		vpcDNS        bool
 		clusterDNSIPs string
+		flowsEnabled  bool
 	)
 	flag.IntVar(&mtu, "mtu", 1450, "pod MTU (underlay MTU minus Geneve overhead)")
 	flag.UintVar(&vni, "vni", uint(datapath.DefaultVNI), "VNI for the default network")
@@ -109,6 +110,8 @@ func main() {
 		"steer VPC pods' cluster-DNS queries to the node-local split-horizon resolver (docs/services-in-vpc.md)")
 	flag.StringVar(&clusterDNSIPs, "cluster-dns", "",
 		"comma-separated cluster DNS ClusterIP(s) to steer; empty auto-discovers from the kube-system/kube-dns Service")
+	flag.BoolVar(&flowsEnabled, "flows", false,
+		"arm flow observability: per-flow events with verdicts and reasons, served on 127.0.0.1:9412 (docs/observability.md; ~14MiB extra map memlock)")
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
@@ -118,13 +121,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(nodeName, mtu, uint32(vni), cniConfName, uint16(genevePort), clusterCIDR, internalCIDRs, masqMode, vpcDNS, clusterDNSIPs, log); err != nil {
+	if err := run(nodeName, mtu, uint32(vni), cniConfName, uint16(genevePort), clusterCIDR, internalCIDRs, masqMode, vpcDNS, clusterDNSIPs, flowsEnabled, log); err != nil {
 		log.Error("agent failed", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort uint16, clusterCIDR, internalCIDRs, masqMode string, vpcDNS bool, clusterDNSIPs string, log *slog.Logger) error {
+func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort uint16, clusterCIDR, internalCIDRs, masqMode string, vpcDNS bool, clusterDNSIPs string, flowsEnabled bool, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -412,6 +415,13 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 	// registered.
 	if sdnClient, err := sdnclientset.NewForConfig(cfg); err != nil {
 		log.Warn("sdn client init failed; VPC networks won't be programmed", "err", err)
+		if flowsEnabled {
+			log.Warn("flow observability needs the sdn API for enrichment and the :9411 server; disarming")
+		}
+		// Clear a pinned leftover either way: params survives agent restarts.
+		if err := mgr.SetFlowEnabled(false); err != nil {
+			log.Warn("disarm flow observability", "err", err)
+		}
 	} else {
 		factory := sdninformers.NewSharedInformerFactory(sdnClient, 0)
 		watchVPCs(factory, mgr, log)
@@ -426,9 +436,29 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		if err := watchHostFirewalls(ctx, factory, client, mgr, nodeName, log); err != nil {
 			log.Error("watch hostfirewalls", "err", err)
 		}
+		// Flow observability (docs/observability.md): arm the datapath, drain
+		// the ring, and serve raw flows on the node loopback. The listers reuse
+		// informers already registered above, so this adds no watches.
+		var flows *flowPipeline
+		if flowsEnabled {
+			if err := mgr.SetFlowEnabled(true); err != nil {
+				log.Error("arm flow observability", "err", err)
+			} else {
+				flows = newFlowPipeline(mgr,
+					factory.Sdn().V1alpha1().VPCs().Lister(),
+					factory.Sdn().V1alpha1().Ports().Lister(),
+					localFactory.Local().V1alpha1().FabricIPs().Lister(),
+					nodeName, log)
+				go flows.run(ctx)
+				flows.serveLoopback(ctx)
+			}
+		} else if err := mgr.SetFlowEnabled(false); err != nil {
+			log.Warn("disarm flow observability", "err", err)
+		}
+
 		// Per-VPC traffic metrics (#2): serve the datapath counters, labeled by
 		// VPC via the same VPC lister the networks map is built from.
-		serveMetrics(ctx, mgr, factory.Sdn().V1alpha1().VPCs(), nodeName, log)
+		serveMetrics(ctx, mgr, factory.Sdn().V1alpha1().VPCs(), nodeName, flows, log)
 		factory.Start(ctx.Done())
 	}
 
@@ -1898,7 +1928,7 @@ func watchServiceVIPs(ctx context.Context, factory sdninformers.SharedInformerFa
 // text on :9411/metrics, labeled by the owning VPC. Hand-rolled exposition (no
 // client dependency), read fresh on each scrape from the PERCPU map and the VPC
 // lister (net id -> VPC namespace/name).
-func serveMetrics(ctx context.Context, mgr *datapath.Manager, vpcs sdnv1alpha1informers.VPCInformer, nodeName string, log *slog.Logger) {
+func serveMetrics(ctx context.Context, mgr *datapath.Manager, vpcs sdnv1alpha1informers.VPCInformer, nodeName string, flows *flowPipeline, log *slog.Logger) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		counters, err := mgr.VPCCounters()
@@ -2023,6 +2053,12 @@ func serveMetrics(ctx context.Context, mgr *datapath.Manager, vpcs sdnv1alpha1in
 		}
 		fmt.Fprintf(&b, "# HELP cozyplane_hf_sync_errors_total HostFirewall compiler sync failures (this node).\n# TYPE cozyplane_hf_sync_errors_total counter\n")
 		fmt.Fprintf(&b, "cozyplane_hf_sync_errors_total{node=\"%s\"} %d\n", nodeName, hfSyncErrors.Load())
+
+		// Flow-derived series (docs/observability.md §5) — bounded cardinality,
+		// no IP/port/pod labels; fine-grained identity lives in /flows.
+		if flows != nil {
+			flows.writeMetrics(&b, names)
+		}
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		_, _ = w.Write([]byte(b.String()))
 	})

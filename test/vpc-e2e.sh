@@ -423,6 +423,187 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
+# A KubeVirt VM only sees NICs KubeVirt put in its domain, and spec.networks
+# admits only `pod` and `multus` — so a VM's secondary NIC goes through a
+# NetworkAttachmentDefinition and the plugin's delegate mode
+# (docs/kubevirt-multi-nic.md). No VM here: kind cannot host KubeVirt. What is
+# testable, and what actually breaks, is the plumbing underneath — the delegate
+# builds one leg, the primary keeps its own, and the two DELs stay apart.
+phase "Multus delegate: a secondary NIC through a NetworkAttachmentDefinition"
+if ! $K get crd network-attachment-definitions.k8s.cni.cncf.io >/dev/null 2>&1; then
+  skip "the cluster does not serve NetworkAttachmentDefinition (no Multus)"
+else
+  # The shim is generated from the VPCBinding, so it lands where attachment is
+  # already authorized. Nothing hand-written should be needed.
+  NAD=""
+  for _ in $(seq 1 10); do
+    NAD=$($K -n "$NS" get net-attach-def vb -o jsonpath='{.spec.config}' 2>/dev/null)
+    [ -n "$NAD" ] && break
+    sleep 2
+  done
+  case "$NAD" in
+    *'"type":"cozyplane"'*'"vpc":"'"$NS"'/vb"'*)
+      pass "the VPCBinding generated a NAD naming its VPC" ;;
+    "") fail "no NAD was generated for the binding" ;;
+    *)  fail "the generated NAD does not name the VPC: $NAD" ;;
+  esac
+
+  apply <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: d1
+  namespace: $NS
+  annotations:
+    # The primary leg — what a VM's \`pod: {}\` network is — plus a pin for the
+    # NIC Multus will build. netN names are reserved for delegation, so the
+    # primary invocation skips that entry instead of claiming the interface.
+    sdn.cozystack.io/networks: '[{"vpc":"va"},{"name":"net1","vpc":"vb","ip":"10.91.0.77"}]'
+    # What KubeVirt generates from spec.networks[].multus
+    k8s.v1.cni.cncf.io/networks: vb
+spec:
+  nodeName: $W2
+  containers: [{name: s, image: nicolaka/netshoot, command: [sh, -c, "$SRV"]}]
+EOF
+  if ! $K -n "$NS" wait --for=condition=Ready pod/d1 --timeout=180s >/dev/null 2>&1; then
+    fail "the pod with a delegated NIC never became ready"
+  else
+    IFS0=$($K -n "$NS" exec d1 -- ip -4 -o addr show eth0 2>/dev/null | grep -c 'inet ')
+    IFS1=$($K -n "$NS" exec d1 -- ip -4 -o addr show net1 2>/dev/null | grep -c 'inet ')
+    [ "$IFS0" = "1" ] && [ "$IFS1" = "1" ] \
+      && pass "both legs exist: eth0 from the annotation, net1 from the NAD" \
+      || fail "expected an address on eth0 and net1 (got eth0=$IFS0 net1=$IFS1)"
+
+    PIN=$($K -n "$NS" exec d1 -- ip -4 -o addr show net1 2>/dev/null | grep -o '10\.91\.0\.77')
+    [ "$PIN" = "10.91.0.77" ] \
+      && pass "the delegated NIC took the pinned address from the annotation entry" \
+      || fail "net1 did not take the pinned address"
+
+    # N default routes would have the kernel pick an egress interface by
+    # whatever metric it assigned. The secondary gets its own CIDR and no more.
+    DEFN=$($K -n "$NS" exec d1 -- ip route 2>/dev/null | grep -c '^default')
+    [ "$DEFN" = "1" ] \
+      && pass "one default route, on the primary leg only" \
+      || fail "got $DEFN default routes; the egress interface would be nondeterministic"
+
+    B1IP=$(vpcip b1)
+    served d1 "http://[$B1IP]:8080/" 2>/dev/null || served d1 "http://$B1IP:8080/" \
+      && pass "the delegated NIC carries east-west traffic in its own VPC" \
+      || fail "no traffic over the delegated NIC to $B1IP"
+
+    # The delegated Port must be tellable apart from the primary's, or a DEL
+    # releases the wrong address.
+    DIF=$($K get ports -l "sdn.cozystack.io/pod-name=d1,sdn.cozystack.io/ifname=net1" \
+          -o jsonpath='{.items[*].spec.vpcRef.name}' 2>/dev/null)
+    [ "$DIF" = "vb" ] \
+      && pass "the delegated Port is labelled with its interface, in the NAD's VPC" \
+      || fail "the delegated Port is not identifiable by interface (got '$DIF')"
+  fi
+
+  # THE security property: a NAD names a VPC, it does not grant one. A tenant
+  # who writes their own pointing at someone else's VPC must get nothing.
+  $K create ns "${NS}-rogue" >/dev/null 2>&1
+  apply <<EOF
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata: {name: stolen, namespace: ${NS}-rogue}
+spec:
+  config: '{"cniVersion":"1.0.0","name":"stolen","type":"cozyplane","vpc":"$NS/vb"}'
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: thief
+  namespace: ${NS}-rogue
+  annotations: {k8s.v1.cni.cncf.io/networks: stolen}
+spec:
+  nodeName: $W
+  containers: [{name: s, image: nicolaka/netshoot, command: [sleep, infinity]}]
+EOF
+  sleep 20
+  THIEFIP=$($K -n "${NS}-rogue" get pod thief -o jsonpath='{.status.podIP}' 2>/dev/null)
+  STOLEN=$($K get ports -l "sdn.cozystack.io/pod-namespace=${NS}-rogue" -o name 2>/dev/null)
+  [ -z "$STOLEN" ] \
+    && pass "a hand-written NAD naming another namespace's VPC is refused (no VPCBinding, no Port)" \
+    || fail "a hand-written NAD got a Port in an unauthorized namespace: $STOLEN (pod ip $THIEFIP)"
+  $K delete ns "${NS}-rogue" --wait=false >/dev/null 2>&1
+fi
+
+# ---------------------------------------------------------------------------
+phase "flow observability: verdicts with reasons on /flows (docs/observability.md)"
+# The agents serve /flows only when launched with --flows; probe first and skip
+# rather than fail a cluster that has the feature off (the chart default).
+AGENTS=$($K -n kube-system get pods -l app=cozyplane-agent -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+# The raw flow endpoints are loopback-only (docs/observability.md §4); reach them
+# by exec-ing wget inside the agent, the operator path cozyplane-flowctl uses.
+flowget() { $K -n kube-system exec "$1" -c agent -- wget -q -O- "http://127.0.0.1:9412/flows?limit=4096" 2>/dev/null; }
+flowprobe() {
+  for ap in $AGENTS; do
+    $K -n kube-system exec "$ap" -c agent -- wget -q -O- "http://127.0.0.1:9412/flows?limit=1" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+# flowsHave polls every agent's /flows for a line matching ALL given fragments.
+flowsHave() {
+  for _ in $(seq 1 12); do
+    for ap in $AGENTS; do
+      out=$(flowget "$ap") || continue
+      hit=1
+      for frag in "$@"; do echo "$out" | grep -qF "$frag" || { hit=0; break; }; done
+      [ "$hit" = "1" ] && return 0
+    done
+    sleep 2
+  done
+  return 1
+}
+if ! flowprobe; then
+  skip "flow observability (agents run without --flows)"
+else
+  # An admitted east-west flow shows up enriched with its VPC and pods.
+  served a1 "http://$A2:8080/" >/dev/null 2>&1
+  flowsHave '"verdict":"allow"' '"reason":"allow"' "\"pod\":\"$NS/a2\"" "\"vpc\":\"$NS/va\"" \
+    && pass "an admitted east-west flow is visible, enriched with VPC and pod" \
+    || fail "no enriched allow event for a1->a2"
+
+  # A SecurityGroup deny names its gate: reason=sg_ingress, correct target.
+  # vb has a single pod, so bring a short-lived co-VPC client for the denied dial.
+  apply <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: bflow, namespace: $NS, annotations: {sdn.cozystack.io/vpc: vb}}
+spec:
+  containers: [{name: s, image: nicolaka/netshoot, command: [sleep, infinity]}]
+EOF
+  $K -n "$NS" wait --for=condition=Ready pod/bflow --timeout=120s >/dev/null 2>&1
+  $K -n "$NS" label pod b1 role=flowlocked --overwrite >/dev/null
+  apply <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: SecurityGroup
+metadata: {name: flowlock, namespace: $NS}
+spec:
+  vpcRef: {name: vb}
+  podSelector: {matchLabels: {role: flowlocked}}
+  ingress: [{from: {cidr: "192.0.2.0/24"}, ports: [{protocol: TCP, port: 8080}]}]
+EOF
+  sleep 6
+  refused bflow "http://$B1:8080/" >/dev/null 2>&1 || true
+  flowsHave '"verdict":"deny"' '"reason":"sg_ingress"' "\"pod\":\"$NS/b1\"" \
+    && pass "a SecurityGroup deny is visible with reason=sg_ingress and the right target" \
+    || fail "no sg_ingress deny event for the locked pod"
+  $K -n "$NS" delete securitygroup flowlock >/dev/null 2>&1
+  $K -n "$NS" label pod b1 role- >/dev/null 2>&1
+  $K -n "$NS" delete pod bflow --wait=false >/dev/null 2>&1
+
+  # The flow-derived Prometheus series ride the same /metrics as everything.
+  FM=0
+  for ap in $AGENTS; do
+    n=$($K get --raw "/api/v1/namespaces/kube-system/pods/${ap}:9411/proxy/metrics" 2>/dev/null | grep -c '^cozyplane_flows_total') && [ "${n:-0}" -gt 0 ] && FM=1 && break
+  done
+  [ "$FM" = "1" ] && pass "cozyplane_flows_total is served on /metrics" \
+    || fail "cozyplane_flows_total missing from /metrics"
+fi
+
+# ---------------------------------------------------------------------------
 phase "revocation: severing a live pod's VPC access"
 $K -n "$NS" delete vpcbinding va >/dev/null 2>&1
 sleep 10

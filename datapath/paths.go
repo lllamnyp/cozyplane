@@ -77,6 +77,9 @@ const (
 	// cfgHFEgEnabled arms host-firewall EGRESS: the node's own new flows are
 	// default-deny (node→node and node→local-pod stay exempt).
 	cfgHFEgEnabled = uint32(10)
+	// cfgFlowEnabled arms flow observability (docs/observability.md): every
+	// flow_emit site pays one params lookup while it is off.
+	cfgFlowEnabled = uint32(11)
 )
 
 // ResolverPort is the port the split-horizon resolver binds on the node
@@ -95,9 +98,20 @@ const DefaultVNI uint32 = 1
 // match PORT_F_GATEWAY in bpf/overlay.c.
 const PortGatewayFlag uint32 = 1 << 31
 
-// PortNet strips the gateway flag from a ports-map value, yielding the network
-// id (the locals/remotes scope). Mirrors PORT_NET in bpf/overlay.c.
-func PortNet(v uint32) uint32 { return v &^ PortGatewayFlag }
+// PortForwardFlag marks a TENANT forwarding leg — a router or firewall attached
+// to several VPCs (docs/multi-attach.md). Like the gateway flag it lifts
+// from_pod's source RPF check, and there the resemblance stops: gateway traffic
+// is north-south and skips east-west SecurityGroups, while a tenant router is
+// the one workload whose traffic most needs policing. A forwarded packet is
+// marked FWD_MARK instead, which clears the destination's isolation check and
+// still faces its SecurityGroups (as a north-south source, since this VPC holds
+// no identity for an address it does not own). Must match PORT_F_FORWARD in
+// bpf/overlay.c.
+const PortForwardFlag uint32 = 1 << 30
+
+// PortNet strips the flag bits from a ports-map value, yielding the network id
+// (the locals/remotes scope). Mirrors PORT_NET in bpf/overlay.c.
+func PortNet(v uint32) uint32 { return v &^ (PortGatewayFlag | PortForwardFlag) }
 
 // QuarantineNet is a reserved network id assigned to a pod's ports-map entry to
 // sever it: no VPC CIDR is ever programmed into the networks map with this id

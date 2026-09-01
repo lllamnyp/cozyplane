@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -219,6 +220,17 @@ func run() error {
 	state := &informerState{ports: portInf.GetIndexer(), svcs: svcInf.GetIndexer(), eps: epsInf.GetIndexer(), peerings: peeringInf.GetIndexer(), svips: svipInf.GetIndexer(), fips: fipInf.GetIndexer()}
 	res := &responder.Resolver{Domain: domain, Upstreams: upstreams, State: state}
 
+	// DNS observability (docs/observability.md §D): opt-in like the rest of
+	// observability (off by default, matching Cozystack's Hubble posture). When
+	// enabled, count and serve the query/response aggregates on a distinct port
+	// (the agent already holds :9411/:9412 in this shared hostNetwork namespace).
+	// Disabled, the resolver never counts and binds no extra port.
+	if os.Getenv("COZYPLANE_DNS_METRICS") == "1" {
+		metrics := responder.NewDNSMetrics()
+		res.Metrics = metrics // nil-safe when unset
+		go serveDNSMetrics(metrics, nodeName)
+	}
+
 	var wg sync.WaitGroup
 	errc := make(chan error, 8)
 	for _, ip := range []string{nodeIP, nodeIP6} {
@@ -239,6 +251,25 @@ func run() error {
 		}
 	}
 	return <-errc
+}
+
+// dnsMetricsAddr is where the responder serves its DNS metrics. Distinct from
+// the agent's :9411 (same hostNetwork namespace) and its :9412 flow loopback.
+const dnsMetricsAddr = ":9413"
+
+// serveDNSMetrics exposes the resolver's DNS counters as Prometheus text.
+func serveDNSMetrics(m *responder.DNSMetrics, node string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+		var b strings.Builder
+		m.WriteMetrics(&b, node)
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		_, _ = w.Write([]byte(b.String()))
+	})
+	log.Printf("serving DNS metrics on %s/metrics", dnsMetricsAddr)
+	if err := http.ListenAndServe(dnsMetricsAddr, mux); err != nil {
+		log.Printf("dns metrics server: %v", err)
+	}
 }
 
 // nodeInternalIPs returns the node's InternalIP per family.

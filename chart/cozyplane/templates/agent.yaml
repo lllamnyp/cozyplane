@@ -176,6 +176,10 @@ spec:
             # (routed to the gateway instead, which proxies DNS / denies the rest).
             - "--internal-cidrs={{ join "," $internal }}"
             {{- end }}
+            {{- if .Values.observability.flows }}
+            # Flow observability (docs/observability.md): flow events + /flows.
+            - "--flows=true"
+            {{- end }}
           ports:
             # Per-VPC traffic metrics (#2), Prometheus text at /metrics.
             - name: metrics
@@ -222,11 +226,23 @@ spec:
           image: {{ .Values.image }}
           imagePullPolicy: {{ .Values.imagePullPolicy }}
           command: ["/usr/local/bin/cozyplane-responder"]
+          {{- if .Values.observability.dnsMetrics }}
+          ports:
+            # DNS observability (docs/observability.md §D): Prometheus text at
+            # /metrics — bounded, address-free aggregates (qtype/rcode by VPC).
+            - name: dns-metrics
+              containerPort: 9413
+              hostPort: 9413
+          {{- end }}
           env:
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            {{- if .Values.observability.dnsMetrics }}
+            - name: COZYPLANE_DNS_METRICS
+              value: "1"
+            {{- end }}
             {{- if .Values.kubeApiServer.host }}
             - name: KUBERNETES_SERVICE_HOST
               value: {{ .Values.kubeApiServer.host | quote }}

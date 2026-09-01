@@ -55,6 +55,21 @@ egress:
   # their gateways (e.g. the node/management network).
   internalCIDRs: []
 
+# Observability (docs/observability.md). ALL OFF BY DEFAULT, matching
+# Cozystack's own posture (its Hubble ships disabled by default). Turn on only
+# what you want; each part is independent.
+observability:
+  # Per-flow events with verdicts and drop reasons: the flow_events ring buffer
+  # + flow_seen LRU in the datapath, the raw /flows loopback endpoint (read via
+  # cozyplane-flowctl), and the cozyplane_flow_* / cozyplane_flows_total series
+  # on each agent's :9411/metrics. Enabling adds ~14MiB of map memlock per node
+  # (visible in cozyplane_bpf_map_memlock_bytes).
+  flows: false
+  # DNS metrics from the split-horizon resolver: cozyplane_dns_{queries,
+  # responses}_total on the responder's :9413/metrics. Cheap (no datapath), but
+  # off by default so the node exposes no extra port unless asked.
+  dnsMetrics: false
+
 agent:
   priorityClassName: system-node-critical
   resources:

@@ -220,6 +220,34 @@ pool that covers every family a VPC uses.
 > and a v6 identity and shed its gateway pod, on agents that loaded the new datapath
 > with no verifier error.
 
+## 6b. The door can be the tenant's own appliance
+
+A VPC's door is whatever holds `gateways[vni]`, and off-VPC traffic is delivered
+to it **with the original destination intact** — so the holder receives the VPC's
+egress by construction and may route it on rather than merely NAT it. That entry
+is built from Ports carrying `spec.gateway`.
+
+Until now only cozyplane's own gateway pod could carry it: `addGatewayLeg` claims
+it, restricted to the agent's namespace and to the VPC's reserved `.1`. A tenant
+running a firewall or router had no way to say "that is my door", so a capability
+the datapath already had was unreachable by the workload it was for.
+
+`VPCGateway.spec.appliance.podSelector` says it. The VPCGateway is already the
+VPC's one declared boundary, so what serves as that boundary belongs on it rather
+than on a new kind. The controller resolves the selector, finds the selected
+workload's Port **in this VPC** (a multi-attached appliance has one per VPC, and
+only the local leg can be its door), and moves `spec.gateway` onto it.
+`desiredGateways` is unchanged, and so is the datapath: the door was always a Port
+flag, and this only decides which Port carries it. While an appliance is declared
+cozyplane spawns no gateway pod of its own — one entry, one claimant.
+
+**Receiving is not sending.** Being the door means traffic arrives; emitting a
+source you do not own is the separate `VPCBinding.allowForwarding` grant, authored
+by whoever holds `export` on the VPC (docs/multi-attach.md). A firewall wants
+both, and they are deliberately granted by different people: the tenant may point
+its own VPC's door wherever it likes inside its own network, but the right to
+impersonate a member of that VPC stays with the VPC's owner.
+
 ## 7. Open questions
 
 - **Where does the gateway's DNS door go?** The gateway pod opens `:53` to cluster

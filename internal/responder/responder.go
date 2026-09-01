@@ -78,6 +78,7 @@ type Resolver struct {
 	Domain    string   // cluster domain, e.g. "cluster.local"
 	Upstreams []string // "host:port" forwarders for non-cluster names
 	State     State
+	Metrics   *DNSMetrics // optional; nil disables DNS observability
 }
 
 // ServeDNS implements dns.Handler.
@@ -97,17 +98,26 @@ func (r *Resolver) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	port := r.State.PortByFabricIP(canonIP(host))
 	if port == nil {
 		// Not a datapath-steered VPC query (someone dialed the node address
-		// directly): refuse rather than leak any view.
+		// directly): refuse rather than leak any view. Not a tenant query, so
+		// not metered.
 		r.reply(w, req, r.refused(req))
 		return
 	}
 
+	// A steered VPC query: metered, attributed to the querying VPC (the only
+	// identity here — never the domain name).
+	vpc := port.Spec.VPCRef
+	r.Metrics.Query(q.Qtype, vpc)
+
 	zone := dns.Fqdn(r.Domain)
 	if dns.IsSubDomain(zone, qname) {
-		r.reply(w, req, r.authoritative(req, q, qname, port))
+		resp := r.authoritative(req, q, qname, port)
+		r.reply(w, req, resp)
+		r.Metrics.Response(resp.Rcode, vpc)
 		return
 	}
-	r.forward(w, req)
+	resp := r.forward(w, req)
+	r.Metrics.Response(resp.Rcode, vpc)
 }
 
 // authoritative answers a cluster-domain name for the querying Port's VPC.
@@ -333,7 +343,9 @@ func containsVPC(refs []sdnv1alpha1.VPCRef, want sdnv1alpha1.VPCRef) bool {
 
 // forward relays a non-cluster name to the node's upstream resolvers over the
 // same transport the client used, returning the first response.
-func (r *Resolver) forward(w dns.ResponseWriter, req *dns.Msg) {
+// forward relays a non-cluster name upstream and returns the reply it sent, so
+// the caller can meter its rcode.
+func (r *Resolver) forward(w dns.ResponseWriter, req *dns.Msg) *dns.Msg {
 	proto := "udp"
 	if _, ok := w.RemoteAddr().(*net.TCPAddr); ok {
 		proto = "tcp"
@@ -346,11 +358,12 @@ func (r *Resolver) forward(w dns.ResponseWriter, req *dns.Msg) {
 		}
 		in.Id = req.Id
 		r.reply(w, req, in)
-		return
+		return in
 	}
 	m := new(dns.Msg)
 	m.SetRcode(req, dns.RcodeServerFailure)
 	r.reply(w, req, m)
+	return m
 }
 
 func (r *Resolver) nxdomain(m *dns.Msg) *dns.Msg {

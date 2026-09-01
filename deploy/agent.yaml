@@ -190,6 +190,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # DNS observability (docs/observability.md §D): opt-in. Set to "1"
+            # to serve cozyplane_dns_* on :9413; unset disables it (and the port).
+            - name: COZYPLANE_DNS_METRICS
+              value: "1"
             # CLUSTER_DOMAIN is autodetected from the kubelet-written search
             # path (dnsPolicy: ClusterFirstWithHostNet); set it to override.
             # Forward external names to the node's own upstreams, not the

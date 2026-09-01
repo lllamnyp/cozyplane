@@ -26,6 +26,19 @@ const (
 	// "<owner-ns>/<vpc>".
 	AnnotationVPC = "sdn.cozystack.io/vpc"
 
+	// AnnotationNetworks on a pod requests SEVERAL attachments at once
+	// (docs/multi-attach.md), which AnnotationVPC cannot express. Its value is a
+	// JSON list of {vpc, ip?, mac?, name?}; `vpc` takes the same syntax as
+	// AnnotationVPC. Carrying both annotations is an error, not a precedence
+	// rule.
+	//
+	// Order is part of the contract: entry 0 is the PRIMARY attachment — it
+	// carries the fabric bridge (so it is what status.podIP resolves to and what
+	// kubelet probes reach) and it alone receives the default route. The others
+	// get an on-link route to their own VPC CIDR, because N default routes pick
+	// an egress interface by whatever metric the kernel assigned.
+	AnnotationNetworks = "sdn.cozystack.io/networks"
+
 	// AnnotationGatewayFor on a (default-network, system-namespace) pod makes
 	// it the egress gateway of a VPC: it gets a second interface carrying the
 	// VPC's reserved .1 address. Same value syntax as AnnotationVPC. Honored
@@ -82,6 +95,28 @@ const (
 	// fresh one, so the VPC IP + MAC survive pod churn and live migration. The
 	// persistent-Port controller selects on this to drive migration cutover and GC.
 	LabelVMName = "sdn.cozystack.io/vm-name"
+
+	// LabelVMNIC identifies the NIC a persistent Port belongs to, and it is what
+	// makes a multi-NIC VM's Ports tellable apart. Binding selects a VM's
+	// persistent Port by {vpc-namespace, vpc, vm-name}; with two NICs that
+	// selector matches two Ports and the first one returned is arbitrary, so the
+	// VM's interfaces would swap addresses at random across restarts.
+	//
+	// Its value comes from whichever path built the attachment, in deliberately
+	// disjoint spaces: the annotation path writes the decimal attachment index,
+	// a Multus-delegated NIC writes its interface name (net1, net2 — see
+	// docs/kubevirt-multi-nic.md). A decimal and a name beginning "net" can never
+	// be equal, so two NICs of one VM on one VPC — one from each path — still
+	// select different Ports.
+	LabelVMNIC = "sdn.cozystack.io/vm-nic"
+
+	// LabelIfName is the pod interface a Port was claimed for, set only on
+	// Multus-delegated attachments. It is what lets a delegated CNI DEL release
+	// exactly its own Port: Multus calls the delegate's DEL once per NIC, and
+	// selecting on {pod, VPC} alone would match both Ports of a VM holding two
+	// NICs on the same VPC — so tearing down one NIC would release the other's
+	// address while its interface is still up.
+	LabelIfName = "sdn.cozystack.io/ifname"
 
 	// KubeVirt labels on a virt-launcher pod, read to recognize a VM NIC and drive
 	// migration. The stable VM identity is (namespace, KubeVirtLabelVMName); the
