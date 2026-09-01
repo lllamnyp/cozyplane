@@ -25,8 +25,6 @@ import (
 
 // VPCGatewayStatusApplyConfiguration represents a declarative configuration of the VPCGatewayStatus type for use
 // with apply.
-//
-// VPCGatewayStatus is the observed state of a VPCGateway.
 type VPCGatewayStatusApplyConfiguration struct {
 	// NATAddress is the v4 address this VPC's v4 egress wears on the wire — read from
 	// the gateway's owned v4 LoadBalancer Service (docs/external-addresses.md §5), and
@@ -41,6 +39,11 @@ type VPCGatewayStatusApplyConfiguration struct {
 	// a family with none keeps the gateway pod. The pod is retired only once every
 	// family the VPC has is served in eBPF.
 	NATAddress6 *string `json:"natAddress6,omitempty"`
+	// AppliancePort is the Port currently serving as the VPC's door when
+	// spec.appliance is set — the cluster-scoped Port name, so an operator can
+	// see WHICH leg of a multi-attached appliance was chosen. Empty when no
+	// appliance is declared or none could be resolved.
+	AppliancePort *string `json:"appliancePort,omitempty"`
 	// Phase is the lifecycle phase.
 	Phase *sdnv1alpha1.VPCGatewayPhase `json:"phase,omitempty"`
 	// Conditions is the detailed state.
@@ -66,6 +69,14 @@ func (b *VPCGatewayStatusApplyConfiguration) WithNATAddress(value string) *VPCGa
 // If called multiple times, the NATAddress6 field is set to the value of the last call.
 func (b *VPCGatewayStatusApplyConfiguration) WithNATAddress6(value string) *VPCGatewayStatusApplyConfiguration {
 	b.NATAddress6 = &value
+	return b
+}
+
+// WithAppliancePort sets the AppliancePort field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the AppliancePort field is set to the value of the last call.
+func (b *VPCGatewayStatusApplyConfiguration) WithAppliancePort(value string) *VPCGatewayStatusApplyConfiguration {
+	b.AppliancePort = &value
 	return b
 }
 

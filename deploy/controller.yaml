@@ -28,6 +28,12 @@ rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["ports/status"]
     verbs: ["get", "update", "patch"]
+  # NetworkAttachmentDefinitions: the Multus shim a KubeVirt VM needs to name a
+  # VPC at all (docs/kubevirt-multi-nic.md). One per VPCBinding, in the binding's
+  # namespace, so it lands where attachment is already authorized.
+  - apiGroups: ["k8s.cni.cncf.io"]
+    resources: ["network-attachment-definitions"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["securitygroups"]
     verbs: ["get", "list", "watch"]

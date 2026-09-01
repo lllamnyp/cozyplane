@@ -52,6 +52,8 @@ type VPCGatewayReconciler struct {
 
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=vpcgateways,verbs=get;list;watch
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=vpcgateways/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=sdn.cozystack.io,resources=ports,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;create;update;patch;delete
 
@@ -96,11 +98,26 @@ func (r *VPCGatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
+	// The VPC's door may be a workload of the tenant's own (docs/multi-attach.md).
+	// Off-VPC traffic is delivered to gateways[vni] with its destination intact,
+	// and that map is built from Ports carrying spec.gateway — so designating an
+	// appliance is exactly "move that flag onto its Port".
+	appliancePort, applianceErr := "", ""
+	if exclusive && gw.Spec.Appliance != nil && vpcOK {
+		appliancePort, applianceErr, err = r.reconcileAppliance(ctx, gw, vpc)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+	} else if err := r.clearAppliancePorts(ctx, gw, vpc, ""); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	status := sdnv1alpha1.VPCGatewayStatus{
-		Phase:       sdnv1alpha1.VPCGatewayPhasePending,
-		NATAddress:  natAddr,
-		NATAddress6: natAddr6,
-		Conditions:  append([]metav1.Condition(nil), gw.Status.Conditions...),
+		Phase:         sdnv1alpha1.VPCGatewayPhasePending,
+		NATAddress:    natAddr,
+		NATAddress6:   natAddr6,
+		AppliancePort: appliancePort,
+		Conditions:    append([]metav1.Condition(nil), gw.Status.Conditions...),
 	}
 	setGWCondition(&status, sdnv1alpha1.VPCGatewayConditionVPCResolved, vpcOK,
 		"VPCResolved", "spec.vpcRef names a VPC in this namespace")
@@ -120,6 +137,11 @@ func (r *VPCGatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		setGWCondition(&status, sdnv1alpha1.VPCGatewayConditionExclusive, false,
 			"GatewayConflict",
 			fmt.Sprintf("VPCGateway %q is already this VPC's boundary; a VPC has exactly one", conflict))
+	}
+	if gw.Spec.Appliance != nil {
+		setGWCondition(&status, sdnv1alpha1.VPCGatewayConditionApplianceResolved,
+			appliancePort != "", "ApplianceResolved",
+			applianceMessage(appliancePort, applianceErr))
 	}
 	if vpcOK && exclusive {
 		status.Phase = sdnv1alpha1.VPCGatewayPhaseReady
@@ -424,6 +446,7 @@ func setGWCondition(status *sdnv1alpha1.VPCGatewayStatus, condType string, ok bo
 
 func gwStatusEqual(a, b sdnv1alpha1.VPCGatewayStatus) bool {
 	if a.Phase != b.Phase || a.NATAddress != b.NATAddress || a.NATAddress6 != b.NATAddress6 ||
+		a.AppliancePort != b.AppliancePort ||
 		len(a.Conditions) != len(b.Conditions) {
 		return false
 	}
@@ -440,14 +463,204 @@ func gwStatusEqual(a, b sdnv1alpha1.VPCGatewayStatus) bool {
 	return true
 }
 
+// applianceMessage phrases the ApplianceResolved condition.
+func applianceMessage(port, problem string) string {
+	if port != "" {
+		return "the VPC's door is " + port
+	}
+	if problem != "" {
+		return problem
+	}
+	return "spec.appliance selects a workload with a Port in this VPC"
+}
+
+// reconcileAppliance points the VPC's door at the selected workload's Port and
+// takes it off any other. Returns the chosen Port name, or a human-readable
+// reason it could not be chosen (which is NOT an error — a selector that matches
+// nothing yet is an ordinary state on the way up, and must not wedge the
+// reconcile).
+//
+// The Port is chosen, not created: the CNI already made one when the appliance
+// attached to this VPC. All this does is move spec.gateway, which is what
+// desiredGateways reads to build gateways[vni].
+func (r *VPCGatewayReconciler) reconcileAppliance(ctx context.Context, gw *sdnv1alpha1.VPCGateway,
+	vpc *sdnv1alpha1.VPC) (chosen string, problem string, err error) {
+	sel, e := metav1.LabelSelectorAsSelector(&gw.Spec.Appliance.PodSelector)
+	if e != nil {
+		return "", fmt.Sprintf("spec.appliance.podSelector is invalid: %v", e), nil
+	}
+	ns := gw.Spec.Appliance.Namespace
+	if ns == "" {
+		ns = gw.Namespace
+	}
+
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(ns), client.MatchingLabelsSelector{Selector: sel}); err != nil {
+		return "", "", fmt.Errorf("list appliance pods: %w", err)
+	}
+
+	// Ports of this VPC belonging to a selected pod. A multi-attached appliance
+	// has one per VPC, and only the leg in THIS VPC can be its door.
+	var ports sdnv1alpha1.PortList
+	if err := r.List(ctx, &ports, client.MatchingLabels{
+		sdnv1alpha1.LabelVPCNamespace: gw.Namespace,
+		sdnv1alpha1.LabelVPC:          vpc.Name,
+	}); err != nil {
+		return "", "", fmt.Errorf("list VPC ports: %w", err)
+	}
+
+	live := map[string]bool{}
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if p.DeletionTimestamp == nil {
+			live[p.Namespace+"/"+p.Name] = true
+		}
+	}
+
+	var candidates []*sdnv1alpha1.Port
+	for i := range ports.Items {
+		p := &ports.Items[i]
+		if live[p.Spec.PodNamespace+"/"+p.Spec.PodName] {
+			candidates = append(candidates, p)
+		}
+	}
+	if len(candidates) == 0 {
+		if len(pods.Items) == 0 {
+			problem = fmt.Sprintf("no live pod in namespace %q matches spec.appliance.podSelector", ns)
+		} else {
+			problem = fmt.Sprintf("the selected workload holds no Port in VPC %q — is it attached to it?", vpc.Name)
+		}
+		return "", problem, r.clearAppliancePorts(ctx, gw, vpc, "")
+	}
+	// Oldest wins, name breaks the tie — the same total order EffectiveGateway
+	// uses, so every replica of the controller picks the same door.
+	best := candidates[0]
+	for _, c := range candidates[1:] {
+		if c.CreationTimestamp.Before(&best.CreationTimestamp) ||
+			(c.CreationTimestamp.Equal(&best.CreationTimestamp) && c.Name < best.Name) {
+			best = c
+		}
+	}
+
+	if err := r.clearAppliancePorts(ctx, gw, vpc, best.Name); err != nil {
+		return "", "", err
+	}
+	if !best.Spec.Gateway {
+		best.Spec.Gateway = true
+		if err := r.Update(ctx, best); err != nil {
+			if apierrors.IsConflict(err) {
+				return "", "", nil // requeued by the conflict; next pass settles it
+			}
+			return "", "", fmt.Errorf("make port %s the VPC door: %w", best.Name, err)
+		}
+		log.FromContext(ctx).Info("VPC door pointed at a tenant appliance",
+			"vpcgateway", client.ObjectKeyFromObject(gw).String(), "port", best.Name, "vpc", vpc.Name)
+	}
+	return best.Name, "", nil
+}
+
+// clearAppliancePorts takes spec.gateway off every Port of this VPC except
+// `keep`. It runs on the no-appliance path too: dropping spec.appliance, or
+// pointing it elsewhere, must actually move the door rather than leave two.
+//
+// A Port claimed by cozyplane's OWN gateway pod is left alone — that flag is
+// addGatewayLeg's, set at CNI ADD, and the two mechanisms must not fight. They
+// are mutually exclusive by construction anyway: GatewayReconciler spawns no pod
+// while an appliance is declared.
+func (r *VPCGatewayReconciler) clearAppliancePorts(ctx context.Context, gw *sdnv1alpha1.VPCGateway,
+	vpc *sdnv1alpha1.VPC, keep string) error {
+	if vpc == nil || vpc.Name == "" {
+		return nil
+	}
+	var ports sdnv1alpha1.PortList
+	if err := r.List(ctx, &ports, client.MatchingLabels{
+		sdnv1alpha1.LabelVPCNamespace: gw.Namespace,
+		sdnv1alpha1.LabelVPC:          vpc.Name,
+	}); err != nil {
+		return fmt.Errorf("list VPC ports: %w", err)
+	}
+	for i := range ports.Items {
+		p := &ports.Items[i]
+		if !p.Spec.Gateway || p.Name == keep || p.Spec.PodNamespace == "" {
+			continue
+		}
+		// cozyplane's own gateway leg is the reserved .1 and lives in the
+		// agent's namespace; an appliance Port belongs to the tenant. Only
+		// unset what an appliance reconcile could have set.
+		if p.Spec.PodNamespace != gw.Namespace &&
+			(gw.Spec.Appliance == nil || p.Spec.PodNamespace != gw.Spec.Appliance.Namespace) {
+			continue
+		}
+		p.Spec.Gateway = false
+		if err := r.Update(ctx, p); err != nil && !apierrors.IsConflict(err) && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("release the VPC door from port %s: %w", p.Name, err)
+		}
+	}
+	return nil
+}
+
 // SetupWithManager wires the controller.
 func (r *VPCGatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&sdnv1alpha1.VPCGateway{}).
 		Owns(&corev1.Service{}). // re-reconcile when an owned NAT Service's LB ingress fills
 		Watches(&sdnv1alpha1.VPC{}, handler.EnqueueRequestsFromMapFunc(r.mapVPCToGateways)).
+		// An appliance's Port appears at CNI ADD and vanishes at DEL, and its pod
+		// is normally replaced under it (a Deployment, a VM). The door has to
+		// follow, so both re-enqueue the gateways of their namespace.
+		Watches(&sdnv1alpha1.Port{}, handler.EnqueueRequestsFromMapFunc(r.mapPortToGateways)).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.mapPodToGateways)).
 		Named("vpcgateway").
 		Complete(r)
+}
+
+// mapPortToGateways re-enqueues the gateways of the Port's VPC namespace. Only
+// gateways that declare an appliance care, and Reconcile is cheap for the rest.
+func (r *VPCGatewayReconciler) mapPortToGateways(ctx context.Context, obj client.Object) []ctrl.Request {
+	ns := obj.GetLabels()[sdnv1alpha1.LabelVPCNamespace]
+	if ns == "" {
+		return nil
+	}
+	return r.gatewaysIn(ctx, ns)
+}
+
+// mapPodToGateways re-enqueues the gateways that could select this pod. Scoped
+// to namespaces that actually declare an appliance, so ordinary pod churn costs
+// a cache list and nothing more.
+func (r *VPCGatewayReconciler) mapPodToGateways(ctx context.Context, obj client.Object) []ctrl.Request {
+	var list sdnv1alpha1.VPCGatewayList
+	if err := r.List(ctx, &list); err != nil {
+		return nil
+	}
+	var out []ctrl.Request
+	for i := range list.Items {
+		g := &list.Items[i]
+		if g.Spec.Appliance == nil {
+			continue
+		}
+		ns := g.Spec.Appliance.Namespace
+		if ns == "" {
+			ns = g.Namespace
+		}
+		if ns == obj.GetNamespace() {
+			out = append(out, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(g)})
+		}
+	}
+	return out
+}
+
+func (r *VPCGatewayReconciler) gatewaysIn(ctx context.Context, namespace string) []ctrl.Request {
+	var list sdnv1alpha1.VPCGatewayList
+	if err := r.List(ctx, &list, client.InNamespace(namespace)); err != nil {
+		return nil
+	}
+	var out []ctrl.Request
+	for i := range list.Items {
+		if list.Items[i].Spec.Appliance != nil {
+			out = append(out, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(&list.Items[i])})
+		}
+	}
+	return out
 }
 
 func (r *VPCGatewayReconciler) mapVPCToGateways(ctx context.Context, obj client.Object) []ctrl.Request {

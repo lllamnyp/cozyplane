@@ -70,6 +70,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCBindingList":          schema_cozyplane_api_sdn_v1alpha1_VPCBindingList(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCBindingSpec":          schema_cozyplane_api_sdn_v1alpha1_VPCBindingSpec(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGateway":              schema_cozyplane_api_sdn_v1alpha1_VPCGateway(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayAppliance":     schema_cozyplane_api_sdn_v1alpha1_VPCGatewayAppliance(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayIngress":       schema_cozyplane_api_sdn_v1alpha1_VPCGatewayIngress(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayList":          schema_cozyplane_api_sdn_v1alpha1_VPCGatewayList(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayNAT":           schema_cozyplane_api_sdn_v1alpha1_VPCGatewayNAT(ref),
@@ -868,6 +869,13 @@ func schema_cozyplane_api_sdn_v1alpha1_PortSpec(ref common.ReferenceCallback) co
 					"gateway": {
 						SchemaProps: spec.SchemaProps{
 							Description: "Gateway marks the VPC's gateway port (the .1 leg of the egress gateway pod); agents route off-VPC traffic to it.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+					"forwarding": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Forwarding marks a port allowed to emit packets sourced from an address that is not its own — a tenant router or firewall bridging two VPCs (docs/multi-attach.md). The CNI sets it from the VPCBinding's spec.allowForwarding; the datapath honours it as PORT_F_GATEWAY, which lifts from_pod's source RPF check and marks what the port delivers as gateway-forwarded so the destination's isolation check admits an off-VPC source.\n\nDISTINCT from Gateway, and it must stay that way. Gateway means \"this is the VPC's .1 egress leg\" and is what desiredGateways reads to program gateways[vni]; a forwarding port is not the VPC's door and must never be programmed as one. They happen to share a datapath flag, not a meaning.",
 							Type:        []string{"boolean"},
 							Format:      "",
 						},
@@ -1784,6 +1792,13 @@ func schema_cozyplane_api_sdn_v1alpha1_VPCBindingSpec(ref common.ReferenceCallba
 							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCRef"),
 						},
 					},
+					"allowForwarding": {
+						SchemaProps: spec.SchemaProps{
+							Description: "AllowForwarding lets a pod attached under this binding emit packets whose source address is not its own — what a router, firewall or NFV workload bridging two VPCs must do (docs/multi-attach.md).\n\nIt is a GRANT, and it lives here rather than on the pod for a reason. from_pod runs a source-address RPF check per interface: the source must resolve, in `locals`, to the very veth it was emitted on. A pod's SecurityGroup identity is keyed on that source IP, so lifting the check hands the workload the ability to impersonate ANY member of the VPC and inherit its groups. That is the capability AWS spells `sourceDestCheck: false`, and it belongs to whoever owns the network.\n\nA VPCBinding is created by whoever holds the `export` verb on the referenced VPC — the VPC's owner, not the tenant consuming it — so the grant sits at the right level of authority and is visible in RBAC instead of living in an operator's head.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
 				},
 				Required: []string{"vpcRef"},
 			},
@@ -1837,6 +1852,36 @@ func schema_cozyplane_api_sdn_v1alpha1_VPCGateway(ref common.ReferenceCallback) 
 		},
 		Dependencies: []string{
 			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewaySpec", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayStatus", v1.ObjectMeta{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_VPCGatewayAppliance(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "VPCGatewayStatus is the observed state of a VPCGateway. VPCGatewayAppliance selects the tenant workload that serves as the VPC's door.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"podSelector": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PodSelector selects the appliance pod. A selector rather than a name because the workload is normally a Deployment or a VM whose pod name changes underneath it; the door must survive that.",
+							Default:     map[string]interface{}{},
+							Ref:         ref(v1.LabelSelector{}.OpenAPIModelName()),
+						},
+					},
+					"namespace": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Namespace is where to look for it. Empty means the VPCGateway's own namespace, which is the ordinary case — the appliance belongs to the tenant that owns the VPC.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"podSelector"},
+			},
+		},
+		Dependencies: []string{
+			v1.LabelSelector{}.OpenAPIModelName()},
 	}
 }
 
@@ -1977,12 +2022,18 @@ func schema_cozyplane_api_sdn_v1alpha1_VPCGatewaySpec(ref common.ReferenceCallba
 							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayIngress"),
 						},
 					},
+					"appliance": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Appliance names a workload of the tenant's own that IS this VPC's door — a firewall or router attached to several VPCs (docs/multi-attach.md).\n\nOff-VPC traffic from a VPC pod is delivered to gateways[vni] with its original destination intact, so whatever holds that entry receives the VPC's egress by construction and may route it on. Until now only cozyplane's own gateway pod could hold it — claimed by addGatewayLeg, restricted to the agent's namespace and to the VPC's reserved .1 — which left no way to say \"my appliance is the door\".\n\nSetting it does NOT give the appliance the right to emit a source it does not own; that is the separate, export-gated VPCBinding.allowForwarding grant. Being the door means receiving; forwarding means sending. A firewall wants both, and they are granted by different people.\n\nWhen set, the controller points the VPC's gateway at the selected workload's Port in this VPC and spawns no gateway pod of its own.",
+							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayAppliance"),
+						},
+					},
 				},
 				Required: []string{"vpcRef"},
 			},
 		},
 		Dependencies: []string{
-			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalVPCRef", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayIngress", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayNAT"},
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalVPCRef", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayAppliance", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayIngress", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCGatewayNAT"},
 	}
 }
 
@@ -1990,8 +2041,7 @@ func schema_cozyplane_api_sdn_v1alpha1_VPCGatewayStatus(ref common.ReferenceCall
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "VPCGatewayStatus is the observed state of a VPCGateway.",
-				Type:        []string{"object"},
+				Type: []string{"object"},
 				Properties: map[string]spec.Schema{
 					"natAddress": {
 						SchemaProps: spec.SchemaProps{
@@ -2003,6 +2053,13 @@ func schema_cozyplane_api_sdn_v1alpha1_VPCGatewayStatus(ref common.ReferenceCall
 					"natAddress6": {
 						SchemaProps: spec.SchemaProps{
 							Description: "NATAddress6 is the v6 counterpart: the address this VPC's v6 egress wears (docs/north-south.md §6a), read from the gateway's owned v6 LoadBalancer Service. Each family gets its own eBPF identity when the LB implementation can assign one; a family with none keeps the gateway pod. The pod is retired only once every family the VPC has is served in eBPF.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"appliancePort": {
+						SchemaProps: spec.SchemaProps{
+							Description: "AppliancePort is the Port currently serving as the VPC's door when spec.appliance is set — the cluster-scoped Port name, so an operator can see WHICH leg of a multi-attached appliance was chosen. Empty when no appliance is declared or none could be resolved.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
