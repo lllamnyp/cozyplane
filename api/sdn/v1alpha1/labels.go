@@ -26,6 +26,19 @@ const (
 	// "<owner-ns>/<vpc>".
 	AnnotationVPC = "sdn.cozystack.io/vpc"
 
+	// AnnotationNetworks on a pod requests SEVERAL attachments at once
+	// (docs/multi-attach.md), which AnnotationVPC cannot express. Its value is a
+	// JSON list of {vpc, ip?, mac?, name?}; `vpc` takes the same syntax as
+	// AnnotationVPC. Carrying both annotations is an error, not a precedence
+	// rule.
+	//
+	// Order is part of the contract: entry 0 is the PRIMARY attachment — it
+	// carries the fabric bridge (so it is what status.podIP resolves to and what
+	// kubelet probes reach) and it alone receives the default route. The others
+	// get an on-link route to their own VPC CIDR, because N default routes pick
+	// an egress interface by whatever metric the kernel assigned.
+	AnnotationNetworks = "sdn.cozystack.io/networks"
+
 	// AnnotationGatewayFor on a (default-network, system-namespace) pod makes
 	// it the egress gateway of a VPC: it gets a second interface carrying the
 	// VPC's reserved .1 address. Same value syntax as AnnotationVPC. Honored
@@ -82,6 +95,14 @@ const (
 	// fresh one, so the VPC IP + MAC survive pod churn and live migration. The
 	// persistent-Port controller selects on this to drive migration cutover and GC.
 	LabelVMName = "sdn.cozystack.io/vm-name"
+
+	// LabelVMNIC is the attachment INDEX a persistent Port belongs to, and it is
+	// what makes a multi-NIC VM's Ports tellable apart. Binding selects a VM's
+	// persistent Port by {vpc-namespace, vpc, vm-name}; with two NICs that
+	// selector matches two Ports and the first one returned is arbitrary, so the
+	// VM's interfaces would swap addresses at random across restarts. The index
+	// pins each Port to the interface it belongs to.
+	LabelVMNIC = "sdn.cozystack.io/vm-nic"
 
 	// KubeVirt labels on a virt-launcher pod, read to recognize a VM NIC and drive
 	// migration. The stable VM identity is (namespace, KubeVirtLabelVMName); the

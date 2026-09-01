@@ -45,6 +45,19 @@ type PortSpecApplyConfiguration struct {
 	// Gateway marks the VPC's gateway port (the .1 leg of the egress gateway
 	// pod); agents route off-VPC traffic to it.
 	Gateway *bool `json:"gateway,omitempty"`
+	// Forwarding marks a port allowed to emit packets sourced from an address
+	// that is not its own — a tenant router or firewall bridging two VPCs
+	// (docs/multi-attach.md). The CNI sets it from the VPCBinding's
+	// spec.allowForwarding; the datapath honours it as PORT_F_GATEWAY, which
+	// lifts from_pod's source RPF check and marks what the port delivers as
+	// gateway-forwarded so the destination's isolation check admits an off-VPC
+	// source.
+	//
+	// DISTINCT from Gateway, and it must stay that way. Gateway means "this is
+	// the VPC's .1 egress leg" and is what desiredGateways reads to program
+	// gateways[vni]; a forwarding port is not the VPC's door and must never be
+	// programmed as one. They happen to share a datapath flag, not a meaning.
+	Forwarding *bool `json:"forwarding,omitempty"`
 }
 
 // PortSpecApplyConfiguration constructs a declarative configuration of the PortSpec type for use with
@@ -114,5 +127,13 @@ func (b *PortSpecApplyConfiguration) WithPodName(value string) *PortSpecApplyCon
 // If called multiple times, the Gateway field is set to the value of the last call.
 func (b *PortSpecApplyConfiguration) WithGateway(value bool) *PortSpecApplyConfiguration {
 	b.Gateway = &value
+	return b
+}
+
+// WithForwarding sets the Forwarding field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Forwarding field is set to the value of the last call.
+func (b *PortSpecApplyConfiguration) WithForwarding(value bool) *PortSpecApplyConfiguration {
+	b.Forwarding = &value
 	return b
 }

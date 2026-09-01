@@ -933,6 +933,7 @@ func autoConvert_v1alpha1_PortSpec_To_sdn_PortSpec(in *PortSpec, out *sdn.PortSp
 	out.PodNamespace = in.PodNamespace
 	out.PodName = in.PodName
 	out.Gateway = in.Gateway
+	out.Forwarding = in.Forwarding
 	return nil
 }
 
@@ -952,6 +953,7 @@ func autoConvert_sdn_PortSpec_To_v1alpha1_PortSpec(in *sdn.PortSpec, out *PortSp
 	out.PodNamespace = in.PodNamespace
 	out.PodName = in.PodName
 	out.Gateway = in.Gateway
+	out.Forwarding = in.Forwarding
 	return nil
 }
 
@@ -1476,6 +1478,7 @@ func autoConvert_v1alpha1_VPCBindingSpec_To_sdn_VPCBindingSpec(in *VPCBindingSpe
 	if err := Convert_v1alpha1_VPCRef_To_sdn_VPCRef(&in.VPCRef, &out.VPCRef, s); err != nil {
 		return err
 	}
+	out.AllowForwarding = in.AllowForwarding
 	return nil
 }
 
@@ -1488,6 +1491,7 @@ func autoConvert_sdn_VPCBindingSpec_To_v1alpha1_VPCBindingSpec(in *sdn.VPCBindin
 	if err := Convert_sdn_VPCRef_To_v1alpha1_VPCRef(&in.VPCRef, &out.VPCRef, s); err != nil {
 		return err
 	}
+	out.AllowForwarding = in.AllowForwarding
 	return nil
 }
 

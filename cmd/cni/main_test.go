@@ -20,6 +20,7 @@ import (
 	"context"
 	"net"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -166,12 +167,41 @@ func newVPC(ns, name string, vni int32, cidr string) *sdnv1alpha1.VPC {
 	}
 }
 
+// res builds the resolved attachment attachPort now takes. Index 0 unless given.
+func res(vpc *sdnv1alpha1.VPC, vpcNS string, opts ...func(*resolvedAttachment)) resolvedAttachment {
+	_, cidr, err := net.ParseCIDR(vpc.Spec.CIDRs[0])
+	if err != nil {
+		panic(err)
+	}
+	r := resolvedAttachment{
+		attachment: attachment{Index: 0, VPCNamespace: vpcNS, VPCName: vpc.Name, IfName: "eth0"},
+		vpc:        vpc,
+		cidr:       cidr,
+	}
+	for _, o := range opts {
+		o(&r)
+	}
+	return r
+}
+
+func withIP(ip string) func(*resolvedAttachment) {
+	return func(r *resolvedAttachment) { r.IP = net.ParseIP(ip) }
+}
+
+func withIndex(i int) func(*resolvedAttachment) {
+	return func(r *resolvedAttachment) { r.Index = i; r.IfName = defaultIfName(i) }
+}
+
+func withForwarding() func(*resolvedAttachment) {
+	return func(r *resolvedAttachment) { r.forwarding = true }
+}
+
 func TestClaimIP_FirstAddressAndPortShape(t *testing.T) {
 	client := sdnfake.NewSimpleClientset()
 	vpc := newVPC("team-a", "tenant-a", 100, "10.10.0.0/24")
 	state := &datapath.AgentState{NodeName: "node1", NodeIP: "192.0.2.1"}
 
-	ip, _, port, _, err := attachPort(t.Context(), client, vpc, "team-a", state, "10.244.0.5", "team-a", "app-1", "uid-1", "", "")
+	ip, _, port, _, err := attachPort(t.Context(), client, res(vpc, "team-a"), state, "team-a", "app-1", "uid-1", "", "")
 	if err != nil {
 		t.Fatalf("claimIP: %v", err)
 	}
@@ -216,7 +246,7 @@ func TestClaimIP_IPv6(t *testing.T) {
 	vpc := newVPC("team-a", "tenant6", 200, "fd00:a::/64")
 	state := &datapath.AgentState{NodeName: "node1", NodeIP: "192.0.2.1"}
 
-	ip, _, port, _, err := attachPort(t.Context(), client, vpc, "team-a", state, "10.244.0.5", "team-a", "app6", "uid-6", "", "")
+	ip, _, port, _, err := attachPort(t.Context(), client, res(vpc, "team-a"), state, "team-a", "app6", "uid-6", "", "")
 	if err != nil {
 		t.Fatalf("claimIP v6: %v", err)
 	}
@@ -237,10 +267,10 @@ func TestClaimIP_SkipsUsedAddresses(t *testing.T) {
 	vpc := newVPC("team-a", "tenant-a", 100, "10.10.0.0/24")
 	state := &datapath.AgentState{NodeName: "node1", NodeIP: "192.0.2.1"}
 
-	if _, _, _, _, err := attachPort(t.Context(), client, vpc, "team-a", state, "10.244.0.5", "team-a", "app-1", "uid-1", "", ""); err != nil {
+	if _, _, _, _, err := attachPort(t.Context(), client, res(vpc, "team-a"), state, "team-a", "app-1", "uid-1", "", ""); err != nil {
 		t.Fatalf("first attachPort: %v", err)
 	}
-	ip, _, _, _, err := attachPort(t.Context(), client, vpc, "team-a", state, "10.244.0.6", "team-a", "app-2", "uid-2", "", "")
+	ip, _, _, _, err := attachPort(t.Context(), client, res(vpc, "team-a"), state, "team-a", "app-2", "uid-2", "", "")
 	if err != nil {
 		t.Fatalf("second attachPort: %v", err)
 	}
@@ -258,7 +288,7 @@ func TestClaimIP_RetriesOnNameCollision(t *testing.T) {
 	vpc := newVPC("team-a", "tenant-a", 100, "10.10.0.0/24")
 	state := &datapath.AgentState{NodeName: "node1", NodeIP: "192.0.2.1"}
 
-	ip, _, port, _, err := attachPort(t.Context(), client, vpc, "team-a", state, "10.244.0.5", "team-a", "app-1", "uid-1", "", "")
+	ip, _, port, _, err := attachPort(t.Context(), client, res(vpc, "team-a"), state, "team-a", "app-1", "uid-1", "", "")
 	if err != nil {
 		t.Fatalf("claimIP: %v", err)
 	}
@@ -282,7 +312,7 @@ func TestClaimIP_ExhaustionErrors(t *testing.T) {
 	vpc := newVPC("team-a", "tenant-a", 200, "10.0.0.0/30")
 	state := &datapath.AgentState{NodeName: "node1", NodeIP: "192.0.2.1"}
 
-	if _, _, _, _, err := attachPort(t.Context(), client, vpc, "team-a", state, "10.244.0.5", "team-a", "app-1", "uid-1", "", ""); err == nil {
+	if _, _, _, _, err := attachPort(t.Context(), client, res(vpc, "team-a"), state, "team-a", "app-1", "uid-1", "", ""); err == nil {
 		t.Fatal("attachPort on exhausted VPC = nil error, want exhaustion error")
 	}
 }
@@ -316,7 +346,7 @@ func TestRequireVPCBinding(t *testing.T) {
 				objs = append(objs, o)
 			}
 			client := sdnfake.NewSimpleClientset(objs...)
-			err := requireVPCBinding(t.Context(), client, c.podNS, c.vNS, c.vName)
+			_, err := requireVPCBinding(t.Context(), client, c.podNS, c.vNS, c.vName)
 			if c.wantAllow && err != nil {
 				t.Fatalf("want allowed, got error: %v", err)
 			}
@@ -368,12 +398,148 @@ func TestReleaseFabricIPsRunsAfterTheOperationContextDied(t *testing.T) {
 		t.Fatal("cleanup context has no deadline: a rollback could hang forever")
 	}
 
-	releaseFabricIPs(cctx, client, "uid-1")
+	if err := releaseFabricIPs(cctx, client, "uid-1"); err != nil {
+		t.Fatalf("release fabric IPs: %v", err)
+	}
 
 	if len(issued) != 1 {
 		t.Fatalf("release issued %d delete-collection calls against a dead parent, want 1", len(issued))
 	}
 	if !strings.Contains(issued[0], "uid-1") {
 		t.Errorf("release selector = %q, want it scoped to the pod UID", issued[0])
+	}
+}
+
+// A requested address must be claimed EXACTLY. The whole point of the field is
+// that a gateway, a resolver or a peer-configured database gets the address it
+// was promised.
+func TestAttachPortStaticIPClaimsExactly(t *testing.T) {
+	client := sdnfake.NewSimpleClientset()
+	vpc := newVPC("team-a", "tenant-a", 100, "10.10.0.0/24")
+	state := &datapath.AgentState{NodeName: "node1", NodeIP: "192.0.2.1"}
+
+	ip, _, port, bound, err := attachPort(t.Context(), client,
+		res(vpc, "team-a", withIP("10.10.0.42")), state, "team-a", "app-1", "uid-1", "", "")
+	if err != nil {
+		t.Fatalf("static claim: %v", err)
+	}
+	if bound {
+		t.Error("a fresh claim is not a bind")
+	}
+	if ip.String() != "10.10.0.42" {
+		t.Fatalf("got %s, want the requested 10.10.0.42", ip)
+	}
+	if port.Name != "v100.10-10-0-42" {
+		t.Errorf("port name = %q, want v100.10-10-0-42 (the name IS the claim)", port.Name)
+	}
+}
+
+// Taken is an ERROR, not a cue to walk on. Silently handing back a different
+// address is the failure the field exists to remove.
+func TestAttachPortStaticIPTakenIsHardError(t *testing.T) {
+	client := sdnfake.NewSimpleClientset()
+	vpc := newVPC("team-a", "tenant-a", 100, "10.10.0.0/24")
+	state := &datapath.AgentState{NodeName: "node1", NodeIP: "192.0.2.1"}
+
+	if _, _, _, _, err := attachPort(t.Context(), client,
+		res(vpc, "team-a", withIP("10.10.0.42")), state, "team-a", "app-1", "uid-1", "", ""); err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	ip, _, _, _, err := attachPort(t.Context(), client,
+		res(vpc, "team-a", withIP("10.10.0.42")), state, "team-a", "app-2", "uid-2", "", "")
+	if err == nil {
+		t.Fatalf("second claim of a taken address returned %s instead of failing", ip)
+	}
+}
+
+func TestAttachPortStaticIPOutsideCIDRIsRefused(t *testing.T) {
+	client := sdnfake.NewSimpleClientset()
+	vpc := newVPC("team-a", "tenant-a", 100, "10.10.0.0/24")
+	state := &datapath.AgentState{NodeName: "node1", NodeIP: "192.0.2.1"}
+
+	if _, _, _, _, err := attachPort(t.Context(), client,
+		res(vpc, "team-a", withIP("10.99.0.1")), state, "team-a", "app-1", "uid-1", "", ""); err == nil {
+		t.Fatal("an address outside the VPC CIDR must be refused")
+	}
+}
+
+// The forwarding grant rides from the VPCBinding onto the Port, and it must land
+// on Forwarding — never on Gateway, which is what desiredGateways reads to
+// program gateways[vni]. A tenant firewall is not its VPC's door.
+func TestAttachPortForwardingIsSeparateFromGateway(t *testing.T) {
+	state := &datapath.AgentState{NodeName: "node1", NodeIP: "192.0.2.1"}
+
+	client := sdnfake.NewSimpleClientset()
+	vpc := newVPC("team-a", "tenant-a", 100, "10.10.0.0/24")
+	_, _, port, _, err := attachPort(t.Context(), client,
+		res(vpc, "team-a", withForwarding()), state, "team-a", "fw", "uid-fw", "", "")
+	if err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	if !port.Spec.Forwarding {
+		t.Error("the grant did not reach Port.spec.forwarding")
+	}
+	if port.Spec.Gateway {
+		t.Error("a forwarding port must NOT be marked Gateway: it is not the VPC's egress door")
+	}
+
+	client2 := sdnfake.NewSimpleClientset()
+	_, _, plain, _, err := attachPort(t.Context(), client2,
+		res(newVPC("team-a", "tenant-a", 100, "10.10.0.0/24"), "team-a"), state, "team-a", "app", "uid-a", "", "")
+	if err != nil {
+		t.Fatalf("attach plain: %v", err)
+	}
+	if plain.Spec.Forwarding {
+		t.Error("an ungranted attachment must not be forwarding")
+	}
+}
+
+// A multi-NIC VM has one persistent Port per interface. Selecting them by
+// {vpc, vm-name} alone matches both and the first returned is arbitrary, so the
+// VM's interfaces would swap addresses across restarts. The NIC index pins each.
+func TestAttachPortMultiNICVMBindsThePortForItsInterface(t *testing.T) {
+	vpc := newVPC("team-a", "tenant-a", 100, "10.10.0.0/24")
+	state := &datapath.AgentState{NodeName: "node1", NodeIP: "192.0.2.1"}
+
+	persistent := func(nic int, ip, mac string) *sdnv1alpha1.Port {
+		return &sdnv1alpha1.Port{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "v100." + strings.ReplaceAll(ip, ".", "-"),
+				Labels: map[string]string{
+					labelVPCNamespace: "team-a",
+					labelVPC:          "tenant-a",
+					labelVMName:       "vm1",
+					labelVMNIC:        strconv.Itoa(nic),
+				},
+			},
+			Spec: sdnv1alpha1.PortSpec{
+				VPCRef: sdnv1alpha1.VPCRef{Namespace: "team-a", Name: "tenant-a"},
+				IP:     ip, MAC: mac, Node: "node1", NodeIP: "192.0.2.1",
+			},
+		}
+	}
+	client := sdnfake.NewSimpleClientset(
+		persistent(0, "10.10.0.10", "02:00:00:00:00:aa"),
+		persistent(1, "10.10.0.11", "02:00:00:00:00:bb"),
+	)
+
+	for _, c := range []struct {
+		nic             int
+		wantIP, wantMAC string
+	}{
+		{0, "10.10.0.10", "02:00:00:00:00:aa"},
+		{1, "10.10.0.11", "02:00:00:00:00:bb"},
+	} {
+		ip, mac, _, bound, err := attachPort(t.Context(), client,
+			res(vpc, "team-a", withIndex(c.nic)), state, "team-a", "virt-launcher-vm1", "uid-l1", "vm1", "")
+		if err != nil {
+			t.Fatalf("nic %d: %v", c.nic, err)
+		}
+		if !bound {
+			t.Fatalf("nic %d: should have BOUND the persistent Port, not claimed a fresh one", c.nic)
+		}
+		if ip.String() != c.wantIP || mac.String() != c.wantMAC {
+			t.Errorf("nic %d bound %s/%s, want %s/%s", c.nic, ip, mac, c.wantIP, c.wantMAC)
+		}
 	}
 }

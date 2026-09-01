@@ -178,6 +178,14 @@ type VPCBindingList struct {
 type VPCBindingSpec struct {
 	// VPCRef is the VPC being made usable, identified by owner namespace + name.
 	VPCRef VPCRef
+
+	// AllowForwarding lets a pod attached under this binding emit packets whose
+	// source address is not its own — what a router or firewall bridging two
+	// VPCs must do. It is a grant: lifting from_pod's source RPF check hands the
+	// workload the ability to impersonate any member of the VPC and inherit its
+	// SecurityGroups, so it is authored by whoever holds `export` on the VPC
+	// (docs/multi-attach.md).
+	AllowForwarding bool
 }
 
 // +genclient
@@ -275,6 +283,13 @@ type PortSpec struct {
 	// Gateway marks the VPC's gateway port (the .1 leg of the egress gateway
 	// pod); agents route off-VPC traffic to it.
 	Gateway bool
+
+	// Forwarding marks a port allowed to emit packets sourced from an address
+	// that is not its own — a tenant router or firewall bridging two VPCs. Set
+	// by the CNI from the VPCBinding's AllowForwarding grant; honoured by the
+	// datapath as PORT_F_GATEWAY. DISTINCT from Gateway, which means "the VPC's
+	// .1 egress leg" and alone programs gateways[vni] (docs/multi-attach.md).
+	Forwarding bool
 }
 
 // PortStatus is the controller-observed state of a Port.

@@ -70,6 +70,21 @@ type PortSpec struct {
 	// pod); agents route off-VPC traffic to it.
 	// +optional
 	Gateway bool `json:"gateway,omitempty"`
+
+	// Forwarding marks a port allowed to emit packets sourced from an address
+	// that is not its own — a tenant router or firewall bridging two VPCs
+	// (docs/multi-attach.md). The CNI sets it from the VPCBinding's
+	// spec.allowForwarding; the datapath honours it as PORT_F_GATEWAY, which
+	// lifts from_pod's source RPF check and marks what the port delivers as
+	// gateway-forwarded so the destination's isolation check admits an off-VPC
+	// source.
+	//
+	// DISTINCT from Gateway, and it must stay that way. Gateway means "this is
+	// the VPC's .1 egress leg" and is what desiredGateways reads to program
+	// gateways[vni]; a forwarding port is not the VPC's door and must never be
+	// programmed as one. They happen to share a datapath flag, not a meaning.
+	// +optional
+	Forwarding bool `json:"forwarding,omitempty"`
 }
 
 // PortStatus is the controller-observed state of a Port.

@@ -872,6 +872,13 @@ func schema_cozyplane_api_sdn_v1alpha1_PortSpec(ref common.ReferenceCallback) co
 							Format:      "",
 						},
 					},
+					"forwarding": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Forwarding marks a port allowed to emit packets sourced from an address that is not its own — a tenant router or firewall bridging two VPCs (docs/multi-attach.md). The CNI sets it from the VPCBinding's spec.allowForwarding; the datapath honours it as PORT_F_GATEWAY, which lifts from_pod's source RPF check and marks what the port delivers as gateway-forwarded so the destination's isolation check admits an off-VPC source.\n\nDISTINCT from Gateway, and it must stay that way. Gateway means \"this is the VPC's .1 egress leg\" and is what desiredGateways reads to program gateways[vni]; a forwarding port is not the VPC's door and must never be programmed as one. They happen to share a datapath flag, not a meaning.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
 				},
 				Required: []string{"vpcRef", "ip", "node", "nodeIP"},
 			},
@@ -1782,6 +1789,13 @@ func schema_cozyplane_api_sdn_v1alpha1_VPCBindingSpec(ref common.ReferenceCallba
 							Description: "VPCRef is the VPC being made usable, identified by owner namespace + name.",
 							Default:     map[string]interface{}{},
 							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCRef"),
+						},
+					},
+					"allowForwarding": {
+						SchemaProps: spec.SchemaProps{
+							Description: "AllowForwarding lets a pod attached under this binding emit packets whose source address is not its own — what a router, firewall or NFV workload bridging two VPCs must do (docs/multi-attach.md).\n\nIt is a GRANT, and it lives here rather than on the pod for a reason. from_pod runs a source-address RPF check per interface: the source must resolve, in `locals`, to the very veth it was emitted on. A pod's SecurityGroup identity is keyed on that source IP, so lifting the check hands the workload the ability to impersonate ANY member of the VPC and inherit its groups. That is the capability AWS spells `sourceDestCheck: false`, and it belongs to whoever owns the network.\n\nA VPCBinding is created by whoever holds the `export` verb on the referenced VPC — the VPC's owner, not the tenant consuming it — so the grant sits at the right level of authority and is visible in RBAC instead of living in an operator's head.",
+							Type:        []string{"boolean"},
+							Format:      "",
 						},
 					},
 				},
