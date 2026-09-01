@@ -108,6 +108,7 @@ Start with [design.md](docs/design.md) (the vision and the **design tenets**), t
 | [docs/external-addresses.md](docs/external-addresses.md) | *Design* — how external addresses are sourced (a delegated Service); cozyplane allocates/attracts/reserves none |
 | [docs/multitenancy.md](docs/multitenancy.md) | The tenancy rules, each justified or dropped (a namespace *is* the tenant) |
 | [docs/live-migration.md](docs/live-migration.md) | VM live migration via persistent Ports (IP + MAC preservation) |
+| [docs/multi-attach.md](docs/multi-attach.md) | *Design* — several VPCs on one pod (tenant router/firewall), static addressing, and the forwarding grant |
 | [docs/policy-layers.md](docs/policy-layers.md) | How the three policy layers compose, and the shared trust model |
 | [docs/security-groups.md](docs/security-groups.md) | Intra-VPC policy (security groups) |
 | [docs/network-policy.md](docs/network-policy.md) | Upstream `NetworkPolicy` on the default network |

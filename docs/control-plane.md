@@ -193,6 +193,19 @@ Two tiers: **declarative** (authored by tenants/operators, desired state) and
 > do not exist** — a VPC carries its CIDRs directly, a pod attaches by annotation +
 > `VPCBinding`, and the VPC's door is the shipped **`VPCGateway`**. Treat the
 > unbuilt three as vocabulary from `design.md` §10, not as API.
+>
+> `NetworkAttachment` is not merely unbuilt but **deliberately dropped**: several
+> attachments per pod are declared by a JSON-list annotation, not by an object, and
+> the grant that lets one of them forward is a field on `VPCBinding` — the object
+> that already carries the `export`-gated grant. A template CRD can be layered on
+> later without changing the CNI. See [multi-attach.md](multi-attach.md).
+>
+> The one real `net-attach-def` in the system is unrelated to that shape: cozyplane
+> generates a shim `NetworkAttachmentDefinition` per `VPCBinding` so a **KubeVirt
+> VM** can name a VPC at all — `spec.networks` admits only `pod` and `multus`, so
+> Multus is the only vocabulary a VM's secondary NIC has. The shim carries no
+> addressing, policy or identity. See
+> [kubevirt-multi-nic.md](kubevirt-multi-nic.md).
 
 ### Declarative
 
