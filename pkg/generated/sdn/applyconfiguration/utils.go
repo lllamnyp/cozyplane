@@ -96,6 +96,8 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &sdnv1alpha1.VPCBindingSpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPCGateway"):
 		return &sdnv1alpha1.VPCGatewayApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPCGatewayAppliance"):
+		return &sdnv1alpha1.VPCGatewayApplianceApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPCGatewayIngress"):
 		return &sdnv1alpha1.VPCGatewayIngressApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPCGatewayNAT"):

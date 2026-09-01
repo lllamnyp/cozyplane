@@ -26,6 +26,23 @@ package v1alpha1
 type VPCBindingSpecApplyConfiguration struct {
 	// VPCRef is the VPC being made usable, identified by owner namespace + name.
 	VPCRef *VPCRefApplyConfiguration `json:"vpcRef,omitempty"`
+	// AllowForwarding lets a pod attached under this binding emit packets whose
+	// source address is not its own — what a router, firewall or NFV workload
+	// bridging two VPCs must do (docs/multi-attach.md).
+	//
+	// It is a GRANT, and it lives here rather than on the pod for a reason.
+	// from_pod runs a source-address RPF check per interface: the source must
+	// resolve, in `locals`, to the very veth it was emitted on. A pod's
+	// SecurityGroup identity is keyed on that source IP, so lifting the check
+	// hands the workload the ability to impersonate ANY member of the VPC and
+	// inherit its groups. That is the capability AWS spells
+	// `sourceDestCheck: false`, and it belongs to whoever owns the network.
+	//
+	// A VPCBinding is created by whoever holds the `export` verb on the
+	// referenced VPC — the VPC's owner, not the tenant consuming it — so the
+	// grant sits at the right level of authority and is visible in RBAC instead
+	// of living in an operator's head.
+	AllowForwarding *bool `json:"allowForwarding,omitempty"`
 }
 
 // VPCBindingSpecApplyConfiguration constructs a declarative configuration of the VPCBindingSpec type for use with
@@ -39,5 +56,13 @@ func VPCBindingSpec() *VPCBindingSpecApplyConfiguration {
 // If called multiple times, the VPCRef field is set to the value of the last call.
 func (b *VPCBindingSpecApplyConfiguration) WithVPCRef(value *VPCRefApplyConfiguration) *VPCBindingSpecApplyConfiguration {
 	b.VPCRef = value
+	return b
+}
+
+// WithAllowForwarding sets the AllowForwarding field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the AllowForwarding field is set to the value of the last call.
+func (b *VPCBindingSpecApplyConfiguration) WithAllowForwarding(value bool) *VPCBindingSpecApplyConfiguration {
+	b.AllowForwarding = &value
 	return b
 }
