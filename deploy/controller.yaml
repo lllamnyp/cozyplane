@@ -10,16 +10,20 @@ kind: ClusterRole
 metadata:
   name: cozyplane-controller
 rules:
+  # vpcs: "export" is the authority to create a forwarding grant on a VPC; the
+  # managed VPNGateway controller creates that grant on the tenant's behalf
+  # (issue #6, docs/vpn.md §3.2).
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcs"]
-    verbs: ["get", "list", "watch", "update", "patch"]
+    verbs: ["get", "list", "watch", "update", "patch", "export"]
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcs/status"]
     verbs: ["get", "update", "patch"]
-  # VPCBindings: maintain the reap finalizer and reap Ports on revocation.
+  # VPCBindings: maintain the reap finalizer and reap Ports on revocation;
+  # create/delete the managed VPN appliance's scoped forwarding grant (issue #6).
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcbindings"]
-    verbs: ["get", "list", "watch", "update", "patch"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Ports: reap on revocation; PortGC releases the sever finalizer when the
   # port's node is gone (needs nodes read).
   - apiGroups: ["sdn.cozystack.io"]
@@ -28,6 +32,12 @@ rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["ports/status"]
     verbs: ["get", "update", "patch"]
+  # NetworkAttachmentDefinitions: the Multus shim a KubeVirt VM needs to name a
+  # VPC at all (docs/kubevirt-multi-nic.md). One per VPCBinding, in the binding's
+  # namespace, so it lands where attachment is already authorized.
+  - apiGroups: ["k8s.cni.cncf.io"]
+    resources: ["network-attachment-definitions"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["securitygroups"]
     verbs: ["get", "list", "watch"]
@@ -55,13 +65,35 @@ rules:
     resources: ["vpcpeerings/status"]
     verbs: ["get", "update", "patch"]
   # FloatingIPs: own the delegated LoadBalancer Service that sources the address
-  # and gate readiness on a live target Port (docs/external-addresses.md).
+  # and gate readiness on a live target Port (docs/external-addresses.md); the
+  # VPNGateway controller creates one as its tunnel endpoint (issue #6).
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["floatingips"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["floatingips/status"]
     verbs: ["get", "update", "patch"]
+  # VPNGateways / VPNConnections: the managed tunnel endpoint and its peers
+  # (docs/vpn.md). The controller owns their status and reads them to realize
+  # the tunnel workload.
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpngateways"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpngateways/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpnconnections"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpnconnections/status"]
+    verbs: ["get", "update", "patch"]
+  # Secrets: the VPNGateway controller generates the appliance's WireGuard
+  # keypair, renders the peer config it mounts, and reads each connection's
+  # referenced preshared-key Secret (issue #6), all in the tenant namespace.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # ServiceVIPs: materialize one per attached Service, allocate the VIP,
   # resolve backends from Services/EndpointSlices (services-in-vpc.md).
   - apiGroups: ["sdn.cozystack.io"]
@@ -86,10 +118,13 @@ rules:
   # launcher-pod signal without it.
   - apiGroups: ["kubevirt.io"]
     resources: ["virtualmachineinstances"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Gateway Deployments for a pool-less VPCGateway (a pooled one is pure eBPF).
   - apiGroups: ["apps"]
-    resources: ["deployments"]
+    resources: ["deployments", "statefulsets"]
     verbs: ["get", "list", "watch", "create", "update", "delete"]
   # Severed-gateway heal: recreate a Ready gateway pod whose .1 Port is gone.
   # watch: the persistent-Port controller watches virt-launcher pods to drive

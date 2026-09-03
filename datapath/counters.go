@@ -25,14 +25,15 @@ import (
 // NS doors — the ways a tenant's traffic can cross the VPC's north-south
 // boundary (docs/north-south.md). Must match the NS_* constants in bpf/overlay.c.
 const (
-	NSGateway = 0 // out through the VPC's egress gateway (and back)
-	NSEIP     = 1 // a floating address: 1:1, the tenant's own identity
-	NSLB      = 2 // LoadBalancer/NodePort ingress landing on a VPC backend
-	nsDoors   = 3
+	NSGateway   = 0 // out through the VPC's egress gateway (and back)
+	NSEIP       = 1 // a floating address: 1:1, the tenant's own identity
+	NSLB        = 2 // LoadBalancer/NodePort ingress landing on a VPC backend
+	NSAppliance = 3 // out through a per-VPC route table entry (a VPN endpoint / router)
+	nsDoors     = 4
 )
 
 // NSDoorNames labels the doors for metrics; index by the NS* constants.
-var NSDoorNames = [nsDoors]string{"gateway", "eip", "loadbalancer"}
+var NSDoorNames = [nsDoors]string{"gateway", "eip", "loadbalancer", "appliance"}
 
 // VPCCounter is the per-VPC traffic tally read from the datapath (#2).
 //

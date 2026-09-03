@@ -143,7 +143,21 @@ struct cozy_mac {
 // ports-map value layout: bit 31 flags a VPC egress-gateway leg; the low bits
 // are the network id (VNIs stay far below 2^23, see TUN_F_GATEWAY).
 #define PORT_F_GATEWAY (1u << 31)
-#define PORT_NET(v) ((v) & ~PORT_F_GATEWAY)
+// PORT_F_FORWARD marks a TENANT forwarding leg — a router or firewall attached
+// to several VPCs (docs/multi-attach.md). It is deliberately NOT PORT_F_GATEWAY.
+// Both lift the source-address RPF check, and there the resemblance must stop:
+// a gateway's traffic is north-south and is exempted from east-west
+// SecurityGroups, while a tenant router is the one workload whose traffic most
+// needs policing. Reusing the gateway flag silently disabled SecurityGroups for
+// the forwarder — measured on a live cluster before this bit existed.
+#define PORT_F_FORWARD (1u << 30)
+// PORT_F_FWD_SCOPED narrows PORT_F_FORWARD to declared prefixes (issue #6,
+// VPCBinding.forwardingCIDRs): a foreign source is admitted only if it matches
+// this port's `fwd_cidrs` allowlist, instead of the blanket "any foreign source"
+// PORT_F_FORWARD alone grants. Set by the CNI when the binding names CIDRs;
+// clear means the legacy all-foreign behaviour.
+#define PORT_F_FWD_SCOPED (1u << 29)
+#define PORT_NET(v) ((v) & ~(PORT_F_GATEWAY | PORT_F_FORWARD | PORT_F_FWD_SCOPED))
 
 // Gateway-forwarded traffic may carry an off-VPC source (the internet) into a
 // tenant pod, which the ingress anti-spoof check would otherwise drop. It is
@@ -154,7 +168,19 @@ struct cozy_mac {
 #define SG_OK          0x200000  // bit 21: from_overlay already enforced security groups (TLV)
 #define NS_MARK        0x400000  // bit 22: pod-originated north-south (subject to SG); host-
                                  // originated (kubelet) reaches the bridge unmarked and exempt
+#define FWD_MARK       0x080000  // bit 19: a TENANT forwarding leg handed this
+                                 // packet on, and its source belongs to another
+                                 // VPC. It buys passage through the destination's
+                                 // ISOLATION check and nothing else — unlike
+                                 // GW_MARK it does NOT skip SecurityGroups; the
+                                 // destination judges it as a north-south source
+                                 // (a from:{cidr} rule), because this VPC holds
+                                 // no identity for an address it does not own.
 #define TUN_F_GATEWAY  (1 << 23) // top bit of the Geneve VNI; real VNIs are < 2^23
+#define TUN_F_FORWARD  (1 << 22) // ... and the tenant-forwarding twin, so the
+                                 // receiving node can re-mark after decap. Real
+                                 // VNIs are therefore < 2^22, which is 4M — the
+                                 // allocator starts at 100 and increments.
 
 // Security-group identity TLV (docs/security-groups.md, v2 stage B). The source
 // node stamps the source pod's authoritative {net, group bitmap} into a Geneve
@@ -345,15 +371,59 @@ struct gw_entry {
 	__u32 pad;
 };
 
+#define ROUTE_NH_MAX 2
+
+// A route may carry two active next-hops. The bounded array keeps the map ABI
+// verifier-friendly while covering the HA contract; count is one for every
+// ordinary route and two for active-active VPN ECMP.
+struct route_entry {
+	struct gw_entry next_hops[ROUTE_NH_MAX];
+	__u8 count;
+	__u8 pad[7];
+};
+
 // gateways: network id -> egress gateway. Off-VPC traffic from a pod in the
 // network is delivered to the gateway instead of being dropped.
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, __u32);
-	__type(value, struct gw_entry);
+	__type(value, struct route_entry);
 	__uint(max_entries, 1024);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } gateways SEC(".maps");
+
+// vpc_routes: the per-VPC route table (issue #6, docs/vpn.md §3.1). A scoped-LPM
+// twin of `gateways`: keyed by {scope_net, remote prefix}, valued by the same
+// {gw_ip, node_ip} next-hop, delivered the same way. Consulted in from_pod for
+// an off-VPC destination BEFORE the NAT decision, so a routed remote prefix
+// reaches its appliance (a VPN endpoint / router) instead of being masqueraded
+// toward the internet. A miss changes nothing — the existing NAT/gateway path
+// is the fallback. Net-scoped, so overlapping tenant CIDRs never collide and a
+// route is tenant-scoped by construction.
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__type(key, struct lpm_key);
+	__type(value, struct gw_entry);
+	__uint(max_entries, 4096);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} vpc_routes SEC(".maps");
+
+// fwd_cidrs: a forwarding leg's allowed remote source prefixes (issue #6,
+// VPCBinding.forwardingCIDRs). Scoped-LPM keyed by {veth ifindex, source
+// prefix}; a bare presence (value 1) means "this source is a sanctioned foreign
+// source for this leg". Consulted in from_pod's anti-spoof check ONLY for a
+// port carrying PORT_F_FWD_SCOPED — an unscoped forwarding leg admits any
+// foreign source as before. Node-local: the CNI programs it for the leg's own
+// veth at ADD.
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__type(key, struct lpm_key);
+	__type(value, __u8);
+	__uint(max_entries, 4096);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} fwd_cidrs SEC(".maps");
 
 // bridges: fabric IP (unique, from the node pod CIDR — network byte order) ->
 // the pod's (network id, VPC IP). A plain /32 route sends the fabric IP to the
@@ -710,7 +780,11 @@ struct {
                  // carries an identity the TENANT owns rather than the node's
 #define NS_LB  2 // LoadBalancer/NodePort ingress landing on a VPC backend —
                  // the door that rides the platform's stack all the way in
-#define NS_MECH_MAX 3
+#define NS_APPLIANCE 3 // a per-VPC route table entry (issue #6): traffic leaving
+                 // through a tenant appliance leg (a VPN endpoint, a router)
+                 // rather than the NAT gateway. Metered apart so a VPC running a
+                 // tunnel does not read as gateway egress.
+#define NS_MECH_MAX 4
 
 struct vpc_counter {
 	__u64 tx_packets;
@@ -1838,6 +1912,16 @@ static __always_inline __u32 *remote_of(__u32 scope, struct addr128 addr)
 	return bpf_map_lookup_elem(&remotes, &key);
 }
 
+// route_of resolves an off-VPC destination against the source VPC's route table
+// (vpc_routes): the longest-prefix next-hop for `addr` in `scope`, or NULL for
+// no route (fall through to NAT/gateway). LPM, so a fully-specified query key
+// matches the widest covering prefix.
+static __always_inline struct route_entry *route_of(__u32 scope, struct addr128 addr)
+{
+	struct lpm_key key = { .prefixlen = LPM_FULL, .scope_net = scope, .addr = addr };
+	return bpf_map_lookup_elem(&vpc_routes, &key);
+}
+
 // node_remote_of returns the Geneve underlay IP of the node that owns `addr`
 // (any of its interface addresses), or NULL if `addr` is not a known node.
 static __always_inline __u32 *node_remote_of(struct addr128 addr)
@@ -1944,6 +2028,24 @@ static __always_inline int parse_ip(struct __sk_buff *skb, struct pkt *p)
 	return -1;
 }
 
+// route_next_hop picks one active next-hop from the immutable inner packet.
+// The hash deliberately does not depend on skb metadata so source and
+// destination nodes make the same decision before and after Geneve.
+static __always_inline struct gw_entry *route_next_hop(struct route_entry *route, const struct pkt *p)
+{
+	if (!route || route->count == 0 || route->count > ROUTE_NH_MAX)
+		return NULL;
+	__u32 src, dst;
+	__builtin_memcpy(&src, &p->src.b[12], sizeof(src));
+	__builtin_memcpy(&dst, &p->dst.b[12], sizeof(dst));
+	__u32 hash = src ^ (dst << 1) ^ p->proto;
+	hash *= 2654435761u;
+	hash ^= hash >> 16;
+	if (route->count == 1 || !(hash & 1))
+		return &route->next_hops[0];
+	return &route->next_hops[1];
+}
+
 // deliver_local redirects the frame into a local pod's veth (through to_pod).
 static __always_inline int deliver_local(struct __sk_buff *skb, struct endpoint *ep)
 {
@@ -1955,7 +2057,7 @@ static __always_inline int deliver_local(struct __sk_buff *skb, struct endpoint 
 // encap sets the Geneve tunnel key and redirects to the Geneve device. tunnel_id
 // is the destination network so the receiver can demux by VNI; the gateway flag
 // rides the top VNI bit for the receiver's anti-spoof re-mark.
-static __always_inline int encap_sg(struct __sk_buff *skb, __u32 dstnet, __u32 node_ip, __u32 gw, __u32 srcnet, __u64 srcmap)
+static __always_inline int encap_sg(struct __sk_buff *skb, __u32 dstnet, __u32 node_ip, __u32 tunflags, __u32 srcnet, __u64 srcmap)
 {
 	__u32 geneve = cfg(CFG_GENEVE_IFINDEX);
 	if (!geneve)
@@ -1965,8 +2067,7 @@ static __always_inline int encap_sg(struct __sk_buff *skb, __u32 dstnet, __u32 n
 		return TC_ACT_SHOT;
 	struct bpf_tunnel_key tkey = {};
 	tkey.tunnel_id = dstnet ? dstnet : cfg(CFG_VNI);
-	if (gw)
-		tkey.tunnel_id |= TUN_F_GATEWAY;
+	tkey.tunnel_id |= tunflags;
 	tkey.remote_ipv4 = node_ip;
 	if (bpf_skb_set_tunnel_key(skb, &tkey, sizeof(tkey), BPF_F_ZERO_CSUM_TX) < 0)
 		return TC_ACT_SHOT;
@@ -1987,9 +2088,9 @@ static __always_inline int encap_sg(struct __sk_buff *skb, __u32 dstnet, __u32 n
 
 // encap without a security-group TLV (gateway, default-network, migration
 // re-encap — no tenant source identity to vouch for).
-static __always_inline int encap(struct __sk_buff *skb, __u32 dstnet, __u32 node_ip, __u32 gw)
+static __always_inline int encap(struct __sk_buff *skb, __u32 dstnet, __u32 node_ip, __u32 tunflags)
 {
-	return encap_sg(skb, dstnet, node_ip, gw, 0, 0);
+	return encap_sg(skb, dstnet, node_ip, tunflags, 0, 0);
 }
 
 // ---- eBPF bridge NAT (north-south, no netfilter) -------------------------
@@ -4679,11 +4780,13 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 		return TC_ACT_OK;
 
 	__u32 ifindex = skb->ifindex;
-	__u32 srcnet = 0, is_gw = 0;
+	__u32 srcnet = 0, is_gw = 0, is_fwd = 0, is_fwd_scoped = 0, foreign_src = 0;
 	__u32 *sp = bpf_map_lookup_elem(&ports, &ifindex);
 	if (sp) {
 		srcnet = PORT_NET(*sp);
 		is_gw = *sp & PORT_F_GATEWAY;
+		is_fwd = *sp & PORT_F_FORWARD;
+		is_fwd_scoped = *sp & PORT_F_FWD_SCOPED;
 	}
 
 	// At the uplink-egress attachment only: bpf cluster-egress masquerade
@@ -4730,10 +4833,29 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	if (srcnet && !is_gw) {
 		struct endpoint *self = local_of(srcnet, p.src);
 		if (!self || self->ifindex != ifindex) {
-			__u64 *d = bpf_map_lookup_elem(&sg_drops, &srcnet);
-			if (d)
-				(*d)++;
-			return TC_ACT_SHOT;
+			// A forwarding leg (VPCBinding.allowForwarding) is permitted to
+			// emit a source it does not own — that IS routing. Everything
+			// else is a spoof. Record that the source is foreign, because
+			// only such a packet gets FWD_MARK: the router's OWN traffic
+			// must keep taking the ordinary east-west path, groups and all.
+			//
+			// A SCOPED forwarding leg (VPCBinding.forwardingCIDRs, issue #6)
+			// admits a foreign source ONLY within its declared prefixes —
+			// anti-spoofing stays on for everything else, closing the blanket
+			// impersonation an unscoped grant allows. An unscoped leg (no
+			// PORT_F_FWD_SCOPED) keeps the legacy all-foreign behaviour.
+			int fwd_ok = is_fwd;
+			if (is_fwd && is_fwd_scoped) {
+				struct lpm_key fk = { .prefixlen = LPM_FULL, .scope_net = ifindex, .addr = p.src };
+				fwd_ok = bpf_map_lookup_elem(&fwd_cidrs, &fk) != NULL;
+			}
+			if (!fwd_ok) {
+				__u64 *d = bpf_map_lookup_elem(&sg_drops, &srcnet);
+				if (d)
+					(*d)++;
+				return TC_ACT_SHOT;
+			}
+			foreign_src = 1;
 		}
 	}
 
@@ -4910,6 +5032,32 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 			return fr;
 	}
 
+	// The per-VPC route table (issue #6, docs/vpn.md §3.1): a routed remote
+	// prefix is delivered to its appliance leg, checked BEFORE the NAT gateway
+	// below so the SNAT does not steal routed traffic toward the internet. It is
+	// off-VPC egress, so it is gated by the source's egress SecurityGroups and
+	// metered on the appliance door exactly as the gateway path is; then it is
+	// delivered to the next-hop Port by identity (deliver_local / encap), the
+	// same delivery as gateways[vni]. A miss falls through to NAT/gateway.
+	if (srcnet && !dstnet && !is_gw) {
+		struct route_entry *route = route_of(srcnet, p.dst);
+		struct gw_entry *rt = route_next_hop(route, &p);
+		if (rt) {
+			if (!ns_egress_ok(skb, srcnet, p.is_v6, p.proto, p.src, p.dst)) {
+				return TC_ACT_SHOT;
+			}
+			count_ns(srcnet, skb->len, NS_APPLIANCE, 0);
+			if (!rt->node_ip) {
+				struct endpoint *rl = local_of(srcnet, rt->gw_ip);
+				if (rl)
+					return deliver_local(skb, rl);
+				// next-hop leg not here yet: fall through to NAT/gateway.
+			} else {
+				return encap(skb, srcnet, rt->node_ip, 0);
+			}
+		}
+	}
+
 	// The VPC's own NAT gateway (docs/north-south.md): off-VPC egress for a pod
 	// with no floating address of its own, SNATed to the VPC's identity and sent
 	// straight out the uplink — no gateway pod, no hairpin. Checked after the EIP
@@ -4996,6 +5144,11 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 			// admits it.
 			if (is_gw)
 				skb->mark = GW_MARK;
+			else if (foreign_src)
+				// A tenant router's transit traffic. FWD_MARK, not GW_MARK:
+				// it must clear the isolation check and still face the
+				// destination's SecurityGroups.
+				skb->mark |= FWD_MARK;
 			return deliver_local(skb, l);
 		}
 	}
@@ -5025,7 +5178,12 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 		    bpf_map_lookup_elem(&hf_self, &p.src) &&
 		    !bpf_map_lookup_elem(&np_nodes, &p.dst))
 			bpf_tail_call(skb, &lb_prog, 3);
-		return encap_sg(skb, dstnet, *node_ip, is_gw, srcnet, srcmap);
+		__u32 tunflags = 0;
+		if (is_gw)
+			tunflags = TUN_F_GATEWAY;
+		else if (foreign_src)
+			tunflags = TUN_F_FORWARD;
+		return encap_sg(skb, dstnet, *node_ip, tunflags, srcnet, srcmap);
 	}
 
 	// A default-network pod addressing a *node* (its reply to a hostNetwork
@@ -5150,6 +5308,15 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 	// The exception is gateway-forwarded traffic into a VPC pod: its source is
 	// off-VPC (the internet, cluster DNS) so srcnet is 0, but it carries the
 	// in-kernel gateway mark that tenants cannot forge.
+	// Read the mark ONCE, into a local. Every test below used skb->mark
+	// directly until clang folded one of them into a variable ctx offset
+	// (`r2 = ctx; r2 += r3; r2 = *(u32 *)(r2)`) and the verifier refused the
+	// program outright: "dereference of modified ctx ptr R2 off=8 disallowed".
+	// A ctx field must be loaded at a CONSTANT offset; one hoisted read leaves
+	// clang no room to decide otherwise, and is cheaper besides. Nothing in
+	// to_pod writes the mark, so a single read is also exact.
+	__u32 mark = skb->mark;
+
 	if (!nets_allowed(srcnet, dstnet)) {
 		// A second exception: an LB/NodePort flow into a VPC-pod backend
 		// (docs/lb-ingress.md) — external source, tenant destination, pinned
@@ -5171,8 +5338,36 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 					return TC_ACT_OK;
 			}
 		}
-		if (!(srcnet == 0 && dstnet != 0 && skb->mark == GW_MARK))
+		// A tenant router's transit traffic (docs/multi-attach.md): the source
+		// belongs to another VPC, so srcnet is 0 here and isolation would drop
+		// it. FWD_MARK, set only for a GRANTED forwarding leg carrying a source
+		// it does not own, admits it past this check — and past nothing else.
+		// The policy gate below still runs, which is the entire difference
+		// between this bit and GW_MARK.
+		if (!(mark & FWD_MARK) &&
+		    !(srcnet == 0 && dstnet != 0 && mark == GW_MARK))
 			return TC_ACT_SHOT;
+	}
+
+	// SecurityGroups for a forwarded packet. This VPC holds no identity for an
+	// address it does not own, so the east-west group test below cannot judge
+	// it: srcnet is 0, the source bitmap is empty, and a grouped destination
+	// would deny everything with no rule able to allow it. Judge it as what it
+	// is from this VPC's point of view — a north-south source — through the
+	// same helper the fabric bridge and floating IPs use. A tenant writes
+	// `from: {cidr: 10.10.0.0/24}` and means exactly this.
+	//
+	// An UNGROUPED destination still passes (ns_sg_admit short-circuits on an
+	// empty member bitmap), so forwarding works out of the box and tightens the
+	// moment the destination joins a group.
+	if (dstnet && (mark & FWD_MARK)) {
+		__u16 fdport;
+		__u32 fl4off = p.is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
+		if (sg_l4(skb, p.proto, fl4off, &fdport) &&
+		    !ns_sg_admit(dstnet, p.dst, p.src, p.proto, fdport)) {
+			count_sg_drop(dstnet);
+			return TC_ACT_SHOT;
+		}
 	}
 
 	// Security-group ingress (destination-side, #7). Only genuine intra-VPC /
@@ -5194,7 +5389,7 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 	// every grouped source (the off-VPC dst is ungrouped) and break all TCP/UDP
 	// north-south egress. A normal east-west delivery always has an in-VPC dst.
 	int ns_transit = net_of(&networks, dstnet, p.dst) == 0;
-	if (dstnet && !ns_transit && !(skb->mark & (GW_MARK | SG_OK))) {
+	if (dstnet && !ns_transit && !(mark & (GW_MARK | SG_OK | FWD_MARK))) {
 		__u16 dport;
 		__u32 l4off = p.is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
 		if (sg_l4(skb, p.proto, l4off, &dport)) {
@@ -5303,7 +5498,8 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 		return TC_ACT_OK;
 
 	__u32 gw = tk.tunnel_id & TUN_F_GATEWAY;
-	__u32 vni = (__u32)tk.tunnel_id & ~TUN_F_GATEWAY;
+	__u32 fwd = tk.tunnel_id & TUN_F_FORWARD;
+	__u32 vni = (__u32)tk.tunnel_id & ~(TUN_F_GATEWAY | TUN_F_FORWARD);
 	if (vni == cfg(CFG_VNI)) {
 		// etp: Cluster DSR (docs/lb-ingress.md): the ingress node DNAT'd an
 		// LB/NodePort flow to a backend on THIS node and stamped the frontend
@@ -5345,6 +5541,11 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 	if (ep) {
 		if (gw) {
 			skb->mark = GW_MARK;
+		} else if (fwd) {
+			// A tenant router's transit traffic, from another node. It carries
+			// no identity option (its source is not a member here), so there is
+			// nothing to enforce authoritatively; to_pod judges it below.
+			skb->mark |= FWD_MARK;
 		} else {
 			// Authoritative security-group enforcement (stage B): a grouped
 			// source stamped its {net, groups} in a Geneve option. Enforce it
@@ -5428,6 +5629,18 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 		struct endpoint *gep = local_of(vni, g->gw_ip);
 		if (gep)
 			return deliver_local(skb, gep);
+	}
+
+	// A per-VPC route table next-hop hosted here (issue #6): the source node
+	// encap'd routed traffic (its destination a remote prefix, not a local pod)
+	// toward this node under the VPC's VNI. Deliver it to the appliance leg the
+	// route names. Mirrors the gateways lookup above.
+	struct route_entry *route = route_of(vni, p.dst);
+	struct gw_entry *rt = route_next_hop(route, &p);
+	if (rt && !rt->node_ip) {
+		struct endpoint *rep = local_of(vni, rt->gw_ip);
+		if (rep)
+			return deliver_local(skb, rep);
 	}
 
 	// Migration forwarding (stage 2): this was the source node of a VM that

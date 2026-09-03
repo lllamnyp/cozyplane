@@ -1,0 +1,14 @@
+# Live migration needs storage available to both source and target nodes.
+# Replace the namespace and StorageClass with an RWX-capable implementation.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vpn-appliance-state
+  namespace: vpn-example
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: REPLACE_ME_RWX_STORAGE_CLASS
+  resources:
+    requests:
+      storage: 1Gi

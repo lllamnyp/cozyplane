@@ -200,6 +200,13 @@ type overlayPeerKey struct {
 	DstNet uint32
 }
 
+type overlayRouteEntry struct {
+	_        structs.HostLayout
+	NextHops [2]overlayGwEntry
+	Count    uint8
+	Pad      [7]uint8
+}
+
 type overlaySgCidrKey struct {
 	_         structs.HostLayout
 	Prefixlen uint32
@@ -303,9 +310,9 @@ type overlayVpcCounter struct {
 	TxBytes   uint64
 	RxPackets uint64
 	RxBytes   uint64
-	NsPackets [3][2]uint64
-	NsBytes   [3][2]uint64
-	NsDenied  [3]uint64
+	NsPackets [4][2]uint64
+	NsBytes   [4][2]uint64
+	NsDenied  [4]uint64
 }
 
 type overlayVpcNat struct {
@@ -330,6 +337,7 @@ const (
 	overlayMapFloatUplinkMac        = "float_uplink_mac"
 	overlayMapFloating              = "floating"
 	overlayMapFloatingEgress        = "floating_egress"
+	overlayMapFwdCidrs              = "fwd_cidrs"
 	overlayMapGateways              = "gateways"
 	overlayMapHfAllow               = "hf_allow"
 	overlayMapHfCt                  = "hf_ct"
@@ -372,6 +380,7 @@ const (
 	overlayMapVpcCounters           = "vpc_counters"
 	overlayMapVpcIngress            = "vpc_ingress"
 	overlayMapVpcNat                = "vpc_nat"
+	overlayMapVpcRoutes             = "vpc_routes"
 	overlayProgCozyplaneFromOverlay = "cozyplane_from_overlay"
 	overlayProgCozyplaneFromPod     = "cozyplane_from_pod"
 	overlayProgCozyplaneFromUplink  = "cozyplane_from_uplink"
@@ -448,6 +457,7 @@ type overlayMapSpecs struct {
 	FloatUplinkMac *ebpf.MapSpec `ebpf:"float_uplink_mac"`
 	Floating       *ebpf.MapSpec `ebpf:"floating"`
 	FloatingEgress *ebpf.MapSpec `ebpf:"floating_egress"`
+	FwdCidrs       *ebpf.MapSpec `ebpf:"fwd_cidrs"`
 	Gateways       *ebpf.MapSpec `ebpf:"gateways"`
 	HfAllow        *ebpf.MapSpec `ebpf:"hf_allow"`
 	HfCt           *ebpf.MapSpec `ebpf:"hf_ct"`
@@ -490,6 +500,7 @@ type overlayMapSpecs struct {
 	VpcCounters    *ebpf.MapSpec `ebpf:"vpc_counters"`
 	VpcIngress     *ebpf.MapSpec `ebpf:"vpc_ingress"`
 	VpcNat         *ebpf.MapSpec `ebpf:"vpc_nat"`
+	VpcRoutes      *ebpf.MapSpec `ebpf:"vpc_routes"`
 }
 
 // overlayVariableSpecs contains global variables before they are loaded into the kernel.
@@ -528,6 +539,7 @@ type overlayMaps struct {
 	FloatUplinkMac *ebpf.Map `ebpf:"float_uplink_mac"`
 	Floating       *ebpf.Map `ebpf:"floating"`
 	FloatingEgress *ebpf.Map `ebpf:"floating_egress"`
+	FwdCidrs       *ebpf.Map `ebpf:"fwd_cidrs"`
 	Gateways       *ebpf.Map `ebpf:"gateways"`
 	HfAllow        *ebpf.Map `ebpf:"hf_allow"`
 	HfCt           *ebpf.Map `ebpf:"hf_ct"`
@@ -570,6 +582,7 @@ type overlayMaps struct {
 	VpcCounters    *ebpf.Map `ebpf:"vpc_counters"`
 	VpcIngress     *ebpf.Map `ebpf:"vpc_ingress"`
 	VpcNat         *ebpf.Map `ebpf:"vpc_nat"`
+	VpcRoutes      *ebpf.Map `ebpf:"vpc_routes"`
 }
 
 func (m *overlayMaps) Close() error {
@@ -584,6 +597,7 @@ func (m *overlayMaps) Close() error {
 		m.FloatUplinkMac,
 		m.Floating,
 		m.FloatingEgress,
+		m.FwdCidrs,
 		m.Gateways,
 		m.HfAllow,
 		m.HfCt,
@@ -626,6 +640,7 @@ func (m *overlayMaps) Close() error {
 		m.VpcCounters,
 		m.VpcIngress,
 		m.VpcNat,
+		m.VpcRoutes,
 	)
 }
 

@@ -35,6 +35,8 @@ rules:
       - vpcpeerings
       - securitygroups
       - floatingips
+      - vpngateways
+      - vpnconnections
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["sdn.cozystack.io"]
     resources:
@@ -43,6 +45,8 @@ rules:
       - vpcpeerings/status
       - securitygroups/status
       - floatingips/status
+      - vpngateways/status
+      - vpnconnections/status
     verbs: ["get"]
 
   # The virtual verbs on a tenant's OWN VPCs.
@@ -75,4 +79,6 @@ rules:
       - vpcpeerings
       - securitygroups
       - floatingips
+      - vpngateways
+      - vpnconnections
     verbs: ["get", "list", "watch"]

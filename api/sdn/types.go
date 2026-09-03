@@ -91,6 +91,31 @@ type VPCGatewaySpec struct {
 	LoadBalancerClass string
 	NAT               VPCGatewayNAT
 	Ingress           VPCGatewayIngress
+
+	// Appliance names a tenant workload that IS this VPC's door — a firewall or
+	// router attached to several VPCs. Off-VPC traffic is delivered to
+	// gateways[vni] with its destination intact, so whatever holds that entry
+	// receives the VPC's egress and may route it on. Being the door is about
+	// RECEIVING; the right to emit a source you do not own is the separate,
+	// export-gated VPCBinding.AllowForwarding (docs/multi-attach.md).
+	Appliance *VPCGatewayAppliance
+
+	// Routes is the VPC's route table for off-VPC destinations (issue #6):
+	// remote prefixes delivered through a named appliance leg by identity,
+	// consulted before the NAT decision. The NAT gateway is the default entry.
+	Routes []VPCGatewayRoute
+}
+
+// VPCGatewayRoute directs off-VPC prefixes through a named workload.
+type VPCGatewayRoute struct {
+	CIDRs []string
+	Via   VPCGatewayVia
+}
+
+// VPCGatewayVia selects a route's next-hop workload, resolved to a Port.
+type VPCGatewayVia struct {
+	PodSelector metav1.LabelSelector
+	Namespace   string
 }
 
 // VPCGatewayStatus is the observed state of a VPCGateway.
@@ -101,6 +126,27 @@ type VPCGatewayStatus struct {
 	NATAddress6 string
 	Phase       VPCGatewayPhase
 	Conditions  []metav1.Condition
+
+	// AppliancePort is the Port currently serving as the VPC's door when
+	// Appliance is set (the cluster-scoped Port name).
+	AppliancePort string
+
+	// Routes reports how each spec route resolved (its CIDRs and the Port they
+	// were programmed toward).
+	Routes []VPCGatewayRouteStatus
+}
+
+// VPCGatewayRouteStatus reports one resolved route.
+type VPCGatewayRouteStatus struct {
+	CIDRs []string
+	Port  string
+	Ports []string
+}
+
+// VPCGatewayAppliance selects the tenant workload that serves as the VPC's door.
+type VPCGatewayAppliance struct {
+	PodSelector metav1.LabelSelector
+	Namespace   string
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -122,6 +168,213 @@ type VPCGatewayList struct {
 	metav1.TypeMeta
 	metav1.ListMeta
 	Items []VPCGateway
+}
+
+// VPNGatewayPhase is the lifecycle phase of a VPNGateway.
+type VPNGatewayPhase string
+type VPNGatewayHAMode string
+
+const (
+	VPNGatewayPhasePending VPNGatewayPhase = "Pending"
+	VPNGatewayPhaseReady   VPNGatewayPhase = "Ready"
+)
+
+const (
+	VPNGatewayHAModeWarmStandby   VPNGatewayHAMode = "WarmStandby"
+	VPNGatewayHAModeLiveMigration VPNGatewayHAMode = "LiveMigration"
+	VPNGatewayHAModeActiveActive  VPNGatewayHAMode = "ActiveActive"
+)
+
+type VPNGatewayActiveActive struct {
+	LocalASN      int64
+	PeerASN       int64
+	PeerAddresses []string
+	BFD           bool
+}
+
+type VPNGatewayVirtualMachine struct {
+	Image              string
+	StateClaimName     string
+	CloudInitSecretRef string
+}
+
+type VPNGatewayHA struct {
+	Mode           VPNGatewayHAMode
+	ActiveActive   *VPNGatewayActiveActive
+	VirtualMachine *VPNGatewayVirtualMachine
+}
+
+// VPNGatewayWireGuard configures a WireGuard tunnel endpoint.
+type VPNGatewayWireGuard struct {
+	ListenPort int32
+}
+
+// VPNGatewayIPsec configures an IKEv2/strongSwan tunnel endpoint.
+type VPNGatewayIPsec struct {
+	Proposals           []string
+	CredentialSecretRef string
+	TrustedCASecretRef  string
+	LocalIdentity       string
+	AddressPools        []VPNIPsecAddressPool
+}
+
+// VPNIPsecAddressPool is a named virtual-IP pool for roadwarrior clients.
+type VPNIPsecAddressPool struct {
+	Name string
+	CIDR string
+	DNS  []string
+}
+
+// VPNExternalAddress selects the tunnel endpoint's external address.
+type VPNExternalAddress struct {
+	LoadBalancerClass string
+	AddressClaimName  string
+	AddressClaimNames []string
+}
+
+// VPNGatewaySpec declares a managed tunnel endpoint for a VPC (issue #6).
+type VPNGatewaySpec struct {
+	VPCRef LocalVPCRef
+	// AdditionalVPCRefs are further VPCs this gateway serves (hub, docs/vpn.md
+	// §3.3). Same namespace as the gateway; forbidden with ha.mode=LiveMigration.
+	AdditionalVPCRefs []LocalVPCRef
+	WireGuard         *VPNGatewayWireGuard
+	IPsec             *VPNGatewayIPsec
+	ExternalAddress   VPNExternalAddress
+	HighAvailability  bool
+	HA                *VPNGatewayHA
+}
+
+// VPNGatewayStatus is the observed state of a VPNGateway.
+type VPNGatewayStatus struct {
+	Address        string
+	Addresses      []string
+	PublicKey      string
+	PublicKeys     []string
+	AppliancePort  string
+	AppliancePorts []string
+	Routes         []VPCGatewayRouteStatus
+	Phase          VPNGatewayPhase
+	Conditions     []metav1.Condition
+}
+
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// VPNGateway is a managed tunnel endpoint for a VPC (issue #6).
+type VPNGateway struct {
+	metav1.TypeMeta
+	metav1.ObjectMeta
+
+	Spec   VPNGatewaySpec
+	Status VPNGatewayStatus
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// VPNGatewayList contains a list of VPNGateway.
+type VPNGatewayList struct {
+	metav1.TypeMeta
+	metav1.ListMeta
+	Items []VPNGateway
+}
+
+// VPNConnectionPhase is the lifecycle phase of a VPNConnection.
+type VPNConnectionPhase string
+
+const (
+	VPNConnectionPhasePending     VPNConnectionPhase = "Pending"
+	VPNConnectionPhaseEstablished VPNConnectionPhase = "Established"
+	VPNConnectionPhaseDown        VPNConnectionPhase = "Down"
+)
+
+// VPNIPsecStartAction controls whether this side initiates IKE.
+type VPNIPsecStartAction string
+
+const (
+	VPNIPsecStartActionStart VPNIPsecStartAction = "Start"
+	VPNIPsecStartActionNone  VPNIPsecStartAction = "None"
+)
+
+// LocalVPNGatewayRef references a VPNGateway in the same namespace.
+type LocalVPNGatewayRef struct {
+	Name string
+}
+
+// VPNConnectionWireGuard configures a WireGuard peer.
+type VPNConnectionWireGuard struct {
+	PeerPublicKey         string
+	PeerPublicKeys        []string
+	PeerEndpoint          string
+	PeerEndpoints         []string
+	PresharedKeySecretRef string
+	PersistentKeepalive   int32
+}
+
+// VPNConnectionIPsecAuth configures IPsec peer authentication.
+// VPNIPsecCertificateAuth identifies a certificate-authenticated remote peer.
+type VPNIPsecCertificateAuth struct {
+	RemoteIdentity string
+}
+
+// VPNIPsecEAPAuth configures one EAP identity and its password Secret.
+type VPNIPsecEAPAuth struct {
+	Identity  string
+	SecretRef string
+}
+
+type VPNConnectionIPsecAuth struct {
+	PSKSecretRef string
+	Certificate  *VPNIPsecCertificateAuth
+	EAP          *VPNIPsecEAPAuth
+}
+
+// VPNConnectionIPsec configures an IKEv2 peer.
+type VPNConnectionIPsec struct {
+	PeerAddress string
+	Auth        VPNConnectionIPsecAuth
+	Proposals   []string
+	DPDDelay    int32
+	StartAction VPNIPsecStartAction
+	AddressPool string
+}
+
+// VPNConnectionSpec declares one tunnel to a remote site (issue #6).
+type VPNConnectionSpec struct {
+	GatewayRef  LocalVPNGatewayRef
+	RemoteCIDRs []string
+	WireGuard   *VPNConnectionWireGuard
+	IPsec       *VPNConnectionIPsec
+}
+
+// VPNConnectionStatus is the observed state of a VPNConnection.
+type VPNConnectionStatus struct {
+	Phase             VPNConnectionPhase
+	LastHandshake     *metav1.Time
+	ObservedAt        *metav1.Time
+	AssignedAddresses []string
+	Conditions        []metav1.Condition
+}
+
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// VPNConnection is one tunnel to a remote site, terminated by a VPNGateway.
+type VPNConnection struct {
+	metav1.TypeMeta
+	metav1.ObjectMeta
+
+	Spec   VPNConnectionSpec
+	Status VPNConnectionStatus
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// VPNConnectionList contains a list of VPNConnection.
+type VPNConnectionList struct {
+	metav1.TypeMeta
+	metav1.ListMeta
+	Items []VPNConnection
 }
 
 // VPCStatus is the observed state of a VPC.
@@ -178,6 +431,19 @@ type VPCBindingList struct {
 type VPCBindingSpec struct {
 	// VPCRef is the VPC being made usable, identified by owner namespace + name.
 	VPCRef VPCRef
+
+	// AllowForwarding lets a pod attached under this binding emit packets whose
+	// source address is not its own — what a router or firewall bridging two
+	// VPCs must do. It is a grant: lifting from_pod's source RPF check hands the
+	// workload the ability to impersonate any member of the VPC and inherit its
+	// SecurityGroups, so it is authored by whoever holds `export` on the VPC
+	// (docs/multi-attach.md).
+	AllowForwarding bool
+
+	// ForwardingCIDRs narrows AllowForwarding to declared remote prefixes
+	// (issue #6). Empty keeps the blanket grant; non-empty admits a foreign
+	// source only within these CIDRs.
+	ForwardingCIDRs []string
 }
 
 // +genclient
@@ -275,6 +541,13 @@ type PortSpec struct {
 	// Gateway marks the VPC's gateway port (the .1 leg of the egress gateway
 	// pod); agents route off-VPC traffic to it.
 	Gateway bool
+
+	// Forwarding marks a port allowed to emit packets sourced from an address
+	// that is not its own — a tenant router or firewall bridging two VPCs. Set
+	// by the CNI from the VPCBinding's AllowForwarding grant; honoured by the
+	// datapath as PORT_F_GATEWAY. DISTINCT from Gateway, which means "the VPC's
+	// .1 egress leg" and alone programs gateways[vni] (docs/multi-attach.md).
+	Forwarding bool
 }
 
 // PortStatus is the controller-observed state of a Port.

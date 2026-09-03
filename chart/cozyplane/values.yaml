@@ -52,8 +52,41 @@ egress:
   # (:53 only), so tenant pods resolve with a stock resolv.conf.
   clusterDNS: "10.96.0.10"
   # Additional cluster-internal networks VPC tenants must not reach through
-  # their gateways (e.g. the node/management network).
+  # their gateways (e.g. the node/management network). Also feeds the managed-VPN
+  # route-CIDR deny-set — include the node network here so it is covered.
   internalCIDRs: []
+
+# Managed VPN (issue #6, docs/vpn.md). The controller runs tunnel appliances for
+# VPNGateway/VPNConnection; these bound their placement and per-tenant scale.
+# Every appliance exposes per-connection metrics on the named `vpn-metrics`
+# port. When the VictoriaMetrics Operator VMPodScrape CRD is installed, this
+# chart automatically registers all `app=cozyplane-vpn-gateway` pods for scrape.
+vpn:
+  # Comma-separated "key=value" labels selecting a dedicated gateway node pool.
+  gatewayNodeSelector: ""
+  # Optional taint key tolerated with Exists/NoSchedule.
+  gatewayTolerationKey: ""
+  # Zero uses the controller defaults.
+  maxGatewaysPerNamespace: 0
+  maxConnectionsPerGateway: 0
+  # Opt in after the kubelet admits net.ipv4.ip_forward and
+  # net.ipv6.conf.all.forwarding as pod sysctls. Drops privileged mode and keeps
+  # only NET_ADMIN, NET_RAW and NET_BIND_SERVICE.
+  hardenedAppliance: false
+  observability:
+    podScrape:
+      enabled: true
+      interval: 30s
+    rules:
+      enabled: true
+      # Idle tunnels are valid for many installations, so this alert is opt-in.
+      noTraffic:
+        enabled: false
+        window: 30m
+    dashboard:
+      enabled: true
+      # Empty matches every Grafana instance visible to the operator.
+      instanceSelector: {}
 
 agent:
   priorityClassName: system-node-critical

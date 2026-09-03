@@ -51,6 +51,12 @@ rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcgateways"]
     verbs: ["get", "list", "watch"]
+  # VPNGateways: the agent merges their status.routes (the connections' remote
+  # CIDRs toward the appliance leg) into the per-VPC route table
+  # (issue #6, docs/vpn.md §3.2).
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpngateways"]
+    verbs: ["get", "list", "watch"]
   # VPCPeering halves: the agent programs the peers map from mutually-matched
   # specs (not status), so it only needs to observe them.
   - apiGroups: ["sdn.cozystack.io"]

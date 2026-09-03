@@ -36,6 +36,42 @@ type VPCGatewaySpecApplyConfiguration struct {
 	NAT *VPCGatewayNATApplyConfiguration `json:"nat,omitempty"`
 	// Ingress configures what may enter the VPC from outside.
 	Ingress *VPCGatewayIngressApplyConfiguration `json:"ingress,omitempty"`
+	// Appliance names a workload of the tenant's own that IS this VPC's door —
+	// a firewall or router attached to several VPCs (docs/multi-attach.md).
+	//
+	// Off-VPC traffic from a VPC pod is delivered to gateways[vni] with its
+	// original destination intact, so whatever holds that entry receives the
+	// VPC's egress by construction and may route it on. Until now only
+	// cozyplane's own gateway pod could hold it — claimed by addGatewayLeg,
+	// restricted to the agent's namespace and to the VPC's reserved .1 — which
+	// left no way to say "my appliance is the door".
+	//
+	// Setting it does NOT give the appliance the right to emit a source it does
+	// not own; that is the separate, export-gated VPCBinding.allowForwarding
+	// grant. Being the door means receiving; forwarding means sending. A
+	// firewall wants both, and they are granted by different people.
+	//
+	// When set, the controller points the VPC's gateway at the selected
+	// workload's Port in this VPC and spawns no gateway pod of its own.
+	Appliance *VPCGatewayApplianceApplyConfiguration `json:"appliance,omitempty"`
+	// Routes is the VPC's route table for off-VPC destinations (issue #6). Until
+	// now a VPC had exactly two off-net dispositions: the default gateway
+	// (NAT egress / internet) or drop. A route adds a third — "these remote
+	// prefixes go through THIS workload" — and once there are three there is a
+	// table, of which the NAT gateway is retroactively just the default entry.
+	//
+	// Each route names remote CIDRs and the workload (an appliance leg in this
+	// VPC — a VPN endpoint, a router) they resolve through, by identity. The
+	// datapath consults it BEFORE the NAT decision, so a routed prefix reaches
+	// the appliance instead of being masqueraded toward the internet; a miss
+	// falls through to NAT/drop exactly as today. The workload may reschedule or
+	// change IP and the route re-resolves — a route never names an address.
+	//
+	// A route only delivers; the right of the target to forward a foreign
+	// (remote-site) source is the separate VPCBinding.allowForwarding grant. A
+	// route to a Port whose binding lacks that grant is inert, reported in a
+	// condition, and widens nothing.
+	Routes []VPCGatewayRouteApplyConfiguration `json:"routes,omitempty"`
 }
 
 // VPCGatewaySpecApplyConfiguration constructs a declarative configuration of the VPCGatewaySpec type for use with
@@ -73,5 +109,26 @@ func (b *VPCGatewaySpecApplyConfiguration) WithNAT(value *VPCGatewayNATApplyConf
 // If called multiple times, the Ingress field is set to the value of the last call.
 func (b *VPCGatewaySpecApplyConfiguration) WithIngress(value *VPCGatewayIngressApplyConfiguration) *VPCGatewaySpecApplyConfiguration {
 	b.Ingress = value
+	return b
+}
+
+// WithAppliance sets the Appliance field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Appliance field is set to the value of the last call.
+func (b *VPCGatewaySpecApplyConfiguration) WithAppliance(value *VPCGatewayApplianceApplyConfiguration) *VPCGatewaySpecApplyConfiguration {
+	b.Appliance = value
+	return b
+}
+
+// WithRoutes adds the given value to the Routes field in the declarative configuration
+// and returns the receiver, so that objects can be build by chaining "With" function invocations.
+// If called multiple times, values provided by each call will be appended to the Routes field.
+func (b *VPCGatewaySpecApplyConfiguration) WithRoutes(values ...*VPCGatewayRouteApplyConfiguration) *VPCGatewaySpecApplyConfiguration {
+	for i := range values {
+		if values[i] == nil {
+			panic("nil value passed to WithRoutes")
+		}
+		b.Routes = append(b.Routes, *values[i])
+	}
 	return b
 }

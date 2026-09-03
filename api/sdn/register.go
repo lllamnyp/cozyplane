@@ -65,6 +65,10 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&SecurityGroupList{},
 		&HostFirewall{},
 		&HostFirewallList{},
+		&VPNGateway{},
+		&VPNGatewayList{},
+		&VPNConnection{},
+		&VPNConnectionList{},
 	)
 
 	return nil

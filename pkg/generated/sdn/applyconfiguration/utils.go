@@ -54,6 +54,8 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &sdnv1alpha1.HostFirewallStatusApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("LocalVPCRef"):
 		return &sdnv1alpha1.LocalVPCRefApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("LocalVPNGatewayRef"):
+		return &sdnv1alpha1.LocalVPNGatewayRefApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("Port"):
 		return &sdnv1alpha1.PortApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("PortSpec"):
@@ -96,14 +98,22 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &sdnv1alpha1.VPCBindingSpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPCGateway"):
 		return &sdnv1alpha1.VPCGatewayApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPCGatewayAppliance"):
+		return &sdnv1alpha1.VPCGatewayApplianceApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPCGatewayIngress"):
 		return &sdnv1alpha1.VPCGatewayIngressApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPCGatewayNAT"):
 		return &sdnv1alpha1.VPCGatewayNATApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPCGatewayRoute"):
+		return &sdnv1alpha1.VPCGatewayRouteApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPCGatewayRouteStatus"):
+		return &sdnv1alpha1.VPCGatewayRouteStatusApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPCGatewaySpec"):
 		return &sdnv1alpha1.VPCGatewaySpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPCGatewayStatus"):
 		return &sdnv1alpha1.VPCGatewayStatusApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPCGatewayVia"):
+		return &sdnv1alpha1.VPCGatewayViaApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPCPeering"):
 		return &sdnv1alpha1.VPCPeeringApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPCPeeringSpec"):
@@ -116,6 +126,42 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &sdnv1alpha1.VPCSpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("VPCStatus"):
 		return &sdnv1alpha1.VPCStatusApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPNConnection"):
+		return &sdnv1alpha1.VPNConnectionApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPNConnectionIPsec"):
+		return &sdnv1alpha1.VPNConnectionIPsecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPNConnectionIPsecAuth"):
+		return &sdnv1alpha1.VPNConnectionIPsecAuthApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPNConnectionSpec"):
+		return &sdnv1alpha1.VPNConnectionSpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPNConnectionStatus"):
+		return &sdnv1alpha1.VPNConnectionStatusApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPNConnectionWireGuard"):
+		return &sdnv1alpha1.VPNConnectionWireGuardApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPNExternalAddress"):
+		return &sdnv1alpha1.VPNExternalAddressApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPNGateway"):
+		return &sdnv1alpha1.VPNGatewayApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPNGatewayActiveActive"):
+		return &sdnv1alpha1.VPNGatewayActiveActiveApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPNGatewayHA"):
+		return &sdnv1alpha1.VPNGatewayHAApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPNGatewayIPsec"):
+		return &sdnv1alpha1.VPNGatewayIPsecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPNGatewaySpec"):
+		return &sdnv1alpha1.VPNGatewaySpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPNGatewayStatus"):
+		return &sdnv1alpha1.VPNGatewayStatusApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPNGatewayVirtualMachine"):
+		return &sdnv1alpha1.VPNGatewayVirtualMachineApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPNGatewayWireGuard"):
+		return &sdnv1alpha1.VPNGatewayWireGuardApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPNIPsecAddressPool"):
+		return &sdnv1alpha1.VPNIPsecAddressPoolApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPNIPsecCertificateAuth"):
+		return &sdnv1alpha1.VPNIPsecCertificateAuthApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("VPNIPsecEAPAuth"):
+		return &sdnv1alpha1.VPNIPsecEAPAuthApplyConfiguration{}
 
 	}
 	return nil

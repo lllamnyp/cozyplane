@@ -15,9 +15,14 @@ permissions:
   contents: read
 
 jobs:
-  e2e:
+  vpn-kind:
+    name: VPN (${{ matrix.backend }}) on kind
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [wireguard, ipsec]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -31,5 +36,39 @@ jobs:
       - name: build image
         run: docker build -t ghcr.io/lllamnyp/cozyplane:e2e .
 
-      - name: run e2e
-        run: IMAGE=ghcr.io/lllamnyp/cozyplane:e2e IMAGE_PREBUILT=1 bash test/e2e.sh
+      - name: bootstrap kind datapath e2e
+        run: IMAGE=ghcr.io/lllamnyp/cozyplane:e2e IMAGE_PREBUILT=1 KEEP=1 bash test/e2e.sh
+
+      - name: run VPN e2e
+        run: BACKEND=${{ matrix.backend }} MODE=materialize KCTX=kind-cozyplane-e2e bash test/vpn-e2e.sh
+
+      - name: collect diagnostics
+        if: failure()
+        run: kubectl --context kind-cozyplane-e2e get pods,events -A || true
+
+      - name: remove kind cluster
+        if: always()
+        run: kind delete cluster --name cozyplane-e2e || true
+
+  # This job runs only on the dedicated laboratory runner. It deliberately
+  # reuses its pre-provisioned Talos cluster; hosted runners cannot validate
+  # Talos, KubeVirt, external peers, or hardware-dependent networking.
+  vpn-lab:
+    name: VPN (${{ matrix.backend }}) in lab
+    runs-on: [self-hosted, linux, vpn-lab]
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [wireguard, ipsec]
+    steps:
+      - uses: actions/checkout@v4
+      - name: run VPN e2e against the laboratory cluster
+        env:
+          KCTX: ${{ vars.COZYPLANE_LAB_CONTEXT }}
+        run: BACKEND=${{ matrix.backend }} MODE=live bash test/vpn-e2e.sh
+      - name: collect diagnostics
+        if: failure()
+        env:
+          KCTX: ${{ vars.COZYPLANE_LAB_CONTEXT }}
+        run: kubectl --context "$KCTX" get pods,events -A || true

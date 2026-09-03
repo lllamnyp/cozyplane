@@ -65,3 +65,8 @@ most likely to set:
 - RBAC for both components, the aggregated tenant roles (`cozyplane-tenant-edit` /
   `-view`, docs/multitenancy.md), and the export
   ValidatingAdmissionPolicy.
+
+Managed VPN appliances use privileged compatibility mode by default. On nodes
+whose kubelet admits the forwarding sysctls, set `vpn.hardenedAppliance=true` to
+drop privileged mode and retain only `NET_ADMIN`, `NET_RAW`, and
+`NET_BIND_SERVICE`.

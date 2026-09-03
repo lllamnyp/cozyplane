@@ -14,16 +14,22 @@ metadata:
   labels:
     {{- include "cozyplane.labels" . | nindent 4 }}
 rules:
+  # vpcs: the "export" verb is the authority to create a forwarding grant on a
+  # VPC (the VPCBinding admission checks it, sdnv1alpha1 vpcbinding strategy). The
+  # managed VPNGateway controller creates that grant on the tenant's behalf, so it
+  # holds export cluster-wide — the tenant's authority is gated one level up, at
+  # "create a VPNGateway in my namespace" for my own VPC (issue #6).
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcs"]
-    verbs: ["get", "list", "watch", "update", "patch"]
+    verbs: ["get", "list", "watch", "update", "patch", "export"]
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcs/status"]
     verbs: ["get", "update", "patch"]
-  # VPCBindings: maintain the reap finalizer and reap Ports on revocation.
+  # VPCBindings: maintain the reap finalizer and reap Ports on revocation;
+  # create/delete the managed VPN appliance's scoped forwarding grant (issue #6).
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcbindings"]
-    verbs: ["get", "list", "watch", "update", "patch"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Ports: reap on revocation; PortGC releases the sever finalizer when the
   # port's node is gone (needs nodes read).
   - apiGroups: ["sdn.cozystack.io"]
@@ -33,6 +39,14 @@ rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["ports/status"]
     verbs: ["get", "update", "patch"]
+  # NetworkAttachmentDefinitions: the Multus shim a KubeVirt VM needs to name a
+  # VPC at all — spec.networks admits only `pod` and `multus`. One per
+  # VPCBinding, in the binding's namespace, so it lands where attachment is
+  # already authorized (docs/kubevirt-multi-nic.md). Reconciled only when the
+  # cluster serves the kind; harmless on a cluster without Multus.
+  - apiGroups: ["k8s.cni.cncf.io"]
+    resources: ["network-attachment-definitions"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
   # SecurityGroups: id allocation (status) + selector evaluation.
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["securitygroups"]
@@ -61,13 +75,38 @@ rules:
     resources: ["vpcpeerings/status"]
     verbs: ["get", "update", "patch"]
   # FloatingIPs: own the delegated LoadBalancer Service that sources the address
-  # and gate readiness on a live target Port (docs/external-addresses.md).
+  # and gate readiness on a live target Port (docs/external-addresses.md); the
+  # VPNGateway controller creates one as its tunnel endpoint (issue #6).
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["floatingips"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["floatingips/status"]
     verbs: ["get", "update", "patch"]
+  # VPNGateways: a VPC's managed tunnel-termination endpoint (docs/vpn.md). The
+  # controller owns their status (VPC resolution, external address, phase) and
+  # reads them to realize the tunnel workload.
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpngateways"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpngateways/status"]
+    verbs: ["get", "update", "patch"]
+  # VPNConnections: one site-to-site peer of a VPNGateway. The controller owns
+  # their status (phase, last handshake) and reads them to program the tunnel.
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpnconnections"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpnconnections/status"]
+    verbs: ["get", "update", "patch"]
+  # Secrets: the VPNGateway controller generates the appliance's WireGuard
+  # keypair, renders the peer config (private key + PSKs) it mounts, and reads
+  # each connection's referenced preshared-key Secret (issue #6). All in the
+  # tenant namespace where the gateway lives.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # ServiceVIPs: materialize one per attached Service, allocate the VIP,
   # resolve backends from Services/EndpointSlices (services-in-vpc.md).
   - apiGroups: ["sdn.cozystack.io"]
@@ -93,11 +132,14 @@ rules:
   # launcher-pod signal without it.
   - apiGroups: ["kubevirt.io"]
     resources: ["virtualmachineinstances"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Gateway Deployments for a VPCGateway family with no eBPF identity yet
   # (one with addresses for every family is pure eBPF — docs/north-south.md §6a).
   - apiGroups: ["apps"]
-    resources: ["deployments"]
+    resources: ["deployments", "statefulsets"]
     verbs: ["get", "list", "watch", "create", "update", "delete"]
   # Severed-gateway heal: recreate a Ready gateway pod whose .1 Port is gone.
   # watch: the persistent-Port controller watches virt-launcher pods to drive
@@ -161,6 +203,21 @@ spec:
             - --internal-cidrs={{ concat (list .Values.egress.clusterCIDR .Values.egress.serviceCIDR) .Values.egress.internalCIDRs | compact | join "," }}
             {{- with .Values.egress.clusterDNS }}
             - --cluster-dns={{ . }}
+            {{- end }}
+            {{- with .Values.vpn.gatewayNodeSelector }}
+            - --vpn-gateway-node-selector={{ . }}
+            {{- end }}
+            {{- with .Values.vpn.gatewayTolerationKey }}
+            - --vpn-gateway-toleration-key={{ . }}
+            {{- end }}
+            {{- if .Values.vpn.maxGatewaysPerNamespace }}
+            - --vpn-max-gateways-per-namespace={{ .Values.vpn.maxGatewaysPerNamespace }}
+            {{- end }}
+            {{- if .Values.vpn.maxConnectionsPerGateway }}
+            - --vpn-max-connections-per-gateway={{ .Values.vpn.maxConnectionsPerGateway }}
+            {{- end }}
+            {{- if .Values.vpn.hardenedAppliance }}
+            - --vpn-hardened-appliance=true
             {{- end }}
             {{- end }}
           env:

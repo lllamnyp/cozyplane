@@ -42,6 +42,10 @@ type Interface interface {
 	VPCGateways() VPCGatewayInformer
 	// VPCPeerings returns a VPCPeeringInformer.
 	VPCPeerings() VPCPeeringInformer
+	// VPNConnections returns a VPNConnectionInformer.
+	VPNConnections() VPNConnectionInformer
+	// VPNGateways returns a VPNGatewayInformer.
+	VPNGateways() VPNGatewayInformer
 }
 
 type version struct {
@@ -98,4 +102,14 @@ func (v *version) VPCGateways() VPCGatewayInformer {
 // VPCPeerings returns a VPCPeeringInformer.
 func (v *version) VPCPeerings() VPCPeeringInformer {
 	return &vPCPeeringInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// VPNConnections returns a VPNConnectionInformer.
+func (v *version) VPNConnections() VPNConnectionInformer {
+	return &vPNConnectionInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// VPNGateways returns a VPNGatewayInformer.
+func (v *version) VPNGateways() VPNGatewayInformer {
+	return &vPNGatewayInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }

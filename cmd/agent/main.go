@@ -419,6 +419,7 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		watchPorts(ctx, factory, localFactory, sdnClient, client, mgr, nodeName, state.NodeIP, log)
 		watchPeerings(ctx, factory, mgr, log)
 		watchGateways(ctx, factory, mgr, nodeName, log)
+		watchRoutes(ctx, factory, mgr, nodeName, log)
 		watchFloatingIPs(ctx, factory, mgr, log)
 		watchServiceUplinks(ctx, client, mgr, log)
 		watchServiceVIPs(ctx, factory, mgr, log)
@@ -1075,6 +1076,111 @@ func watchGateways(ctx context.Context, factory sdninformers.SharedInformerFacto
 
 	go func() {
 		if cache.WaitForCacheSync(ctx.Done(), ports.Informer().HasSynced) {
+			resync()
+		}
+	}()
+}
+
+// watchRoutes keeps the vpc_routes map equal to the resolved per-VPC route
+// tables (VPCGateway.status.routes, issue #6), from this node's point of view.
+// The controller resolves each route's selector to a next-hop Port; the agent
+// turns that Port's current location into a datapath entry (local redirect or
+// encapsulation to its node), and re-resolves when the Port moves. Diffed
+// against the pinned map so a restarted agent prunes routes that vanished.
+func watchRoutes(ctx context.Context, factory sdninformers.SharedInformerFactory, mgr *datapath.Manager, selfName string, log *slog.Logger) {
+	gws := factory.Sdn().V1alpha1().VPCGateways()
+	vpnGWs := factory.Sdn().V1alpha1().VPNGateways()
+	ports := factory.Sdn().V1alpha1().Ports()
+
+	// resolveRoutes turns a set of status routes (the shape both VPCGateway and
+	// VPNGateway publish) into datapath entries, resolving each next-hop Port to
+	// its IP and node. An unresolved or off-node-address route is skipped.
+	resolveRoutes := func(routes []sdnv1alpha1.VPCGatewayRouteStatus, out *[]datapath.RouteEntry) {
+		for _, rt := range routes {
+			portNames := append([]string(nil), rt.Ports...)
+			if len(portNames) == 0 && rt.Port != "" {
+				portNames = []string{rt.Port}
+			}
+			if len(portNames) == 0 {
+				continue // unresolved route: no datapath entry
+			}
+			var vni uint32
+			var nextHops []datapath.RouteNextHop
+			for _, portName := range portNames {
+				port, err := ports.Lister().Get(portName)
+				if err != nil || port.Spec.IP == "" {
+					continue
+				}
+				portVNI, ok := vniFromPortName(port.Name)
+				if !ok || (vni != 0 && portVNI != vni) {
+					continue
+				}
+				vni = portVNI
+				gwIP := net.ParseIP(port.Spec.IP)
+				if gwIP == nil {
+					continue
+				}
+				var nodeIP net.IP
+				if port.Spec.Node != selfName {
+					nodeIP = net.ParseIP(port.Spec.NodeIP)
+					if nodeIP == nil {
+						continue
+					}
+				}
+				nextHops = append(nextHops, datapath.RouteNextHop{GwIP: gwIP, NodeIP: nodeIP})
+			}
+			if len(nextHops) == 0 {
+				continue
+			}
+			for _, cidr := range rt.CIDRs {
+				*out = append(*out, datapath.RouteEntry{
+					Scope: vni, CIDR: cidr, NextHops: append([]datapath.RouteNextHop(nil), nextHops...),
+				})
+			}
+		}
+	}
+
+	var mu sync.Mutex
+	resync := func() {
+		mu.Lock()
+		defer mu.Unlock()
+
+		var desired []datapath.RouteEntry
+		// A VPCGateway's explicit spec.routes (increment 1) and a VPNGateway's
+		// connection-derived routes (increment 4) merge into one route table —
+		// docs/vpn.md §3.2. Both address the same vpc_routes map.
+		allGW, err := gws.Lister().List(labels.Everything())
+		if err != nil {
+			log.Error("list vpcgateways for routes", "err", err)
+			return
+		}
+		for _, gw := range allGW {
+			resolveRoutes(gw.Status.Routes, &desired)
+		}
+		allVPN, err := vpnGWs.Lister().List(labels.Everything())
+		if err != nil {
+			log.Error("list vpngateways for routes", "err", err)
+			return
+		}
+		for _, gw := range allVPN {
+			resolveRoutes(gw.Status.Routes, &desired)
+		}
+		if err := mgr.SyncRoutes(desired); err != nil {
+			log.Error("sync routes", "err", err)
+		}
+	}
+
+	onAny := cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(any) { resync() },
+		UpdateFunc: func(_, newObj any) { resync() },
+		DeleteFunc: func(any) { resync() },
+	}
+	_, _ = gws.Informer().AddEventHandler(onAny)
+	_, _ = vpnGWs.Informer().AddEventHandler(onAny)
+	_, _ = ports.Informer().AddEventHandler(onAny)
+
+	go func() {
+		if cache.WaitForCacheSync(ctx.Done(), gws.Informer().HasSynced, vpnGWs.Informer().HasSynced, ports.Informer().HasSynced) {
 			resync()
 		}
 	}()
