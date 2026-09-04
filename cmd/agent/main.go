@@ -432,11 +432,19 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		factory.Start(ctx.Done())
 	}
 
-	// Datapath is up and remotes are syncing; expose the CNI to kubelet.
-	if err := writeCNIConf(cniConfName, mtu); err != nil {
+	// Datapath is up and remotes are syncing; expose the CNI to kubelet — unless
+	// another CNI already owns the directory, in which case say which one. A
+	// silent abstention here would read exactly like a bug.
+	winner, err := writeCNIConf(cniConfName, mtu)
+	if err != nil {
 		return fmt.Errorf("write CNI conf: %w", err)
 	}
-	log.Info("CNI configuration installed; agent ready")
+	if winner != "" {
+		log.Info("CNI configuration left to another owner; agent ready",
+			"owner", winner, "ours", cniConfName)
+	} else {
+		log.Info("CNI configuration installed; agent ready")
+	}
 
 	<-ctx.Done()
 	log.Info("shutting down")
@@ -1426,16 +1434,77 @@ func severLocalPort(ctx context.Context, core kubernetes.Interface, localFactory
 	}
 }
 
-func writeCNIConf(name string, mtu int) error {
+// writeCNIConf installs our conflist unless another CNI already owns the
+// directory. It reports the name of the conf that wins, or "" when we wrote.
+//
+// **Why it looks before it writes.** The runtime loads exactly one conf from
+// this directory: the one that sorts first. Writing unconditionally therefore
+// carries an unstated assumption — that cozyplane is alone on the node — and
+// the assumption is false wherever the platform chains another CNI. On a Talos
+// lab running Multus in front of Cilium, installing ours took the node's pod
+// networking from a chain that was working, and every VPC attachment with it.
+// Nothing said so; the file simply won.
+//
+// So the assumption becomes a check, and the check is deliberately narrow:
+// **if another conf already sorts ahead of the name we were given, we keep our
+// hands off.** That is the accident — a name that would have lost anyway, or a
+// directory whose owner arrived first.
+//
+// It is NOT a guard against a name chosen to win. `--cni-conf-name` is how the
+// operator says which side of that line they mean to be on: a low prefix wins on
+// purpose (replacing another CNI, docs/design.md §13), a high one stays inert
+// beside a chain. Asking for a winning name is asking to win, and this function
+// will grant it — the chained platform's protection is the name its chart asks
+// for, not this check.
+func writeCNIConf(name string, mtu int) (string, error) {
+	if winner := cniConfOwner(cniConfDir, name); winner != "" {
+		return winner, nil
+	}
 	if err := os.MkdirAll(cniConfDir, 0o755); err != nil {
-		return err
+		return "", err
 	}
 	body := fmt.Sprintf(cniConfBody, mtu)
 	tmp := filepath.Join(cniConfDir, "."+name+".tmp")
 	if err := os.WriteFile(tmp, []byte(body), 0o644); err != nil {
-		return err
+		return "", err
 	}
-	return os.Rename(tmp, filepath.Join(cniConfDir, name))
+	return "", os.Rename(tmp, filepath.Join(cniConfDir, name))
+}
+
+// cniConfOwner returns the conf file in dir that the runtime would load ahead of
+// name, or "" when nothing does.
+//
+// Extensions are the three the CRI plugins accept; dotfiles are skipped because
+// that is where our own atomic temporary lives, and a missing or unreadable
+// directory means nothing is there to own it — the caller then writes, which is
+// the behaviour of a node where cozyplane really is alone.
+func cniConfOwner(dir, name string) string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	winner := ""
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		other := e.Name()
+		if other == name || strings.HasPrefix(other, ".") {
+			continue
+		}
+		switch filepath.Ext(other) {
+		case ".conf", ".conflist", ".json":
+		default:
+			continue
+		}
+		if other >= name {
+			continue
+		}
+		if winner == "" || other < winner {
+			winner = other
+		}
+	}
+	return winner
 }
 
 func internalIP(node *corev1.Node) string {
