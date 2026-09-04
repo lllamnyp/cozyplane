@@ -220,6 +220,34 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		log.Warn("veths without a rebuild record lost their datapath state; restart their pods", "veths", stats.Skipped)
 	}
 
+	// A peer CNI sharing a veth programs its endpoint asynchronously, AFTER CNI
+	// ADD has returned, so the order we set at attach time is not the order that
+	// survives. An anchor decides where we land; only this loop keeps us there.
+	// Correctly ordered hooks are a query and no writes, so the steady state is
+	// cheap and silent.
+	//
+	// A count that stays non-zero tick after tick is worth reading as a signal,
+	// not noise: it means the peer keeps re-taking the position, and each repair
+	// opens a brief unclassified window.
+	go func() {
+		tick := time.NewTicker(5 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				moved, err := mgr.ReconcilePodTCXOrder()
+				if err != nil {
+					log.Warn("reconcile pod tcx order", "err", err)
+				}
+				if moved > 0 {
+					log.Info("reconciled pod tcx order", "moved", moved)
+				}
+			}
+		}
+	}()
+
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
 		return fmt.Errorf("in-cluster config: %w", err)
