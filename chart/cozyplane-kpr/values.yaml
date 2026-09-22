@@ -4,7 +4,7 @@
 # procedure and records that gap.
 # It imports Cilium's LB control plane, so it is a large image and a SEPARATE
 # component from the cozyplane agent — never co-mingled.
-image: ghcr.io/lllamnyp/cozyplane-kpr@sha256:425693919d8a4f24daea9629548180ef5cef72dece4d31bf5b6505a671147766
+image: ghcr.io/lllamnyp/cozyplane-kpr@sha256:8f5323f639ee82dbfcd3e36fbf8a59e2e03303af59501fdf7d992973fa8105d2
 imagePullPolicy: IfNotPresent
 imagePullSecrets: []
 

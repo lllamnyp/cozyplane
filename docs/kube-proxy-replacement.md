@@ -192,8 +192,10 @@ Cilium's map ABI is not.
 
 2. **kube-proxy-less kind e2e — DONE (`test/kpr-e2e.sh`).** Packaged as an
    image (`kpr/Dockerfile`) + DaemonSet (`deploy/kpr-daemonset.yaml`:
-   hostNetwork, privileged, host bpffs + cgroup2 mounts, an init container that
-   mounts bpffs on nodes that lack it — e.g. kind), and validated on a
+   hostNetwork, privileged, host bpffs + cgroup2 mounts; kpr mounts bpffs
+   in-process on nodes that lack one — e.g. kind — `statfs`-checking the mount
+   **point** for `BPF_FS_MAGIC`, never the mount's source name, which is
+   arbitrary and is `none` on Talos: bringup-field-notes.md §10), and validated on a
    `kubeProxyMode: none` cluster where **there is no service proxy to fall back
    on**, so a working ClusterIP *is* socket-LB. From a pod: TCP and UDP
    ClusterIP both resolve and load-balance across backends, and cluster DNS

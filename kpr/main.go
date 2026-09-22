@@ -109,12 +109,24 @@ func main() {
 	pflag.Parse()
 
 	logger := defaultLogger()
+
+	// Pin storage must be a real bpffs before the LB reconciler or the
+	// socket-LB attach pins anything. Done in-process, statfs-checked, rather
+	// than by a privileged busybox init container: a shell guard that matched
+	// the mount *source* name read Talos's "none"-sourced host bpffs as absent
+	// and stacked an empty one over it, hiding the agent's pins (see bpffs.go).
+	bpffsRoot := defaultSocketLBConfig().BPFFSRoot
+	if err := ensureBPFFSAt(bpffsRoot); err != nil {
+		logger.Error("ensure bpffs", "root", bpffsRoot, "err", err)
+		os.Exit(1)
+	}
+
 	// KPR increment 3, Half A (docs/kube-proxy-replacement.md): feed net-0
 	// ClusterIPs into the agent's pinned svc_vips map, for clients socket-LB
 	// can't rewrite at connect() — a bridge-bound KubeVirt guest. Independent of
 	// the LB hive (which drives socket-LB via Cilium's own maps); dies with the
 	// process on shutdown.
-	pinDir := filepath.Join(defaultSocketLBConfig().BPFFSRoot, "cozyplane")
+	pinDir := filepath.Join(bpffsRoot, "cozyplane")
 	// NODE_NAME (downward API) scopes LoadBalancer-ingress rows to this node's
 	// ready backends (docs/lb-ingress.md). Without it only ClusterIP rows are
 	// fed — LB delivery silently off, so say so.
