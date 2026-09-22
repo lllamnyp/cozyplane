@@ -39,6 +39,29 @@ jobs:
             exit 1
           fi
 
+  # kpr/ is a separate module, so the root `go vet ./...` and `go test ./...`
+  # above never reach it — its packages need their own job or they go unchecked.
+  # (gofmt above does cover them: it lists files repo-wide.)
+  kpr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: kpr/go.mod
+          cache-dependency-path: kpr/go.sum
+
+      - name: go vet
+        run: go -C kpr vet ./...
+
+      - name: go test
+        run: go -C kpr test ./...
+
+      # The image cross-compiles for arm64 (release.yml); catch a break here,
+      # where the failure is one line, rather than in the release build.
+      - name: cross-compile arm64
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go -C kpr build -o /dev/null .
+
   helm:
     runs-on: ubuntu-latest
     steps:

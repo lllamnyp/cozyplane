@@ -1,0 +1,3 @@
+# The hand-built binary from the pre-CI workflow: the image builds from source,
+# so this only bloats the build context (docker ignores .gitignore).
+cozyplane-kpr

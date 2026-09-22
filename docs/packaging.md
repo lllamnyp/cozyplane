@@ -80,23 +80,31 @@ and config timestamps, digest-pinned base images, `-trimpath -buildvcs=false` on
 every `go build`, and apt byproducts removed in the same layer. The same source
 tree therefore always produces the same index digest.
 
-### `ghcr.io/lllamnyp/cozyplane-kpr` — hand-built, amd64 only
+### `ghcr.io/lllamnyp/cozyplane-kpr` — CI-built, multi-arch, reproducible
 
-Built from `kpr/` with `kpr/Dockerfile`, which expects a **pre-built binary**
-rather than compiling from source:
+Built and pushed by the `kpr-image` job in the same workflow, on the same
+triggers, for the same two platforms, from `kpr/Dockerfile` with `kpr/` as the
+build context — so nothing outside that module reaches the image. Same tags,
+same digest in the job summary, and the same reproducibility measures as above.
+
+It is a separate image because it is a separate module: it imports Cilium's
+load-balancer control plane, which the main cozyplane module never does
+(`kpr/go.mod`). Both images are built for every commit to `main`, so a commit
+always has both and the digest-pin loop below converges for each.
+
+The arm64 leg costs almost nothing despite Cilium's ~394-module tree, because
+nothing is emulated: the builder stage is pinned to `$BUILDPLATFORM` and
+cross-compiles via `GOARCH`, and the final stage only `COPY`s — there is no
+`RUN` under the target platform. The embedded `bpf_sock.o` is `--target=bpf`
+bytecode (`kpr/build-bpf.sh`), which is architecture-neutral, so one object
+serves both legs. CI cross-compiles for arm64 on every PR, where a break is one
+line rather than a failed release build.
+
+Building it locally:
 
 ```sh
-CGO_ENABLED=0 go -C kpr build -o kpr/cozyplane-kpr .
-docker build -t ghcr.io/lllamnyp/cozyplane-kpr:<tag> -f kpr/Dockerfile kpr
-docker push ghcr.io/lllamnyp/cozyplane-kpr:<tag>
+docker build -t cozyplane-kpr:dev -f kpr/Dockerfile kpr
 ```
-
-**There is no CI job for this image.** It is pushed by hand, it is `linux/amd64`
-only, and it is not reproducible. Both known gaps: an arm64 cluster cannot run
-`cozyplane-kpr` today, and the digest can only be refreshed by someone with a
-push credential running the commands above. Fixing this means a multi-stage
-`kpr/Dockerfile` and a second job in `release.yml`; it has not been done because
-`kpr/` pulls Cilium's ~394-module tree and the from-source image build is slow.
 
 ## 4. The digest pin, and why it isn't circular
 
@@ -133,9 +141,10 @@ This is checkable after the fact, and it holds today: `main-e1f36dd` (a datapath
 fix) and `main-b10baf0` (a docs-only commit on top of it) both resolve to
 `sha256:79866d68…`.
 
-For `cozyplane-kpr` the same argument does not apply — the image is not
-reproducible — so the rule there is weaker and manual: rebuild and push whenever
-anything under `kpr/` changes, then pin the digest the push reported.
+`cozyplane-kpr` now follows the same two-step, for the same reason: `chart/` is
+not even in its build context, and its build carries the same reproducibility
+measures. Note that `kpr/` is a separate module, so a commit touching only the
+main module still rebuilds it to the identical digest.
 
 ### Refreshing a pin
 
