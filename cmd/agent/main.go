@@ -1136,12 +1136,25 @@ func watchServiceUplinks(ctx context.Context, client kubernetes.Interface, mgr *
 			return
 		}
 		for _, s := range list {
+			// Both kinds of external address kpr writes rows for need the same
+			// thing here: if the address lands on a secondary NIC rather than
+			// the default uplink, from_uplink must be attached there too, or
+			// nothing intercepts the traffic. EnsureFloatingUplink no-ops for an
+			// address on the default uplink or behind a gateway.
 			for _, ing := range s.Status.LoadBalancer.Ingress {
 				if ing.IP == "" {
 					continue
 				}
 				if err := mgr.EnsureFloatingUplink(ing.IP); err != nil {
 					log.Warn("ensure LB uplink", "service", s.Namespace+"/"+s.Name, "ip", ing.IP, "err", err)
+				}
+			}
+			for _, ext := range s.Spec.ExternalIPs {
+				if ext == "" {
+					continue
+				}
+				if err := mgr.EnsureFloatingUplink(ext); err != nil {
+					log.Warn("ensure externalIP uplink", "service", s.Namespace+"/"+s.Name, "ip", ext, "err", err)
 				}
 			}
 		}

@@ -448,9 +448,10 @@ type bucketKey struct {
 
 // computeRows derives the map rows from a Service and its EndpointSlices:
 // ClusterIP rows (cluster-wide ready backends — the per-packet fallback for
-// clients socket-LB can't rewrite) and, for a LoadBalancer Service, LB-ingress
-// rows keyed by the Service's status ingress IPs whose backend set is THIS
-// node's ready endpoints only (docs/lb-ingress.md).
+// clients socket-LB can't rewrite); for a LoadBalancer Service, LB-ingress rows
+// keyed by the Service's status ingress IPs whose backend set is THIS node's
+// ready endpoints only; and rows for any spec.externalIPs the Service carries
+// (docs/lb-ingress.md).
 //
 // Single pass over the EndpointSlices: ready endpoints are bucketed by
 // {address family, port name}, cluster-wide and node-local in parallel, then
@@ -627,6 +628,43 @@ func computeRows(svc *corev1.Service, slices []*discoveryv1.EndpointSlice, nodeN
 					desiredSrc[lbSrcKey{Prefixlen: 128 + sr.bits, Vip: lb128, Client: sr.a}] = 1
 				}
 			}
+		}
+	}
+
+	// externalIPs (docs/lb-ingress.md): addresses the cluster does not allocate
+	// but that route to a node. This is Cozystack's stock host-ingress
+	// publishing on clouds whose routable address is not a Kubernetes node
+	// address, and kube-proxy and Cilium both implement it — kpr replaces them,
+	// so it must too, or those addresses answer nothing.
+	//
+	// Three differences from the LB-ingress block above, all matching upstream:
+	// any Service type may carry externalIPs (Cozystack's ingress is a plain
+	// ClusterIP Service), the frontend port is the service port rather than a
+	// NodePort, and loadBalancerSourceRanges does not apply.
+	//
+	// The backend selection is the same pick(), and that is not merely for
+	// consistency: rows carrying a remote backend without DSR would have it
+	// reply straight to the client with the wrong source, which is exactly why
+	// Cluster is opt-in for LB rows.
+	for _, extStr := range svc.Spec.ExternalIPs {
+		extIP := net.ParseIP(extStr)
+		if extIP == nil {
+			continue
+		}
+		ext128, ok := addr128(extIP)
+		if !ok {
+			continue
+		}
+		for _, sp := range svc.Spec.Ports {
+			proto, ok := protoNum(sp.Protocol)
+			if !ok {
+				continue
+			}
+			be := pick(bucketKey{v4: extIP.To4() != nil, portName: sp.Name})
+			if len(be) == 0 {
+				continue // Local: no local ready backend -> no row (the contract)
+			}
+			desired[svcKey{Net: 0, Vip: ext128, Proto: proto, Port: htons(uint16(sp.Port))}] = mkVal(be)
 		}
 	}
 
