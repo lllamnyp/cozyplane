@@ -4,7 +4,7 @@
 # procedure and how the pin is refreshed.
 # It imports Cilium's LB control plane, so it is a large image and a SEPARATE
 # component from the cozyplane agent — never co-mingled.
-image: ghcr.io/lllamnyp/cozyplane-kpr@sha256:8f5323f639ee82dbfcd3e36fbf8a59e2e03303af59501fdf7d992973fa8105d2
+image: ghcr.io/lllamnyp/cozyplane-kpr@sha256:93353087eb57f1cb0488e5fe503a376173703a5c626a9c074f0b527a57e4b4b6
 imagePullPolicy: IfNotPresent
 imagePullSecrets: []
 
