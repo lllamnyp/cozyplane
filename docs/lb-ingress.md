@@ -297,6 +297,52 @@ already does.
   documented answer for CCM users: target backend-hosting nodes, or accept
   that mis-attracted traffic is dropped by `Local` semantics (as upstream).
 
+## `spec.externalIPs`
+
+A Service may carry `spec.externalIPs`: addresses the cluster does not allocate
+but that route to a node. kube-proxy and Cilium both program them, so kpr — which
+replaces them — must too, or those addresses answer nothing. This is not an edge
+case: it is Cozystack's stock host-ingress publishing (`publishing.externalIPs`,
+a plain **ClusterIP** Service carrying the addresses) on clouds where the node's
+routable address is not a Kubernetes node address.
+
+They are handled exactly like LB-ingress IPs, with three differences, all
+matching upstream:
+
+- **any Service type** may carry them — the ClusterIP case above is the common one;
+- the frontend port is the **service port**, not a NodePort;
+- `loadBalancerSourceRanges` does **not** apply.
+
+The backend selection is the same, and not merely for symmetry: a row carrying a
+remote backend without DSR would have that backend reply straight to the client
+with the wrong source — the same reason `externalTrafficPolicy: Cluster` is an
+opt-in for LB rows.
+
+### Open gap: node-owned external addresses
+
+An external address that is **one of the node's own addresses** is accepted by
+kpr but not yet delivered by the agent. The agent resolves the interface a VIP
+routes through in order to build the `bpf_redirect_neigh` reply path; a
+node-owned address routes via `lo`, which has no MAC, so
+`EnsureFloatingUplink` refuses it:
+
+```
+"ensure externalIP uplink" ip=10.20.0.16 err="floating uplink lo has no MAC"
+```
+
+External packets to that address then fall through to the host stack and get an
+RST. This is the normal shape on clouds that NAT a public address onto the
+instance's primary private address — OCI, GCP, AWS — so it is not exotic.
+
+Closing it needs a **local-VIP mode** in the datapath rather than a patch here:
+intercept in `from_uplink` on the interface the packet arrived on and reply
+through normal routing (or the arrival interface's gateway) instead of requiring
+a floating uplink MAC. That is new hook behaviour and wants its own design pass;
+it is tracked in [roadmap.md](roadmap.md) §6.
+
+Until then, on such clouds the host ingress must be published through a floating
+**secondary** address (one that routes via a real NIC) or a host-network proxy.
+
 ## Non-goals
 
 - **Address allocation / IPAM, LB provisioning, and traffic attraction**
