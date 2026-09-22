@@ -66,9 +66,8 @@ agent:
       # to ~100MB+ before the Go heap. Request enough that the scheduler knows.
       memory: 192Mi
     limits:
-      # 256Mi was marginal and finally bit: the agent was OOM-killed at startup on
-      # every node (28MB anon RSS — the cgroup was full of *map* memory, not heap).
-      # A few MB of new maps was the difference. Size for the map footprint.
+      # Sized for the same preallocated map footprint as the request above, with
+      # headroom for new maps — not for the Go heap.
       memory: 512Mi
 
 controller:
