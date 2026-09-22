@@ -282,7 +282,10 @@ func (o CozyplaneServerOptions) RunCozyplaneServer(ctx context.Context) error {
 		clientConfig := config.GenericConfig.ClientConfig
 		removeCRDs := o.RemoveBootstrapCRDs
 		server.GenericAPIServer.AddPostStartHookOrDie("ensure-apiservice", func(hookCtx genericapiserver.PostStartHookContext) error {
-			if err := EnsureAPIService(hookCtx, clientConfig, svcNS, svcName, o.EnsureAPIServiceCAInjection, o.EnsureAPIServiceInsecureSkipTLS); err != nil {
+			// hookCtx is cancelled when the server stops, so the reconcile
+			// loop this starts lives exactly as long as the server serving the
+			// group does.
+			if err := ReconcileAPIService(hookCtx, clientConfig, svcNS, svcName, o.EnsureAPIServiceCAInjection, o.EnsureAPIServiceInsecureSkipTLS); err != nil {
 				return err
 			}
 			if !removeCRDs {
