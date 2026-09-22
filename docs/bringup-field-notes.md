@@ -375,3 +375,49 @@ Its nodes share the laptop's kernel (6.8), where pin removal *does* detach. Any
 assumption about BPF object lifetime needs checking on the target kernel — and
 "one link per hook" is now asserted by construction rather than inferred from
 refcount behaviour.
+
+## 10. kpr's init container stacks an empty bpffs on Talos (FIXED)
+
+Switching an existing Cozystack cluster to the cozyplane networking variant
+installed `cozyplane-kpr`, and every pod sandbox on every node immediately began
+failing — 739 `FailedCreatePodSandBox` across 3 Talos nodes in minutes:
+
+```
+plugin type="cozyplane" failed (add): open pinned from_pod program:
+no such file or directory
+```
+
+Nothing was wrong with the agent or its pins. kpr's init container guarded its
+bpffs mount by grepping busybox `mount` output for the mount's **source** name:
+
+```sh
+mount | grep -q 'bpf on /sys/fs/bpf ' || mount -t bpf bpf /sys/fs/bpf
+```
+
+A mount's source name is arbitrary, and Talos names its host bpffs `none`. The
+guard therefore read a node that *had* a bpffs as having none and mounted a
+second, empty one on top. The volume is `mountPropagation: Bidirectional`, so
+that empty mount propagated to the host and shadowed everything the agent had
+pinned under `/sys/fs/bpf/cozyplane` — programs, maps, tcx links. The CNI plugin
+opens those pins on every ADD (`datapath/attach.go`, `OpenPinnedProgram`), so
+every ADD failed, cluster-wide, and the aggregated apiserver never started
+because its pods could not get a sandbox. Each kpr restart stacked another layer.
+
+The comment above the init container claimed Cilium's DaemonSet did the
+equivalent. It does not, and the difference is exactly the bug: Cilium matches
+the **target and filesystem type** (`mount | grep "/sys/fs/bpf type bpf"`), which
+no source name can fool.
+
+The fix drops the init container from both the chart and `deploy/`, and kpr now
+ensures bpffs in-process at startup (`kpr/bpffs.go`) the way the agent already
+does (`datapath.EnsureBPFFS`): `statfs` the mount point and mount only if its
+type is not `BPF_FS_MAGIC`. `statfs` cannot observe a source name at all, so the
+check is immune by construction rather than by matching a better string. The
+helper is duplicated rather than imported because `kpr/` is a separate module
+pinning Cilium's dependency tree; requiring the main module there would pull its
+`cilium/ebpf` version in through MVS.
+
+**If you take one thing from this note:** never identify a mount by its source
+name. Ask the kernel what is mounted at the target. kind cannot see this class of
+bug either — its nodes' bpffs is conventionally named — so anything that decides
+whether to mount needs checking on Talos.

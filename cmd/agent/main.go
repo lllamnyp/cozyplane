@@ -406,6 +406,11 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		return err
 	}
 
+	// LoadBalancer-ingress uplinks are driven by core Services, not by
+	// sdn.cozystack.io. They live outside the gate below so they keep being
+	// programmed while the aggregated group is absent.
+	watchServiceUplinks(ctx, client, mgr, log)
+
 	// VPC watching is best-effort: the default network must work even before the
 	// sdn.cozystack.io API exists, so we don't block readiness on it. One shared
 	// factory backs all sdn informers; it is started only after every handler is
@@ -414,22 +419,35 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		log.Warn("sdn client init failed; VPC networks won't be programmed", "err", err)
 	} else {
 		factory := sdninformers.NewSharedInformerFactory(sdnClient, 0)
-		watchVPCs(factory, mgr, log)
-		watchVPCGateways(ctx, factory, mgr, nodePools, nodeIPs, nodeName, state.NodeIP, log)
-		watchPorts(ctx, factory, localFactory, sdnClient, client, mgr, nodeName, state.NodeIP, log)
-		watchPeerings(ctx, factory, mgr, log)
-		watchGateways(ctx, factory, mgr, nodeName, log)
-		watchFloatingIPs(ctx, factory, mgr, log)
-		watchServiceUplinks(ctx, client, mgr, log)
-		watchServiceVIPs(ctx, factory, mgr, log)
-		watchSecurityGroups(ctx, factory, mgr, log)
-		if err := watchHostFirewalls(ctx, factory, client, mgr, nodeName, log); err != nil {
-			log.Error("watch hostfirewalls", "err", err)
-		}
 		// Per-VPC traffic metrics (#2): serve the datapath counters, labeled by
-		// VPC via the same VPC lister the networks map is built from.
+		// VPC via the same VPC lister the networks map is built from. Outside the
+		// gate so the endpoint is up from the start; until the factory runs the
+		// lister is simply empty and the counters carry no VPC names.
 		serveMetrics(ctx, mgr, factory.Sdn().V1alpha1().VPCs(), nodeName, log)
-		factory.Start(ctx.Done())
+
+		register := func(context.Context) error {
+			watchVPCs(factory, mgr, log)
+			watchVPCGateways(ctx, factory, mgr, nodePools, nodeIPs, nodeName, state.NodeIP, log)
+			watchPorts(ctx, factory, localFactory, sdnClient, client, mgr, nodeName, state.NodeIP, log)
+			watchPeerings(ctx, factory, mgr, log)
+			watchGateways(ctx, factory, mgr, nodeName, log)
+			watchFloatingIPs(ctx, factory, mgr, log)
+			watchServiceVIPs(ctx, factory, mgr, log)
+			watchSecurityGroups(ctx, factory, mgr, log)
+			if err := watchHostFirewalls(ctx, factory, client, mgr, nodeName, log); err != nil {
+				log.Error("watch hostfirewalls", "err", err)
+			}
+			factory.Start(ctx.Done())
+			return nil
+		}
+
+		if err := gateSDNInformers(ctx, cfg, register, log); err != nil {
+			// Discovery is unavailable, which says nothing about the group. Start
+			// the informers rather than leave VPC networking unprogrammed: the
+			// pre-gate behaviour, log spam included, beats silence.
+			log.Warn("sdn discovery client init failed; starting sdn informers ungated", "err", err)
+			_ = register(ctx)
+		}
 	}
 
 	// Datapath is up and remotes are syncing; expose the CNI to kubelet.
