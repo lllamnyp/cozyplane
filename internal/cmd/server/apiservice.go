@@ -55,23 +55,17 @@ var apiServiceGVR = schema.GroupVersionResource{
 	Group: "apiregistration.k8s.io", Version: "v1", Resource: "apiservices",
 }
 
-// EnsureAPIService registers (or takes over) the APIService for the group this
-// server serves, pointing it at the given Service. This cannot be a chart
-// manifest: when the group bootstraps as CRDs, the kube-apiserver has already
-// auto-registered a local APIService for it, and Helm refuses to adopt an
-// object it does not own. Create-or-patch from the server itself is ownerless
-// and idempotent; dropping the autoregistration label stops the CRD controller
-// from reconciling the object back to local serving. caInjection, when set
-// ("namespace/certificate"), lets cert-manager's cainjector maintain the
-// caBundle, exactly as the manifest flow did.
-func EnsureAPIService(ctx context.Context, cfg *rest.Config, svcNamespace, svcName, caInjection string, insecureSkipTLS bool) error {
-	dyn, err := dynamic.NewForConfig(cfg)
-	if err != nil {
-		return fmt.Errorf("dynamic client: %w", err)
-	}
-	c := dyn.Resource(apiServiceGVR)
+// apiServiceResyncInterval is how often the registration is re-checked once the
+// server is running. Cheap (one GET of one cluster-scoped object) and the
+// recovery window it bounds is what matters: while the APIService is missing,
+// the whole aggregated group is, so every agent informer and the sdn
+// controllers lose their kinds.
+const apiServiceResyncInterval = 30 * time.Second
 
-	spec := map[string]any{
+// apiServiceDesired builds the spec and annotations this server wants on its
+// APIService.
+func apiServiceDesired(svcNamespace, svcName, caInjection string, insecureSkipTLS bool) (spec, annotations map[string]any) {
+	spec = map[string]any{
 		"group":                sdnGroup,
 		"version":              sdnVersion,
 		"groupPriorityMinimum": int64(1000),
@@ -87,57 +81,139 @@ func EnsureAPIService(ctx context.Context, cfg *rest.Config, svcNamespace, svcNa
 		// the aggregator has no CA to pin. Production installs inject one.
 		spec["insecureSkipTLSVerify"] = true
 	}
-	annotations := map[string]any{}
+	annotations = map[string]any{}
 	if caInjection != "" {
 		annotations["cert-manager.io/inject-ca-from"] = caInjection
 	}
+	return spec, annotations
+}
 
-	// Retry across startup races (RBAC propagation, transient apiserver blips).
-	return wait.PollUntilContextTimeout(ctx, 2*time.Second, 60*time.Second, true, func(ctx context.Context) (bool, error) {
-		_, err := c.Get(ctx, apiServiceName, metav1.GetOptions{})
-		switch {
-		case apierrors.IsNotFound(err):
-			obj := &unstructured.Unstructured{Object: map[string]any{
-				"apiVersion": "apiregistration.k8s.io/v1",
-				"kind":       "APIService",
-				"metadata": map[string]any{
-					"name":        apiServiceName,
-					"annotations": annotations,
-				},
-				"spec": spec,
-			}}
-			if _, err := c.Create(ctx, obj, metav1.CreateOptions{FieldManager: "cozyplane-apiserver"}); err != nil {
-				klog.Warningf("create APIService %s: %v (retrying)", apiServiceName, err)
-				return false, nil
-			}
-			klog.Infof("registered APIService %s -> %s/%s", apiServiceName, svcNamespace, svcName)
-			return true, nil
-		case err != nil:
-			klog.Warningf("get APIService %s: %v (retrying)", apiServiceName, err)
-			return false, nil
-		}
-
-		// Exists from a previous run of ours: merge-patch the desired spec in.
-		// (Nothing else creates this object anymore. The group has no CRDs, so
-		// the kube-apiserver's CRD autoregistration never sees it — the whole
-		// takeover dance, and the label fight it needed, is gone.)
-		patch := map[string]any{
+// ensureAPIServiceOnce is a single create-or-patch pass. It reports whether it
+// had to create the object, which is the interesting case after startup: it
+// means something deleted it.
+func ensureAPIServiceOnce(ctx context.Context, c dynamic.ResourceInterface, spec, annotations map[string]any) (created bool, err error) {
+	_, err = c.Get(ctx, apiServiceName, metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "apiregistration.k8s.io/v1",
+			"kind":       "APIService",
 			"metadata": map[string]any{
+				"name":        apiServiceName,
 				"annotations": annotations,
 			},
 			"spec": spec,
+		}}
+		if _, err := c.Create(ctx, obj, metav1.CreateOptions{FieldManager: "cozyplane-apiserver"}); err != nil {
+			return false, fmt.Errorf("create APIService %s: %w", apiServiceName, err)
 		}
-		body, err := json.Marshal(patch)
+		return true, nil
+	case err != nil:
+		return false, fmt.Errorf("get APIService %s: %w", apiServiceName, err)
+	}
+
+	// Exists from a previous run of ours: merge-patch the desired spec in.
+	// (Nothing else creates this object anymore. The group has no CRDs, so
+	// the kube-apiserver's CRD autoregistration never sees it — the whole
+	// takeover dance, and the label fight it needed, is gone.)
+	patch := map[string]any{
+		"metadata": map[string]any{
+			"annotations": annotations,
+		},
+		"spec": spec,
+	}
+	body, err := json.Marshal(patch)
+	if err != nil {
+		return false, err
+	}
+	if _, err := c.Patch(ctx, apiServiceName, types.MergePatchType, body, metav1.PatchOptions{FieldManager: "cozyplane-apiserver"}); err != nil {
+		return false, fmt.Errorf("patch APIService %s: %w", apiServiceName, err)
+	}
+	return false, nil
+}
+
+func apiServiceClient(cfg *rest.Config, svcNamespace, svcName, caInjection string, insecureSkipTLS bool) (dynamic.ResourceInterface, map[string]any, map[string]any, error) {
+	dyn, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("dynamic client: %w", err)
+	}
+	spec, annotations := apiServiceDesired(svcNamespace, svcName, caInjection, insecureSkipTLS)
+	return dyn.Resource(apiServiceGVR), spec, annotations, nil
+}
+
+// ensureAPIServiceWithRetry retries across startup races (RBAC propagation,
+// transient apiserver blips).
+func ensureAPIServiceWithRetry(ctx context.Context, c dynamic.ResourceInterface, spec, annotations map[string]any, svcNamespace, svcName string) error {
+	return wait.PollUntilContextTimeout(ctx, 2*time.Second, 60*time.Second, true, func(ctx context.Context) (bool, error) {
+		created, err := ensureAPIServiceOnce(ctx, c, spec, annotations)
 		if err != nil {
-			return false, err
-		}
-		if _, err := c.Patch(ctx, apiServiceName, types.MergePatchType, body, metav1.PatchOptions{FieldManager: "cozyplane-apiserver"}); err != nil {
-			klog.Warningf("patch APIService %s: %v (retrying)", apiServiceName, err)
+			klog.Warningf("%v (retrying)", err)
 			return false, nil
 		}
-		klog.V(2).Infof("APIService %s ensured -> %s/%s", apiServiceName, svcNamespace, svcName)
+		if created {
+			klog.Infof("registered APIService %s -> %s/%s", apiServiceName, svcNamespace, svcName)
+		} else {
+			klog.V(2).Infof("APIService %s ensured -> %s/%s", apiServiceName, svcNamespace, svcName)
+		}
 		return true, nil
 	})
+}
+
+// ReconcileAPIService registers (or takes over) the APIService for the group
+// this server serves, pointing it at the given Service, and then keeps it
+// registered until ctx is done.
+//
+// Registration cannot be a chart manifest: when the group bootstraps as CRDs,
+// the kube-apiserver has already auto-registered a local APIService for it, and
+// Helm refuses to adopt an object it does not own. Create-or-patch from the
+// server itself is ownerless and idempotent; dropping the autoregistration
+// label stops the CRD controller from reconciling the object back to local
+// serving. caInjection, when set ("namespace/certificate"), lets cert-manager's
+// cainjector maintain the caBundle, exactly as the manifest flow did.
+//
+// Ensuring it once at startup is not enough, and a cluster proved it: on an
+// in-place switch to the cozyplane networking variant, this server started
+// first and took the object over, and the *previous* owner's Helm release was
+// upgraded minutes later with the APIService no longer in its manifest — so
+// Helm deleted it. The aggregated group vanished, every agent's informers and
+// the sdn controllers lost their kinds, and nothing brought it back because
+// registration only ever happened at boot. Recovery was a manual restart of
+// this pod.
+//
+// Anything that reconciles the cluster — Helm, a GitOps agent, an operator —
+// can delete or rewrite an object it believes it owns. The registration is this
+// server's to maintain for as long as it is serving, not to assert once.
+//
+// The first pass is blocking, so a server that cannot register still fails
+// loudly at startup. Afterwards, failures are logged and retried rather than
+// fatal: a transient API error must not take down a server that is otherwise
+// serving its group perfectly well.
+func ReconcileAPIService(ctx context.Context, cfg *rest.Config, svcNamespace, svcName, caInjection string, insecureSkipTLS bool) error {
+	c, spec, annotations, err := apiServiceClient(cfg, svcNamespace, svcName, caInjection, insecureSkipTLS)
+	if err != nil {
+		return err
+	}
+	if err := ensureAPIServiceWithRetry(ctx, c, spec, annotations, svcNamespace, svcName); err != nil {
+		return err
+	}
+
+	go func() {
+		// UntilWithContext runs f immediately and then every interval; the
+		// immediate pass is a harmless no-op patch right after the one above.
+		wait.UntilWithContext(ctx, func(ctx context.Context) {
+			created, err := ensureAPIServiceOnce(ctx, c, spec, annotations)
+			switch {
+			case err != nil:
+				klog.Warningf("reconcile APIService: %v", err)
+			case created:
+				// The incident above. Loud on purpose: something outside this
+				// server deleted the registration for its own group.
+				klog.Warningf("APIService %s had been deleted; recreated it -> %s/%s",
+					apiServiceName, svcNamespace, svcName)
+			}
+		}, apiServiceResyncInterval)
+	}()
+	return nil
 }
 
 // splitServiceRef parses "namespace/name".

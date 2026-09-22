@@ -30,6 +30,29 @@ autoregistration controller, the CRD-delete grant, and the ordering constraint
 between the two charts. The server still registers its own APIService at
 startup — but that is now a plain create, because nothing else creates one.
 
+**It keeps registering it.** A one-shot at boot is not enough: the object is
+ownerless by design, and anything that reconciles the cluster — Helm, a GitOps
+agent, an operator — can delete or rewrite an object it believes it owns. That
+is not hypothetical. On an in-place switch to the cozyplane networking variant
+this server started first and took the APIService over, and the previous owner's
+Helm release was upgraded minutes later with the APIService no longer in its
+manifest, so Helm deleted it. The aggregated group vanished, every agent's
+informers and the sdn controllers lost their kinds, and nothing recreated it —
+recovery was a manual restart of this pod.
+
+So registration is reconciled (`ReconcileAPIService`, 30s resync) for as long as
+the server is serving the group, and a *recreation* is logged loudly rather than
+at debug level: it means something outside this server deleted its own group's
+registration, which is worth an operator's attention even though it self-heals.
+The first pass stays blocking, so a server that genuinely cannot register still
+fails at startup instead of serving a group nothing routes to.
+
+The other half of that incident belongs to whoever owns the departing release:
+on a variant switch the APIService should be handed over (keep rendering it, or
+mark it `helm.sh/resource-policy: keep`) rather than deleted. This server's
+reconcile bounds the damage to one resync interval; it does not make the delete
+correct.
+
 ## 0a. Bootstrap ordering — the controller runs degraded, never crashlooping
 
 Deleting the takeover deleted the ordering constraint *between the two charts*,
