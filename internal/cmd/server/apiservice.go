@@ -132,26 +132,6 @@ func ensureAPIServiceOnce(ctx context.Context, c dynamic.ResourceInterface, spec
 	return false, nil
 }
 
-// EnsureAPIService registers (or takes over) the APIService for the group this
-// server serves, pointing it at the given Service. This cannot be a chart
-// manifest: when the group bootstraps as CRDs, the kube-apiserver has already
-// auto-registered a local APIService for it, and Helm refuses to adopt an
-// object it does not own. Create-or-patch from the server itself is ownerless
-// and idempotent; dropping the autoregistration label stops the CRD controller
-// from reconciling the object back to local serving. caInjection, when set
-// ("namespace/certificate"), lets cert-manager's cainjector maintain the
-// caBundle, exactly as the manifest flow did.
-//
-// This is the blocking first pass. Registration must keep being maintained
-// afterwards — see ReconcileAPIService.
-func EnsureAPIService(ctx context.Context, cfg *rest.Config, svcNamespace, svcName, caInjection string, insecureSkipTLS bool) error {
-	c, spec, annotations, err := apiServiceClient(cfg, svcNamespace, svcName, caInjection, insecureSkipTLS)
-	if err != nil {
-		return err
-	}
-	return ensureAPIServiceWithRetry(ctx, c, spec, annotations, svcNamespace, svcName)
-}
-
 func apiServiceClient(cfg *rest.Config, svcNamespace, svcName, caInjection string, insecureSkipTLS bool) (dynamic.ResourceInterface, map[string]any, map[string]any, error) {
 	dyn, err := dynamic.NewForConfig(cfg)
 	if err != nil {
@@ -179,8 +159,17 @@ func ensureAPIServiceWithRetry(ctx context.Context, c dynamic.ResourceInterface,
 	})
 }
 
-// ReconcileAPIService ensures the APIService and then keeps ensuring it, until
-// ctx is done.
+// ReconcileAPIService registers (or takes over) the APIService for the group
+// this server serves, pointing it at the given Service, and then keeps it
+// registered until ctx is done.
+//
+// Registration cannot be a chart manifest: when the group bootstraps as CRDs,
+// the kube-apiserver has already auto-registered a local APIService for it, and
+// Helm refuses to adopt an object it does not own. Create-or-patch from the
+// server itself is ownerless and idempotent; dropping the autoregistration
+// label stops the CRD controller from reconciling the object back to local
+// serving. caInjection, when set ("namespace/certificate"), lets cert-manager's
+// cainjector maintain the caBundle, exactly as the manifest flow did.
 //
 // Ensuring it once at startup is not enough, and a cluster proved it: on an
 // in-place switch to the cozyplane networking variant, this server started
