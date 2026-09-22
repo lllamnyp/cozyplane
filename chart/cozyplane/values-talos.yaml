@@ -11,9 +11,8 @@
 # the primary CNI over any co-installed one.
 cniConfName: "00-cozyplane.conflist"
 
-# Talos runs KubePrism (a node-local apiserver load balancer) on localhost:7445.
-# The hostNetwork agent/responder dial it, so they reach the apiserver during
-# bootstrap without kube-proxy and before cozyplane-kpr serves the ClusterIP.
+# Talos runs KubePrism (a node-local apiserver load balancer) on localhost:7445 —
+# the real endpoint `kubeApiServer` asks for; see values.yaml.
 kubeApiServer:
   host: "localhost"
   port: "7445"
