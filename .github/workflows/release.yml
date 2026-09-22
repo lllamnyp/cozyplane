@@ -11,6 +11,7 @@ permissions:
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
+  IMAGE_KPR: ghcr.io/${{ github.repository }}-kpr
 
 jobs:
   image:
@@ -54,8 +55,8 @@ jobs:
           outputs: type=image,rewrite-timestamp=true,push=true
           provenance: false
           sbom: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=cozyplane
+          cache-to: type=gha,mode=max,scope=cozyplane
 
       # The chart pins the image by digest; surface it so it's a copy-paste away.
       - name: report digest
@@ -68,4 +69,67 @@ jobs:
             echo "\`\`\`"
             echo ""
             echo "Pin it in \`chart/cozyplane/values.yaml\` (\`image:\`)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # cozyplane-kpr is a SEPARATE image from a separate module: it imports Cilium's
+  # load-balancer control plane, which the main cozyplane module never does
+  # (kpr/go.mod). Same triggers as the job above, so both images always exist for
+  # the same commit and the digest-pin loop converges for each.
+  kpr-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No setup-qemu here, unlike the job above: kpr's builder stage is pinned
+      # to $BUILDPLATFORM and cross-compiles via GOARCH, and its final stage only
+      # COPYs — nothing ever executes under the target platform, so there is
+      # nothing to emulate. (Emulating Cilium's ~394-module build would be
+      # glacial, which is why the image had no CI job for so long.)
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_KPR }}
+          tags: |
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=main-,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      # Digest-reproducible on the same terms as the cozyplane image (#4); see
+      # the comment on that job. The build context is kpr/, so nothing outside
+      # that module reaches the image. A distinct cache scope keeps the two
+      # images from evicting each other's layers.
+      - id: build
+        uses: docker/build-push-action@v6
+        env:
+          SOURCE_DATE_EPOCH: 0
+        with:
+          context: kpr
+          file: kpr/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          outputs: type=image,rewrite-timestamp=true,push=true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=kpr
+          cache-to: type=gha,mode=max,scope=kpr
+
+      - name: report digest
+        run: |
+          {
+            echo "## cozyplane-kpr image"
+            echo ""
+            echo "\`\`\`"
+            echo "${{ env.IMAGE_KPR }}@${{ steps.build.outputs.digest }}"
+            echo "\`\`\`"
+            echo ""
+            echo "Pin it in \`chart/cozyplane-kpr/values.yaml\` (\`image:\`)."
           } >> "$GITHUB_STEP_SUMMARY"
