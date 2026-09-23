@@ -355,11 +355,27 @@ Which gives the whole taxonomy:
 
 | FIB answer | Arrives on | Action |
 |---|---|---|
-| via a gateway | default uplink | nothing — already hooked |
+| via a gateway on the default uplink | default uplink | nothing — already hooked |
+| via a gateway on another NIC | that NIC | bind; the gateway is the next-hop |
 | on-link, default uplink | default uplink | nothing — already hooked |
-| on-link, other NIC | that NIC | bind: attach + MAC + subnet + next-hop |
-| `local … dev lo`, owner is the default uplink | default uplink | **nothing** — already hooked, default route resolves the reply |
-| `local … dev lo`, owner is another NIC | that NIC | bind, as above |
+| on-link, other NIC | that NIC | bind: attach + subnet + next-hop |
+| `RTN_LOCAL`, owner is the default uplink | default uplink | **nothing** — already hooked, default route resolves the reply |
+| `RTN_LOCAL`, owner is another NIC | that NIC | bind, as above |
+| `RTN_LOCAL`, owner is lo / a dummy / a down link | nowhere | refuse — nothing arrives there |
+
+The egress link is what the FIB names in both attracted cases, on-link or behind
+a gateway: a router forwards the address to the node over the segment it reaches
+it on, so that is where the packet arrives. Leaving a gateway'd address unbound
+is not harmless — with `CFG_FLOAT_IFINDEX` unset the reply falls back to the
+default uplink and leaves a spoof-guarded NIC with a foreign source.
+
+A bind needs a covering subnet on the link: `float_net` separates on-subnet
+destinations (their own neighbour) from off-subnet ones (via `CFG_FLOAT_NH`).
+For an on-link address that subnet is the one the address sits in; for a
+gateway'd one the address is off-link, so the **gateway** anchors the lookup and
+is itself the next-hop. A host prefix (`/32`) is not a subnet — its "first host"
+is the neighbouring address, not a router — so a link carrying only a `/32` is
+refused rather than bound with a next-hop that goes nowhere.
 
 The common cloud case is the fourth row, and it needs nothing programmed: the
 address arrives where `from_uplink` already is, and the default route resolves
@@ -369,12 +385,22 @@ split is a non-issue for it. ARP is likewise not cozyplane's problem here — th
 kernel already answers for an address the node owns, and the datapath does not
 craft ARP at all.
 
-**Remaining limitation.** `float_uplink_mac`, `float_net`, `CFG_FLOAT_IFINDEX` and
-`CFG_FLOAT_NH` are single-cell: one non-default uplink per node. A node that has
-both a genuine floating VLAN *and* node-owned external addresses on some third NIC
-would have the two contend for that one slot. Pre-existing (two floating VLANs
-contend the same way) and not hit in practice; closing it means giving those maps
-a per-ifindex shape.
+**Remaining limitation.** `float_net`, `CFG_FLOAT_IFINDEX` and `CFG_FLOAT_NH` are
+single-cell: one non-default uplink per node. A node with two claimants — a
+floating VLAN and node-owned addresses on a third NIC, say — does not settle on
+one of them. `watchServiceUplinks` resyncs over every Service on every Service
+event, so each pass re-binds the slot to whichever address it sees, the values
+flip, and the reply path for **both** is nondeterministic; `from_uplink` is never
+detached from the loser. The agent logs a warning on each re-bind so the
+condition is identifiable rather than presenting as intermittent black-holing.
+Pre-existing (two floating VLANs contend identically); closing it means giving
+those maps a per-ifindex shape.
+
+`float_uplink_mac` and `uplink_mac` are **vestigial** — no program has read them
+since the in-datapath ARP/NDP responder was removed, and the kernel answers v4
+ARP for addresses the node owns. They are still written so the pinned maps keep
+their shape; deleting a `PIN_BY_NAME` map strands a pin on every upgraded node,
+so that removal is its own change.
 
 ## Non-goals
 

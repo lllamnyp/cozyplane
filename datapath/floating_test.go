@@ -17,74 +17,92 @@ limitations under the License.
 package datapath
 
 import (
+	"errors"
 	"net"
+	"strings"
 	"testing"
+
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
-// The taxonomy of external addresses, and where the floating machinery binds
-// for each. The node-owned rows are the regression: lo must never be the
-// selected link.
-func TestFloatFactsBindLink(t *testing.T) {
-	const (
-		lo       = 1
-		uplink   = 2 // eth0, the default route link; from_uplink already here
-		vlan     = 3 // a secondary NIC
-		otherNIC = 4
-	)
+const (
+	loIdx     = 1
+	uplinkIdx = 2 // eth0, the default route link; from_uplink already here
+	vlanIdx   = 3 // a secondary NIC
+	otherIdx  = 4
+)
 
+func ipNetOf(t *testing.T, s string) *net.IPNet {
+	t.Helper()
+	ip, n, err := net.ParseCIDR(s)
+	if err != nil {
+		t.Fatalf("ParseCIDR(%q): %v", s, err)
+	}
+	n.IP = ip // as the kernel reports it: the address, with the prefix's mask
+	return n
+}
+
+// The taxonomy of external addresses, and where the floating machinery binds
+// for each.
+func TestFloatFactsBindLink(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		facts   floatFacts
 		want    int
 		wantErr bool
 	}{{
-		// A routed pool: something upstream forwards it to us, so it arrives on
-		// the default uplink.
-		name:  "routed to us via a gateway",
-		facts: floatFacts{RouteLink: uplink, RouteGw: net.ParseIP("10.0.0.1"), DefaultUplink: uplink},
+		name:  "routed via a gateway on the default uplink",
+		facts: floatFacts{RouteLink: uplinkIdx, RouteGw: net.ParseIP("10.0.0.1"), DefaultUplink: uplinkIdx},
 		want:  0,
+	}, {
+		// The router forwards the address to us over the secondary NIC, so it
+		// arrives there and from_uplink must be attached there. Leaving it
+		// unbound egresses the default, spoof-guarded NIC with a foreign source.
+		name:  "routed via a gateway on a secondary NIC",
+		facts: floatFacts{RouteLink: vlanIdx, RouteGw: net.ParseIP("10.20.0.1"), DefaultUplink: uplinkIdx},
+		want:  vlanIdx,
 	}, {
 		name:  "on-link on the default uplink",
-		facts: floatFacts{RouteLink: uplink, DefaultUplink: uplink},
+		facts: floatFacts{RouteLink: uplinkIdx, DefaultUplink: uplinkIdx},
 		want:  0,
 	}, {
-		// The floating case: an OCI L2 VLAN carries the range while the
-		// default route rides the native NIC.
 		name:  "on-link on a secondary NIC",
-		facts: floatFacts{RouteLink: vlan, DefaultUplink: uplink},
-		want:  vlan,
+		facts: floatFacts{RouteLink: vlanIdx, DefaultUplink: uplinkIdx},
+		want:  vlanIdx,
 	}, {
 		name:  "FIB named no link",
-		facts: floatFacts{RouteLink: 0, DefaultUplink: uplink},
+		facts: floatFacts{RouteLink: 0, DefaultUplink: uplinkIdx},
 		want:  0,
 	}, {
-		// The FIB says lo; the address lives on eth0, which is already hooked
-		// and whose default route resolves an off-subnet reply. Nothing to
-		// program.
+		// A cloud NATs the public address onto the instance's own private one.
 		name: "node-owned, on the default uplink",
 		facts: floatFacts{
-			RouteLink: lo, RouteViaLo: true,
-			OwnerLink: uplink, DefaultUplink: uplink,
+			RouteLink: loIdx, RouteLocal: true,
+			OwnerLink: uplinkIdx, OwnerUsable: true, DefaultUplink: uplinkIdx,
 		},
 		want: 0,
 	}, {
-		// Node-owned but on a NIC that is not the default route link: the reply
-		// to an off-subnet client cannot be resolved by the FIB out of that
-		// link, so the floating machinery must bind there — to the OWNING link,
-		// never to lo.
 		name: "node-owned, on a secondary NIC",
 		facts: floatFacts{
-			RouteLink: lo, RouteViaLo: true,
-			OwnerLink: otherNIC, DefaultUplink: uplink,
+			RouteLink: loIdx, RouteLocal: true,
+			OwnerLink: otherIdx, OwnerUsable: true, DefaultUplink: uplinkIdx,
 		},
-		want: otherNIC,
+		want: otherIdx,
 	}, {
-		// The FIB calls it local but no interface admits to carrying it. Refuse
-		// loudly rather than bind something arbitrary.
 		name: "local but owned by no link",
 		facts: floatFacts{
-			RouteLink: lo, RouteViaLo: true,
-			OwnerLink: 0, DefaultUplink: uplink,
+			RouteLink: loIdx, RouteLocal: true,
+			OwnerLink: 0, DefaultUplink: uplinkIdx,
+		},
+		wantErr: true,
+	}, {
+		// A VIP on lo, a dummy, or a down link: nothing arrives there, and
+		// binding it would black-hole every reply on the node.
+		name: "local, owner cannot carry wire traffic",
+		facts: floatFacts{
+			RouteLink: loIdx, RouteLocal: true,
+			OwnerLink: loIdx, OwnerUsable: false, DefaultUplink: uplinkIdx,
 		},
 		wantErr: true,
 	}} {
@@ -106,21 +124,167 @@ func TestFloatFactsBindLink(t *testing.T) {
 	}
 }
 
-// lo must never be selected, whatever else is true: it has no MAC and no
-// covering subnet, so binding it can only produce a black hole.
+// lo must never be selected, whatever else is true: nothing arrives on it.
 func TestFloatFactsNeverBindsLoopback(t *testing.T) {
-	const lo = 1
 	for _, f := range []floatFacts{
-		{RouteLink: lo, RouteViaLo: true, OwnerLink: 2, DefaultUplink: 2},
-		{RouteLink: lo, RouteViaLo: true, OwnerLink: 3, DefaultUplink: 2},
-		{RouteLink: lo, RouteViaLo: true, OwnerLink: lo, DefaultUplink: 2},
+		{RouteLink: loIdx, RouteLocal: true, OwnerLink: uplinkIdx, OwnerUsable: true, DefaultUplink: uplinkIdx},
+		{RouteLink: loIdx, RouteLocal: true, OwnerLink: otherIdx, OwnerUsable: true, DefaultUplink: uplinkIdx},
+		{RouteLink: loIdx, RouteLocal: true, OwnerLink: loIdx, OwnerUsable: false, DefaultUplink: uplinkIdx},
 	} {
 		got, err := f.bindLink()
 		if err != nil {
 			continue // refusing is always acceptable
 		}
-		if got == lo {
+		if got == loIdx {
 			t.Fatalf("bindLink() selected the loopback for %+v", f)
 		}
+	}
+}
+
+// The owner lookup is the costly step, so it must be made only when the FIB
+// says the address is ours.
+func TestFactsForAndNeedsOwner(t *testing.T) {
+	local := factsFor(netlink.Route{LinkIndex: loIdx, Type: unix.RTN_LOCAL}, uplinkIdx)
+	if !local.RouteLocal || !local.needsOwner() {
+		t.Fatalf("RTN_LOCAL route: RouteLocal=%v needsOwner=%v, want both true", local.RouteLocal, local.needsOwner())
+	}
+	// The single-NIC LB-ingress case: on-link on the default uplink, by far the
+	// most common, and it must cost nothing beyond the route lookup.
+	onLink := factsFor(netlink.Route{LinkIndex: uplinkIdx, Type: unix.RTN_UNICAST}, uplinkIdx)
+	if onLink.RouteLocal || onLink.needsOwner() {
+		t.Fatal("on-link route asked for an owner lookup")
+	}
+	gw := factsFor(netlink.Route{LinkIndex: vlanIdx, Gw: net.ParseIP("10.20.0.1"), Type: unix.RTN_UNICAST}, uplinkIdx)
+	if gw.needsOwner() || gw.RouteGw == nil {
+		t.Fatal("gateway route mis-read")
+	}
+}
+
+func TestCarriesWire(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		l    linkInfo
+		want bool
+	}{
+		{"up ethernet", linkInfo{Flags: net.FlagUp, Type: "device"}, true},
+		{"loopback", linkInfo{Flags: net.FlagUp | net.FlagLoopback, Type: "device"}, false},
+		{"dummy", linkInfo{Flags: net.FlagUp, Type: "dummy"}, false},
+		{"down", linkInfo{Flags: 0, Type: "device"}, false},
+	} {
+		if got := carriesWire(tc.l); got != tc.want {
+			t.Errorf("%s: carriesWire = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestOwnerFromAddrs(t *testing.T) {
+	ip := net.ParseIP("10.20.0.16")
+	up := linkInfo{Flags: net.FlagUp, Type: "device"}
+	links := map[int]linkInfo{
+		loIdx:     {Flags: net.FlagUp | net.FlagLoopback, Type: "device"},
+		uplinkIdx: up,
+		vlanIdx:   up,
+		otherIdx:  {Flags: net.FlagUp, Type: "dummy"},
+	}
+	addr := func(idx int, s string) netlink.Addr {
+		return netlink.Addr{IPNet: ipNetOf(t, s), LinkIndex: idx}
+	}
+
+	if idx, usable := ownerFromAddrs([]netlink.Addr{addr(vlanIdx, "10.20.0.16/24")}, links, ip); idx != vlanIdx || !usable {
+		t.Errorf("usable owner = %d,%v; want %d,true", idx, usable, vlanIdx)
+	}
+	// Configured only on lo: reported, so the error can name it, but not usable.
+	if idx, usable := ownerFromAddrs([]netlink.Addr{addr(loIdx, "10.20.0.16/32")}, links, ip); idx != loIdx || usable {
+		t.Errorf("lo owner = %d,%v; want %d,false", idx, usable, loIdx)
+	}
+	// A dummy is reported the same way — never as usable.
+	if idx, usable := ownerFromAddrs([]netlink.Addr{addr(otherIdx, "10.20.0.16/32")}, links, ip); idx != otherIdx || usable {
+		t.Errorf("dummy owner = %d,%v; want %d,false", idx, usable, otherIdx)
+	}
+	// A usable owner wins over an unusable one whatever the dump order.
+	for _, order := range [][]netlink.Addr{
+		{addr(loIdx, "10.20.0.16/32"), addr(vlanIdx, "10.20.0.16/24")},
+		{addr(vlanIdx, "10.20.0.16/24"), addr(loIdx, "10.20.0.16/32")},
+	} {
+		if idx, usable := ownerFromAddrs(order, links, ip); idx != vlanIdx || !usable {
+			t.Errorf("mixed owners = %d,%v; want %d,true", idx, usable, vlanIdx)
+		}
+	}
+	if idx, _ := ownerFromAddrs([]netlink.Addr{addr(vlanIdx, "10.20.0.99/24")}, links, ip); idx != 0 {
+		t.Errorf("no owner = %d, want 0", idx)
+	}
+}
+
+// The next-hop derivation. A host prefix covers only the address itself, so
+// treating it as a subnet yields VIP+1 — not a router — and black-holes every
+// reply on the node, since the floating slot is global.
+func TestCoveringSubnet(t *testing.T) {
+	ip := net.ParseIP("10.20.0.16")
+	addrs := func(ss ...string) []netlink.Addr {
+		var out []netlink.Addr
+		for _, s := range ss {
+			out = append(out, netlink.Addr{IPNet: ipNetOf(t, s)})
+		}
+		return out
+	}
+
+	if n, nh := coveringSubnet(addrs("10.20.0.16/32"), ip); n != nil || nh != nil {
+		t.Errorf("host prefix alone = %v,%v; want nil,nil", n, nh)
+	}
+	// The address configured with a real prefix IS its own covering subnet.
+	if n, nh := coveringSubnet(addrs("10.20.0.16/24"), ip); n == nil || n.String() != "10.20.0.0/24" || !nh.Equal(net.ParseIP("10.20.0.1")) {
+		t.Errorf("own /24 = %v,%v; want 10.20.0.0/24,10.20.0.1", n, nh)
+	}
+	// A /32 secondary alongside a real prefix: the prefix wins, either order.
+	for _, a := range [][]netlink.Addr{
+		addrs("10.20.0.16/32", "10.20.0.5/24"),
+		addrs("10.20.0.5/24", "10.20.0.16/32"),
+	} {
+		n, nh := coveringSubnet(a, ip)
+		if n == nil || n.String() != "10.20.0.0/24" || !nh.Equal(net.ParseIP("10.20.0.1")) {
+			t.Errorf("mixed prefixes = %v,%v; want 10.20.0.0/24,10.20.0.1", n, nh)
+		}
+	}
+	// Longest covering prefix wins.
+	if n, _ := coveringSubnet(addrs("10.20.0.5/16", "10.20.0.5/24"), ip); n == nil || n.String() != "10.20.0.0/24" {
+		t.Errorf("longest prefix = %v, want 10.20.0.0/24", n)
+	}
+	if n, _ := coveringSubnet(addrs("10.30.0.5/24"), ip); n != nil {
+		t.Errorf("non-covering prefix = %v, want nil", n)
+	}
+	// A routed pool anchors on the gateway, which is on the link's subnet even
+	// though the address itself is not.
+	if n, _ := coveringSubnet(addrs("10.20.0.5/24"), net.ParseIP("10.20.0.1")); n == nil || n.String() != "10.20.0.0/24" {
+		t.Errorf("gateway anchor = %v, want 10.20.0.0/24", n)
+	}
+}
+
+func TestFloatRebind(t *testing.T) {
+	if !floatRebind(vlanIdx, otherIdx) {
+		t.Error("moving the slot between two links is a rebind")
+	}
+	if floatRebind(vlanIdx, vlanIdx) {
+		t.Error("same link is not a rebind")
+	}
+	if floatRebind(0, vlanIdx) {
+		t.Error("first bind is not a rebind")
+	}
+}
+
+func TestRouteLookupErr(t *testing.T) {
+	if err := routeLookupErr("10.20.0.16", 1, nil); err != nil {
+		t.Errorf("a resolved route is not an error: %v", err)
+	}
+	empty := routeLookupErr("10.20.0.16", 0, nil)
+	if empty == nil {
+		t.Fatal("an empty FIB answer must be an error")
+	}
+	if strings.Contains(empty.Error(), "%!w") {
+		t.Errorf("empty answer wraps a nil error: %q", empty.Error())
+	}
+	sentinel := errors.New("boom")
+	wrapped := routeLookupErr("10.20.0.16", 0, sentinel)
+	if !errors.Is(wrapped, sentinel) {
+		t.Errorf("a real failure must stay unwrappable: %v", wrapped)
 	}
 }

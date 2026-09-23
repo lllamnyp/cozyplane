@@ -112,6 +112,8 @@ func main() {
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	// datapath warns through the default logger; match this one's format.
+	slog.SetDefault(log)
 
 	if nodeName == "" {
 		log.Error("NODE_NAME must be set (downward API)")

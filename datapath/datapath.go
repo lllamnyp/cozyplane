@@ -39,7 +39,6 @@ type Manager struct {
 	objs          overlayObjects
 	geneveIfindex int
 	uplinkIfindex int
-	uplinkMAC     net.HardwareAddr
 	// The floating uplink, when floating addresses live on a different link
 	// than the default route (EnsureFloatingUplink); zero = same as uplink.
 	// floatMu serializes EnsureFloatingUplink: it is called from several
@@ -50,7 +49,6 @@ type Manager struct {
 	// from_uplink attach the moment three watchers raced).
 	floatMu       sync.Mutex
 	floatIfindex  int
-	floatMAC      net.HardwareAddr
 	recreatedPins []string
 }
 
@@ -211,7 +209,6 @@ func (m *Manager) AttachUplinkIngress() (string, error) {
 		return "", err
 	}
 	m.uplinkIfindex = idx
-	m.uplinkMAC = link.Attrs().HardwareAddr
 	return name, nil
 }
 

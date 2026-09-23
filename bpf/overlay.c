@@ -583,8 +583,7 @@ struct {
                              // floating-IP range when it differs from the
                              // default-route uplink (an OCI L2 VLAN). 0 = same
                              // link as CFG_UPLINK_IFINDEX (single-NIC default).
-                             // Floating egress redirects here; the ARP/NDP
-                             // responders answer with float_uplink_mac on it.
+                             // Floating egress redirects here.
 #define CFG_FLOAT_NH       7 // v4 next-hop (network order) for floating egress
                              // out the floating uplink — the L2 fabric's virtual
                              // router. Needed because the kernel FIB routes
@@ -621,8 +620,9 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } params SEC(".maps");
 
-// uplink_mac holds the node uplink's MAC (index 0), so from_uplink can put it in
-// the floating-IP ARP replies it crafts. Written by the agent at attach time.
+// uplink_mac holds the node uplink's MAC (index 0). Vestigial: no program reads
+// it; written only so the pinned map keeps its shape
+// (docs/lb-ingress.md § "Node-owned external addresses").
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__type(key, __u32);
@@ -634,10 +634,9 @@ struct {
 // float_uplink_mac: the *floating* uplink's MAC, when floating traffic rides a
 // different link than the default route (CFG_FLOAT_IFINDEX set) — e.g. an OCI
 // L2 VLAN carrying the floating range, while the default route (and the
-// cluster-egress masquerade) stays on the native, spoof-guarded NIC. The ARP/NDP
-// responders answer with this MAC for requests arriving on that link. A separate
-// one-cell map (not uplink_mac[1]) so the pinned uplink_mac keeps its shape
-// across upgrades.
+// cluster-egress masquerade) stays on the native, spoof-guarded NIC. Vestigial,
+// like uplink_mac above. A separate one-cell map (not
+// uplink_mac[1]) so the pinned uplink_mac keeps its shape across upgrades.
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__type(key, __u32);
