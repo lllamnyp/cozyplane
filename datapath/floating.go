@@ -31,8 +31,9 @@ import (
 // preserved. Unlike the fabric bridge it needs no /32 route — from_uplink
 // intercepts the address at the node uplink's tc ingress (before kernel routing)
 // and redirects it into the pod's veth, where to_pod DNATs public->VPC. Here we
-// only publish the mapping in the pinned `floating` map the datapath keys on; the
-// agent advertises the address (ARP/NDP) separately, from the pod's own node.
+// only publish the mapping in the pinned `floating` map the datapath keys on.
+// Nothing here announces the address: the fabric must already hand it to a node
+// (tenet 3, docs/north-south.md).
 
 // linkInfo is the part of a link carriesWire needs, split out to be testable.
 type linkInfo struct {
@@ -117,7 +118,8 @@ func (f floatFacts) bindLink() (int, error) {
 // carry wire traffic. An unusable owner is still reported, so errors can name it.
 func ownerFromAddrs(addrs []netlink.Addr, links map[int]linkInfo, ip net.IP) (idx int, usable bool) {
 	for _, a := range addrs {
-		if a.IP == nil || !a.IP.Equal(ip) {
+		// a.IP is a.IPNet.IP: the embedded pointer must be checked first.
+		if a.IPNet == nil || a.IP == nil || !a.IP.Equal(ip) {
 			continue
 		}
 		li, ok := links[a.LinkIndex]
@@ -265,16 +267,27 @@ func (m *Manager) bindFloatUplink(link netlink.Link, ip, gw net.IP) error {
 
 	// Serialized: several watchers call this on the same event cascade, and a
 	// concurrent attach would tear down the winner's pinned link (see floatMu).
+	var nhv uint32
+	if nh4 := nh.To4(); nh4 != nil {
+		nhv = binary.NativeEndian.Uint32(nh4)
+	}
+	want := floatBinding{
+		ifindex: idx,
+		nh:      nhv,
+		base:    binary.NativeEndian.Uint32(subnet.IP.To4()),
+		mask:    binary.NativeEndian.Uint32(net.IP(subnet.Mask).To4()),
+	}
+
 	m.floatMu.Lock()
 	defer m.floatMu.Unlock()
-	if m.floatIfindex == idx {
+	if !floatNeedsProgram(m.floatBound, want) {
 		return nil // already configured this run
 	}
-	if floatRebind(m.floatIfindex, idx) {
+	if floatRebind(m.floatBound, want) {
 		// One slot: the loser keeps from_uplink attached and the two flip on
 		// every resync.
 		slog.Default().Warn("floating uplink re-bound to a different link; two links are contending for the single slot",
-			"from", m.floatIfindex, "to", idx, "link", link.Attrs().Name)
+			"from", m.floatBound.ifindex, "to", idx, "link", link.Attrs().Name)
 	}
 
 	if err := AttachIngress(idx, m.objs.CozyplaneFromUplink); err != nil {
@@ -286,29 +299,40 @@ func (m *Manager) bindFloatUplink(link netlink.Link, ip, gw net.IP) error {
 	if err := m.objs.FloatUplinkMac.Put(uint32(0), &v); err != nil {
 		return fmt.Errorf("set floating uplink mac: %w", err)
 	}
-	if err := m.objs.Params.Put(cfgFloatIfindex, uint32(idx)); err != nil {
-		return fmt.Errorf("set floating uplink ifindex: %w", err)
-	}
-	var nhv uint32
-	if nh4 := nh.To4(); nh4 != nil {
-		nhv = binary.NativeEndian.Uint32(nh4)
-	}
-	if err := m.objs.Params.Put(cfgFloatNH, nhv); err != nil {
+	if err := m.objs.Params.Put(cfgFloatNH, want.nh); err != nil {
 		return fmt.Errorf("set floating next-hop: %w", err)
 	}
-	var fn overlayFloatNet
-	fn.Base = binary.NativeEndian.Uint32(subnet.IP.To4())
-	fn.Mask = binary.NativeEndian.Uint32(net.IP(subnet.Mask).To4())
+	fn := overlayFloatNet{Base: want.base, Mask: want.mask}
 	if err := m.objs.FloatNet.Put(uint32(0), &fn); err != nil {
 		return fmt.Errorf("set floating subnet: %w", err)
 	}
-	m.floatIfindex = idx
+	// Last: the ifindex is the commit point, so the datapath never sees the new
+	// link paired with the previous subnet and next-hop.
+	if err := m.objs.Params.Put(cfgFloatIfindex, uint32(idx)); err != nil {
+		return fmt.Errorf("set floating uplink ifindex: %w", err)
+	}
+	m.floatBound = want
 	return nil
 }
 
-// floatRebind reports that the single floating slot is being moved between two
-// different links.
-func floatRebind(cur, next int) bool { return cur != 0 && next != 0 && cur != next }
+// floatBinding is everything the single floating slot holds. Comparing the whole
+// binding, not just the link, catches two addresses that share a link but
+// resolve different next-hops — the second used to be discarded silently.
+type floatBinding struct {
+	ifindex    int
+	nh         uint32
+	base, mask uint32
+}
+
+// floatNeedsProgram reports whether the slot must be rewritten. The comparison
+// is over the whole binding: two addresses can share a link and still resolve
+// different next-hops, and keying on the link alone dropped the second.
+func floatNeedsProgram(cur, want floatBinding) bool { return cur != want }
+
+// floatRebind reports that the slot is being moved to a different link.
+func floatRebind(cur, next floatBinding) bool {
+	return cur.ifindex != 0 && next.ifindex != 0 && cur.ifindex != next.ifindex
+}
 
 // SetFloating records the 1:1 mapping in both directions: floating[publicIP] =
 // {net, VPC IP} for inbound DNAT, and floating_egress[{net, VPC IP}] = publicIP

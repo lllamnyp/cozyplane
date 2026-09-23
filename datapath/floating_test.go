@@ -260,14 +260,64 @@ func TestCoveringSubnet(t *testing.T) {
 }
 
 func TestFloatRebind(t *testing.T) {
-	if !floatRebind(vlanIdx, otherIdx) {
+	on := func(idx int) floatBinding { return floatBinding{ifindex: idx, nh: 1, base: 2, mask: 3} }
+	if !floatRebind(on(vlanIdx), on(otherIdx)) {
 		t.Error("moving the slot between two links is a rebind")
 	}
-	if floatRebind(vlanIdx, vlanIdx) {
+	if floatRebind(on(vlanIdx), on(vlanIdx)) {
 		t.Error("same link is not a rebind")
 	}
-	if floatRebind(0, vlanIdx) {
+	if floatRebind(floatBinding{}, on(vlanIdx)) {
 		t.Error("first bind is not a rebind")
+	}
+}
+
+// The slot holds a link AND its next-hop and subnet. Two addresses can share a
+// link and resolve different next-hops; keying the "already configured" check on
+// the link alone silently kept the first address's next-hop for the second.
+func TestFloatNeedsProgram(t *testing.T) {
+	cur := floatBinding{ifindex: vlanIdx, nh: 0x0100140a, base: 0x0000140a, mask: 0x00ffffff}
+
+	if floatNeedsProgram(cur, cur) {
+		t.Error("an identical binding must not be re-programmed")
+	}
+	otherNH := cur
+	otherNH.nh = 0xfe00140a
+	if !floatNeedsProgram(cur, otherNH) {
+		t.Error("same link, different next-hop must be re-programmed")
+	}
+	otherNet := cur
+	otherNet.mask = 0x0000ffff
+	if !floatNeedsProgram(cur, otherNet) {
+		t.Error("same link, different subnet must be re-programmed")
+	}
+	otherLink := cur
+	otherLink.ifindex = otherIdx
+	if !floatNeedsProgram(cur, otherLink) {
+		t.Error("a different link must be re-programmed")
+	}
+	// ...but a next-hop change on one link is not a link re-bind, so it must not
+	// warn about contention.
+	if floatRebind(cur, otherNH) {
+		t.Error("same link is not a re-bind, even when the next-hop changes")
+	}
+}
+
+func TestOwnerFromAddrsNilIPNet(t *testing.T) {
+	links := map[int]linkInfo{uplinkIdx: {Flags: net.FlagUp, Type: "device"}}
+	ip := net.ParseIP("10.20.0.16")
+	// netlink.Addr embeds *net.IPNet; a row parsed from a message carrying
+	// neither IFA_ADDRESS nor IFA_LOCAL leaves it nil, and a.IP dereferences it.
+	nilRow := netlink.Addr{LinkIndex: uplinkIdx}
+	if idx, _ := ownerFromAddrs([]netlink.Addr{nilRow}, links, ip); idx != 0 {
+		t.Fatalf("nil IPNet row = %d, want 0", idx)
+	}
+	// And it must not hide a real owner sitting behind it in the dump.
+	real := netlink.Addr{IPNet: ipNetOf(t, "10.20.0.16/24"), LinkIndex: uplinkIdx}
+	for _, order := range [][]netlink.Addr{{nilRow, real}, {real, nilRow}} {
+		if idx, usable := ownerFromAddrs(order, links, ip); idx != uplinkIdx || !usable {
+			t.Errorf("with a nil row = %d,%v; want %d,true", idx, usable, uplinkIdx)
+		}
 	}
 }
 

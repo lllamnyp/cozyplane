@@ -56,7 +56,7 @@ struct arp_eth {
 	__be32 tip;    // target IP
 } __attribute__((packed));
 
-// A 6-byte MAC in an 8-byte cell (the node uplink's, for the ARP responder).
+// A 6-byte MAC in an 8-byte cell.
 struct cozy_mac {
 	__u8 addr[6];
 	__u8 pad[2];

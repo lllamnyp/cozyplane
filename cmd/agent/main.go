@@ -1159,8 +1159,9 @@ func watchServiceUplinks(ctx context.Context, client kubernetes.Interface, mgr *
 			// Both kinds of external address kpr writes rows for need the same
 			// thing here: if the address lands on a secondary NIC rather than
 			// the default uplink, from_uplink must be attached there too, or
-			// nothing intercepts the traffic. EnsureFloatingUplink no-ops for an
-			// address on the default uplink or behind a gateway.
+			// nothing intercepts the traffic. EnsureFloatingUplink no-ops only
+			// when the address arrives on the default uplink; a gateway'd or
+			// node-owned address on another NIC binds there.
 			for _, ing := range s.Status.LoadBalancer.Ingress {
 				if ing.IP == "" {
 					continue
