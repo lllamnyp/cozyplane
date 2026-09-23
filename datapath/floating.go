@@ -32,19 +32,92 @@ import (
 // only publish the mapping in the pinned `floating` map the datapath keys on; the
 // agent advertises the address (ARP/NDP) separately, from the pod's own node.
 
-// EnsureFloatingUplink makes the datapath serve a floating address from the
-// link that actually owns it. The FIB is authoritative: if the address is
-// on-link on a NON-default interface (e.g. an OCI L2 VLAN carrying the floating
-// range, while the default route rides the native, spoof-guarded NIC), floating
-// must attach, answer ARP/NDP, announce, and egress THERE — binding it to the
-// default uplink is a bug (the announcement goes to the wrong segment and the
-// egress leaves a spoof-guarded NIC with a foreign source). Called by the agent
-// for every floating address it programs; a no-op when the address is off-link
-// (a routed pool) or on the default uplink, so single-NIC nodes are unchanged.
+// floatFacts are the facts about one external address that decide where, if
+// anywhere, the floating machinery binds.
+type floatFacts struct {
+	// RouteLink is the ifindex the FIB would send out of; 0 if it named none.
+	RouteLink int
+	// RouteGw is the next hop the FIB named; nil for an on-link or local answer.
+	RouteGw net.IP
+	// RouteViaLo records that the FIB answered "local" — the node owns this
+	// address.
+	RouteViaLo bool
+	// OwnerLink is the ifindex the address is CONFIGURED on; 0 if it is not
+	// ours. Only meaningful when RouteViaLo.
+	OwnerLink int
+	// DefaultUplink is the ifindex from_uplink is already attached to.
+	DefaultUplink int
+}
+
+// bindLink resolves which link's ingress must carry the floating machinery for
+// this address, or 0 when there is nothing to program. Addresses owned by the
+// node's own interfaces are special-cased: the FIB answers "via lo" for them,
+// so OwnerLink and not RouteLink decides.
 //
-// The off-subnet next-hop is the covering subnet's first host — the L2 fabric's
-// virtual router by convention (OCI, and most gateways) — since the node's FIB
-// carries no route via that link.
+// See docs/lb-ingress.md § "Node-owned external addresses".
+func (f floatFacts) bindLink() (int, error) {
+	switch {
+	case f.RouteGw != nil:
+		// Routed to us from elsewhere (a routed pool): it arrives on the
+		// default uplink, which is already hooked.
+		return 0, nil
+
+	case f.RouteViaLo:
+		// The node's own address.
+		switch {
+		case f.OwnerLink == 0:
+			return 0, fmt.Errorf("address is local to this node but configured on no link")
+		case f.OwnerLink == f.RouteLink:
+			// RouteViaLo means RouteLink IS the loopback, so this says the
+			// owner resolved to lo. Refuse rather than bind it.
+			return 0, fmt.Errorf("address is local and its owning link resolved to the loopback")
+		case f.OwnerLink == f.DefaultUplink:
+			// Arrives where from_uplink already is, and the default route
+			// resolves an off-subnet reply. Nothing to program.
+			return 0, nil
+		default:
+			return f.OwnerLink, nil
+		}
+
+	case f.RouteLink == 0, f.RouteLink == f.DefaultUplink:
+		return 0, nil
+
+	default:
+		// On-link on a non-default NIC: the floating case.
+		return f.RouteLink, nil
+	}
+}
+
+// addrOwnerLink returns the ifindex of the link ip is configured on, or 0 if
+// the address is not the node's own.
+func addrOwnerLink(ip net.IP) (int, error) {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return 0, fmt.Errorf("list links: %w", err)
+	}
+	for _, l := range links {
+		if l.Attrs().Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := netlink.AddrList(l, netlink.FAMILY_V4)
+		if err != nil {
+			continue // a link that vanished mid-scan is not the owner
+		}
+		for _, a := range addrs {
+			if a.IP != nil && a.IP.Equal(ip) {
+				return l.Attrs().Index, nil
+			}
+		}
+	}
+	return 0, nil
+}
+
+// EnsureFloatingUplink makes the datapath serve an external address from the
+// link that actually carries it: binding it to the default uplink instead would
+// egress a spoof-guarded NIC with a foreign source. Called for every floating
+// address, LB ingress address and Service externalIP the agent programs; a
+// no-op unless the address arrives on a non-default link, so single-NIC nodes
+// are unchanged. Which link that is — see floatFacts.bindLink.
 func (m *Manager) EnsureFloatingUplink(publicIP string) error {
 	ip := net.ParseIP(publicIP)
 	if ip == nil || ip.To4() == nil {
@@ -55,20 +128,53 @@ func (m *Manager) EnsureFloatingUplink(publicIP string) error {
 		return fmt.Errorf("route lookup for %s: %w", publicIP, err)
 	}
 	r := routes[0]
-	if r.Gw != nil || r.LinkIndex == 0 || r.LinkIndex == m.uplinkIfindex {
-		return nil // routed pool, or already the default uplink
+	facts := floatFacts{RouteLink: r.LinkIndex, RouteGw: r.Gw, DefaultUplink: m.uplinkIfindex}
+
+	// The address lookup is only worth its cost when the FIB answered "local",
+	// so the attracted-address path stays one route lookup.
+	var routeLink netlink.Link
+	if r.Gw == nil && r.LinkIndex != 0 {
+		if routeLink, err = netlink.LinkByIndex(r.LinkIndex); err != nil {
+			return fmt.Errorf("floating uplink link %d: %w", r.LinkIndex, err)
+		}
+		if routeLink.Attrs().Flags&net.FlagLoopback != 0 {
+			facts.RouteViaLo = true
+			if facts.OwnerLink, err = addrOwnerLink(ip); err != nil {
+				return fmt.Errorf("owner lookup for %s: %w", publicIP, err)
+			}
+		}
 	}
+
+	idx, err := facts.bindLink()
+	if err != nil {
+		return fmt.Errorf("floating uplink for %s: %w", publicIP, err)
+	}
+	if idx == 0 {
+		return nil
+	}
+
+	link := routeLink
+	if link == nil || link.Attrs().Index != idx {
+		if link, err = netlink.LinkByIndex(idx); err != nil {
+			return fmt.Errorf("floating uplink link %d: %w", idx, err)
+		}
+	}
+	return m.bindFloatUplink(link, ip)
+}
+
+// bindFloatUplink attaches from_uplink at link's ingress and programs the four
+// facts the datapath needs to emit a reply out of it: the egress ifindex, the
+// source MAC, the covering subnet, and the off-subnet next-hop.
+func (m *Manager) bindFloatUplink(link netlink.Link, ip net.IP) error {
+	idx := link.Attrs().Index
 	// Serialized: several watchers call this on the same event cascade, and a
 	// concurrent attach would tear down the winner's pinned link (see floatMu).
 	m.floatMu.Lock()
 	defer m.floatMu.Unlock()
-	if m.floatIfindex == r.LinkIndex {
+	if m.floatIfindex == idx {
 		return nil // already configured this run
 	}
-	link, err := netlink.LinkByIndex(r.LinkIndex)
-	if err != nil {
-		return fmt.Errorf("floating uplink link %d: %w", r.LinkIndex, err)
-	}
+	// Every real NIC has one; a link without is mis-selected.
 	mac := link.Attrs().HardwareAddr
 	if len(mac) != 6 {
 		return fmt.Errorf("floating uplink %s has no MAC", link.Attrs().Name)
@@ -92,8 +198,8 @@ func (m *Manager) EnsureFloatingUplink(publicIP string) error {
 		}
 	}
 
-	// from_uplink at the floating link's ingress: ARP answers + inbound DNAT.
-	if err := AttachIngress(r.LinkIndex, m.objs.CozyplaneFromUplink); err != nil {
+	// from_uplink at the floating link's ingress: inbound DNAT.
+	if err := AttachIngress(idx, m.objs.CozyplaneFromUplink); err != nil {
 		return fmt.Errorf("attach from_uplink on %s: %w", link.Attrs().Name, err)
 	}
 	var v overlayCozyMac
@@ -101,7 +207,7 @@ func (m *Manager) EnsureFloatingUplink(publicIP string) error {
 	if err := m.objs.FloatUplinkMac.Put(uint32(0), &v); err != nil {
 		return fmt.Errorf("set floating uplink mac: %w", err)
 	}
-	if err := m.objs.Params.Put(cfgFloatIfindex, uint32(r.LinkIndex)); err != nil {
+	if err := m.objs.Params.Put(cfgFloatIfindex, uint32(idx)); err != nil {
 		return fmt.Errorf("set floating uplink ifindex: %w", err)
 	}
 	var nhv uint32
@@ -119,7 +225,7 @@ func (m *Manager) EnsureFloatingUplink(publicIP string) error {
 	if err := m.objs.FloatNet.Put(uint32(0), &fn); err != nil {
 		return fmt.Errorf("set floating subnet: %w", err)
 	}
-	m.floatIfindex = r.LinkIndex
+	m.floatIfindex = idx
 	m.floatMAC = mac
 	return nil
 }

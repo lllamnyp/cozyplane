@@ -318,30 +318,63 @@ remote backend without DSR would have that backend reply straight to the client
 with the wrong source — the same reason `externalTrafficPolicy: Cluster` is an
 opt-in for LB rows.
 
-### Open gap: node-owned external addresses
+### Node-owned external addresses
 
-An external address that is **one of the node's own addresses** is accepted by
-kpr but not yet delivered by the agent. The agent resolves the interface a VIP
-routes through in order to build the `bpf_redirect_neigh` reply path; a
-node-owned address routes via `lo`, which has no MAC, so
-`EnsureFloatingUplink` refuses it:
+An external address is often the node's **own** address. Clouds that NAT a public
+address onto the instance's primary private address — OCI, GCP, AWS — produce
+exactly this, and it is what `publishing.externalIPs` names. Serving it needs no
+new datapath behaviour, but it does need the right question asked.
+
+The FIB answers *"how would I send to this address"*. For an address the node
+owns, that answer is "deliver it locally":
 
 ```
-"ensure externalIP uplink" ip=10.20.0.16 err="floating uplink lo has no MAC"
+$ ip route get 10.20.0.16
+local 10.20.0.16 dev lo table local src 10.20.0.16
 ```
 
-External packets to that address then fall through to the host stack and get an
-RST. This is the normal shape on clouds that NAT a public address onto the
-instance's primary private address — OCI, GCP, AWS — so it is not exotic.
+`lo` is not where the address lives — it is where *delivery* goes. The address is
+configured on a real NIC, and packets for it still arrive there. Reading the route
+answer as "the link that carries this address" bound the floating machinery to the
+loopback, which has no MAC and no covering subnet, and the agent refused with
+`floating uplink lo has no MAC` — so nothing intercepted the traffic, it fell
+through to the host stack, and every public hostname answered `connection refused`
+on 443 while the same node served 6443 fine.
 
-Closing it needs a **local-VIP mode** in the datapath rather than a patch here:
-intercept in `from_uplink` on the interface the packet arrived on and reply
-through normal routing (or the arrival interface's gateway) instead of requiring
-a floating uplink MAC. That is new hook behaviour and wants its own design pass;
-it is tracked in [roadmap.md](roadmap.md) §6.
+So two questions are kept apart (`floatFacts.bindLink`):
 
-Until then, on such clouds the host ingress must be published through a floating
-**secondary** address (one that routes via a real NIC) or a host-network proxy.
+1. **Which link does the address arrive on?** For an attracted address, the FIB's
+   egress link. For an owned address, the link it is **configured** on — found by
+   an address lookup, because the FIB cannot answer it.
+2. **Can the kernel resolve an off-subnet reply out of that link?** Only a default
+   route can. Any other link needs the agent-supplied virtual router
+   (`CFG_FLOAT_NH` + `float_net`), because `bpf_redirect_neigh` with no next-hop
+   would return the *default* link's gateway — the wrong neighbour for that NIC.
+
+Which gives the whole taxonomy:
+
+| FIB answer | Arrives on | Action |
+|---|---|---|
+| via a gateway | default uplink | nothing — already hooked |
+| on-link, default uplink | default uplink | nothing — already hooked |
+| on-link, other NIC | that NIC | bind: attach + MAC + subnet + next-hop |
+| `local … dev lo`, owner is the default uplink | default uplink | **nothing** — already hooked, default route resolves the reply |
+| `local … dev lo`, owner is another NIC | that NIC | bind, as above |
+
+The common cloud case is the fourth row, and it needs nothing programmed: the
+address arrives where `from_uplink` already is, and the default route resolves
+off-subnet replies. Note also that the reply's source is then the instance's own
+address, so the anti-spoof filtering that motivates the whole floating-uplink
+split is a non-issue for it. ARP is likewise not cozyplane's problem here — the
+kernel already answers for an address the node owns, and the datapath does not
+craft ARP at all.
+
+**Remaining limitation.** `float_uplink_mac`, `float_net`, `CFG_FLOAT_IFINDEX` and
+`CFG_FLOAT_NH` are single-cell: one non-default uplink per node. A node that has
+both a genuine floating VLAN *and* node-owned external addresses on some third NIC
+would have the two contend for that one slot. Pre-existing (two floating VLANs
+contend the same way) and not hit in practice; closing it means giving those maps
+a per-ifindex shape.
 
 ## Non-goals
 
