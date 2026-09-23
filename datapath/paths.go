@@ -58,10 +58,10 @@ const (
 	// leaves by (which is not the InternalIP on a multi-NIC node). 0 disables the
 	// bpf masquerade.
 	cfgMasqIP = uint32(5)
-	// cfgFloatIfindex is the floating uplink — the link whose subnet covers the
-	// floating range when it differs from the default-route uplink (e.g. an OCI
-	// L2 VLAN). Derived from the FIB per floating address (EnsureFloatingUplink);
-	// 0 = floating rides the default uplink (single-NIC).
+	// cfgFloatIfindex is the floating uplink — the link an external address
+	// arrives on when that is not the default-route uplink (e.g. an OCI L2
+	// VLAN). Selected per address by floatFacts.bindLink, which the FIB alone
+	// cannot answer for an address the node owns; 0 = the default uplink.
 	cfgFloatIfindex = uint32(6)
 	// cfgFloatNH is the v4 next-hop for floating egress out the floating uplink
 	// (the L2 fabric's virtual router; raw network-order bytes, native read) —

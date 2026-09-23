@@ -318,30 +318,97 @@ remote backend without DSR would have that backend reply straight to the client
 with the wrong source — the same reason `externalTrafficPolicy: Cluster` is an
 opt-in for LB rows.
 
-### Open gap: node-owned external addresses
+### Node-owned external addresses
 
-An external address that is **one of the node's own addresses** is accepted by
-kpr but not yet delivered by the agent. The agent resolves the interface a VIP
-routes through in order to build the `bpf_redirect_neigh` reply path; a
-node-owned address routes via `lo`, which has no MAC, so
-`EnsureFloatingUplink` refuses it:
+An external address is often the node's **own** address. Clouds that NAT a public
+address onto the instance's primary private address — OCI, GCP, AWS — produce
+exactly this, and it is what `publishing.externalIPs` names. Serving it needs no
+new datapath behaviour, but it does need the right question asked.
+
+The FIB answers *"how would I send to this address"*. For an address the node
+owns, that answer is "deliver it locally":
 
 ```
-"ensure externalIP uplink" ip=10.20.0.16 err="floating uplink lo has no MAC"
+$ ip route get 10.20.0.16
+local 10.20.0.16 dev lo table local src 10.20.0.16
 ```
 
-External packets to that address then fall through to the host stack and get an
-RST. This is the normal shape on clouds that NAT a public address onto the
-instance's primary private address — OCI, GCP, AWS — so it is not exotic.
+`lo` is not where the address lives — it is where *delivery* goes. The address is
+configured on a real NIC, and packets for it still arrive there. Reading the route
+answer as "the link that carries this address" bound the floating machinery to the
+loopback, which has no MAC and no covering subnet, and the agent refused with
+`floating uplink lo has no MAC` — so nothing intercepted the traffic, it fell
+through to the host stack, and every public hostname answered `connection refused`
+on 443 while the same node served 6443 fine.
 
-Closing it needs a **local-VIP mode** in the datapath rather than a patch here:
-intercept in `from_uplink` on the interface the packet arrived on and reply
-through normal routing (or the arrival interface's gateway) instead of requiring
-a floating uplink MAC. That is new hook behaviour and wants its own design pass;
-it is tracked in [roadmap.md](roadmap.md) §6.
+So two questions are kept apart (`floatFacts.bindLink`):
 
-Until then, on such clouds the host ingress must be published through a floating
-**secondary** address (one that routes via a real NIC) or a host-network proxy.
+1. **Which link does the address arrive on?** For an attracted address, the FIB's
+   egress link. For an owned address, the link it is **configured** on — found by
+   an address lookup, because the FIB cannot answer it.
+2. **Can the kernel resolve an off-subnet reply out of that link?** Only a default
+   route can. Any other link needs the agent-supplied virtual router
+   (`CFG_FLOAT_NH` + `float_net`), because `bpf_redirect_neigh` with no next-hop
+   would return the *default* link's gateway — the wrong neighbour for that NIC.
+
+Which gives the whole taxonomy:
+
+| FIB answer | Arrives on | Action |
+|---|---|---|
+| via a gateway on the default uplink | default uplink | nothing — already hooked |
+| via a gateway on another NIC | that NIC | bind; the gateway is the next-hop |
+| on-link, default uplink | default uplink | nothing — already hooked |
+| on-link, other NIC | that NIC | bind: attach + subnet + next-hop |
+| `RTN_LOCAL`, owner is the default uplink | default uplink | **nothing** — already hooked, default route resolves the reply |
+| `RTN_LOCAL`, owner is another NIC | that NIC | bind, as above |
+| `RTN_LOCAL`, owner is lo, a dummy, an L3 device or administratively down | nowhere | refuse — no Ethernet frame arrives there |
+
+The egress link is what the FIB names in both attracted cases, on-link or behind
+a gateway: a router forwards the address to the node over the segment it reaches
+it on, so that is where the packet arrives. Leaving a gateway'd address unbound
+is not harmless — with `CFG_FLOAT_IFINDEX` unset the reply falls back to the
+default uplink and leaves a spoof-guarded NIC with a foreign source.
+
+A bind needs a covering subnet on the link: `float_net` separates on-subnet
+destinations (their own neighbour) from off-subnet ones (via `CFG_FLOAT_NH`).
+For an on-link address that subnet is the one the address sits in; for a
+gateway'd one the address is off-link, so the **gateway** anchors the lookup and
+is itself the next-hop. A host prefix (`/32`) is not a subnet — its "first host"
+is the neighbouring address, not a router — so a link carrying only a `/32` is
+refused rather than bound with a next-hop that goes nowhere.
+
+The common cloud case is the fourth row, and it needs nothing programmed: the
+address arrives where `from_uplink` already is, and the default route resolves
+off-subnet replies. Note also that the reply's source is then the instance's own
+address, so the anti-spoof filtering that motivates the whole floating-uplink
+split is a non-issue for it. ARP is likewise not cozyplane's problem here — the
+kernel already answers for an address the node owns, and the datapath does not
+craft ARP at all.
+
+**Remaining limitation.** `float_net`, `CFG_FLOAT_IFINDEX` and `CFG_FLOAT_NH` are
+single-cell: one non-default uplink per node. A node with two claimants — a
+floating VLAN and node-owned addresses on a third NIC, say — does not settle on
+one of them. `watchServiceUplinks` resyncs over every Service on every Service
+event, so each pass re-binds the slot to whichever address it sees, the values
+flip, and the reply path for **both** is nondeterministic; `from_uplink` is never
+detached from the loser. Two addresses on the *same* link contend the same way
+when they resolve different next-hops — an on-link address takes its subnet's
+first host, a gateway'd one takes the gateway. The agent warns whenever a live
+binding is displaced, by either route, so the condition is identifiable rather
+than presenting as intermittent black-holing.
+
+The three cells are also written separately, so a re-bind has a brief window in
+which one address's link is paired with another's next-hop. That is tolerated
+rather than fixed: it only arises under the contention above, and closing it
+means folding the binding into a single map value.
+Pre-existing (two floating VLANs contend identically); closing it means giving
+those maps a per-ifindex shape.
+
+`float_uplink_mac` and `uplink_mac` are **vestigial** — no program has read them
+since the in-datapath ARP/NDP responder was removed, and the kernel answers v4
+ARP for addresses the node owns. They are still written so the pinned maps keep
+their shape; deleting a `PIN_BY_NAME` map strands a pin on every upgraded node,
+so that removal is its own change.
 
 ## Non-goals
 
