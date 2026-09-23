@@ -455,3 +455,21 @@ cannot see a divergence in `chart/` — and the chart is what ships. A frontend
 that silently writes no rows while the process looks healthy is the shape to
 watch for; the diagnostic that would have found it in minutes is dumping
 `svc_vips` and noticing the external frontends are absent from it.
+
+**The second half of the same outage.** With the rows finally written, replies
+still did not reach the client — and this is why the symptom read as "not
+intercepted" for so long. `lb_return` chose its egress link from
+`CFG_FLOAT_IFINDEX`, one value for the whole node. node0 carried the published
+addresses on eth0 (`CFG_UPLINK_IFINDEX=8`) but the slot held eth1
+(`CFG_FLOAT_IFINDEX=9`, the MetalLB VLAN, bound because its VIPs are on-link on a
+non-default NIC). So an eth0 request was DNAT'd correctly and its reply left eth1
+sourced `10.20.0.16` — a segment that cannot source it, dropped by the cloud's
+anti-spoof. The client hung; the probe script reported `000`, which it also
+reports for a refusal, and the two were never distinguished. The arrival link is
+now per-flow (`svc_rev_val.ifindex`).
+
+**Second thing to take from this note:** `curl -o /dev/null -w '%{http_code}'`
+returns `000` for a refusal and for a timeout alike. Those point at opposite ends
+of the datapath — no interception versus a misrouted reply — so a probe that
+cannot tell them apart will send you to the wrong half. Record the failure mode,
+not just the code.

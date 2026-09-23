@@ -1797,6 +1797,13 @@ struct svc_rev_val {
 	__u16 vport;
 	__u16 lb; // 1: DNAT'd at from_uplink (LB ingress) — the client is external
 	          // and the reply exits by the uplink at the backend's from_pod
+	// The link the request arrived on, so the reply leaves by the same one.
+	// CFG_FLOAT_IFINDEX cannot answer this: it holds ONE link for the node, and
+	// a node can carry external addresses on two (an L2 VLAN with a MetalLB
+	// pool on one, cloud-NAT'd node addresses on the other) — the reply then
+	// left the wrong segment with a source the fabric drops. 0 when the arrival
+	// link is not a usable answer (the DSR path arrives over the overlay).
+	__u32 ifindex;
 };
 
 struct {
@@ -3981,7 +3988,11 @@ static __always_inline int lb_return(struct __sk_buff *skb, struct pkt *p, __u32
 	// (docs/north-south.md).
 	count_ns(srcnet, skb->len, NS_LB, 0);
 
-	__u32 uplink = cfg(CFG_FLOAT_IFINDEX);
+	// The flow's own arrival link first; the node-wide slot only when the flow
+	// does not know (DSR) — see svc_rev_val.ifindex.
+	__u32 uplink = rv->ifindex;
+	if (!uplink)
+		uplink = cfg(CFG_FLOAT_IFINDEX);
 	if (!uplink)
 		uplink = cfg(CFG_UPLINK_IFINDEX);
 	if (!uplink)
@@ -3999,7 +4010,11 @@ static __always_inline int lb_return(struct __sk_buff *skb, struct pkt *p, __u32
 	if (sport != rv->vport)
 		nat_port(skb, p->proto, L4_SPORT_OFF, sport, rv->vport);
 
-	__u32 nh = cfg(CFG_FLOAT_NH);
+	// CFG_FLOAT_NH is the floating link's router. It applies only when the
+	// reply actually leaves that link; on any other link the FIB resolves the
+	// neighbour itself, and forcing the floating router there would name a
+	// next-hop that is not reachable from it.
+	__u32 nh = (uplink == cfg(CFG_FLOAT_IFINDEX)) ? cfg(CFG_FLOAT_NH) : 0;
 	if (nh) {
 		__u32 zero = 0;
 		struct float_net *fn = bpf_map_lookup_elem(&float_net, &zero);
@@ -4233,6 +4248,7 @@ int cozyplane_lb_ingress(struct __sk_buff *skb)
 		s->rv.vip = p.dst;
 		s->rv.vport = dport;
 		s->rv.lb = 1;
+		s->rv.ifindex = skb->ingress_ifindex;
 		asm volatile("" ::: "memory");
 		bpf_map_update_elem(&svc_rev, &s->rk, &s->rv, BPF_ANY);
 	}
@@ -4491,6 +4507,9 @@ int cozyplane_lb_dsr(struct __sk_buff *skb)
 		s->rv.vip = lopt.vip;
 		s->rv.vport = lopt.vport;
 		s->rv.lb = 1;
+		// Arrived encapsulated: ingress_ifindex is the geneve device, not an
+		// uplink, so leave it unset and fall back to the node-wide slot.
+		s->rv.ifindex = 0;
 		asm volatile("" ::: "memory");
 		bpf_map_update_elem(&svc_rev, &s->rk, &s->rv, BPF_ANY);
 	}

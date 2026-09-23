@@ -279,10 +279,11 @@ type overlaySvcRevKey struct {
 }
 
 type overlaySvcRevVal struct {
-	_     structs.HostLayout
-	Vip   overlayAddr128
-	Vport uint16
-	Lb    uint16
+	_       structs.HostLayout
+	Vip     overlayAddr128
+	Vport   uint16
+	Lb      uint16
+	Ifindex uint32
 }
 
 type overlaySvcVal struct {
