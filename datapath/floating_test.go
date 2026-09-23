@@ -166,10 +166,15 @@ func TestCarriesWire(t *testing.T) {
 		l    linkInfo
 		want bool
 	}{
-		{"up ethernet", linkInfo{Flags: net.FlagUp, Type: "device"}, true},
+		{"up ethernet", linkInfo{Flags: net.FlagUp, Type: "device", Ether: true}, true},
 		{"loopback", linkInfo{Flags: net.FlagUp | net.FlagLoopback, Type: "device"}, false},
-		{"dummy", linkInfo{Flags: net.FlagUp, Type: "dummy"}, false},
-		{"down", linkInfo{Flags: 0, Type: "device"}, false},
+		{"dummy", linkInfo{Flags: net.FlagUp, Type: "dummy", Ether: true}, false},
+		{"administratively down", linkInfo{Flags: 0, Type: "device", Ether: true}, false},
+		// L3 devices: up, not loopback, not dummy — and no Ethernet header for
+		// from_uplink to parse.
+		{"wireguard", linkInfo{Flags: net.FlagUp, Type: "wireguard"}, false},
+		{"ipip", linkInfo{Flags: net.FlagUp, Type: "ipip"}, false},
+		{"gre", linkInfo{Flags: net.FlagUp, Type: "gre"}, false},
 	} {
 		if got := carriesWire(tc.l); got != tc.want {
 			t.Errorf("%s: carriesWire = %v, want %v", tc.name, got, tc.want)
@@ -179,12 +184,14 @@ func TestCarriesWire(t *testing.T) {
 
 func TestOwnerFromAddrs(t *testing.T) {
 	ip := net.ParseIP("10.20.0.16")
-	up := linkInfo{Flags: net.FlagUp, Type: "device"}
+	up := linkInfo{Flags: net.FlagUp, Type: "device", Ether: true}
+	const wgIdx = 5
 	links := map[int]linkInfo{
 		loIdx:     {Flags: net.FlagUp | net.FlagLoopback, Type: "device"},
 		uplinkIdx: up,
 		vlanIdx:   up,
-		otherIdx:  {Flags: net.FlagUp, Type: "dummy"},
+		otherIdx:  {Flags: net.FlagUp, Type: "dummy", Ether: true},
+		wgIdx:     {Flags: net.FlagUp, Type: "wireguard"},
 	}
 	addr := func(idx int, s string) netlink.Addr {
 		return netlink.Addr{IPNet: ipNetOf(t, s), LinkIndex: idx}
@@ -209,6 +216,11 @@ func TestOwnerFromAddrs(t *testing.T) {
 		if idx, usable := ownerFromAddrs(order, links, ip); idx != vlanIdx || !usable {
 			t.Errorf("mixed owners = %d,%v; want %d,true", idx, usable, vlanIdx)
 		}
+	}
+	// An address on an L3 device is reported but never usable: from_uplink
+	// would parse its IP header as a MAC header.
+	if idx, usable := ownerFromAddrs([]netlink.Addr{addr(wgIdx, "10.20.0.16/32")}, links, ip); idx != wgIdx || usable {
+		t.Errorf("wireguard owner = %d,%v; want %d,false", idx, usable, wgIdx)
 	}
 	if idx, _ := ownerFromAddrs([]netlink.Addr{addr(vlanIdx, "10.20.0.99/24")}, links, ip); idx != 0 {
 		t.Errorf("no owner = %d, want 0", idx)
@@ -259,16 +271,32 @@ func TestCoveringSubnet(t *testing.T) {
 	}
 }
 
-func TestFloatRebind(t *testing.T) {
-	on := func(idx int) floatBinding { return floatBinding{ifindex: idx, nh: 1, base: 2, mask: 3} }
-	if !floatRebind(on(vlanIdx), on(otherIdx)) {
-		t.Error("moving the slot between two links is a rebind")
+func TestFloatContends(t *testing.T) {
+	cur := floatBinding{ifindex: vlanIdx, nh: 0x0100140a, base: 0x0000140a, mask: 0x00ffffff}
+
+	if floatContends(floatBinding{}, cur) {
+		t.Error("the first bind displaces nothing")
 	}
-	if floatRebind(on(vlanIdx), on(vlanIdx)) {
-		t.Error("same link is not a rebind")
+	if floatContends(cur, cur) {
+		t.Error("an identical binding is not contention")
 	}
-	if floatRebind(floatBinding{}, on(vlanIdx)) {
-		t.Error("first bind is not a rebind")
+	other := cur
+	other.ifindex = otherIdx
+	if !floatContends(cur, other) {
+		t.Error("moving the slot between links is contention")
+	}
+	// Two addresses can share a link and still contend: an on-link address
+	// resolves the subnet's first host, a gateway'd one the gateway. The values
+	// flip on every resync, so this must warn rather than pass silently.
+	otherNH := cur
+	otherNH.nh = 0x0900140a
+	if !floatContends(cur, otherNH) {
+		t.Error("same link, different next-hop is contention")
+	}
+	otherNet := cur
+	otherNet.mask = 0x0000ffff
+	if !floatContends(cur, otherNet) {
+		t.Error("same link, different subnet is contention")
 	}
 }
 
@@ -296,15 +324,10 @@ func TestFloatNeedsProgram(t *testing.T) {
 	if !floatNeedsProgram(cur, otherLink) {
 		t.Error("a different link must be re-programmed")
 	}
-	// ...but a next-hop change on one link is not a link re-bind, so it must not
-	// warn about contention.
-	if floatRebind(cur, otherNH) {
-		t.Error("same link is not a re-bind, even when the next-hop changes")
-	}
 }
 
 func TestOwnerFromAddrsNilIPNet(t *testing.T) {
-	links := map[int]linkInfo{uplinkIdx: {Flags: net.FlagUp, Type: "device"}}
+	links := map[int]linkInfo{uplinkIdx: {Flags: net.FlagUp, Type: "device", Ether: true}}
 	ip := net.ParseIP("10.20.0.16")
 	// netlink.Addr embeds *net.IPNet; a row parsed from a message carrying
 	// neither IFA_ADDRESS nor IFA_LOCAL leaves it nil, and a.IP dereferences it.

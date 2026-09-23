@@ -361,7 +361,7 @@ Which gives the whole taxonomy:
 | on-link, other NIC | that NIC | bind: attach + subnet + next-hop |
 | `RTN_LOCAL`, owner is the default uplink | default uplink | **nothing** — already hooked, default route resolves the reply |
 | `RTN_LOCAL`, owner is another NIC | that NIC | bind, as above |
-| `RTN_LOCAL`, owner is lo / a dummy / a down link | nowhere | refuse — nothing arrives there |
+| `RTN_LOCAL`, owner is lo, a dummy, an L3 device or administratively down | nowhere | refuse — no Ethernet frame arrives there |
 
 The egress link is what the FIB names in both attracted cases, on-link or behind
 a gateway: a router forwards the address to the node over the segment it reaches
@@ -391,8 +391,16 @@ floating VLAN and node-owned addresses on a third NIC, say — does not settle o
 one of them. `watchServiceUplinks` resyncs over every Service on every Service
 event, so each pass re-binds the slot to whichever address it sees, the values
 flip, and the reply path for **both** is nondeterministic; `from_uplink` is never
-detached from the loser. The agent logs a warning on each re-bind so the
-condition is identifiable rather than presenting as intermittent black-holing.
+detached from the loser. Two addresses on the *same* link contend the same way
+when they resolve different next-hops — an on-link address takes its subnet's
+first host, a gateway'd one takes the gateway. The agent warns whenever a live
+binding is displaced, by either route, so the condition is identifiable rather
+than presenting as intermittent black-holing.
+
+The three cells are also written separately, so a re-bind has a brief window in
+which one address's link is paired with another's next-hop. That is tolerated
+rather than fixed: it only arises under the contention above, and closing it
+means folding the binding into a single map value.
 Pre-existing (two floating VLANs contend identically); closing it means giving
 those maps a per-ifindex shape.
 

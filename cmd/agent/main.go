@@ -112,7 +112,8 @@ func main() {
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
-	// datapath warns through the default logger; match this one's format.
+	// datapath warns through the default logger; this also routes the stdlib
+	// log package (and any dependency using it) through the same handler.
 	slog.SetDefault(log)
 
 	if nodeName == "" {

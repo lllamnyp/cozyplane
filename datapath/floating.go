@@ -39,17 +39,24 @@ import (
 type linkInfo struct {
 	Flags net.Flags
 	Type  string
+	// Ether is ARPHRD_ETHER. from_uplink parses every packet as Ethernet-framed
+	// (parse_ipv4/parse_ip start at an ethhdr), so on an L3 device — wireguard,
+	// ipip, sit, gre, tun — it reads the IP header as a MAC header.
+	Ether bool
 }
 
 func linkInfoOf(l netlink.Link) linkInfo {
-	return linkInfo{Flags: l.Attrs().Flags, Type: l.Type()}
+	a := l.Attrs()
+	return linkInfo{Flags: a.Flags, Type: l.Type(), Ether: len(a.HardwareAddr) == 6}
 }
 
-// carriesWire reports whether a packet from the wire can arrive on this link.
-// Binding one that cannot points the node's single floating slot at a device
-// that never delivers, black-holing every floating and LB reply.
+// carriesWire reports whether an Ethernet frame from the wire can arrive on this
+// link. Binding one that cannot points the node's single floating slot at a
+// device that never delivers, black-holing every floating and LB reply.
+// FlagUp is administrative state only: a link that is up with no carrier still
+// qualifies, because requiring carrier would re-bind the slot on every bounce.
 func carriesWire(l linkInfo) bool {
-	if l.Flags&net.FlagLoopback != 0 || l.Type == "dummy" {
+	if l.Flags&net.FlagLoopback != 0 || l.Type == "dummy" || !l.Ether {
 		return false
 	}
 	return l.Flags&net.FlagUp != 0
@@ -99,7 +106,7 @@ func (f floatFacts) bindLink() (int, error) {
 		case f.OwnerLink == 0:
 			return 0, fmt.Errorf("address is local to this node but configured on no link")
 		case !f.OwnerUsable:
-			return 0, fmt.Errorf("address is local but its owning link cannot carry traffic from the wire")
+			return 0, fmt.Errorf("address is local but its owning link (ifindex %d) cannot carry Ethernet traffic from the wire", f.OwnerLink)
 		case f.OwnerLink == f.DefaultUplink:
 			return 0, nil
 		default:
@@ -243,7 +250,7 @@ func (m *Manager) EnsureFloatingUplink(publicIP string) error {
 func (m *Manager) bindFloatUplink(link netlink.Link, ip, gw net.IP) error {
 	idx := link.Attrs().Index
 	if !carriesWire(linkInfoOf(link)) {
-		return fmt.Errorf("floating uplink %s cannot carry traffic from the wire", link.Attrs().Name)
+		return fmt.Errorf("floating uplink %s cannot carry Ethernet traffic from the wire (down, loopback or an L3 device)", link.Attrs().Name)
 	}
 	anchor := ip
 	if gw != nil {
@@ -283,11 +290,13 @@ func (m *Manager) bindFloatUplink(link netlink.Link, ip, gw net.IP) error {
 	if !floatNeedsProgram(m.floatBound, want) {
 		return nil // already configured this run
 	}
-	if floatRebind(m.floatBound, want) {
+	if floatContends(m.floatBound, want) {
 		// One slot: the loser keeps from_uplink attached and the two flip on
 		// every resync.
-		slog.Default().Warn("floating uplink re-bound to a different link; two links are contending for the single slot",
-			"from", m.floatBound.ifindex, "to", idx, "link", link.Attrs().Name)
+		slog.Default().Warn("floating uplink re-bound; two addresses are contending for the single slot",
+			"from_ifindex", m.floatBound.ifindex, "to_ifindex", idx,
+			"from_nh", m.floatBound.nh, "to_nh", want.nh,
+			"from_base", m.floatBound.base, "to_base", want.base, "link", link.Attrs().Name)
 	}
 
 	if err := AttachIngress(idx, m.objs.CozyplaneFromUplink); err != nil {
@@ -299,17 +308,22 @@ func (m *Manager) bindFloatUplink(link netlink.Link, ip, gw net.IP) error {
 	if err := m.objs.FloatUplinkMac.Put(uint32(0), &v); err != nil {
 		return fmt.Errorf("set floating uplink mac: %w", err)
 	}
+	// Three independent cells, so no order makes this atomic: during a re-bind
+	// the datapath briefly sees one address's link with another's next-hop, and
+	// those replies are misrouted. Tolerated because a re-bind only happens
+	// under the contention above, which a healthy configuration does not have.
+	// ifindex first: on a FIRST bind it leaves the window at (new link, nh 0),
+	// which falls back to a plain FIB lookup, rather than (default link, new
+	// nh), whose next-hop is not reachable there.
+	if err := m.objs.Params.Put(cfgFloatIfindex, uint32(idx)); err != nil {
+		return fmt.Errorf("set floating uplink ifindex: %w", err)
+	}
 	if err := m.objs.Params.Put(cfgFloatNH, want.nh); err != nil {
 		return fmt.Errorf("set floating next-hop: %w", err)
 	}
 	fn := overlayFloatNet{Base: want.base, Mask: want.mask}
 	if err := m.objs.FloatNet.Put(uint32(0), &fn); err != nil {
 		return fmt.Errorf("set floating subnet: %w", err)
-	}
-	// Last: the ifindex is the commit point, so the datapath never sees the new
-	// link paired with the previous subnet and next-hop.
-	if err := m.objs.Params.Put(cfgFloatIfindex, uint32(idx)); err != nil {
-		return fmt.Errorf("set floating uplink ifindex: %w", err)
 	}
 	m.floatBound = want
 	return nil
@@ -329,9 +343,11 @@ type floatBinding struct {
 // different next-hops, and keying on the link alone dropped the second.
 func floatNeedsProgram(cur, want floatBinding) bool { return cur != want }
 
-// floatRebind reports that the slot is being moved to a different link.
-func floatRebind(cur, next floatBinding) bool {
-	return cur.ifindex != 0 && next.ifindex != 0 && cur.ifindex != next.ifindex
+// floatContends reports that the slot is being taken from a binding another
+// address still needs — a different link, or the same link with a different
+// next-hop or subnet. Either way the two flip on every resync.
+func floatContends(cur, next floatBinding) bool {
+	return cur.ifindex != 0 && cur != next
 }
 
 // SetFloating records the 1:1 mapping in both directions: floating[publicIP] =
