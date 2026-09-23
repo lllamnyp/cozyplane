@@ -305,6 +305,18 @@ func TestExternalIPRows(t *testing.T) {
 		t.Fatalf("etp Cluster externalIP row = %+v ok=%v, want the cluster-wide 2 backends", rows[extKey], ok)
 	}
 
+	// An empty nodeName — NODE_NAME absent from the DaemonSet — matches no
+	// endpoint, so every externalIP row disappears while the ClusterIP row
+	// survives. That asymmetry shipped to a cluster once: the chart omitted
+	// NODE_NAME, kpr looked healthy, and no external address was ever served.
+	rows, _ = computeRows(svc, slices, "", nil, false)
+	if _, ok := rows[extKey]; ok {
+		t.Error("empty nodeName produced an externalIP row")
+	}
+	if _, ok := rows[keyFor("10.96.0.50", 80)]; !ok {
+		t.Error("empty nodeName dropped the ClusterIP row")
+	}
+
 	// A garbage entry is skipped without taking the good ones with it.
 	bad := extIPSvc(corev1.ServiceExternalTrafficPolicyLocal, "not-an-ip", extIP)
 	rows, _ = computeRows(bad, slices, "node-a", nil, false)

@@ -127,12 +127,16 @@ func main() {
 	// the LB hive (which drives socket-LB via Cilium's own maps); dies with the
 	// process on shutdown.
 	pinDir := filepath.Join(bpffsRoot, "cozyplane")
-	// NODE_NAME (downward API) scopes LoadBalancer-ingress rows to this node's
-	// ready backends (docs/lb-ingress.md). Without it only ClusterIP rows are
-	// fed — LB delivery silently off, so say so.
+	// NODE_NAME (downward API) is what scopes a frontend's row to this node's
+	// ready backends (docs/lb-ingress.md). Without it no endpoint matches, so
+	// EVERY external frontend — LoadBalancer ingress, NodePort and
+	// spec.externalIPs alike — gets no row, while ClusterIPs keep working off
+	// the cluster-wide set. That asymmetry is what makes the omission look like
+	// a healthy kpr, so name the whole consequence.
 	nodeName := os.Getenv("NODE_NAME")
 	if nodeName == "" {
-		logger.Warn("NODE_NAME unset: LoadBalancer-ingress rows disabled")
+		logger.Error("NODE_NAME unset: serving NO LoadBalancer-ingress, NodePort or externalIP rows; " +
+			"ClusterIPs are unaffected, so this will not look like an outage from inside the cluster")
 	}
 	// externalTrafficPolicy: Cluster via DSR is strictly opt-in — it needs
 	// every node permitted to source the LB IPs on the wire, an underlay

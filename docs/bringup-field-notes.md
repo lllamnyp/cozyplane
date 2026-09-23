@@ -421,3 +421,37 @@ pinning Cilium's dependency tree; requiring the main module there would pull its
 name. Ask the kernel what is mounted at the target. kind cannot see this class of
 bug either — its nodes' bpffs is conventionally named — so anything that decides
 whether to mount needs checking on Talos.
+
+## 11. The chart never gave kpr its node name, so no external address was served (FIXED)
+
+For two weeks on the integrations stand every public hostname answered nothing
+on 443 while the same nodes served 6443 fine, and cozyplane looked healthy
+throughout. Three fixes were aimed at it — `spec.externalIPs` support in kpr
+(#44), then the node-owned address resolver (#47) — and none changed the
+symptom, because none of them was the cause.
+
+`chart/cozyplane-kpr/templates/daemonset.yaml` set `KPR_CGROUP_ROOT` and
+`KPR_BPFFS_ROOT` and nothing else. `deploy/kpr-daemonset.yaml` — the kind
+manifest the e2e uses — also set `NODE_NAME` and `CLUSTER_DSR`. So every
+chart-based deployment ran kpr with no node name, no endpoint matched
+`e.NodeName == nodeName`, the node-local backend set was always empty, and every
+external frontend — LoadBalancer ingress, NodePort and `spec.externalIPs` alike
+— got no `svc_vips` row. Confirmed on the stand: 117 rows in `svc_vips`, not one
+for any of the three published externalIPs, nor for the MetalLB VIP.
+
+**What made it invisible for so long** is an asymmetry: ClusterIP rows are built
+from the *cluster-wide* backend set, so they were written normally. In-cluster
+service traffic worked, socket-LB worked (it reads Cilium's own maps, which do
+carry externalIPs), and a cross-node `connect()` to the externalIP succeeded —
+which reads as "kpr's rows are there". Only traffic arriving from *outside*, on
+the wire, had nothing to match. kpr did log `NODE_NAME unset: LoadBalancer-ingress
+rows disabled` at startup, which undersold it: NodePort and externalIP rows were
+disabled too, and the line was one WARN among a healthy boot.
+
+The fix is the two env entries. kpr now says the whole consequence, at ERROR.
+
+**If you take one thing from this note:** the e2e exercises `deploy/`, so it
+cannot see a divergence in `chart/` — and the chart is what ships. A frontend
+that silently writes no rows while the process looks healthy is the shape to
+watch for; the diagnostic that would have found it in minutes is dumping
+`svc_vips` and noticing the external frontends are absent from it.

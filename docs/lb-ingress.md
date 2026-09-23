@@ -297,6 +297,16 @@ already does.
   documented answer for CCM users: target backend-hosting nodes, or accept
   that mis-attracted traffic is dropped by `Local` semantics (as upstream).
 
+## `NODE_NAME` is required for every external frontend
+
+A frontend's row carries *this node's* ready backends, so kpr must know which
+node it is on. `NODE_NAME` (downward API) is the only source. Without it no
+endpoint matches and **no** external frontend gets a row — LoadBalancer ingress,
+NodePort and `spec.externalIPs` alike — while ClusterIP rows, built from the
+cluster-wide set, are written normally. A kpr in that state looks healthy from
+inside the cluster and serves nothing from the wire; see
+[bringup-field-notes.md](bringup-field-notes.md) §11.
+
 ## `spec.externalIPs`
 
 A Service may carry `spec.externalIPs`: addresses the cluster does not allocate
