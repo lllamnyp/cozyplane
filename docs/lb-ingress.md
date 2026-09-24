@@ -416,12 +416,50 @@ The DSR path is the exception: it arrives over the overlay, so its
 `ingress_ifindex` is the geneve device and says nothing about egress. Those flows
 store 0 and keep the node-wide slot.
 
-**Remaining limitation.** `float_net`, `CFG_FLOAT_IFINDEX` and `CFG_FLOAT_NH` are
-still single-cell, and floating-IP and VPC-NAT egress still pick their link from
-that one slot. On a node with two external-address links those paths have the
-problem the LB path just lost. The agent warns whenever a live binding is
-displaced, so the condition is identifiable; closing it properly means a
-per-ifindex map shape.
+### The egress link is a property of the address
+
+Whenever the node emits a packet sourced from an **external** address — a
+floating IP, a VPC's NAT identity, an LB frontend on a reply — it cannot hand the
+packet to the kernel: the source belongs to a pod, not the node, and the reply has
+to return to the same place. So the datapath selects an interface itself. Which
+interface is a property of the address: *which of this node's links can
+legitimately source it*. A node carrying external addresses on two links — an L2
+VLAN with an announced pool on one, cloud-NAT'd node addresses on the other — has
+two different answers at once, so no single node-wide value can be correct.
+
+`ext_links` is that mapping. It is an LPM trie over the repo's `lpm_key`
+(`scope_net` 0, addresses in the usual 128-bit form, so one map serves both
+families), with **one entry per link that carries external addresses**:
+
+| | |
+|---|---|
+| key | the link's subnet |
+| value | `{ifindex, nh, base, mask}` — the link, its router, and its subnet |
+
+A lookup on the address about to be stamped returns the link to leave by and the
+router to reach an off-subnet client through; `base`/`mask` answer whether a given
+destination is on that link's segment (resolve it directly) or beyond it (via the
+router). A **miss** means no link claims the address — a routed pool, delivered to
+us from elsewhere — and the answer is the default uplink with the FIB resolving
+the neighbour, which is what the node-wide fallback always did.
+
+Selection order, at each of the four egress sites (`floating_egress_snat`,
+`vpc_nat_snat` and their v6 twins):
+
+1. the address's own link, from `ext_links`;
+2. the default uplink (`CFG_UPLINK_IFINDEX`), FIB-resolved.
+
+`lb_return` keeps one step in front of that: the arrival interface recorded per
+flow is more exact than anything derived from the address, because it is also
+right for an address no link's subnet covers. It falls back to `ext_links` on the
+frontend address — which is what gives DSR flows, arriving over the overlay with
+no usable arrival interface, a correct answer for the first time — and then to the
+default uplink.
+
+**Superseded, still written.** `CFG_FLOAT_IFINDEX`, `CFG_FLOAT_NH` and `float_net`
+held the single node-wide answer. Nothing reads them once `ext_links` is in place.
+They are still written, because dropping a `PIN_BY_NAME` map strands a pin on every
+upgraded node; removing them is its own change, on the same terms as `uplink_mac`.
 
 `float_uplink_mac` and `uplink_mac` are **vestigial** — no program has read them
 since the in-datapath ARP/NDP responder was removed, and the kernel answers v4

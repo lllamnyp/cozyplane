@@ -76,6 +76,14 @@ type overlayEndpoint struct {
 	Pad     [2]uint8
 }
 
+type overlayExtEgress struct {
+	_       structs.HostLayout
+	Ifindex uint32
+	Nh      uint32
+	Base    uint32
+	Mask    uint32
+}
+
 type overlayFloatNet struct {
 	_    structs.HostLayout
 	Base uint32
@@ -326,6 +334,7 @@ const (
 	overlayMapCtRev                 = "ct_rev"
 	overlayMapDnsCt                 = "dns_ct"
 	overlayMapDnsIps                = "dns_ips"
+	overlayMapExtLinks              = "ext_links"
 	overlayMapFabricOf              = "fabric_of"
 	overlayMapFloatNet              = "float_net"
 	overlayMapFloatUplinkMac        = "float_uplink_mac"
@@ -444,6 +453,7 @@ type overlayMapSpecs struct {
 	CtRev          *ebpf.MapSpec `ebpf:"ct_rev"`
 	DnsCt          *ebpf.MapSpec `ebpf:"dns_ct"`
 	DnsIps         *ebpf.MapSpec `ebpf:"dns_ips"`
+	ExtLinks       *ebpf.MapSpec `ebpf:"ext_links"`
 	FabricOf       *ebpf.MapSpec `ebpf:"fabric_of"`
 	FloatNet       *ebpf.MapSpec `ebpf:"float_net"`
 	FloatUplinkMac *ebpf.MapSpec `ebpf:"float_uplink_mac"`
@@ -524,6 +534,7 @@ type overlayMaps struct {
 	CtRev          *ebpf.Map `ebpf:"ct_rev"`
 	DnsCt          *ebpf.Map `ebpf:"dns_ct"`
 	DnsIps         *ebpf.Map `ebpf:"dns_ips"`
+	ExtLinks       *ebpf.Map `ebpf:"ext_links"`
 	FabricOf       *ebpf.Map `ebpf:"fabric_of"`
 	FloatNet       *ebpf.Map `ebpf:"float_net"`
 	FloatUplinkMac *ebpf.Map `ebpf:"float_uplink_mac"`
@@ -580,6 +591,7 @@ func (m *overlayMaps) Close() error {
 		m.CtRev,
 		m.DnsCt,
 		m.DnsIps,
+		m.ExtLinks,
 		m.FabricOf,
 		m.FloatNet,
 		m.FloatUplinkMac,

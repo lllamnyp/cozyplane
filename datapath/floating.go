@@ -325,6 +325,13 @@ func (m *Manager) bindFloatUplink(link netlink.Link, ip, gw net.IP) error {
 	if err := m.objs.FloatNet.Put(uint32(0), &fn); err != nil {
 		return fmt.Errorf("set floating subnet: %w", err)
 	}
+	// The cells above are the node-wide answer and nothing reads them any more
+	// (docs/lb-ingress.md). This is the one that decides egress: an entry per
+	// link, so two links carrying external addresses no longer overwrite each
+	// other's answer.
+	if err := m.setExtLink(idx, subnet, nh); err != nil {
+		return err
+	}
 	m.floatBound = want
 	return nil
 }
@@ -464,3 +471,44 @@ func (m *Manager) Floatings() (map[string]bool, error) {
 // the kernel's routing decision, delivery works however that was arranged and to
 // whichever node the address lands on — the pod is found through `floating` and
 // reached over the overlay if it lives elsewhere.
+
+// setExtLink records that idx can source addresses inside subnet, with nh as the
+// router for destinations outside it. Keyed by the subnet, so an LPM lookup on
+// any address the link carries finds it.
+//
+// Links with no entry fall back to the default uplink and a plain FIB lookup,
+// which is what an address no link claims — a routed pool — needs anyway, so the
+// default uplink is deliberately not given an entry of its own.
+func (m *Manager) setExtLink(idx int, subnet *net.IPNet, nh net.IP) error {
+	key, err := lpmKey(0, subnet.String())
+	if err != nil {
+		return fmt.Errorf("ext link key for %s: %w", subnet, err)
+	}
+	val, err := extEgressVal(idx, subnet, nh)
+	if err != nil {
+		return err
+	}
+	if err := m.objs.ExtLinks.Put(&key, &val); err != nil {
+		return fmt.Errorf("set ext link %s: %w", subnet, err)
+	}
+	return nil
+}
+
+// extEgressVal builds the map value: the link, its router, and its subnet for
+// the on/off-subnet test the datapath makes against a destination.
+func extEgressVal(idx int, subnet *net.IPNet, nh net.IP) (overlayExtEgress, error) {
+	base := subnet.IP.Mask(subnet.Mask).To4()
+	mask := net.IP(subnet.Mask).To4()
+	if base == nil || mask == nil {
+		return overlayExtEgress{}, fmt.Errorf("ext link %s is not v4", subnet)
+	}
+	v := overlayExtEgress{
+		Ifindex: uint32(idx),
+		Base:    binary.NativeEndian.Uint32(base),
+		Mask:    binary.NativeEndian.Uint32(mask),
+	}
+	if nh4 := nh.To4(); nh4 != nil {
+		v.Nh = binary.NativeEndian.Uint32(nh4)
+	}
+	return v, nil
+}

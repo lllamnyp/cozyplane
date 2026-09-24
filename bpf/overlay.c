@@ -631,6 +631,37 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } uplink_mac SEC(".maps");
 
+// ext_links: which of this node's links can source a given external address —
+// a floating IP, a VPC NAT identity, an LB frontend on a reply. One entry per
+// link that carries external addresses, keyed by that link's subnet, so an LPM
+// lookup on the address being stamped names the link to leave by.
+//
+// This replaces CFG_FLOAT_IFINDEX for egress selection. That cell held one
+// answer for the node, and a node can carry external addresses on two links at
+// once (an L2 VLAN with an announced pool, plus cloud-NAT'd node addresses) —
+// whichever link won the cell, the other link's traffic left the wrong segment
+// with a source the fabric drops. See docs/lb-ingress.md § "The egress link is
+// a property of the address".
+//
+// A miss means no link claims the address: a routed pool, delivered to us from
+// elsewhere. The default uplink with a plain FIB lookup is the answer then, as
+// it always was.
+struct ext_egress {
+	__u32 ifindex;
+	__be32 nh;   // the link's router, for destinations off its subnet; 0 = ask the FIB
+	__be32 base; // the link's subnet, to tell those destinations apart
+	__be32 mask;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__type(key, struct lpm_key);
+	__type(value, struct ext_egress);
+	__uint(max_entries, 64);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} ext_links SEC(".maps");
+
 // float_uplink_mac: the *floating* uplink's MAC, when floating traffic rides a
 // different link than the default route (CFG_FLOAT_IFINDEX set) — e.g. an OCI
 // L2 VLAN carrying the floating range, while the default route (and the
@@ -1828,6 +1859,34 @@ static __always_inline __u32 cfg(__u32 idx)
 // A fully-specified scoped LPM lookup: 32 scope bits + 128 address bits.
 #define LPM_FULL 160
 
+// ext_link_of returns the entry for an external source address, or NULL when no
+// link claims it. The value points into the map, so callers copy what they need
+// before any packet store: a store invalidates it.
+static __always_inline struct ext_egress *ext_link_of(const struct addr128 *src)
+{
+	struct lpm_key k = { .prefixlen = LPM_FULL, .scope_net = 0, .addr = *src };
+	return bpf_map_lookup_elem(&ext_links, &k);
+}
+
+// ext_redirect sends a packet out an external link. ON that link's subnet the
+// destination is its own neighbour and the FIB resolves it; OFF it the link's
+// router must be named, because a plain lookup would return the DEFAULT link's
+// gateway — the wrong neighbour for this one. nh 0 means no router is known
+// (a routed pool on the default uplink), so the FIB answers.
+static __always_inline int ext_redirect(struct __sk_buff *skb, __u32 uplink,
+					__be32 nh, __be32 base, __be32 mask)
+{
+	if (!nh)
+		return bpf_redirect_neigh(uplink, NULL, 0, 0);
+	__be32 dip = 0;
+	bpf_skb_load_bytes(skb, IP_DADDR_OFF, &dip, 4);
+	if (mask && (dip & mask) == base)
+		return bpf_redirect_neigh(uplink, NULL, 0, 0);
+	struct bpf_redir_neigh rn = { .nh_family = AF_INET };
+	rn.ipv4_nh = nh;
+	return bpf_redirect_neigh(uplink, &rn, sizeof(rn), 0);
+}
+
 // net_of resolves an address to a network id *as seen from* a scope network:
 // the destination's net from the source's scope (from_pod), or the source's
 // net from the destination's scope (to_pod). Absent => 0 (default/off-net).
@@ -2958,9 +3017,18 @@ static __always_inline int floating_egress_snat(struct __sk_buff *skb, struct ip
 	// Floating egress leaves by the floating uplink (the link that carries the
 	// public range) — only there is the public source a valid address for the
 	// wire. Falls back to the default uplink when they are the same link.
-	__u32 uplink = cfg(CFG_FLOAT_IFINDEX);
-	if (!uplink)
-		uplink = cfg(CFG_UPLINK_IFINDEX);
+	// The link that can source this address, not a node-wide guess.
+	__u32 uplink;
+	__be32 xnh = 0, xbase = 0, xmask = 0;
+	struct ext_egress *xl = ext_link_of(public_ip);
+	if (xl) {
+		uplink = xl->ifindex;
+		xnh = xl->nh;
+		xbase = xl->base;
+		xmask = xl->mask; // copied: a packet store invalidates the map value
+	} else {
+		uplink = cfg(CFG_UPLINK_IFINDEX); // no link claims it: a routed pool
+	}
 	if (!uplink)
 		return FLOAT_MISS;
 	__u32 pub = v4_of_128(public_ip), osrc = ip->saddr; // copied: stores invalidate ip
@@ -2987,19 +3055,7 @@ static __always_inline int floating_egress_snat(struct __sk_buff *skb, struct ip
 	// OFF it the agent-supplied virtual router is — the FIB would route via
 	// the *default* link's gateway, the wrong neighbour for this uplink, and
 	// the virtual router won't hairpin intra-subnet traffic back in.
-	__u32 nh = cfg(CFG_FLOAT_NH);
-	if (nh) {
-		__u32 zero = 0;
-		struct float_net *fn = bpf_map_lookup_elem(&float_net, &zero);
-		__be32 dip = 0;
-		bpf_skb_load_bytes(skb, IP_DADDR_OFF, &dip, 4);
-		if (fn && fn->mask && (dip & fn->mask) == fn->base)
-			return bpf_redirect_neigh(uplink, NULL, 0, 0); // on-subnet: dst is the neighbour
-		struct bpf_redir_neigh rn = { .nh_family = AF_INET };
-		rn.ipv4_nh = nh;
-		return bpf_redirect_neigh(uplink, &rn, sizeof(rn), 0);
-	}
-	return bpf_redirect_neigh(uplink, NULL, 0, 0);
+	return ext_redirect(skb, uplink, xnh, xbase, xmask);
 }
 
 // encap_lb: encapsulate an LB/NodePort flow to a remote backend's node at
@@ -3068,9 +3124,18 @@ static __always_inline int vpc_nat_snat(struct __sk_buff *skb, struct pkt *p, __
 	__u32 osrc = ip->saddr;
 	__u8 proto = ip->protocol;
 
-	__u32 uplink = cfg(CFG_FLOAT_IFINDEX);
-	if (!uplink)
-		uplink = cfg(CFG_UPLINK_IFINDEX);
+	// The link that can source this address, not a node-wide guess.
+	__u32 uplink;
+	__be32 xnh = 0, xbase = 0, xmask = 0;
+	struct ext_egress *xl = ext_link_of(&nat->ip);
+	if (xl) {
+		uplink = xl->ifindex;
+		xnh = xl->nh;
+		xbase = xl->base;
+		xmask = xl->mask; // copied: a packet store invalidates the map value
+	} else {
+		uplink = cfg(CFG_UPLINK_IFINDEX); // no link claims it: a routed pool
+	}
 	if (!uplink)
 		return NAT_MISS;
 
@@ -3098,7 +3163,7 @@ static __always_inline int vpc_nat_snat(struct __sk_buff *skb, struct pkt *p, __
 		nat_addr(skb, proto, IP_SADDR_OFF, osrc, v4_of_128(&nat->ip));
 		nat_icmp_id(skb, id, gw_id);
 		count_ns(net, skb->len, NS_GW, 0);
-		return bpf_redirect_neigh(uplink, NULL, 0, 0);
+		return ext_redirect(skb, uplink, xnh, xbase, xmask);
 	}
 
 	__u16 sport, dport;
@@ -3124,7 +3189,7 @@ static __always_inline int vpc_nat_snat(struct __sk_buff *skb, struct pkt *p, __
 	nat_port(skb, proto, L4_SPORT_OFF, sport, gw_port);
 	// The VPC's egress, through its own boundary, wearing its own address.
 	count_ns(net, skb->len, NS_GW, 0);
-	return bpf_redirect_neigh(uplink, NULL, 0, 0);
+	return ext_redirect(skb, uplink, xnh, xbase, xmask);
 }
 
 // vpc_nat_reverse: the reply half. A packet addressed to a VPC's NAT address
@@ -3442,9 +3507,10 @@ static __always_inline int floating_egress_snat6(struct __sk_buff *skb, struct p
 	// Same floating-uplink selection as the v4 path. No explicit v6 next-hop
 	// yet (CFG_FLOAT_NH is a v4 cell): on a distinct floating uplink, v6
 	// off-subnet egress still resolves via the FIB — revisit with v6 floating.
-	__u32 uplink = cfg(CFG_FLOAT_IFINDEX);
-	if (!uplink)
-		uplink = cfg(CFG_UPLINK_IFINDEX);
+	// The link that can source this address, not a node-wide guess. v6 has no
+	// next-hop cell; the FIB resolves the neighbour on the chosen link.
+	struct ext_egress *xl = ext_link_of(public_ip);
+	__u32 uplink = xl ? xl->ifindex : cfg(CFG_UPLINK_IFINDEX);
 	if (!uplink)
 		return FLOAT_MISS;
 	struct addr128 pub = *public_ip; // copied: stores below invalidate map values too
@@ -3639,9 +3705,10 @@ static __always_inline int vpc_nat_snat6(struct __sk_buff *skb, struct pkt *p, _
 		return TC_ACT_SHOT; // SG egress, the same gate the gateway path applies
 	__u32 pb = nat->port_base, ps = nat->port_span;
 
-	__u32 uplink = cfg(CFG_FLOAT_IFINDEX);
-	if (!uplink)
-		uplink = cfg(CFG_UPLINK_IFINDEX);
+	// The link that can source this address, not a node-wide guess. v6 has no
+	// next-hop cell; the FIB resolves the neighbour on the chosen link.
+	struct ext_egress *xl = ext_link_of(&natip);
+	__u32 uplink = xl ? xl->ifindex : cfg(CFG_UPLINK_IFINDEX);
 	if (!uplink)
 		return NAT_MISS;
 
@@ -3988,11 +4055,23 @@ static __always_inline int lb_return(struct __sk_buff *skb, struct pkt *p, __u32
 	// (docs/north-south.md).
 	count_ns(srcnet, skb->len, NS_LB, 0);
 
-	// The flow's own arrival link first; the node-wide slot only when the flow
-	// does not know (DSR) — see svc_rev_val.ifindex.
+	// The flow's own arrival link is the most exact answer: it is right even for
+	// an address no link's subnet covers. A DSR flow arrived over the overlay
+	// and has none, so it falls back to the frontend address's own link — which
+	// is the first correct answer those flows have had.
 	__u32 uplink = rv->ifindex;
-	if (!uplink)
-		uplink = cfg(CFG_FLOAT_IFINDEX);
+	__be32 xnh = 0, xbase = 0, xmask = 0;
+	struct ext_egress *xl = ext_link_of(&rv->vip);
+	if (xl) {
+		if (!uplink)
+			uplink = xl->ifindex;
+		// The router belongs to that link; name it only if we leave by it.
+		if (uplink == xl->ifindex) {
+			xnh = xl->nh;
+			xbase = xl->base;
+			xmask = xl->mask; // copied: a packet store invalidates the value
+		}
+	}
 	if (!uplink)
 		uplink = cfg(CFG_UPLINK_IFINDEX);
 	if (!uplink)
@@ -4010,23 +4089,7 @@ static __always_inline int lb_return(struct __sk_buff *skb, struct pkt *p, __u32
 	if (sport != rv->vport)
 		nat_port(skb, p->proto, L4_SPORT_OFF, sport, rv->vport);
 
-	// CFG_FLOAT_NH is the floating link's router. It applies only when the
-	// reply actually leaves that link; on any other link the FIB resolves the
-	// neighbour itself, and forcing the floating router there would name a
-	// next-hop that is not reachable from it.
-	__u32 nh = (uplink == cfg(CFG_FLOAT_IFINDEX)) ? cfg(CFG_FLOAT_NH) : 0;
-	if (nh) {
-		__u32 zero = 0;
-		struct float_net *fn = bpf_map_lookup_elem(&float_net, &zero);
-		__be32 dip = 0;
-		bpf_skb_load_bytes(skb, IP_DADDR_OFF, &dip, 4);
-		if (fn && fn->mask && (dip & fn->mask) == fn->base)
-			return bpf_redirect_neigh(uplink, NULL, 0, 0); // on-subnet: dst is the neighbour
-		struct bpf_redir_neigh rn = { .nh_family = AF_INET };
-		rn.ipv4_nh = nh;
-		return bpf_redirect_neigh(uplink, &rn, sizeof(rn), 0);
-	}
-	return bpf_redirect_neigh(uplink, NULL, 0, 0);
+	return ext_redirect(skb, uplink, xnh, xbase, xmask);
 }
 
 // Per-CPU scratch for lb_ingress: the svc/ct keys and values are ~200 bytes
