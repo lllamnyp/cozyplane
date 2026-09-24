@@ -439,15 +439,30 @@ families), with **one entry per link that carries external addresses**:
 A lookup on the address about to be stamped returns the link to leave by and the
 router to reach an off-subnet client through; `base`/`mask` answer whether a given
 destination is on that link's segment (resolve it directly) or beyond it (via the
-router). A **miss** means no link claims the address — a routed pool, delivered to
-us from elsewhere — and the answer is the default uplink with the FIB resolving
-the neighbour, which is what the node-wide fallback always did.
+router).
 
-Selection order, at each of the four egress sites (`floating_egress_snat`,
-`vpc_nat_snat` and their v6 twins):
+Two keys go in per address, because the address is not always inside the link's
+subnet. A **routed pool** is delivered by a router *on* the link, so the pool sits
+outside it: the subnet key alone would miss and egress would fall back to the
+default uplink — the wrong segment, and the same silent drop this map exists to
+prevent. So the address itself is keyed as a host prefix, and the link's subnet
+alongside it, covering addresses the pool grows into before the agent sees them.
+
+A **miss** then means no link on this node claims the address at all, and the
+default uplink with a plain FIB lookup is the answer.
+
+Selection order at the two v4 egress sites (`floating_egress_snat`,
+`vpc_nat_snat`):
 
 1. the address's own link, from `ext_links`;
 2. the default uplink (`CFG_UPLINK_IFINDEX`), FIB-resolved.
+
+**v6 is not there yet.** `EnsureFloatingUplink` returns early for a v6 address, so
+nothing writes a v6 entry and the lookup always misses. The v6 twins therefore
+keep the node-wide cell as their second step, ahead of the default uplink —
+dropping straight to the default would move v6 egress off a secondary link that
+currently carries it. Making v6 per-address means v6 floating-uplink selection
+first, which does not exist.
 
 `lb_return` keeps one step in front of that: the arrival interface recorded per
 flow is more exact than anything derived from the address, because it is also
@@ -457,9 +472,16 @@ no usable arrival interface, a correct answer for the first time — and then to
 default uplink.
 
 **Superseded, still written.** `CFG_FLOAT_IFINDEX`, `CFG_FLOAT_NH` and `float_net`
-held the single node-wide answer. Nothing reads them once `ext_links` is in place.
-They are still written, because dropping a `PIN_BY_NAME` map strands a pin on every
-upgraded node; removing them is its own change, on the same terms as `uplink_mac`.
+held the single node-wide answer. No v4 path reads them once `ext_links` is in
+place; `CFG_FLOAT_IFINDEX` survives only as the v6 fallback above. They are still
+written, because dropping a `PIN_BY_NAME` map strands a pin on every upgraded node;
+removing them is its own change, on the same terms as `uplink_mac`.
+
+**Stale entries are pruned.** An LPM entry is not inert when it goes stale — it
+outranks the default-uplink fallback, so a renumbered link would keep claiming its
+old prefix. Each bind drops entries that point at the link it just wrote but are
+not among that link's current keys, and any entry naming a link that no longer
+exists.
 
 `float_uplink_mac` and `uplink_mac` are **vestigial** — no program has read them
 since the in-datapath ARP/NDP responder was removed, and the kernel answers v4

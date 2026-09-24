@@ -636,12 +636,13 @@ struct {
 // link that carries external addresses, keyed by that link's subnet, so an LPM
 // lookup on the address being stamped names the link to leave by.
 //
-// This replaces CFG_FLOAT_IFINDEX for egress selection. That cell held one
+// This replaces CFG_FLOAT_IFINDEX for v4 egress selection. That cell held one
 // answer for the node, and a node can carry external addresses on two links at
 // once (an L2 VLAN with an announced pool, plus cloud-NAT'd node addresses) —
 // whichever link won the cell, the other link's traffic left the wrong segment
-// with a source the fabric drops. See docs/lb-ingress.md § "The egress link is
-// a property of the address".
+// with a source the fabric drops. The v6 paths still fall back to the cell,
+// because nothing writes v6 entries yet. See docs/lb-ingress.md § "The egress
+// link is a property of the address".
 //
 // A miss means no link claims the address: a routed pool, delivered to us from
 // elsewhere. The default uplink with a plain FIB lookup is the answer then, as
@@ -3504,13 +3505,16 @@ static __always_inline int floating_egress_snat6(struct __sk_buff *skb, struct p
 	// SG egress gates a floating pod's off-VPC traffic (the v4 twin's rationale).
 	if (!ns_egress_ok(skb, net, 1, proto, p->src, p->dst))
 		return TC_ACT_SHOT;
-	// Same floating-uplink selection as the v4 path. No explicit v6 next-hop
-	// yet (CFG_FLOAT_NH is a v4 cell): on a distinct floating uplink, v6
-	// off-subnet egress still resolves via the FIB — revisit with v6 floating.
-	// The link that can source this address, not a node-wide guess. v6 has no
-	// next-hop cell; the FIB resolves the neighbour on the chosen link.
+	// The link that can source this address. ext_links is v4-only today:
+	// EnsureFloatingUplink returns early for a v6 address, so nothing writes a
+	// v6 entry, which leaves the node-wide cell as the v6 answer until v6
+	// floating-uplink selection exists. Dropping straight to the default uplink
+	// here would move v6 egress off a secondary link that currently carries it.
+	// No v6 next-hop cell either: the FIB resolves the neighbour on that link.
 	struct ext_egress *xl = ext_link_of(public_ip);
-	__u32 uplink = xl ? xl->ifindex : cfg(CFG_UPLINK_IFINDEX);
+	__u32 uplink = xl ? xl->ifindex : cfg(CFG_FLOAT_IFINDEX);
+	if (!uplink)
+		uplink = cfg(CFG_UPLINK_IFINDEX);
 	if (!uplink)
 		return FLOAT_MISS;
 	struct addr128 pub = *public_ip; // copied: stores below invalidate map values too
@@ -3705,10 +3709,16 @@ static __always_inline int vpc_nat_snat6(struct __sk_buff *skb, struct pkt *p, _
 		return TC_ACT_SHOT; // SG egress, the same gate the gateway path applies
 	__u32 pb = nat->port_base, ps = nat->port_span;
 
-	// The link that can source this address, not a node-wide guess. v6 has no
-	// next-hop cell; the FIB resolves the neighbour on the chosen link.
+	// The link that can source this address. ext_links is v4-only today:
+	// EnsureFloatingUplink returns early for a v6 address, so nothing writes a
+	// v6 entry, which leaves the node-wide cell as the v6 answer until v6
+	// floating-uplink selection exists. Dropping straight to the default uplink
+	// here would move v6 egress off a secondary link that currently carries it.
+	// No v6 next-hop cell either: the FIB resolves the neighbour on that link.
 	struct ext_egress *xl = ext_link_of(&natip);
-	__u32 uplink = xl ? xl->ifindex : cfg(CFG_UPLINK_IFINDEX);
+	__u32 uplink = xl ? xl->ifindex : cfg(CFG_FLOAT_IFINDEX);
+	if (!uplink)
+		uplink = cfg(CFG_UPLINK_IFINDEX);
 	if (!uplink)
 		return NAT_MISS;
 

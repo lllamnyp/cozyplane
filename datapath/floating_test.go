@@ -409,3 +409,83 @@ func u32ToIP(v uint32) string {
 	binary.NativeEndian.PutUint32(b[:], v)
 	return net.IP(b[:]).String()
 }
+
+// A routed pool is delivered by a router ON a secondary link, so the pool sits
+// OUTSIDE that link's subnet. Keying only by the subnet made the lookup miss and
+// egress fall back to the default uplink — the wrong segment, silently.
+func TestExtLinkKeysRoutedPool(t *testing.T) {
+	_, vlan, _ := net.ParseCIDR("10.20.100.0/24")
+	pool := net.ParseIP("203.0.113.5") // routed to us via 10.20.100.1
+
+	keys, err := extLinkKeys(pool, vlan)
+	if err != nil {
+		t.Fatalf("extLinkKeys: %v", err)
+	}
+	want, err := addr128(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, k := range keys {
+		if k.Addr == want && k.Prefixlen == 32+96+32 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no host key for the pool address in %d key(s); a routed pool would miss", len(keys))
+	}
+	// The subnet key stays, covering addresses the pool grows into on-link.
+	sk, _ := lpmKey(0, vlan.String())
+	var haveSubnet bool
+	for _, k := range keys {
+		if k == sk {
+			haveSubnet = true
+		}
+	}
+	if !haveSubnet {
+		t.Error("the link's subnet key is missing")
+	}
+}
+
+// A stale LPM entry outranks the default-uplink fallback, so a renumbered link
+// would keep claiming its old prefix forever.
+func TestExtLinksToPrune(t *testing.T) {
+	key := func(c string) overlayLpmKey {
+		k, err := lpmKey(0, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	old, cur, other := key("10.20.100.0/24"), key("10.20.200.0/24"), key("10.30.0.0/24")
+	have := map[overlayLpmKey]overlayExtEgress{
+		old:   {Ifindex: uint32(vlanIdx)},  // the prefix eth1 used to carry
+		cur:   {Ifindex: uint32(vlanIdx)},  // what this bind just wrote
+		other: {Ifindex: uint32(otherIdx)}, // another live link's answer
+	}
+	live := func(int) bool { return true }
+
+	stale := extLinksToPrune(have, vlanIdx, []overlayLpmKey{cur}, live)
+	if len(stale) != 1 || stale[0] != old {
+		t.Fatalf("pruned %d key(s), want just the renumbered-away one", len(stale))
+	}
+
+	// Another link's entry is another address's answer: never touched...
+	for _, s := range extLinksToPrune(have, vlanIdx, []overlayLpmKey{cur}, live) {
+		if s == other {
+			t.Error("pruned a live sibling link's entry")
+		}
+	}
+	// ...unless that link is gone.
+	dead := extLinksToPrune(have, vlanIdx, []overlayLpmKey{cur},
+		func(i int) bool { return i != otherIdx })
+	var sawOther bool
+	for _, s := range dead {
+		if s == other {
+			sawOther = true
+		}
+	}
+	if !sawOther {
+		t.Error("an entry naming a vanished link was kept")
+	}
+}
