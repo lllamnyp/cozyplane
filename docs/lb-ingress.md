@@ -422,8 +422,6 @@ that one slot. On a node with two external-address links those paths have the
 problem the LB path just lost. The agent warns whenever a live binding is
 displaced, so the condition is identifiable; closing it properly means a
 per-ifindex map shape.
-Pre-existing (two floating VLANs contend identically); closing it means giving
-those maps a per-ifindex shape.
 
 `float_uplink_mac` and `uplink_mac` are **vestigial** — no program has read them
 since the in-datapath ARP/NDP responder was removed, and the kernel answers v4

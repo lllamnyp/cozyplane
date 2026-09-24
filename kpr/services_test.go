@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"net"
 	"testing"
 
@@ -322,5 +323,32 @@ func TestExternalIPRows(t *testing.T) {
 	rows, _ = computeRows(bad, slices, "node-a", nil, false)
 	if _, ok := rows[extKey]; !ok {
 		t.Error("an unparseable externalIP dropped the valid one")
+	}
+}
+
+// Without a node name no endpoint can match, so every external frontend goes
+// unserved while ClusterIPs keep working — a kpr that looks healthy. The
+// hostname is the node's own on a hostNetwork pod, so it closes that gap
+// instead of leaving it to the manifest.
+func TestResolveNodeName(t *testing.T) {
+	env := func(m map[string]string) func(string) string {
+		return func(k string) string { return m[k] }
+	}
+	host := func(h string, err error) func() (string, error) {
+		return func() (string, error) { return h, err }
+	}
+
+	if n, fb := resolveNodeName(env(map[string]string{"NODE_NAME": "node0"}), host("ignored", nil)); n != "node0" || fb {
+		t.Errorf("NODE_NAME set = %q,%v; want node0,false", n, fb)
+	}
+	if n, fb := resolveNodeName(env(nil), host("node1", nil)); n != "node1" || !fb {
+		t.Errorf("NODE_NAME unset = %q,%v; want node1,true", n, fb)
+	}
+	// Nothing to go on: the caller must refuse rather than serve no frontend.
+	if n, _ := resolveNodeName(env(nil), host("", nil)); n != "" {
+		t.Errorf("empty hostname = %q; want \"\"", n)
+	}
+	if n, _ := resolveNodeName(env(nil), host("node2", errors.New("boom"))); n != "" {
+		t.Errorf("hostname error = %q; want \"\"", n)
 	}
 }

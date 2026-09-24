@@ -426,9 +426,9 @@ whether to mount needs checking on Talos.
 
 For two weeks on the integrations stand every public hostname answered nothing
 on 443 while the same nodes served 6443 fine, and cozyplane looked healthy
-throughout. Three fixes were aimed at it — `spec.externalIPs` support in kpr
-(#44), then the node-owned address resolver (#47) — and none changed the
-symptom, because none of them was the cause.
+throughout. Two fixes were aimed at it — `spec.externalIPs` support in kpr
+(#44), then the node-owned address resolver (#47) — and neither changed the
+symptom, because neither was the cause.
 
 `chart/cozyplane-kpr/templates/daemonset.yaml` set `KPR_CGROUP_ROOT` and
 `KPR_BPFFS_ROOT` and nothing else. `deploy/kpr-daemonset.yaml` — the kind
