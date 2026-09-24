@@ -17,6 +17,7 @@ limitations under the License.
 package datapath
 
 import (
+	"encoding/binary"
 	"errors"
 	"net"
 	"strings"
@@ -359,5 +360,132 @@ func TestRouteLookupErr(t *testing.T) {
 	wrapped := routeLookupErr("10.20.0.16", 0, sentinel)
 	if !errors.Is(wrapped, sentinel) {
 		t.Errorf("a real failure must stay unwrappable: %v", wrapped)
+	}
+}
+
+// The value the datapath reads to decide where an external address leaves by.
+// Two links carrying external addresses get two entries, so neither overwrites
+// the other's answer — the failure this map replaced.
+func TestExtEgressVal(t *testing.T) {
+	_, vlan, _ := net.ParseCIDR("10.20.100.0/24")
+	v, err := extEgressVal(vlanIdx, vlan, net.ParseIP("10.20.100.1"))
+	if err != nil {
+		t.Fatalf("extEgressVal: %v", err)
+	}
+	if v.Ifindex != uint32(vlanIdx) {
+		t.Errorf("ifindex = %d, want %d", v.Ifindex, vlanIdx)
+	}
+	// Stored in network order, the form the datapath compares against a packet.
+	if got := u32ToIP(v.Base); got != "10.20.100.0" {
+		t.Errorf("base = %s, want 10.20.100.0", got)
+	}
+	if got := u32ToIP(v.Mask); got != "255.255.255.0" {
+		t.Errorf("mask = %s, want 255.255.255.0", got)
+	}
+	if got := u32ToIP(v.Nh); got != "10.20.100.1" {
+		t.Errorf("nh = %s, want 10.20.100.1", got)
+	}
+
+	// No router known: the datapath falls back to a plain FIB lookup.
+	v, err = extEgressVal(uplinkIdx, vlan, nil)
+	if err != nil || v.Nh != 0 {
+		t.Errorf("absent nh = %d, %v; want 0, nil", v.Nh, err)
+	}
+
+	// The key is the subnet, so every address the link carries finds it.
+	k, err := lpmKey(0, vlan.String())
+	if err != nil {
+		t.Fatalf("lpmKey: %v", err)
+	}
+	// The 32-bit scope leads the key and v4 sits under the /96 NAT64 prefix, so
+	// a /24 matches on 32+96+24 bits (LPM_FULL being 32+128).
+	if k.Prefixlen != 32+96+24 {
+		t.Errorf("prefixlen = %d, want %d", k.Prefixlen, 32+96+24)
+	}
+}
+
+func u32ToIP(v uint32) string {
+	var b [4]byte
+	binary.NativeEndian.PutUint32(b[:], v)
+	return net.IP(b[:]).String()
+}
+
+// A routed pool is delivered by a router ON a secondary link, so the pool sits
+// OUTSIDE that link's subnet. Keying only by the subnet made the lookup miss and
+// egress fall back to the default uplink — the wrong segment, silently.
+func TestExtLinkKeysRoutedPool(t *testing.T) {
+	_, vlan, _ := net.ParseCIDR("10.20.100.0/24")
+	pool := net.ParseIP("203.0.113.5") // routed to us via 10.20.100.1
+
+	keys, err := extLinkKeys(pool, vlan)
+	if err != nil {
+		t.Fatalf("extLinkKeys: %v", err)
+	}
+	want, err := addr128(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, k := range keys {
+		if k.Addr == want && k.Prefixlen == 32+96+32 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no host key for the pool address in %d key(s); a routed pool would miss", len(keys))
+	}
+	// The subnet key stays, covering addresses the pool grows into on-link.
+	sk, _ := lpmKey(0, vlan.String())
+	var haveSubnet bool
+	for _, k := range keys {
+		if k == sk {
+			haveSubnet = true
+		}
+	}
+	if !haveSubnet {
+		t.Error("the link's subnet key is missing")
+	}
+}
+
+// A stale LPM entry outranks the default-uplink fallback, so a renumbered link
+// would keep claiming its old prefix forever.
+func TestExtLinksToPrune(t *testing.T) {
+	key := func(c string) overlayLpmKey {
+		k, err := lpmKey(0, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	old, cur, other := key("10.20.100.0/24"), key("10.20.200.0/24"), key("10.30.0.0/24")
+	have := map[overlayLpmKey]overlayExtEgress{
+		old:   {Ifindex: uint32(vlanIdx)},  // the prefix eth1 used to carry
+		cur:   {Ifindex: uint32(vlanIdx)},  // what this bind just wrote
+		other: {Ifindex: uint32(otherIdx)}, // another live link's answer
+	}
+	live := func(int) bool { return true }
+
+	stale := extLinksToPrune(have, vlanIdx, []overlayLpmKey{cur}, live)
+	if len(stale) != 1 || stale[0] != old {
+		t.Fatalf("pruned %d key(s), want just the renumbered-away one", len(stale))
+	}
+
+	// Another link's entry is another address's answer: never touched...
+	for _, s := range extLinksToPrune(have, vlanIdx, []overlayLpmKey{cur}, live) {
+		if s == other {
+			t.Error("pruned a live sibling link's entry")
+		}
+	}
+	// ...unless that link is gone.
+	dead := extLinksToPrune(have, vlanIdx, []overlayLpmKey{cur},
+		func(i int) bool { return i != otherIdx })
+	var sawOther bool
+	for _, s := range dead {
+		if s == other {
+			sawOther = true
+		}
+	}
+	if !sawOther {
+		t.Error("an entry naming a vanished link was kept")
 	}
 }
