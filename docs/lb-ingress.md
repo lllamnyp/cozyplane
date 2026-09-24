@@ -489,6 +489,23 @@ ARP for addresses the node owns. They are still written so the pinned maps keep
 their shape; deleting a `PIN_BY_NAME` map strands a pin on every upgraded node,
 so that removal is its own change.
 
+## Testing the two-link case
+
+`test/two-link-e2e.sh` reproduces it without a cloud: `test/kind.yaml` nodes are
+docker containers, so a second link is a `docker network connect` away. The script
+attaches one, publishes an external address on **each** link, and requires both to
+be served at once.
+
+The pair is what makes it a test rather than a demonstration. The node-wide cell
+can only name one link, so against the old selection the second link's address
+still works while the default uplink's times out — one of two, which reads as
+"partly working" and is why the field diagnosis went to the inbound path. It also
+asserts the `ext_links` entry for the secondary link's address names that link,
+host key included, which is the part unit tests cannot reach.
+
+What it does not cover: the floating-IP and VPC-NAT egress sites, which are
+pod-originated and would need a FloatingIP and a VPC in the fixture.
+
 ## Non-goals
 
 - **Address allocation / IPAM, LB provisioning, and traffic attraction**
