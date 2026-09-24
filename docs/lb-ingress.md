@@ -297,6 +297,16 @@ already does.
   documented answer for CCM users: target backend-hosting nodes, or accept
   that mis-attracted traffic is dropped by `Local` semantics (as upstream).
 
+## `NODE_NAME` is required for every external frontend
+
+A frontend's row carries *this node's* ready backends, so kpr must know which
+node it is on. `NODE_NAME` (downward API) is the only source. Without it no
+endpoint matches and **no** external frontend gets a row — LoadBalancer ingress,
+NodePort and `spec.externalIPs` alike — while ClusterIP rows, built from the
+cluster-wide set, are written normally. A kpr in that state looks healthy from
+inside the cluster and serves nothing from the wire; see
+[bringup-field-notes.md](bringup-field-notes.md) §11.
+
 ## `spec.externalIPs`
 
 A Service may carry `spec.externalIPs`: addresses the cluster does not allocate
@@ -385,24 +395,33 @@ split is a non-issue for it. ARP is likewise not cozyplane's problem here — th
 kernel already answers for an address the node owns, and the datapath does not
 craft ARP at all.
 
-**Remaining limitation.** `float_net`, `CFG_FLOAT_IFINDEX` and `CFG_FLOAT_NH` are
-single-cell: one non-default uplink per node. A node with two claimants — a
-floating VLAN and node-owned addresses on a third NIC, say — does not settle on
-one of them. `watchServiceUplinks` resyncs over every Service on every Service
-event, so each pass re-binds the slot to whichever address it sees, the values
-flip, and the reply path for **both** is nondeterministic; `from_uplink` is never
-detached from the loser. Two addresses on the *same* link contend the same way
-when they resolve different next-hops — an on-link address takes its subnet's
-first host, a gateway'd one takes the gateway. The agent warns whenever a live
-binding is displaced, by either route, so the condition is identifiable rather
-than presenting as intermittent black-holing.
+### The reply leaves by the link the request arrived on
 
-The three cells are also written separately, so a re-bind has a brief window in
-which one address's link is paired with another's next-hop. That is tolerated
-rather than fixed: it only arises under the contention above, and closing it
-means folding the binding into a single map value.
-Pre-existing (two floating VLANs contend identically); closing it means giving
-those maps a per-ifindex shape.
+A node can carry external addresses on two links at once — an L2 VLAN with a
+MetalLB pool on one, cloud-NAT'd node addresses on the other. `CFG_FLOAT_IFINDEX`
+holds **one** link for the whole node, so using it to pick the reply's egress
+sent replies for flows that arrived on the other link out the wrong segment,
+sourced from an address that link cannot source; the fabric drops them and the
+client sees a hang, not a refusal. Measured on a stand: `CFG_UPLINK_IFINDEX=eth0`
+carrying the published addresses, `CFG_FLOAT_IFINDEX=eth1` (the MetalLB VLAN).
+
+So the arrival link is recorded per flow, in `svc_rev_val.ifindex`, at the moment
+`lb_ingress` DNATs — `skb->ingress_ifindex` is ground truth there — and
+`lb_return` egresses by it. `CFG_FLOAT_NH` is consulted only when the reply is
+actually leaving the floating link; on any other link the FIB resolves the
+neighbour, and forcing the floating router would name a next-hop unreachable
+from it.
+
+The DSR path is the exception: it arrives over the overlay, so its
+`ingress_ifindex` is the geneve device and says nothing about egress. Those flows
+store 0 and keep the node-wide slot.
+
+**Remaining limitation.** `float_net`, `CFG_FLOAT_IFINDEX` and `CFG_FLOAT_NH` are
+still single-cell, and floating-IP and VPC-NAT egress still pick their link from
+that one slot. On a node with two external-address links those paths have the
+problem the LB path just lost. The agent warns whenever a live binding is
+displaced, so the condition is identifiable; closing it properly means a
+per-ifindex map shape.
 
 `float_uplink_mac` and `uplink_mac` are **vestigial** — no program has read them
 since the in-datapath ARP/NDP responder was removed, and the kernel answers v4

@@ -58,6 +58,23 @@ import (
 //go:embed bpf_sock.o
 var bpfSockObject []byte
 
+// resolveNodeName finds the node this instance runs on. NODE_NAME (downward API)
+// is authoritative; without it the hostname is the next best answer — the
+// DaemonSet is hostNetwork, so the container's hostname is the node's, and this
+// is what kube-proxy falls back to. fellBack reports that, so a manifest missing
+// NODE_NAME is visible rather than silently working. An empty return means the
+// node cannot be identified at all.
+func resolveNodeName(getenv func(string) string, hostname func() (string, error)) (name string, fellBack bool) {
+	if v := getenv("NODE_NAME"); v != "" {
+		return v, false
+	}
+	h, err := hostname()
+	if err != nil || h == "" {
+		return "", false
+	}
+	return h, true
+}
+
 func main() {
 	h := hive.New(
 		// Control plane: Kubernetes client + the Services/EndpointSlices
@@ -127,12 +144,20 @@ func main() {
 	// the LB hive (which drives socket-LB via Cilium's own maps); dies with the
 	// process on shutdown.
 	pinDir := filepath.Join(bpffsRoot, "cozyplane")
-	// NODE_NAME (downward API) scopes LoadBalancer-ingress rows to this node's
-	// ready backends (docs/lb-ingress.md). Without it only ClusterIP rows are
-	// fed — LB delivery silently off, so say so.
-	nodeName := os.Getenv("NODE_NAME")
-	if nodeName == "" {
-		logger.Warn("NODE_NAME unset: LoadBalancer-ingress rows disabled")
+	// The node name scopes a frontend's row to this node's ready backends
+	// (docs/lb-ingress.md). Get it wrong and no endpoint matches, so EVERY
+	// external frontend — LoadBalancer ingress, NodePort and spec.externalIPs
+	// alike — gets no row while ClusterIPs keep working off the cluster-wide
+	// set: a kpr that looks healthy and serves nothing from the wire.
+	nodeName, fellBack := resolveNodeName(os.Getenv, os.Hostname)
+	switch {
+	case nodeName == "":
+		// Nothing left to guess with, and degrading here is the failure above.
+		logger.Error("cannot determine this node's name: NODE_NAME unset and no usable hostname")
+		os.Exit(1)
+	case fellBack:
+		logger.Warn("NODE_NAME unset; falling back to the hostname. Set it from the downward API",
+			"nodeName", nodeName)
 	}
 	// externalTrafficPolicy: Cluster via DSR is strictly opt-in — it needs
 	// every node permitted to source the LB IPs on the wire, an underlay

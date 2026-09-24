@@ -77,6 +77,13 @@ spec:
           env:
             - {name: KPR_CGROUP_ROOT, value: {{ .Values.cgroupRoot | quote }}}
             - {name: KPR_BPFFS_ROOT, value: {{ .Values.bpffsRoot | quote }}}
+            # Without NODE_NAME kpr cannot tell which endpoints are node-local,
+            # so it writes NO LoadBalancer-ingress, NodePort or externalIP rows
+            # at all -- ClusterIPs keep working, which is why the omission is
+            # easy to miss (docs/lb-ingress.md).
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - {name: CLUSTER_DSR, value: {{ .Values.clusterDSR | quote }}}
           securityContext:
             privileged: true
           volumeMounts:

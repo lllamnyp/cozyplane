@@ -421,3 +421,55 @@ pinning Cilium's dependency tree; requiring the main module there would pull its
 name. Ask the kernel what is mounted at the target. kind cannot see this class of
 bug either — its nodes' bpffs is conventionally named — so anything that decides
 whether to mount needs checking on Talos.
+
+## 11. The chart never gave kpr its node name, so no external address was served (FIXED)
+
+For two weeks on the integrations stand every public hostname answered nothing
+on 443 while the same nodes served 6443 fine, and cozyplane looked healthy
+throughout. Two fixes were aimed at it — `spec.externalIPs` support in kpr
+(#44), then the node-owned address resolver (#47) — and neither changed the
+symptom, because neither was the cause.
+
+`chart/cozyplane-kpr/templates/daemonset.yaml` set `KPR_CGROUP_ROOT` and
+`KPR_BPFFS_ROOT` and nothing else. `deploy/kpr-daemonset.yaml` — the kind
+manifest the e2e uses — also set `NODE_NAME` and `CLUSTER_DSR`. So every
+chart-based deployment ran kpr with no node name, no endpoint matched
+`e.NodeName == nodeName`, the node-local backend set was always empty, and every
+external frontend — LoadBalancer ingress, NodePort and `spec.externalIPs` alike
+— got no `svc_vips` row. Confirmed on the stand: 117 rows in `svc_vips`, not one
+for any of the three published externalIPs, nor for the MetalLB VIP.
+
+**What made it invisible for so long** is an asymmetry: ClusterIP rows are built
+from the *cluster-wide* backend set, so they were written normally. In-cluster
+service traffic worked, socket-LB worked (it reads Cilium's own maps, which do
+carry externalIPs), and a cross-node `connect()` to the externalIP succeeded —
+which reads as "kpr's rows are there". Only traffic arriving from *outside*, on
+the wire, had nothing to match. kpr did log `NODE_NAME unset: LoadBalancer-ingress
+rows disabled` at startup, which undersold it: NodePort and externalIP rows were
+disabled too, and the line was one WARN among a healthy boot.
+
+The fix is the two env entries. kpr now says the whole consequence, at ERROR.
+
+**If you take one thing from this note:** the e2e exercises `deploy/`, so it
+cannot see a divergence in `chart/` — and the chart is what ships. A frontend
+that silently writes no rows while the process looks healthy is the shape to
+watch for; the diagnostic that would have found it in minutes is dumping
+`svc_vips` and noticing the external frontends are absent from it.
+
+**The second half of the same outage.** With the rows finally written, replies
+still did not reach the client — and this is why the symptom read as "not
+intercepted" for so long. `lb_return` chose its egress link from
+`CFG_FLOAT_IFINDEX`, one value for the whole node. node0 carried the published
+addresses on eth0 (`CFG_UPLINK_IFINDEX=8`) but the slot held eth1
+(`CFG_FLOAT_IFINDEX=9`, the MetalLB VLAN, bound because its VIPs are on-link on a
+non-default NIC). So an eth0 request was DNAT'd correctly and its reply left eth1
+sourced `10.20.0.16` — a segment that cannot source it, dropped by the cloud's
+anti-spoof. The client hung; the probe script reported `000`, which it also
+reports for a refusal, and the two were never distinguished. The arrival link is
+now per-flow (`svc_rev_val.ifindex`).
+
+**Second thing to take from this note:** `curl -o /dev/null -w '%{http_code}'`
+returns `000` for a refusal and for a timeout alike. Those point at opposite ends
+of the datapath — no interception versus a misrouted reply — so a probe that
+cannot tell them apart will send you to the wrong half. Record the failure mode,
+not just the code.

@@ -19,3 +19,11 @@ apiServerURL: ""
 # and the host bpffs root where the LB service/backend maps are pinned.
 cgroupRoot: /host/cgroup2
 bpffsRoot: /sys/fs/bpf
+
+# externalTrafficPolicy: Cluster via DSR. Off, a Cluster-policy Service degrades
+# to node-local delivery: a node with no ready backend serves nothing for that
+# frontend. On, remote backends are reached by DSR, which needs EVERY node
+# permitted to source the LB/external addresses on the wire -- an underlay
+# property cozyplane cannot verify, and one that black-holes silently when the
+# fabric denies it. Hence opt-in (docs/lb-ingress.md, DSR caveats).
+clusterDSR: false
