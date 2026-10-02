@@ -103,6 +103,26 @@ rules:
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
+  # Delegated auth on /metrics: the agent verifies a scraper's token and its
+  # get-on-/metrics permission against the kube-apiserver.
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+---
+# Bind this to the monitoring scraper's ServiceAccount; it is what the agents'
+# delegated /metrics authorization checks for (values.yaml, agent.metricsSecure).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cozyplane-metrics-reader
+  labels:
+    {{- include "cozyplane.labels" . | nindent 4 }}
+rules:
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -176,6 +196,10 @@ spec:
             # (routed to the gateway instead, which proxies DNS / denies the rest).
             - "--internal-cidrs={{ join "," $internal }}"
             {{- end }}
+            # The kubelet expands $(HOST_IP) from the env below (values.yaml,
+            # agent.metricsBindAddress — how to scrape, and why not 0.0.0.0).
+            - "--metrics-bind-address={{ .Values.agent.metricsBindAddress }}"
+            - "--metrics-secure={{ .Values.agent.metricsSecure }}"
           ports:
             # Per-VPC traffic metrics (#2), Prometheus text at /metrics.
             - name: metrics
@@ -186,6 +210,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
             # Gateway-attach is honored only for pods in the agent's namespace.
             - name: AGENT_NAMESPACE
               valueFrom:

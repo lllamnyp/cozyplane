@@ -56,6 +56,22 @@ egress:
   internalCIDRs: []
 
 agent:
+  # Bind address for the per-VPC Prometheus metrics (/metrics). The kubelet
+  # resolves $(HOST_IP) to the node's primary InternalIP, so in-cluster
+  # Prometheus scrapes the agent pods on :9411 as usual (hostNetwork: pod IP ==
+  # host IP) while any other node address — a public one included — serves
+  # nothing. The agent brackets the host itself, so this is also correct when
+  # that primary address is IPv6; only the primary FAMILY is served, though, so
+  # nothing listens on the other family's node address. ":9411" restores
+  # listening on every address; "" disables metrics. See README.md § Upgrading.
+  metricsBindAddress: "$(HOST_IP):9411"
+  # Delegated authn/authz on /metrics (TokenReview + SubjectAccessReview against
+  # the kube-apiserver): the scraper sends its ServiceAccount token — a standard
+  # in-cluster prometheus/vmagent scrape with bearerTokenFile, plain HTTP — and
+  # that ServiceAccount needs `get` on nonResourceURL /metrics, so bind the
+  # cozyplane-metrics-reader ClusterRole to it. false serves /metrics
+  # unauthenticated to anything that can reach the bind address.
+  metricsSecure: true
   priorityClassName: system-node-critical
   resources:
     requests:

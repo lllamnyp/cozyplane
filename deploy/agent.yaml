@@ -150,7 +150,9 @@ spec:
           imagePullPolicy: IfNotPresent
           # --cluster-cidr enables node masquerade: pod traffic leaving the
           # cluster is SNATed to the node (pods get an internet return path).
-          args: ["--mtu=1450", "--cluster-cidr=10.244.0.0/16,fd00:10:244::/56", "--internal-cidrs=10.244.0.0/16,10.96.0.0/16,fd00:10:244::/56,fd00:10:96::/112"]
+          # --metrics-secure=false: prototype e2e posture — the suites scrape
+          # /metrics tokenless and use :9411 as their pod->node probe target.
+          args: ["--mtu=1450", "--cluster-cidr=10.244.0.0/16,fd00:10:244::/56", "--internal-cidrs=10.244.0.0/16,10.96.0.0/16,fd00:10:244::/56,fd00:10:96::/112", "--metrics-secure=false"]
           ports:
             # Per-VPC traffic metrics (#2), Prometheus text at /metrics.
             - name: metrics

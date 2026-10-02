@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"net"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -268,4 +269,35 @@ func TestDesiredPeerLinksCarryCIDRs(t *testing.T) {
 	if l.a != 100 || l.b != 101 || l.cidrA != "10.10.0.0/24" || l.cidrB != "10.20.0.0/24" {
 		t.Errorf("link = %+v, want {100 101 10.10.0.0/24 10.20.0.0/24}", l)
 	}
+}
+
+// The chart passes "$(HOST_IP):9411" and the kubelet substitutes the node's
+// primary InternalIP, which is IPv6 on a v6-first cluster. Unbracketed, that is
+// not a parseable listen address, and the agent would come up healthy serving no
+// metrics at all.
+func TestNormalizeBindAddr(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		// The v6 case this exists for, and the same address already correct.
+		{"fd00:10:244::11:9411", "[fd00:10:244::11]:9411"},
+		{"[fd00:10:244::11]:9411", "[fd00:10:244::11]:9411"},
+		{"::1:9411", "[::1]:9411"},
+		// v4 and port-only forms must be untouched.
+		{"10.20.100.11:9411", "10.20.100.11:9411"},
+		{":9411", ":9411"},
+		// Not an address: handed through rather than mangled.
+		{"fd00:10:244::11", "fd00:10:244::11"},
+		{"localhost:9411", "localhost:9411"},
+		{"9411", "9411"},
+	} {
+		if got := normalizeBindAddr(tc.in); got != tc.want {
+			t.Errorf("normalizeBindAddr(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	// Whatever it returns for a v6 input must actually be listenable.
+	addr := normalizeBindAddr("[::1]:0")
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("normalized %q is not listenable: %v", addr, err)
+	}
+	l.Close()
 }

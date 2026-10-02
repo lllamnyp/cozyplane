@@ -246,8 +246,18 @@ refused same "http://$WIP4:9411/metrics" && pass "same-node pod->node refused (f
 served host2 "http://$WIP4:9411/metrics" && pass "node-sourced client exempt (the plumbing contract)" \
   || fail "node-sourced client gated — the exemption is broken"
 if [ -n "$WIP6" ]; then
-  refused cli "http://[$WIP6]:9411/metrics" && pass "the v6 node address is equally isolated" \
-    || fail "the v6 node address is not gated"
+  # "refused" only means the gate works if something is LISTENING on the v6
+  # address. The agent binds --metrics-bind-address, which the chart points at the
+  # node's PRIMARY InternalIP, so on a v4-primary cluster nothing serves :9411
+  # over v6 and this would pass without exercising the gate at all. Ask a
+  # node-sourced client (exempt by the plumbing contract, as asserted above)
+  # whether the target is there, and skip rather than pass a vacuous check.
+  if served host2 "http://[$WIP6]:9411/metrics"; then
+    refused cli "http://[$WIP6]:9411/metrics" && pass "the v6 node address is equally isolated" \
+      || fail "the v6 node address is not gated"
+  else
+    skip "v6 node address (nothing listening on [$WIP6]:9411 — the agent is bound to one address; set agent.metricsBindAddress=\":9411\" to cover both families)"
+  fi
 else
   skip "v6 node address (cluster has no v6 InternalIP)"
 fi
