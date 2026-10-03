@@ -292,9 +292,24 @@ The CNI natively understands **multiple attachments per pod**:
 - A pod may attach to the system network, to one VPC, or to several (e.g. a
   tenant router/NFV workload bridging two VPCs, or a workload needing a separate
   storage network).
-- Attachments are declared via annotation/CRD (`NetworkAttachment`), realized as
-  additional interfaces by the single CNI — no meta-CNI, no `net-attach-def`
-  chaining. Multus goes away.
+- Attachments are declared **by annotation** — a JSON list on the pod — and
+  realized as additional interfaces by the single CNI: no meta-CNI, no
+  `net-attach-def` chaining. Multus goes away.
+
+The `NetworkAttachment` CRD this section used to name was never built, and an
+annotation is the better shape for it: a pod's network layout is a property of that
+pod, authored with it and dead with it, where a separate namespaced object holding a
+copy is the stale-copy problem removed twice already (`ExternalPool`,
+`Port.spec.fabricIP`). A reusable template CRD can be layered on later — it would
+expand into the same annotation and change neither the CNI nor the datapath.
+
+Two things the section did not say, and both matter more than the plumbing:
+attachment **order** is meaningful (entry 0 carries the fabric bridge, the default
+route and `status.podIP`), and a router needs more than extra interfaces — the
+source-address RPF check drops a forwarded packet at its origin veth. Exempting an
+interface from it is the right to impersonate any member of that VPC, so it is a
+grant on `VPCBinding`, authored by the VPC's owner. See
+[multi-attach.md](multi-attach.md).
 
 ## 10. Controlled doors: Services, DNS, metadata, egress
 
