@@ -19,6 +19,7 @@ package sdn
 import (
 	"context"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -44,8 +45,8 @@ import (
 //     `remotes` location, so re-pointing here re-routes the VPC IP to the node
 //     the VM now runs on; the VPC IP + MAC never change. This is the same move
 //     OVN-Kubernetes makes on a logical-switch-port that changes chassis.
-//   - GC: delete the persistent Port once no virt-launcher pod for its VM exists
-//     (the VM was stopped or deleted). A single pod's CNI DEL never deletes it,
+//   - GC: delete the persistent Port only once no virt-launcher pod or owning
+//     VirtualMachine exists. Stopping a VM retains its reservation. CNI DEL never deletes it,
 //     so the IP + MAC survive pod churn and migration.
 type PersistentPortReconciler struct {
 	client.Client
@@ -62,6 +63,7 @@ type PersistentPortReconciler struct {
 // vmiGVK is the KubeVirt VirtualMachineInstance kind, read as unstructured to
 // avoid importing the (heavy) kubevirt.io/api module.
 var vmiGVK = schema.GroupVersionKind{Group: "kubevirt.io", Version: "v1", Kind: "VirtualMachineInstance"}
+var vmGVK = schema.GroupVersionKind{Group: "kubevirt.io", Version: "v1", Kind: "VirtualMachine"}
 
 func newVMI() *unstructured.Unstructured {
 	u := &unstructured.Unstructured{}
@@ -74,7 +76,7 @@ func newVMI() *unstructured.Unstructured {
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 
 // Reconcile keeps one persistent Port's binding on the active virt-launcher pod,
-// or GCs it when the VM's pods are gone.
+// or GCs it when both the VM and its launcher pods are gone.
 func (r *PersistentPortReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	port := &sdnv1alpha1.Port{}
 	if err := r.Get(ctx, req.NamespacedName, port); err != nil {
@@ -94,9 +96,18 @@ func (r *PersistentPortReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, fmt.Errorf("list virt-launcher pods for vm %q: %w", vmName, err)
 	}
 
-	// No pods (any phase) ⇒ the VM is gone; GC the Port so its IP is freed. The
+	// No pods (any phase) may mean a halted VM; check its owner before GC. The
 	// sever finalizer still drains the owning node's datapath first.
 	if len(pods.Items) == 0 {
+		// A halted VM has no launcher. Its address reservation must survive stop,
+		// primary-interface migration and restart; absence of a pod is not deletion.
+		vm := &unstructured.Unstructured{}
+		vm.SetGroupVersionKind(vmGVK)
+		if err := r.Get(ctx, types.NamespacedName{Namespace: port.Spec.PodNamespace, Name: vmName}, vm); err == nil {
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		} else if !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("check persistent port VM owner: %w", err)
+		}
 		if err := r.Delete(ctx, port); err != nil && !apierrors.IsNotFound(err) {
 			return ctrl.Result{}, fmt.Errorf("gc persistent port %s: %w", port.Name, err)
 		}

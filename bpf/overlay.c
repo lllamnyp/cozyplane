@@ -143,7 +143,21 @@ struct cozy_mac {
 // ports-map value layout: bit 31 flags a VPC egress-gateway leg; the low bits
 // are the network id (VNIs stay far below 2^23, see TUN_F_GATEWAY).
 #define PORT_F_GATEWAY (1u << 31)
-#define PORT_NET(v) ((v) & ~PORT_F_GATEWAY)
+// PORT_F_FORWARD marks a TENANT forwarding leg — a router or firewall attached
+// to several VPCs (docs/multi-attach.md). It is deliberately NOT PORT_F_GATEWAY.
+// Both lift the source-address RPF check, and there the resemblance must stop:
+// a gateway's traffic is north-south and is exempted from east-west
+// SecurityGroups, while a tenant router is the one workload whose traffic most
+// needs policing. Reusing the gateway flag silently disabled SecurityGroups for
+// the forwarder — measured on a live cluster before this bit existed.
+#define PORT_F_FORWARD (1u << 30)
+// PORT_F_FWD_SCOPED narrows PORT_F_FORWARD to declared prefixes (issue #6,
+// VPCBinding.forwardingCIDRs): a foreign source is admitted only if it matches
+// this port's `fwd_cidrs` allowlist, instead of the blanket "any foreign source"
+// PORT_F_FORWARD alone grants. Set by the CNI when the binding names CIDRs;
+// clear means the legacy all-foreign behaviour.
+#define PORT_F_FWD_SCOPED (1u << 29)
+#define PORT_NET(v) ((v) & ~(PORT_F_GATEWAY | PORT_F_FORWARD | PORT_F_FWD_SCOPED))
 
 // Gateway-forwarded traffic may carry an off-VPC source (the internet) into a
 // tenant pod, which the ingress anti-spoof check would otherwise drop. It is
@@ -154,7 +168,19 @@ struct cozy_mac {
 #define SG_OK          0x200000  // bit 21: from_overlay already enforced security groups (TLV)
 #define NS_MARK        0x400000  // bit 22: pod-originated north-south (subject to SG); host-
                                  // originated (kubelet) reaches the bridge unmarked and exempt
+#define FWD_MARK       0x080000  // bit 19: a TENANT forwarding leg handed this
+                                 // packet on, and its source belongs to another
+                                 // VPC. It buys passage through the destination's
+                                 // ISOLATION check and nothing else — unlike
+                                 // GW_MARK it does NOT skip SecurityGroups; the
+                                 // destination judges it as a north-south source
+                                 // (a from:{cidr} rule), because this VPC holds
+                                 // no identity for an address it does not own.
 #define TUN_F_GATEWAY  (1 << 23) // top bit of the Geneve VNI; real VNIs are < 2^23
+#define TUN_F_FORWARD  (1 << 22) // ... and the tenant-forwarding twin, so the
+                                 // receiving node can re-mark after decap. Real
+                                 // VNIs are therefore < 2^22, which is 4M — the
+                                 // allocator starts at 100 and increments.
 
 // Security-group identity TLV (docs/security-groups.md, v2 stage B). The source
 // node stamps the source pod's authoritative {net, group bitmap} into a Geneve
@@ -345,6 +371,17 @@ struct gw_entry {
 	__u32 pad;
 };
 
+#define ROUTE_NH_MAX 2
+
+// A route may carry two active next-hops. The bounded array keeps the map ABI
+// verifier-friendly while covering the HA contract; count is one for every
+// ordinary route and two for active-active VPN ECMP.
+struct route_entry {
+	struct gw_entry next_hops[ROUTE_NH_MAX];
+	__u8 count;
+	__u8 pad[7];
+};
+
 // gateways: network id -> egress gateway. Off-VPC traffic from a pod in the
 // network is delivered to the gateway instead of being dropped.
 struct {
@@ -354,6 +391,39 @@ struct {
 	__uint(max_entries, 1024);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } gateways SEC(".maps");
+
+// vpc_routes: the per-VPC route table (issue #6, docs/vpn.md §3.1). A scoped-LPM
+// twin of `gateways`: keyed by {scope_net, remote prefix}, valued by the same
+// {gw_ip, node_ip} next-hop, delivered the same way. Consulted in from_pod for
+// an off-VPC destination BEFORE the NAT decision, so a routed remote prefix
+// reaches its appliance (a VPN endpoint / router) instead of being masqueraded
+// toward the internet. A miss changes nothing — the existing NAT/gateway path
+// is the fallback. Net-scoped, so overlapping tenant CIDRs never collide and a
+// route is tenant-scoped by construction.
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__type(key, struct lpm_key);
+	__type(value, struct route_entry);
+	__uint(max_entries, 4096);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} vpc_routes SEC(".maps");
+
+// fwd_cidrs: a forwarding leg's allowed remote source prefixes (issue #6,
+// VPCBinding.forwardingCIDRs). Scoped-LPM keyed by {veth ifindex, source
+// prefix}; a bare presence (value 1) means "this source is a sanctioned foreign
+// source for this leg". Consulted in from_pod's anti-spoof check ONLY for a
+// port carrying PORT_F_FWD_SCOPED — an unscoped forwarding leg admits any
+// foreign source as before. Node-local: the CNI programs it for the leg's own
+// veth at ADD.
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__type(key, struct lpm_key);
+	__type(value, __u8);
+	__uint(max_entries, 4096);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} fwd_cidrs SEC(".maps");
 
 // bridges: fabric IP (unique, from the node pod CIDR — network byte order) ->
 // the pod's (network id, VPC IP). A plain /32 route sends the fabric IP to the
@@ -748,7 +818,11 @@ struct {
                  // carries an identity the TENANT owns rather than the node's
 #define NS_LB  2 // LoadBalancer/NodePort ingress landing on a VPC backend —
                  // the door that rides the platform's stack all the way in
-#define NS_MECH_MAX 3
+#define NS_APPLIANCE 3 // a per-VPC route table entry (issue #6): traffic leaving
+                 // through a tenant appliance leg (a VPN endpoint, a router)
+                 // rather than the NAT gateway. Metered apart so a VPC running a
+                 // tunnel does not read as gateway egress.
+#define NS_MECH_MAX 4
 
 struct vpc_counter {
 	__u64 tx_packets;
@@ -1911,6 +1985,16 @@ static __always_inline __u32 *remote_of(__u32 scope, struct addr128 addr)
 	return bpf_map_lookup_elem(&remotes, &key);
 }
 
+// route_of resolves an off-VPC destination against the source VPC's route table
+// (vpc_routes): the longest-prefix next-hop for `addr` in `scope`, or NULL for
+// no route (fall through to NAT/gateway). LPM, so a fully-specified query key
+// matches the widest covering prefix.
+static __always_inline struct route_entry *route_of(__u32 scope, struct addr128 addr)
+{
+	struct lpm_key key = { .prefixlen = LPM_FULL, .scope_net = scope, .addr = addr };
+	return bpf_map_lookup_elem(&vpc_routes, &key);
+}
+
 // node_remote_of returns the Geneve underlay IP of the node that owns `addr`
 // (any of its interface addresses), or NULL if `addr` is not a known node.
 static __always_inline __u32 *node_remote_of(struct addr128 addr)
@@ -2017,6 +2101,24 @@ static __always_inline int parse_ip(struct __sk_buff *skb, struct pkt *p)
 	return -1;
 }
 
+// route_next_hop picks one active next-hop from the immutable inner packet.
+// The hash deliberately does not depend on skb metadata so source and
+// destination nodes make the same decision before and after Geneve.
+static __always_inline struct gw_entry *route_next_hop(struct route_entry *route, const struct pkt *p)
+{
+	if (!route || route->count == 0 || route->count > ROUTE_NH_MAX)
+		return NULL;
+	__u32 src, dst;
+	__builtin_memcpy(&src, &p->src.b[12], sizeof(src));
+	__builtin_memcpy(&dst, &p->dst.b[12], sizeof(dst));
+	__u32 hash = src ^ (dst << 1) ^ p->proto;
+	hash *= 2654435761u;
+	hash ^= hash >> 16;
+	if (route->count == 1 || !(hash & 1))
+		return &route->next_hops[0];
+	return &route->next_hops[1];
+}
+
 // deliver_local redirects the frame into a local pod's veth (through to_pod).
 static __always_inline int deliver_local(struct __sk_buff *skb, struct endpoint *ep)
 {
@@ -2028,7 +2130,7 @@ static __always_inline int deliver_local(struct __sk_buff *skb, struct endpoint 
 // encap sets the Geneve tunnel key and redirects to the Geneve device. tunnel_id
 // is the destination network so the receiver can demux by VNI; the gateway flag
 // rides the top VNI bit for the receiver's anti-spoof re-mark.
-static __always_inline int encap_sg(struct __sk_buff *skb, __u32 dstnet, __u32 node_ip, __u32 gw, __u32 srcnet, __u64 srcmap)
+static __always_inline int encap_sg(struct __sk_buff *skb, __u32 dstnet, __u32 node_ip, __u32 tunflags, __u32 srcnet, __u64 srcmap)
 {
 	__u32 geneve = cfg(CFG_GENEVE_IFINDEX);
 	if (!geneve)
@@ -2038,8 +2140,7 @@ static __always_inline int encap_sg(struct __sk_buff *skb, __u32 dstnet, __u32 n
 		return TC_ACT_SHOT;
 	struct bpf_tunnel_key tkey = {};
 	tkey.tunnel_id = dstnet ? dstnet : cfg(CFG_VNI);
-	if (gw)
-		tkey.tunnel_id |= TUN_F_GATEWAY;
+	tkey.tunnel_id |= tunflags;
 	tkey.remote_ipv4 = node_ip;
 	if (bpf_skb_set_tunnel_key(skb, &tkey, sizeof(tkey), BPF_F_ZERO_CSUM_TX) < 0)
 		return TC_ACT_SHOT;
@@ -2060,9 +2161,9 @@ static __always_inline int encap_sg(struct __sk_buff *skb, __u32 dstnet, __u32 n
 
 // encap without a security-group TLV (gateway, default-network, migration
 // re-encap — no tenant source identity to vouch for).
-static __always_inline int encap(struct __sk_buff *skb, __u32 dstnet, __u32 node_ip, __u32 gw)
+static __always_inline int encap(struct __sk_buff *skb, __u32 dstnet, __u32 node_ip, __u32 tunflags)
 {
-	return encap_sg(skb, dstnet, node_ip, gw, 0, 0);
+	return encap_sg(skb, dstnet, node_ip, tunflags, 0, 0);
 }
 
 // ---- eBPF bridge NAT (north-south, no netfilter) -------------------------
@@ -4148,7 +4249,7 @@ struct {
 // else affected).
 struct {
 	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-	__uint(max_entries, 4); // 0: lb_ingress (from_uplink), 1: lb_dsr
+	__uint(max_entries, 6); // 0: lb_ingress (from_uplink), 1: lb_dsr
 	                        // (from_overlay), 2: hf_ingress (host firewall,
 	                        // every host-stack fall-through), 3: hf_egress
 	                        // (node -> remote pod, from_pod's remotes hit)
@@ -4777,19 +4878,256 @@ static __always_inline int dns_return(struct __sk_buff *skb, struct pkt *p)
 	return TC_ACT_OK;
 }
 
+// Managed VPC boundaries have their own maps and state. They are deliberately
+// separate from additive tenant SGs and run before any NAT/Service return path.
+struct boundary_policy { __u64 revision; __u64 identity; __u32 internet; __u32 pad; };
+struct boundary_rule { __u64 revision; __u32 net; __u32 peer; __u16 port; __u8 proto; __u8 direction; __u32 pad; };
+struct boundary_flow {
+	struct addr128 src; struct addr128 dst;
+	__u32 local; __u32 peer;
+	__u16 sport; __u16 dport; __u8 proto; __u8 hook; __u16 pad;
+};
+struct boundary_flow_value { __u64 local_rev; __u64 peer_rev; __u64 local_id; __u64 peer_id; __u64 expires; };
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH); __type(key, __u32); __type(value, struct boundary_policy);
+	__uint(max_entries, 16384); __uint(pinning, LIBBPF_PIN_BY_NAME);
+} boundary_policy SEC(".maps");
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH); __type(key, struct boundary_rule); __type(value, __u8);
+	__uint(max_entries, 131072); __uint(pinning, LIBBPF_PIN_BY_NAME);
+} boundary_rules SEC(".maps");
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH); __type(key, struct boundary_flow); __type(value, struct boundary_flow_value);
+	__uint(max_entries, 262144); __uint(pinning, LIBBPF_PIN_BY_NAME);
+} boundary_ct SEC(".maps");
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH); __type(key, struct local_key); __type(value, __u8);
+	__uint(max_entries, 65536); __uint(pinning, LIBBPF_PIN_BY_NAME);
+} boundary_primary SEC(".maps");
+struct boundary_cidr { __u32 prefixlen; struct addr128 addr; };
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE); __type(key, struct boundary_cidr); __type(value, __u8);
+	__uint(max_entries, 32768); __uint(map_flags, BPF_F_NO_PREALLOC); __uint(pinning, LIBBPF_PIN_BY_NAME);
+} boundary_cidrs SEC(".maps");
+struct boundary_scratch {
+	struct pkt packet;
+	struct boundary_flow key; struct boundary_flow reverse;
+	struct boundary_flow_value value; struct boundary_rule rule;
+	struct boundary_cidr cidr; struct local_key endpoint;
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY); __type(key, __u32); __type(value, struct boundary_scratch);
+	__uint(max_entries, 1);
+} boundary_scratch SEC(".maps");
+
+// Only ordinary unfragmented IP is supported by the managed L4 boundary.
+// Reject options/extension chains and fragments rather than reading guessed L4.
+static __always_inline int boundary_l4(struct __sk_buff *skb, struct boundary_scratch *s)
+{
+	__u32 off = ETH_HLEN + (s->packet.is_v6 ? 40 : 20);
+	if (!s->packet.is_v6) {
+		__u8 vihl; __u16 frag;
+		if (bpf_skb_load_bytes(skb, ETH_HLEN, &vihl, 1) < 0 || vihl != 0x45 ||
+		    bpf_skb_load_bytes(skb, ETH_HLEN + 6, &frag, 2) < 0 ||
+		    (bpf_ntohs(frag) & 0x3fff)) return 0;
+	}
+	s->key.proto = s->packet.proto;
+	if (s->packet.proto == IPPROTO_TCP || s->packet.proto == IPPROTO_UDP) {
+		if (bpf_skb_load_bytes(skb, off, &s->key.sport, 2) < 0 ||
+		    bpf_skb_load_bytes(skb, off + 2, &s->key.dport, 2) < 0) return 0;
+		return 1;
+	}
+	if (s->packet.proto == IPPROTO_ICMP || s->packet.proto == IPPROTO_ICMPV6) {
+		// Keep the exact type/code in the CT tuple and rule key. Echo also
+		// carries its identifier, preventing one ping from admitting another.
+		if (bpf_skb_load_bytes(skb, off, &s->key.dport, 2) < 0 ||
+		    bpf_skb_load_bytes(skb, off + 4, &s->key.sport, 2) < 0) return 0;
+		return 1;
+	}
+	return 0;
+}
+
+// Error quotations are not fresh initiations. Only the opposite hook's existing
+// flow may admit one; inspecting a quote must never create or refresh flow state.
+// Returns -1 for a non-error message, otherwise an exact related-flow verdict.
+static __attribute__((noinline)) int boundary_related_error(struct __sk_buff *skb,
+							   struct boundary_scratch *s)
+{
+	__u16 tc = bpf_ntohs(s->key.dport);
+	__u8 type = tc >> 8, code = tc & 0xff;
+	if (s->key.proto == IPPROTO_ICMP && !s->packet.is_v6) {
+		if (type != 3 && type != 11 && type != 12) return -1;
+		if ((type == 3 && code > 15) || (type == 11 && code > 1) ||
+		    (type == 12 && code > 2)) return 0;
+	} else if (s->key.proto == IPPROTO_ICMPV6 && s->packet.is_v6) {
+		if (type >= 128) return -1;
+		// RFC 4443's four error formats and their defined codes.
+		if (type < 1 || type > 4 || (type == 1 && code > 6) ||
+		    (type == 2 && code) || (type == 3 && code > 1) ||
+		    (type == 4 && code > 2)) return 0;
+	} else return -1;
+
+	__u32 quoted = ETH_HLEN + (s->packet.is_v6 ? 40 : 20) + 8;
+	__u8 version, proto, l4[8];
+	if (bpf_skb_load_bytes(skb, quoted, &version, 1) < 0) return 0;
+	s->reverse = s->key;
+	s->reverse.hook = !s->key.hook;
+	if (s->packet.is_v6) {
+		if ((version >> 4) != 6 ||
+		    bpf_skb_load_bytes(skb, quoted + 6, &proto, 1) < 0 ||
+		    bpf_skb_load_bytes(skb, quoted + 8, &s->reverse.src, 16) < 0 ||
+		    bpf_skb_load_bytes(skb, quoted + 24, &s->reverse.dst, 16) < 0)
+			return 0;
+		quoted += 40;
+	} else {
+		__u16 frag;
+		__u32 src, dst;
+		if (version != 0x45 ||
+		    bpf_skb_load_bytes(skb, quoted + 6, &frag, 2) < 0 ||
+		    (bpf_ntohs(frag) & 0x3fff) ||
+		    bpf_skb_load_bytes(skb, quoted + 9, &proto, 1) < 0 ||
+		    bpf_skb_load_bytes(skb, quoted + 12, &src, 4) < 0 ||
+		    bpf_skb_load_bytes(skb, quoted + 16, &dst, 4) < 0)
+			return 0;
+		v4_to_128(&s->reverse.src, src);
+		v4_to_128(&s->reverse.dst, dst);
+		quoted += 20;
+	}
+	// An error belongs to the quoted sender, never another endpoint in its VPC.
+	if (!addr128_eq(&s->reverse.src, &s->packet.dst) ||
+	    bpf_skb_load_bytes(skb, quoted, l4, sizeof(l4)) < 0) return 0;
+	s->reverse.proto = proto;
+	if (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
+		__builtin_memcpy(&s->reverse.sport, l4, 2);
+		__builtin_memcpy(&s->reverse.dport, l4 + 2, 2);
+	} else if ((!s->packet.is_v6 && proto == IPPROTO_ICMP &&
+		    (l4[0] == 8 || l4[0] == 0) && !l4[1]) ||
+		   (s->packet.is_v6 && proto == IPPROTO_ICMPV6 &&
+		    (l4[0] == 128 || l4[0] == 129) && !l4[1])) {
+		__builtin_memcpy(&s->reverse.dport, l4, 2);
+		__builtin_memcpy(&s->reverse.sport, l4 + 4, 2);
+	} else return 0; // no extension chains, fragments or nested error quotations
+	struct boundary_flow_value *ct = bpf_map_lookup_elem(&boundary_ct, &s->reverse);
+	if (!ct || ct->local_rev != s->value.local_rev ||
+	    ct->peer_rev != s->value.peer_rev || ct->local_id != s->value.local_id ||
+	    ct->peer_id != s->value.peer_id || ct->expires <= bpf_ktime_get_ns()) return 0;
+	return 1;
+}
+
+static __attribute__((noinline)) int boundary_gate(struct __sk_buff *skb, struct boundary_scratch *s)
+{
+	struct boundary_policy *local = bpf_map_lookup_elem(&boundary_policy, &s->key.local);
+	struct boundary_policy *peer = bpf_map_lookup_elem(&boundary_policy, &s->key.peer);
+	// Materialize scalar presence: LLVM must not combine map pointers with OR,
+	// an operation forbidden by the kernel verifier.
+	volatile __u8 local_present = local != 0;
+	volatile __u8 peer_present = peer != 0;
+	if (!local_present && !peer_present) return 1; // legacy VPCs retain existing behavior
+	if (!local || !local->revision) return 0;
+	if (s->key.local == s->key.peer) return 1; // tenant SGs govern within a VPC
+	if (!boundary_l4(skb, s)) return 0;
+	if (!s->key.peer) {
+		// North-south delivery keeps existing ingress gates. Outbound Internet
+		// requires both a VPC grant and an authenticated primary attachment.
+		if (s->key.hook) return 1;
+		s->cidr.prefixlen = 128; s->cidr.addr = s->packet.dst;
+		if (bpf_map_lookup_elem(&boundary_cidrs, &s->cidr)) return 0;
+		s->endpoint.net = s->key.local; s->endpoint.ip = s->packet.src;
+		return local->internet && bpf_map_lookup_elem(&boundary_primary, &s->endpoint);
+	}
+	if (!peer || !peer->revision) return 0;
+	s->value.local_rev = local->revision; s->value.peer_rev = peer->revision;
+	s->value.local_id = local->identity; s->value.peer_id = peer->identity;
+	if (s->key.proto == IPPROTO_ICMP || s->key.proto == IPPROTO_ICMPV6) {
+		int related = boundary_related_error(skb, s);
+		if (related >= 0) return related;
+	}
+	struct boundary_flow_value *ct = bpf_map_lookup_elem(&boundary_ct, &s->key);
+	__u64 now = bpf_ktime_get_ns();
+	if (ct && ct->local_rev == s->value.local_rev && ct->peer_rev == s->value.peer_rev &&
+	    ct->local_id == s->value.local_id && ct->peer_id == s->value.peer_id && ct->expires > now) {
+		ct->expires = now + 30000000000ULL;
+		return 1;
+	}
+	// ACK/data without tracked authorization cannot initiate a TCP flow.
+	if (s->key.proto == IPPROTO_TCP) {
+		__u8 flags;
+		__u32 off = ETH_HLEN + (s->packet.is_v6 ? 40 : 20);
+		if (bpf_skb_load_bytes(skb, off + 13, &flags, 1) < 0 ||
+		    !(flags & 2) || (flags & (0x10 | 0x04 | 0x01))) return 0;
+	}
+	s->rule.revision = s->value.local_rev; s->rule.net = s->key.local;
+	s->rule.peer = s->key.peer; s->rule.proto = s->key.proto;
+	s->rule.port = s->key.dport; s->rule.direction = s->key.hook;
+	if (!bpf_map_lookup_elem(&boundary_rules, &s->rule)) return 0;
+	s->rule.revision = s->value.peer_rev; s->rule.net = s->key.peer;
+	s->rule.peer = s->key.local; s->rule.direction = !s->key.hook;
+	if (!bpf_map_lookup_elem(&boundary_rules, &s->rule)) return 0;
+	s->value.expires = now + 30000000000ULL;
+	if (bpf_map_update_elem(&boundary_ct, &s->key, &s->value, BPF_ANY) < 0) return 0;
+	s->reverse = s->key; s->reverse.src = s->key.dst; s->reverse.dst = s->key.src;
+	s->reverse.hook = !s->key.hook;
+	if (s->key.proto == IPPROTO_TCP || s->key.proto == IPPROTO_UDP) {
+		s->reverse.sport = s->key.dport; s->reverse.dport = s->key.sport;
+	} else {
+		__u16 tc = bpf_ntohs(s->key.dport);
+		if (s->key.proto == IPPROTO_ICMP && tc == 0x0800) s->reverse.dport = 0;
+		else if (s->key.proto == IPPROTO_ICMPV6 && tc == 0x8000) s->reverse.dport = bpf_htons(0x8100);
+		else return 1; // only echo has a defined automatic reply pair
+	}
+	return bpf_map_update_elem(&boundary_ct, &s->reverse, &s->value, BPF_ANY) == 0;
+}
+
 SEC("tc")
 int cozyplane_from_pod(struct __sk_buff *skb)
+{
+	__u32 zero = 0, net = 0;
+	__u32 ifindex = skb->ifindex;
+	__u32 *port = bpf_map_lookup_elem(&ports, &ifindex);
+	if (port) net = PORT_NET(*port);
+	struct boundary_scratch *s = bpf_map_lookup_elem(&boundary_scratch, &zero);
+	if (!s) return TC_ACT_SHOT;
+	__builtin_memset(s, 0, sizeof(*s));
+	if (net && parse_ip(skb, &s->packet) == 0) {
+		s->key.local = net; s->key.peer = net_of(&networks, net, s->packet.dst);
+		s->key.src = s->packet.src; s->key.dst = s->packet.dst;
+		struct boundary_policy *bp = bpf_map_lookup_elem(&boundary_policy, &net);
+		struct boundary_policy *peer_policy = bpf_map_lookup_elem(&boundary_policy, &s->key.peer);
+		if (!bp && peer_policy) return TC_ACT_SHOT;
+		if (bp && !(port && (*port & PORT_F_GATEWAY))) {
+			struct endpoint *self = local_of(net, s->packet.src);
+			if (!self || self->ifindex != skb->ifindex) return TC_ACT_SHOT;
+			struct addr128 gw4, gw6 = LINK_LOCAL_GW6;
+			v4_to_128(&gw4,bpf_htonl(LINK_LOCAL_GW));
+			int plumbing = addr128_eq(&s->packet.dst, &gw4) || addr128_eq(&s->packet.dst, &gw6) ||
+				(s->packet.is_v6 && v6_link_scoped(&s->packet.dst));
+			__u32 family = s->packet.is_v6;
+			struct addr128 *dns = bpf_map_lookup_elem(&dns_ips, &family);
+			if (!plumbing && dns && addr128_eq(dns, &s->packet.dst) &&
+			    (s->packet.proto == IPPROTO_TCP || s->packet.proto == IPPROTO_UDP) && boundary_l4(skb, s) &&
+			    s->key.dport == bpf_htons(53)) plumbing = 1;
+			if (!plumbing && !boundary_gate(skb, s)) return TC_ACT_SHOT;
+		}
+	}
+	bpf_tail_call(skb, &lb_prog, 4);
+	return TC_ACT_SHOT; // no continuation means no enforcement-ready dataplane
+}
+
+SEC("tc")
+int cozyplane_from_pod_continue(struct __sk_buff *skb)
 {
 	struct pkt p;
 	if (parse_ip(skb, &p) < 0)
 		return TC_ACT_OK;
 
 	__u32 ifindex = skb->ifindex;
-	__u32 srcnet = 0, is_gw = 0;
+	__u32 srcnet = 0, is_gw = 0, is_fwd = 0, is_fwd_scoped = 0, foreign_src = 0;
 	__u32 *sp = bpf_map_lookup_elem(&ports, &ifindex);
 	if (sp) {
 		srcnet = PORT_NET(*sp);
 		is_gw = *sp & PORT_F_GATEWAY;
+		is_fwd = *sp & PORT_F_FORWARD;
+		is_fwd_scoped = *sp & PORT_F_FWD_SCOPED;
 	}
 
 	// At the uplink-egress attachment only: bpf cluster-egress masquerade
@@ -4836,10 +5174,29 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	if (srcnet && !is_gw) {
 		struct endpoint *self = local_of(srcnet, p.src);
 		if (!self || self->ifindex != ifindex) {
-			__u64 *d = bpf_map_lookup_elem(&sg_drops, &srcnet);
-			if (d)
-				(*d)++;
-			return TC_ACT_SHOT;
+			// A forwarding leg (VPCBinding.allowForwarding) is permitted to
+			// emit a source it does not own — that IS routing. Everything
+			// else is a spoof. Record that the source is foreign, because
+			// only such a packet gets FWD_MARK: the router's OWN traffic
+			// must keep taking the ordinary east-west path, groups and all.
+			//
+			// A SCOPED forwarding leg (VPCBinding.forwardingCIDRs, issue #6)
+			// admits a foreign source ONLY within its declared prefixes —
+			// anti-spoofing stays on for everything else, closing the blanket
+			// impersonation an unscoped grant allows. An unscoped leg (no
+			// PORT_F_FWD_SCOPED) keeps the legacy all-foreign behaviour.
+			int fwd_ok = is_fwd;
+			if (is_fwd && is_fwd_scoped) {
+				struct lpm_key fk = { .prefixlen = LPM_FULL, .scope_net = ifindex, .addr = p.src };
+				fwd_ok = bpf_map_lookup_elem(&fwd_cidrs, &fk) != NULL;
+			}
+			if (!fwd_ok) {
+				__u64 *d = bpf_map_lookup_elem(&sg_drops, &srcnet);
+				if (d)
+					(*d)++;
+				return TC_ACT_SHOT;
+			}
+			foreign_src = 1;
 		}
 	}
 
@@ -5016,6 +5373,32 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 			return fr;
 	}
 
+	// The per-VPC route table (issue #6, docs/vpn.md §3.1): a routed remote
+	// prefix is delivered to its appliance leg, checked BEFORE the NAT gateway
+	// below so the SNAT does not steal routed traffic toward the internet. It is
+	// off-VPC egress, so it is gated by the source's egress SecurityGroups and
+	// metered on the appliance door exactly as the gateway path is; then it is
+	// delivered to the next-hop Port by identity (deliver_local / encap), the
+	// same delivery as gateways[vni]. A miss falls through to NAT/gateway.
+	if (srcnet && !dstnet && !is_gw) {
+		struct route_entry *route = route_of(srcnet, p.dst);
+		struct gw_entry *rt = route_next_hop(route, &p);
+		if (rt) {
+			if (!ns_egress_ok(skb, srcnet, p.is_v6, p.proto, p.src, p.dst)) {
+				return TC_ACT_SHOT;
+			}
+			count_ns(srcnet, skb->len, NS_APPLIANCE, 0);
+			if (!rt->node_ip) {
+				struct endpoint *rl = local_of(srcnet, rt->gw_ip);
+				if (rl)
+					return deliver_local(skb, rl);
+				// next-hop leg not here yet: fall through to NAT/gateway.
+			} else {
+				return encap(skb, srcnet, rt->node_ip, 0);
+			}
+		}
+	}
+
 	// The VPC's own NAT gateway (docs/north-south.md): off-VPC egress for a pod
 	// with no floating address of its own, SNATed to the VPC's identity and sent
 	// straight out the uplink — no gateway pod, no hairpin. Checked after the EIP
@@ -5102,6 +5485,11 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 			// admits it.
 			if (is_gw)
 				skb->mark = GW_MARK;
+			else if (foreign_src)
+				// A tenant router's transit traffic. FWD_MARK, not GW_MARK:
+				// it must clear the isolation check and still face the
+				// destination's SecurityGroups.
+				skb->mark |= FWD_MARK;
 			return deliver_local(skb, l);
 		}
 	}
@@ -5131,7 +5519,12 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 		    bpf_map_lookup_elem(&hf_self, &p.src) &&
 		    !bpf_map_lookup_elem(&np_nodes, &p.dst))
 			bpf_tail_call(skb, &lb_prog, 3);
-		return encap_sg(skb, dstnet, *node_ip, is_gw, srcnet, srcmap);
+		__u32 tunflags = 0;
+		if (is_gw)
+			tunflags = TUN_F_GATEWAY;
+		else if (foreign_src)
+			tunflags = TUN_F_FORWARD;
+		return encap_sg(skb, dstnet, *node_ip, tunflags, srcnet, srcmap);
 	}
 
 	// A default-network pod addressing a *node* (its reply to a hostNetwork
@@ -5175,6 +5568,27 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 // node->pod traffic alike — the placement-independent point for ingress policy.
 SEC("tc")
 int cozyplane_to_pod(struct __sk_buff *skb)
+{
+	__u32 zero = 0, net = 0;
+	__u32 ifindex = skb->ifindex;
+	__u32 *port = bpf_map_lookup_elem(&ports, &ifindex);
+	if (port) net = PORT_NET(*port);
+	struct boundary_scratch *s = bpf_map_lookup_elem(&boundary_scratch, &zero);
+	if (!s) return TC_ACT_SHOT;
+	__builtin_memset(s, 0, sizeof(*s));
+	if (net && parse_ip(skb, &s->packet) == 0) {
+		s->key.local = net; s->key.peer = net_of(&networks, net, s->packet.src);
+		s->key.src = s->packet.src; s->key.dst = s->packet.dst; s->key.hook = 1;
+		if (bpf_map_lookup_elem(&boundary_policy, &net) &&
+		    (skb->mark & FWD_MARK)) return TC_ACT_SHOT;
+		if (!boundary_gate(skb, s)) return TC_ACT_SHOT;
+	}
+	bpf_tail_call(skb, &lb_prog, 5);
+	return TC_ACT_SHOT;
+}
+
+SEC("tc")
+int cozyplane_to_pod_continue(struct __sk_buff *skb)
 {
 	struct pkt p;
 	if (parse_ip(skb, &p) < 0)
@@ -5256,6 +5670,15 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 	// The exception is gateway-forwarded traffic into a VPC pod: its source is
 	// off-VPC (the internet, cluster DNS) so srcnet is 0, but it carries the
 	// in-kernel gateway mark that tenants cannot forge.
+	// Read the mark ONCE, into a local. Every test below used skb->mark
+	// directly until clang folded one of them into a variable ctx offset
+	// (`r2 = ctx; r2 += r3; r2 = *(u32 *)(r2)`) and the verifier refused the
+	// program outright: "dereference of modified ctx ptr R2 off=8 disallowed".
+	// A ctx field must be loaded at a CONSTANT offset; one hoisted read leaves
+	// clang no room to decide otherwise, and is cheaper besides. Nothing in
+	// to_pod writes the mark, so a single read is also exact.
+	__u32 mark = skb->mark;
+
 	if (!nets_allowed(srcnet, dstnet)) {
 		// A second exception: an LB/NodePort flow into a VPC-pod backend
 		// (docs/lb-ingress.md) — external source, tenant destination, pinned
@@ -5277,8 +5700,36 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 					return TC_ACT_OK;
 			}
 		}
-		if (!(srcnet == 0 && dstnet != 0 && skb->mark == GW_MARK))
+		// A tenant router's transit traffic (docs/multi-attach.md): the source
+		// belongs to another VPC, so srcnet is 0 here and isolation would drop
+		// it. FWD_MARK, set only for a GRANTED forwarding leg carrying a source
+		// it does not own, admits it past this check — and past nothing else.
+		// The policy gate below still runs, which is the entire difference
+		// between this bit and GW_MARK.
+		if (!(mark & FWD_MARK) &&
+		    !(srcnet == 0 && dstnet != 0 && mark == GW_MARK))
 			return TC_ACT_SHOT;
+	}
+
+	// SecurityGroups for a forwarded packet. This VPC holds no identity for an
+	// address it does not own, so the east-west group test below cannot judge
+	// it: srcnet is 0, the source bitmap is empty, and a grouped destination
+	// would deny everything with no rule able to allow it. Judge it as what it
+	// is from this VPC's point of view — a north-south source — through the
+	// same helper the fabric bridge and floating IPs use. A tenant writes
+	// `from: {cidr: 10.10.0.0/24}` and means exactly this.
+	//
+	// An UNGROUPED destination still passes (ns_sg_admit short-circuits on an
+	// empty member bitmap), so forwarding works out of the box and tightens the
+	// moment the destination joins a group.
+	if (dstnet && (mark & FWD_MARK)) {
+		__u16 fdport;
+		__u32 fl4off = p.is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
+		if (sg_l4(skb, p.proto, fl4off, &fdport) &&
+		    !ns_sg_admit(dstnet, p.dst, p.src, p.proto, fdport)) {
+			count_sg_drop(dstnet);
+			return TC_ACT_SHOT;
+		}
 	}
 
 	// Security-group ingress (destination-side, #7). Only genuine intra-VPC /
@@ -5300,7 +5751,9 @@ int cozyplane_to_pod(struct __sk_buff *skb)
 	// every grouped source (the off-VPC dst is ungrouped) and break all TCP/UDP
 	// north-south egress. A normal east-west delivery always has an in-VPC dst.
 	int ns_transit = net_of(&networks, dstnet, p.dst) == 0;
-	if (dstnet && !ns_transit && !(skb->mark & (GW_MARK | SG_OK))) {
+	int managed_cross = srcnet && srcnet != dstnet &&
+		bpf_map_lookup_elem(&boundary_policy,&srcnet) && bpf_map_lookup_elem(&boundary_policy,&dstnet);
+	if (dstnet && !ns_transit && !managed_cross && !(mark & (GW_MARK | SG_OK | FWD_MARK))) {
 		__u16 dport;
 		__u32 l4off = p.is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
 		if (sg_l4(skb, p.proto, l4off, &dport)) {
@@ -5409,7 +5862,8 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 		return TC_ACT_OK;
 
 	__u32 gw = tk.tunnel_id & TUN_F_GATEWAY;
-	__u32 vni = (__u32)tk.tunnel_id & ~TUN_F_GATEWAY;
+	__u32 fwd = tk.tunnel_id & TUN_F_FORWARD;
+	__u32 vni = (__u32)tk.tunnel_id & ~(TUN_F_GATEWAY | TUN_F_FORWARD);
 	if (vni == cfg(CFG_VNI)) {
 		// etp: Cluster DSR (docs/lb-ingress.md): the ingress node DNAT'd an
 		// LB/NodePort flow to a backend on THIS node and stamped the frontend
@@ -5451,6 +5905,11 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 	if (ep) {
 		if (gw) {
 			skb->mark = GW_MARK;
+		} else if (fwd) {
+			// A tenant router's transit traffic, from another node. It carries
+			// no identity option (its source is not a member here), so there is
+			// nothing to enforce authoritatively; to_pod judges it below.
+			skb->mark |= FWD_MARK;
 		} else {
 			// Authoritative security-group enforcement (stage B): a grouped
 			// source stamped its {net, groups} in a Geneve option. Enforce it
@@ -5463,7 +5922,9 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 			    opt.opt_class == bpf_htons(SG_OPT_CLASS) && opt.type == SG_OPT_TYPE) {
 				__u16 dport;
 				__u32 l4off = p.is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
-				if (sg_l4(skb, p.proto, l4off, &dport)) {
+				int managed = opt.src_net != vni && bpf_map_lookup_elem(&boundary_policy,&vni) &&
+					bpf_map_lookup_elem(&boundary_policy,&opt.src_net);
+				if (!managed && sg_l4(skb, p.proto, l4off, &dport)) {
 					struct local_key dk = { .net = vni, .ip = p.dst };
 					__u64 *dmp = bpf_map_lookup_elem(&sg_members, &dk);
 					__u64 dstmap = dmp ? *dmp : 0;
@@ -5534,6 +5995,18 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 		struct endpoint *gep = local_of(vni, g->gw_ip);
 		if (gep)
 			return deliver_local(skb, gep);
+	}
+
+	// A per-VPC route table next-hop hosted here (issue #6): the source node
+	// encap'd routed traffic (its destination a remote prefix, not a local pod)
+	// toward this node under the VPC's VNI. Deliver it to the appliance leg the
+	// route names. Mirrors the gateways lookup above.
+	struct route_entry *route = route_of(vni, p.dst);
+	struct gw_entry *rt = route_next_hop(route, &p);
+	if (rt && !rt->node_ip) {
+		struct endpoint *rep = local_of(vni, rt->gw_ip);
+		if (rep)
+			return deliver_local(skb, rep);
 	}
 
 	// Migration forwarding (stage 2): this was the source node of a VM that

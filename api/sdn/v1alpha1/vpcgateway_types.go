@@ -48,6 +48,17 @@ const (
 	// unambiguous. The older gateway wins; the loser stays Pending and realizes
 	// nothing (docs/north-south.md).
 	VPCGatewayConditionExclusive = "Exclusive"
+	// VPCGatewayConditionApplianceResolved is True when spec.appliance selects
+	// exactly one live workload holding a Port in this VPC, and that Port has
+	// been made the VPC's door. False (with the reason in the message) when the
+	// selector matches nothing, or matches a workload with no Port here yet.
+	VPCGatewayConditionApplianceResolved = "ApplianceResolved"
+
+	// VPCGatewayConditionRoutesResolved is True when every spec.routes entry
+	// resolved to a live, forwarding-granted Port; False (with a message naming
+	// the offending route) when one did not — an unresolved selector, a route to
+	// an ungranted Port, or a CIDR overlapping a forbidden cluster network.
+	VPCGatewayConditionRoutesResolved = "RoutesResolved"
 )
 
 // VPCGatewayNAT configures many-to-one egress for pods with no address of their
@@ -107,9 +118,87 @@ type VPCGatewaySpec struct {
 	// Ingress configures what may enter the VPC from outside.
 	// +optional
 	Ingress VPCGatewayIngress `json:"ingress,omitempty"`
+
+	// Appliance names a workload of the tenant's own that IS this VPC's door —
+	// a firewall or router attached to several VPCs (docs/multi-attach.md).
+	//
+	// Off-VPC traffic from a VPC pod is delivered to gateways[vni] with its
+	// original destination intact, so whatever holds that entry receives the
+	// VPC's egress by construction and may route it on. Until now only
+	// cozyplane's own gateway pod could hold it — claimed by addGatewayLeg,
+	// restricted to the agent's namespace and to the VPC's reserved .1 — which
+	// left no way to say "my appliance is the door".
+	//
+	// Setting it does NOT give the appliance the right to emit a source it does
+	// not own; that is the separate, export-gated VPCBinding.allowForwarding
+	// grant. Being the door means receiving; forwarding means sending. A
+	// firewall wants both, and they are granted by different people.
+	//
+	// When set, the controller points the VPC's gateway at the selected
+	// workload's Port in this VPC and spawns no gateway pod of its own.
+	// +optional
+	Appliance *VPCGatewayAppliance `json:"appliance,omitempty"`
+
+	// Routes is the VPC's route table for off-VPC destinations (issue #6). Until
+	// now a VPC had exactly two off-net dispositions: the default gateway
+	// (NAT egress / internet) or drop. A route adds a third — "these remote
+	// prefixes go through THIS workload" — and once there are three there is a
+	// table, of which the NAT gateway is retroactively just the default entry.
+	//
+	// Each route names remote CIDRs and the workload (an appliance leg in this
+	// VPC — a VPN endpoint, a router) they resolve through, by identity. The
+	// datapath consults it BEFORE the NAT decision, so a routed prefix reaches
+	// the appliance instead of being masqueraded toward the internet; a miss
+	// falls through to NAT/drop exactly as today. The workload may reschedule or
+	// change IP and the route re-resolves — a route never names an address.
+	//
+	// A route only delivers; the right of the target to forward a foreign
+	// (remote-site) source is the separate VPCBinding.allowForwarding grant. A
+	// route to a Port whose binding lacks that grant is inert, reported in a
+	// condition, and widens nothing.
+	// +optional
+	Routes []VPCGatewayRoute `json:"routes,omitempty"`
+}
+
+// VPCGatewayRoute directs a set of off-VPC prefixes through a named workload.
+type VPCGatewayRoute struct {
+	// CIDRs are the remote prefixes this route matches (v4 or v6). They must not
+	// overlap the cluster's own networks (pod/service/node/join, link-local);
+	// the controller refuses such a route in a condition.
+	CIDRs []string `json:"cidrs"`
+
+	// Via selects the workload the matched traffic is delivered to.
+	Via VPCGatewayVia `json:"via"`
+}
+
+// VPCGatewayVia selects a route's next-hop workload — the same shape as an
+// appliance selector, resolved to a Port identity in this VPC.
+type VPCGatewayVia struct {
+	// PodSelector selects the next-hop pod (a Deployment or VM pod whose name
+	// changes underneath it; a selector so the route survives that).
+	PodSelector metav1.LabelSelector `json:"podSelector"`
+
+	// Namespace is where to look for it. Empty means the VPCGateway's own
+	// namespace.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
 }
 
 // VPCGatewayStatus is the observed state of a VPCGateway.
+// VPCGatewayAppliance selects the tenant workload that serves as the VPC's door.
+type VPCGatewayAppliance struct {
+	// PodSelector selects the appliance pod. A selector rather than a name
+	// because the workload is normally a Deployment or a VM whose pod name
+	// changes underneath it; the door must survive that.
+	PodSelector metav1.LabelSelector `json:"podSelector"`
+
+	// Namespace is where to look for it. Empty means the VPCGateway's own
+	// namespace, which is the ordinary case — the appliance belongs to the
+	// tenant that owns the VPC.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+}
+
 type VPCGatewayStatus struct {
 	// NATAddress is the v4 address this VPC's v4 egress wears on the wire — read from
 	// the gateway's owned v4 LoadBalancer Service (docs/external-addresses.md §5), and
@@ -128,6 +217,20 @@ type VPCGatewayStatus struct {
 	// +optional
 	NATAddress6 string `json:"natAddress6,omitempty"`
 
+	// AppliancePort is the Port currently serving as the VPC's door when
+	// spec.appliance is set — the cluster-scoped Port name, so an operator can
+	// see WHICH leg of a multi-attached appliance was chosen. Empty when no
+	// appliance is declared or none could be resolved.
+	// +optional
+	AppliancePort string `json:"appliancePort,omitempty"`
+
+	// Routes reports how each spec.routes entry resolved: the CIDRs it matched
+	// and the cluster-scoped Port name they were programmed toward, so an
+	// operator sees which leg a route landed on (and, when empty, that it did
+	// not resolve — the RoutesResolved condition carries why).
+	// +optional
+	Routes []VPCGatewayRouteStatus `json:"routes,omitempty"`
+
 	// Phase is the lifecycle phase.
 	// +optional
 	Phase VPCGatewayPhase `json:"phase,omitempty"`
@@ -135,6 +238,21 @@ type VPCGatewayStatus struct {
 	// Conditions is the detailed state.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// VPCGatewayRouteStatus reports one resolved route.
+type VPCGatewayRouteStatus struct {
+	// CIDRs echoes the spec route's prefixes.
+	CIDRs []string `json:"cidrs"`
+	// Port is the cluster-scoped Port name the CIDRs were programmed toward,
+	// empty when the route did not resolve (no live selected Port, or the
+	// selected Port's binding lacks allowForwarding).
+	// +optional
+	Port string `json:"port,omitempty"`
+	// Ports are ECMP next-hops for this prefix. Port remains the first entry for
+	// additive compatibility with single-next-hop agents.
+	// +optional
+	Ports []string `json:"ports,omitempty"`
 }
 
 // +genclient

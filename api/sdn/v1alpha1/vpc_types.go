@@ -42,6 +42,36 @@ type VPCSpec struct {
 	// controller default.
 	// +optional
 	MTU int32 `json:"mtu,omitempty"`
+	// Boundary is an operator-managed ceiling, independent of tenant groups.
+	// Setting, changing or removing it requires manage-boundary on this VPC.
+	// +optional
+	Boundary *VPCBoundary `json:"boundary,omitempty"`
+}
+
+// VPCBoundary limits cross-VPC initiations and Internet egress.
+type VPCBoundary struct {
+	// Revision is positive and increases whenever the policy changes.
+	Revision int64 `json:"revision"`
+	Internet bool  `json:"internet"`
+	// +optional
+	// +listType=atomic
+	Peers []VPCBoundaryRule `json:"peers,omitempty"`
+}
+
+// VPCBoundaryRule admits an initiation; tracked replies require no reverse grant.
+type VPCBoundaryRule struct {
+	PeerRef VPCRef `json:"peerRef"`
+	// Direction is ingress or egress, relative to this VPC.
+	Direction string `json:"direction"`
+	// Protocol is TCP, UDP or ICMP (family follows the packet).
+	Protocol string `json:"protocol"`
+	// +optional
+	// +listType=atomic
+	Ports []int32 `json:"ports,omitempty"`
+	// +optional
+	ICMPType *int32 `json:"icmpType,omitempty"`
+	// +optional
+	ICMPCode *int32 `json:"icmpCode,omitempty"`
 }
 
 // A VPC's way OUT (and in) is not declared here: it is a VPCGateway, which is a
@@ -64,6 +94,22 @@ type VPCStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	// BoundaryNodes acknowledges the revision loaded by each agent instance.
+	// +optional
+	// +listType=map
+	// +listMapKey=node
+	BoundaryNodes []VPCBoundaryNode `json:"boundaryNodes,omitempty"`
+}
+
+// VPCBoundaryNode is an agent instance's successful dataplane acknowledgement.
+type VPCBoundaryNode struct {
+	Node               string `json:"node"`
+	AgentUID           string `json:"agentUID"`
+	Revision           int64  `json:"revision"`
+	ObservedGeneration int64  `json:"observedGeneration"`
+	PrimaryPortsDigest string `json:"primaryPortsDigest"`
+	// TransportReady confirms that peer maps and routes are synchronized.
+	TransportReady bool `json:"transportReady"`
 }
 
 // +genclient

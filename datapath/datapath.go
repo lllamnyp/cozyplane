@@ -36,6 +36,7 @@ import (
 // device, and the remotes map. It is used by the agent. The CNI plugin uses the
 // pinned program/maps directly (see attach.go) rather than this Manager.
 type Manager struct {
+	boundaryMu    sync.Mutex
 	objs          overlayObjects
 	geneveIfindex int
 	uplinkIfindex int
@@ -87,6 +88,13 @@ func (m *Manager) Load(vni uint32) error {
 			return fmt.Errorf("load bpf objects: %+v", ve)
 		}
 		return fmt.Errorf("load bpf objects: %w", err)
+	}
+	// Populate boundary continuations before publishing the entry program pins.
+	if err := m.objs.LbProg.Put(uint32(4), m.objs.CozyplaneFromPodContinue); err != nil {
+		return fmt.Errorf("boundary from continuation: %w", err)
+	}
+	if err := m.objs.LbProg.Put(uint32(5), m.objs.CozyplaneToPodContinue); err != nil {
+		return fmt.Errorf("boundary to continuation: %w", err)
 	}
 
 	// Swap these pins atomically (pin-aside, rename over) rather than

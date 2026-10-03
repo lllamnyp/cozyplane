@@ -35,3 +35,7 @@ type VPCBindingExpansion interface{}
 type VPCGatewayExpansion interface{}
 
 type VPCPeeringExpansion interface{}
+
+type VPNConnectionExpansion interface{}
+
+type VPNGatewayExpansion interface{}

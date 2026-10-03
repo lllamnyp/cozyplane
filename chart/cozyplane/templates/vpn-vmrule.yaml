@@ -1,0 +1,47 @@
+{{- if and .Values.vpn.observability.rules.enabled (.Capabilities.APIVersions.Has "operator.victoriametrics.com/v1beta1/VMRule") }}
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMRule
+metadata:
+  name: cozyplane-vpn
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cozyplane.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vpn
+spec:
+  groups:
+    - name: cozyplane.vpn
+      rules:
+        - alert: CozyplaneVPNConnectionDown
+          expr: max without (backend, pod) (cozyplane_vpn_connection_up) == 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: VPN connection {{ "{{" }} $labels.connection {{ "}}" }} is down
+            description: VPN connection {{ "{{" }} $labels.connection {{ "}}" }} on gateway {{ "{{" }} $labels.gateway {{ "}}" }} in namespace {{ "{{" }} $labels.namespace {{ "}}" }} has been down for at least two minutes.
+        - alert: CozyplaneVPNConnectionNeverHandshake
+          expr: max without (backend, pod) (cozyplane_vpn_connection_last_handshake_timestamp_seconds) == 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: VPN connection {{ "{{" }} $labels.connection {{ "}}" }} never completed a handshake
+            description: VPN connection {{ "{{" }} $labels.connection {{ "}}" }} on gateway {{ "{{" }} $labels.gateway {{ "}}" }} has not completed its first handshake within ten minutes.
+        - alert: CozyplaneVPNConnectionHandshakeStale
+          expr: (max without (backend, pod) (cozyplane_vpn_connection_last_handshake_timestamp_seconds) > 0) and (time() - max without (backend, pod) (cozyplane_vpn_connection_last_handshake_timestamp_seconds) > 300)
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: VPN connection {{ "{{" }} $labels.connection {{ "}}" }} handshake is stale
+            description: VPN connection {{ "{{" }} $labels.connection {{ "}}" }} on gateway {{ "{{" }} $labels.gateway {{ "}}" }} has not handshaken for over five minutes.
+        {{- if .Values.vpn.observability.rules.noTraffic.enabled }}
+        - alert: CozyplaneVPNConnectionNoTraffic
+          expr: sum without (backend, pod) (increase(cozyplane_vpn_connection_rx_bytes_total[{{ .Values.vpn.observability.rules.noTraffic.window }}]) + increase(cozyplane_vpn_connection_tx_bytes_total[{{ .Values.vpn.observability.rules.noTraffic.window }}])) == 0
+          labels:
+            severity: warning
+          annotations:
+            summary: VPN connection {{ "{{" }} $labels.connection {{ "}}" }} has no traffic
+            description: VPN connection {{ "{{" }} $labels.connection {{ "}}" }} on gateway {{ "{{" }} $labels.gateway {{ "}}" }} has transferred no traffic for {{ .Values.vpn.observability.rules.noTraffic.window }}.
+        {{- end }}
+{{- end }}

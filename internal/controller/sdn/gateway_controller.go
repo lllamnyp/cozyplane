@@ -91,6 +91,14 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if gw == nil || !gw.Spec.NAT.Enabled {
 		return ctrl.Result{}, r.deleteGateways(ctx, vpc.Namespace, vpc.Name)
 	}
+	// The tenant declared its own appliance as the VPC's door
+	// (docs/multi-attach.md). There is exactly one door, and gateways[vni] holds
+	// exactly one entry, so cozyplane must not also run a pod for it: two
+	// claimants would race for the same map entry and the winner would be
+	// whichever agent resynced last.
+	if gw.Spec.Appliance != nil {
+		return ctrl.Result{}, r.deleteGateways(ctx, vpc.Namespace, vpc.Name)
+	}
 	// A gateway realizes each family's egress in eBPF (vpc_nat_snat / vpc_nat_snat6)
 	// when the pool could give that family an address — SNAT at the pod's own veth,
 	// no pod, no hairpin, no per-VPC SPOF, the tenant's own identity on the wire

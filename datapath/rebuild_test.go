@@ -32,6 +32,7 @@ func TestVethAliasRoundtrip(t *testing.T) {
 		{"vpc v4", 102, []net.IP{net.ParseIP("10.70.0.2")}},
 		{"vpc v6", 100, []net.IP{net.ParseIP("fd00:70::3")}},
 		{"gateway leg", 102 | PortGatewayFlag, []net.IP{net.ParseIP("10.70.0.1")}},
+		{"tenant forwarding leg", 102 | PortForwardFlag, []net.IP{net.ParseIP("10.70.0.9")}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -77,5 +78,24 @@ func TestParseVethAliasRejects(t *testing.T) {
 	// Sanity: the canonical form is accepted.
 	if _, _, _, ok := parseVethAlias(FormatVethAlias(7, []net.IP{net.ParseIP("10.0.0.1")}, mac)); !ok {
 		t.Fatal("canonical alias rejected")
+	}
+}
+
+// An alias written before multi-attach existed carries no fwd key. It must still
+// parse, as fwd=0 — which is what it was. Getting this wrong would not fail
+// loudly: the veth would come back from an agent restart without
+// PORT_F_FORWARD, and a granted router would start dropping its own transit
+// traffic on the RPF check hours after the change that caused it.
+func TestVethAliasWithoutForwardKeyParsesAsNotForwarding(t *testing.T) {
+	legacy := vethAliasPrefix + "net=102;gw=0;mac=02:a1:b2:c3:d4:e5;ips=10.70.0.2"
+	rawNet, ips, _, ok := parseVethAlias(legacy)
+	if !ok {
+		t.Fatal("a pre-multi-attach alias must still parse")
+	}
+	if rawNet&PortForwardFlag != 0 {
+		t.Error("a legacy alias must not come back as a forwarding leg")
+	}
+	if PortNet(rawNet) != 102 || len(ips) != 1 {
+		t.Errorf("rawNet=%d ips=%v", rawNet, ips)
 	}
 }
