@@ -1,0 +1,14 @@
+[Unit]
+Description=Cozyplane VPN appliance
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/cozyplane-vpn/backend
+ExecStart=/usr/local/libexec/cozyplane-vpn-appliance-start
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

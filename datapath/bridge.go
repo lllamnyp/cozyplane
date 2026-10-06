@@ -225,7 +225,9 @@ func delBridge(fabricIP string) error {
 			if err := fm.Lookup(&fk, &cur); err == nil && cur == fip {
 				_ = fm.Delete(&fk)
 			}
-			fm.Close()
+			if err := fm.Close(); err != nil {
+				return fmt.Errorf("close inverse bridge map: %w", err)
+			}
 		}
 	}
 	if err := m.Delete(fip); err != nil && !isNotExist(err) {

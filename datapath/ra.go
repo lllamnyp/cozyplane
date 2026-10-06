@@ -28,12 +28,11 @@ import (
 )
 
 // Router Advertisements for v6 VPC pods (#8, vm-provisioning.md Part 1,
-// option C): cozyplane pins a /128, so SLAAC's prefix+IID model can't
-// reproduce the address — but RFC 4862 permits a /128 prefix, in which case
-// the "prefix" IS the address and the guest autoconfigures exactly it. A
-// KubeVirt bridge-bound guest thus learns its address, default route
+// option C): cozyplane pins a /128, so Ethernet SLAAC's prefix+IID model can't
+// reproduce the address. The Managed flag requests DHCPv6, which serves that
+// exact binding. A KubeVirt bridge-bound guest learns its address, default route
 // (fe80::1, which the host veth owns), and — when a v6 resolver path exists —
-// its DNS server (RDNSS), with no console access and no DHCPv6.
+// its DNS server (RDNSS), with no console access or manual address assignment.
 //
 // This is control-plane traffic (a few packets per pod lifetime), so it lives
 // in the agent, not the eBPF hooks: one AF_PACKET listener per v6 VPC veth
@@ -49,6 +48,10 @@ const raInterval = 200 * time.Second
 // ctx ends. mtu is the pod MTU to advertise; rdnss (optional) is the v6
 // resolver address to hand out.
 func RunRAResponder(ctx context.Context, mtu int, rdnss net.IP, log *slog.Logger) {
+	if mtu < 1280 || mtu > 65535 {
+		log.Error("RA responder: invalid IPv6 MTU", "mtu", mtu)
+		return
+	}
 	serving := map[int]context.CancelFunc{}
 
 	updates := make(chan netlink.LinkUpdate, 64)
@@ -137,7 +140,7 @@ func serveRA(ctx context.Context, veth string, ifindex int, mac net.HardwareAddr
 	}
 	// Kernel-side filter: only Router Solicitations reach userspace
 	// (ethertype v6 is already bound; check next-header and ICMPv6 type).
-	filter := []unix.SockFilter{
+	filter := [...]unix.SockFilter{
 		{Code: 0x30, K: 20},         // ldb ip6 next-header
 		{Code: 0x15, Jf: 3, K: 58},  // jne ICMPv6 -> drop
 		{Code: 0x30, K: 54},         // ldb icmp6 type
@@ -200,6 +203,9 @@ func serveRA(ctx context.Context, veth string, ifindex int, mac net.HardwareAddr
 // pod's exact address, an MTU option, the source link-layer option, and —
 // when rdnss is set — an RDNSS option.
 func raFrame(mac net.HardwareAddr, podIP net.IP, mtu int, rdnss net.IP) []byte {
+	if mtu < 1280 || mtu > 65535 {
+		return nil
+	}
 	icmpLen := 16 + 32 + 8 + 8 // RA header + PIO + MTU + SLLA
 	if rdnss != nil {
 		icmpLen += 24
@@ -221,15 +227,14 @@ func raFrame(mac net.HardwareAddr, podIP net.IP, mtu int, rdnss net.IP) []byte {
 	ra := f[54:]
 	ra[0] = 134 // router advertisement
 	ra[4] = 64  // cur hop limit
-	// M=1 O=1: the address comes from DHCPv6 (Linux ignores the /128 PIO
-	// below; stacks that honor it can SLAAC instead and skip the exchange).
+	// M=1 O=1: the address comes from DHCPv6; Linux ignores the /128 PIO.
 	ra[5] = 0xc0
 	binary.BigEndian.PutUint16(ra[6:8], 9000) // router lifetime (s)
 
 	opt := ra[16:]
 	// Prefix Information: /128, on-link OFF (the address is host-scoped; all
-	// traffic goes via fe80::1), autonomous ON — RFC 4862 autoconfigures the
-	// exact address, no interface identifier involved.
+	// traffic goes via fe80::1). The legacy A flag is retained for compatibility;
+	// Linux acquires the exact address from DHCPv6, not this PIO.
 	opt[0], opt[1] = 3, 4
 	opt[2] = 128                                      // prefix length
 	opt[3] = 0x40                                     // A=1, L=0

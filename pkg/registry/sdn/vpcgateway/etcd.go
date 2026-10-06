@@ -18,6 +18,7 @@ package vpcgateway
 
 import (
 	"context"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
 	"github.com/lllamnyp/cozyplane/pkg/registry"
@@ -29,8 +30,8 @@ import (
 )
 
 // NewREST returns RESTStorage objects for VPCGateways and their /status subresource.
-func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter) (*registry.REST, *StatusREST, error) {
-	strategy := NewStrategy(scheme)
+func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter, auth authorizer.Authorizer) (*registry.ManagedREST, *StatusREST, error) {
+	strategy := NewStrategy(scheme, auth)
 
 	store := &genericregistry.Store{
 		NewFunc:                   func() runtime.Object { return &sdn.VPCGateway{} },
@@ -55,7 +56,7 @@ func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter) (*reg
 	statusStore := *store
 	statusStore.UpdateStrategy = NewStatusStrategy(strategy)
 
-	return &registry.REST{Store: store}, &StatusREST{store: &statusStore}, nil
+	return &registry.ManagedREST{REST: &registry.REST{Store: store}, Auth: auth, Resource: "vpcgateways"}, &StatusREST{store: &statusStore}, nil
 }
 
 // StatusREST implements the REST endpoint for changing the status of a VPCGateway.

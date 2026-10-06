@@ -32,6 +32,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -225,16 +226,24 @@ func npCompilePorts(policy string, ports []networkingv1.NetworkPolicyPort, warns
 			}
 		}
 		if p.Port == nil {
+			if p.EndPort != nil {
+				*warns = append(*warns, fmt.Sprintf("%s: endPort without port — entry compiled closed", policy))
+				continue
+			}
 			out = append(out, npPort{proto: proto, port: 0})
 			continue
 		}
-		if p.Port.IntValue() == 0 {
+		if p.Port.Type != intstr.Int {
 			*warns = append(*warns, fmt.Sprintf("%s: named port %q not served — entry compiled closed", policy, p.Port.String()))
 			continue
 		}
-		item := npPort{proto: proto, port: uint16(p.Port.IntValue())}
+		if p.Port.IntVal < 1 || p.Port.IntVal > 65535 {
+			*warns = append(*warns, fmt.Sprintf("%s: port %d out of range — entry compiled closed", policy, p.Port.IntVal))
+			continue
+		}
+		item := npPort{proto: proto, port: uint16(p.Port.IntVal)}
 		if p.EndPort != nil {
-			if *p.EndPort < int32(item.port) || *p.EndPort > 65535 {
+			if *p.EndPort < 1 || *p.EndPort < p.Port.IntVal || *p.EndPort > 65535 {
 				*warns = append(*warns, fmt.Sprintf("%s: bad endPort %d — entry compiled closed", policy, *p.EndPort))
 				continue
 			}
@@ -408,6 +417,7 @@ func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*
 					continue
 				}
 				for q := uint32(p.port); q <= uint32(p.endPort); q++ {
+					// #nosec G115 -- q is bounded by the uint16 endPort, including the maximum endpoint.
 					out = append(out, npPort{proto: p.proto, port: uint16(q)})
 				}
 			}

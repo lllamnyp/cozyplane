@@ -41,16 +41,16 @@ func TestPortValidate(t *testing.T) {
 		port *sdn.Port
 		ok   bool
 	}{
-		{"v4 claim", mkPort("v5.10-0-0-2", "10.0.0.2"), true},
-		{"v6 claim", mkPort("v5.fd00-a--2", "fd00:a::2"), true},
-		{"name/spec mismatch", mkPort("v5.10-0-0-2", "10.0.0.3"), false},
-		{"wrong kind prefix", mkPort("sv5.10-0-0-2", "10.0.0.2"), false},
+		{"v4 claim", mkPort("v105.10-0-0-2", "10.0.0.2"), true},
+		{"v6 claim", mkPort("v105.fd00-a--2", "fd00:a::2"), true},
+		{"name/spec mismatch", mkPort("v105.10-0-0-2", "10.0.0.3"), false},
+		{"wrong kind prefix", mkPort("sv105.10-0-0-2", "10.0.0.2"), false},
 		{"no claim shape", mkPort("web", "10.0.0.2"), false},
 		{"VNI zero", mkPort("v0.10-0-0-2", "10.0.0.2"), false},
 		{"VNI leading zero", mkPort("v05.10-0-0-2", "10.0.0.2"), false},
-		{"not an IP", mkPort("v5.bogus", "bogus"), false},
-		{"non-canonical v6", mkPort("v5.fd00-0a--2", "fd00:0a::2"), false},
-		{"v4-mapped spelling", mkPort("v5.--ffff-10-0-0-2", "::ffff:10.0.0.2"), false},
+		{"not an IP", mkPort("v105.bogus", "bogus"), false},
+		{"non-canonical v6", mkPort("v105.fd00-0a--2", "fd00:0a::2"), false},
+		{"v4-mapped spelling", mkPort("v105.--ffff-10-0-0-2", "::ffff:10.0.0.2"), false},
 	}
 	for _, c := range cases {
 		errs := s.Validate(context.Background(), c.port)
@@ -62,7 +62,7 @@ func TestPortValidate(t *testing.T) {
 
 func TestPortValidateUpdate(t *testing.T) {
 	s := portStrategy{}
-	old := mkPort("v5.10-0-0-2", "10.0.0.2")
+	old := mkPort("v105.10-0-0-2", "10.0.0.2")
 
 	moved := old.DeepCopy()
 	moved.Spec.Node = "node-b" // migration cutover: allowed

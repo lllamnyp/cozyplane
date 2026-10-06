@@ -134,6 +134,13 @@ to accept and documented in `internals.md`.
 
 ## Lifecycle / GC
 
+Migration announcement listeners must sleep while their socket is idle and
+observe cancellation within 100 ms. A nonblocking socket with `SO_RCVTIMEO`
+does not provide that wait: readiness polling is required before receiving.
+Every listener releases its child context on success, receive failure, and
+cancellation. A finishing listener may remove only its own registration;
+it must not remove a replacement started after cancellation.
+
 Ports are cluster-scoped, so a namespaced VMI ownerRef can't GC them. The
 persistent-Port controller owns the lifecycle: it **keeps** the Port while any
 virt-launcher pod (or the VMI) for its identity exists, and **deletes** it once

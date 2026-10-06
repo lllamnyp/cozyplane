@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"net"
 
+	"github.com/lllamnyp/cozyplane/pkg/netid"
+
 	"github.com/lllamnyp/cozyplane/api/sdn"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
@@ -170,7 +172,17 @@ func (portStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime
 }
 
 func (portStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
-	return field.ErrorList{}
+	groups := obj.(*sdn.Port).Status.Groups
+	var errs field.ErrorList
+	for i, id := range groups {
+		if id == 0 && len(groups) == 1 {
+			continue
+		} // Pending SG policy, never a user group.
+		if !netid.ValidGroup(id) {
+			errs = append(errs, field.Invalid(field.NewPath("status", "groups").Index(i), id, "must be between 1 and 62, or [0] alone for pending policy"))
+		}
+	}
+	return errs
 }
 
 func (portStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {

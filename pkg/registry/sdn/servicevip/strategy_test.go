@@ -41,13 +41,13 @@ func TestServiceVIPValidate(t *testing.T) {
 		vip  *sdn.ServiceVIP
 		ok   bool
 	}{
-		{"v4 claim", mkVIP("sv5.10-0-0-254", "10.0.0.254"), true},
-		{"v6 claim", mkVIP("sv5.fd00-a--fffe", "fd00:a::fffe"), true},
-		{"name/spec mismatch", mkVIP("sv5.10-0-0-254", "10.0.0.253"), false},
-		{"wrong kind prefix", mkVIP("v5.10-0-0-254", "10.0.0.254"), false},
+		{"v4 claim", mkVIP("sv105.10-0-0-254", "10.0.0.254"), true},
+		{"v6 claim", mkVIP("sv105.fd00-a--fffe", "fd00:a::fffe"), true},
+		{"name/spec mismatch", mkVIP("sv105.10-0-0-254", "10.0.0.253"), false},
+		{"wrong kind prefix", mkVIP("v105.10-0-0-254", "10.0.0.254"), false},
 		{"no claim shape", mkVIP("web", "10.0.0.254"), false},
 		{"VNI zero", mkVIP("sv0.10-0-0-254", "10.0.0.254"), false},
-		{"not an IP", mkVIP("sv5.bogus", "bogus"), false},
+		{"not an IP", mkVIP("sv105.bogus", "bogus"), false},
 	}
 	for _, c := range cases {
 		errs := s.Validate(context.Background(), c.vip)
@@ -59,7 +59,7 @@ func TestServiceVIPValidate(t *testing.T) {
 
 func TestServiceVIPValidateUpdate(t *testing.T) {
 	s := serviceVIPStrategy{}
-	old := mkVIP("sv5.10-0-0-254", "10.0.0.254")
+	old := mkVIP("sv105.10-0-0-254", "10.0.0.254")
 
 	rePorts := old.DeepCopy()
 	rePorts.Spec.Ports = []sdn.VIPPort{{Name: "http", Protocol: "TCP", Port: 80}}

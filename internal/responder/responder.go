@@ -164,6 +164,9 @@ func (r *Resolver) authoritative(req *dns.Msg, q dns.Question, qname string, por
 		}
 		if srvProto != "" {
 			for _, p := range svc.Spec.Ports {
+				if p.Port < 1 || p.Port > 65535 {
+					continue
+				}
 				if !strings.EqualFold(p.Name, srvPort) || !strings.EqualFold(string(p.Protocol), srvProto) {
 					continue
 				}
@@ -226,6 +229,9 @@ func (r *Resolver) authoritative(req *dns.Msg, q dns.Question, qname string, por
 			// Bare-name SRV: one record per endpoint x declared port.
 			for _, e := range eps {
 				for _, p := range svc.Spec.Ports {
+					if p.Port < 1 || p.Port > 65535 {
+						continue
+					}
 					m.Answer = append(m.Answer, srvRecord(owner, e, uint16(p.Port), r.Domain, svcName, ns))
 				}
 			}
@@ -242,6 +248,9 @@ func (r *Resolver) authoritative(req *dns.Msg, q dns.Question, qname string, por
 // answerSRV handles the _port._proto.<svc>... form.
 func (r *Resolver) answerSRV(m *dns.Msg, q dns.Question, owner string, svc *corev1.Service, eps []Endpoint, srvPort, srvProto string) {
 	for _, p := range svc.Spec.Ports {
+		if p.Port < 1 || p.Port > 65535 {
+			continue
+		}
 		if !strings.EqualFold(p.Name, srvPort) || !strings.EqualFold(string(p.Protocol), srvProto) {
 			continue
 		}

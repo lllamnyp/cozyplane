@@ -21,11 +21,14 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"net"
 	"os"
+	"strings"
 	"time"
 
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/discovery"
@@ -69,9 +72,15 @@ func main() {
 		secureMetrics        bool
 		enableHTTP2          bool
 		gatewayImage         string
+		agentImage           string
 		gatewayNamespace     string
 		internalCIDRs        string
 		clusterDNS           string
+		vpnNodeSelector      string
+		vpnTolerationKey     string
+		vpnMaxGateways       int
+		vpnMaxConnections    int
+		vpnHardened          bool
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
@@ -84,6 +93,7 @@ func main() {
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics server")
+	flag.StringVar(&agentImage, "agent-image", "", "agent image that must finish rollout before pending SG encoding is emitted")
 	flag.StringVar(&gatewayImage, "gateway-image", "",
 		"cozyplane image for VPC egress gateway pods; empty disables gateway reconciliation")
 	flag.StringVar(&gatewayNamespace, "gateway-namespace", os.Getenv("POD_NAMESPACE"),
@@ -92,6 +102,16 @@ func main() {
 		"comma-separated cluster-internal CIDRs gateways must not forward tenant traffic to (pod, service, node networks)")
 	flag.StringVar(&clusterDNS, "cluster-dns", "",
 		"cluster DNS ClusterIP gateways allow on :53")
+	flag.StringVar(&vpnNodeSelector, "vpn-gateway-node-selector", "",
+		"comma-separated key=value node labels placing managed VPN appliances on a dedicated gateway pool (issue #6, docs/vpn.md §3.5); empty runs them anywhere")
+	flag.StringVar(&vpnTolerationKey, "vpn-gateway-toleration-key", "",
+		"taint key the managed VPN appliance tolerates (Exists/NoSchedule), so it can schedule onto a tainted gateway pool; empty adds no toleration")
+	flag.IntVar(&vpnMaxGateways, "vpn-max-gateways-per-namespace", 0,
+		"per-tenant cap on managed VPN gateways (0 uses the built-in default)")
+	flag.IntVar(&vpnMaxConnections, "vpn-max-connections-per-gateway", 0,
+		"per-gateway cap on VPN connections/peers (0 uses the built-in default)")
+	flag.BoolVar(&vpnHardened, "vpn-hardened-appliance", false,
+		"use pod forwarding sysctls and only NET_ADMIN/NET_RAW/NET_BIND_SERVICE instead of privileged VPN appliances")
 
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
@@ -174,10 +194,16 @@ func main() {
 		os.Exit(1)
 	}
 	gateCfg := sdnControllerConfig{
-		gatewayImage:     gatewayImage,
-		gatewayNamespace: gatewayNamespace,
-		internalCIDRs:    internalCIDRs,
-		clusterDNS:       clusterDNS,
+		gatewayImage:      gatewayImage,
+		agentImage:        agentImage,
+		gatewayNamespace:  gatewayNamespace,
+		internalCIDRs:     internalCIDRs,
+		clusterDNS:        clusterDNS,
+		vpnNodeSelector:   vpnNodeSelector,
+		vpnTolerationKey:  vpnTolerationKey,
+		vpnMaxGateways:    vpnMaxGateways,
+		vpnMaxConnections: vpnMaxConnections,
+		vpnHardened:       vpnHardened,
 	}
 	gate := &apigate.Gate{
 		Name: sdnv1alpha1.SchemeGroupVersion.String(),
@@ -188,7 +214,7 @@ func main() {
 			// than just the group) keeps a half-registered apiserver — group
 			// advertised, registries not installed — from opening the gate.
 			Resources: []string{"vpcs", "vpcbindings", "vpcpeerings", "vpcgateways",
-				"ports", "securitygroups", "servicevips", "floatingips"},
+				"ports", "securitygroups", "servicevips", "floatingips", "vpngateways", "vpnconnections"},
 		},
 		Interval: apiGroupPollInterval,
 		Register: func(context.Context) error { return setupSDNControllers(mgr, gateCfg) },
@@ -210,10 +236,16 @@ func main() {
 // sdnControllerConfig carries the flags the gated controllers need. It exists
 // so the registration below can run long after the flags were parsed.
 type sdnControllerConfig struct {
-	gatewayImage     string
-	gatewayNamespace string
-	internalCIDRs    string
-	clusterDNS       string
+	gatewayImage      string
+	agentImage        string
+	gatewayNamespace  string
+	internalCIDRs     string
+	clusterDNS        string
+	vpnNodeSelector   string
+	vpnTolerationKey  string
+	vpnMaxGateways    int
+	vpnMaxConnections int
+	vpnHardened       bool
 }
 
 // setupSDNControllers registers every controller that watches a
@@ -227,8 +259,9 @@ type sdnControllerConfig struct {
 // and no restart.
 func setupSDNControllers(mgr manager.Manager, cfg sdnControllerConfig) error {
 	if err := (&sdncontroller.VPCReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		AgentNamespace: cfg.gatewayNamespace,
 		// VNI allocation must read live, never the lagging informer cache —
 		// a stale read hands two VPCs the same network id (isolation break).
 		Reader: mgr.GetAPIReader(),
@@ -290,7 +323,8 @@ func setupSDNControllers(mgr manager.Manager, cfg sdnControllerConfig) error {
 	}
 
 	if err := (&sdncontroller.PortMembershipReconciler{
-		Client: mgr.GetClient(),
+		Client:        mgr.GetClient(),
+		SentinelReady: sdncontroller.AgentRolloutGate(mgr.GetAPIReader(), cfg.gatewayNamespace, cfg.agentImage),
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("unable to create controller %s: %w", "PortMembership", err)
 	}
@@ -315,6 +349,70 @@ func setupSDNControllers(mgr manager.Manager, cfg sdnControllerConfig) error {
 		}).SetupWithManager(mgr); err != nil {
 			return fmt.Errorf("unable to create controller %s: %w", "Gateway", err)
 		}
+
+		// Managed VPN tunnels use the same image, and must open behind the same
+		// aggregated-API gate as the other sdn.cozystack.io controllers.
+		var vpnTolerations []corev1.Toleration
+		if cfg.vpnTolerationKey != "" {
+			vpnTolerations = []corev1.Toleration{{
+				Key:      cfg.vpnTolerationKey,
+				Operator: corev1.TolerationOpExists,
+				Effect:   corev1.TaintEffectNoSchedule,
+			}}
+		}
+		if err := (&sdncontroller.VPNGatewayReconciler{
+			Client: mgr.GetClient(),
+			// Live reads for the tunnel quota — a stale cache would let a burst of
+			// concurrent creates each slip under the cap.
+			Reader: mgr.GetAPIReader(),
+			Scheme: mgr.GetScheme(),
+			Config: sdncontroller.VPNGatewayConfig{
+				Image:                    cfg.gatewayImage,
+				DefaultListenPort:        51820,
+				NodeSelector:             parseNodeSelector(cfg.vpnNodeSelector),
+				Tolerations:              vpnTolerations,
+				MaxGatewaysPerNamespace:  cfg.vpnMaxGateways,
+				MaxConnectionsPerGateway: cfg.vpnMaxConnections,
+				HardenedAppliance:        cfg.vpnHardened,
+				InternalCIDRs:            parseCIDRs(cfg.internalCIDRs),
+			},
+		}).SetupWithManager(mgr); err != nil {
+			return fmt.Errorf("unable to create controller %s: %w", "VPNGateway", err)
+		}
 	}
 	return nil
+}
+
+// parseNodeSelector turns a "k=v,k2=v2" flag into a label map. Malformed entries
+// are skipped rather than fatal — a placement hint should never wedge startup.
+func parseNodeSelector(s string) map[string]string {
+	if s == "" {
+		return nil
+	}
+	out := map[string]string{}
+	for _, pair := range strings.Split(s, ",") {
+		kv := strings.SplitN(strings.TrimSpace(pair), "=", 2)
+		if len(kv) == 2 && kv[0] != "" {
+			out[kv[0]] = kv[1]
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// parseCIDRs turns a comma-separated CIDR list into parsed networks, skipping
+// malformed entries (a placement/deny-set hint must never wedge startup).
+func parseCIDRs(s string) []*net.IPNet {
+	if s == "" {
+		return nil
+	}
+	var out []*net.IPNet
+	for _, c := range strings.Split(s, ",") {
+		if _, n, err := net.ParseCIDR(strings.TrimSpace(c)); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
 }

@@ -1,3 +1,7 @@
+# One tenant API distribution per regional cluster. Never switch in-place.
+api:
+  mode: aggregated
+
 # Container image (shared with the cozyplane chart — the apiserver binary lives
 # in the same image). Digest-pinned (no floating tag); keep it equal to
 # chart/cozyplane/values.yaml's pin. See docs/packaging.md.
@@ -54,5 +58,18 @@ etcd:
     requests:
       cpu: 50m
       memory: 128Mi
+    limits:
+      memory: 256Mi
+
+# CRD control-plane phase, after the CNI and cert-manager.
+admission:
+  replicas: 2
+  tls:
+    existingSecret: ""
+    caBundle: ""
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
     limits:
       memory: 256Mi

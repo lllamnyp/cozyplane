@@ -19,6 +19,7 @@ package sdn
 import (
 	"context"
 	"fmt"
+	"github.com/lllamnyp/cozyplane/pkg/netid"
 	"net"
 	"slices"
 	"strings"
@@ -97,7 +98,7 @@ func (r *ServiceVIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err := r.Get(ctx, types.NamespacedName{Namespace: vpcNS, Name: vpcName}, vpc); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	if vpc.Status.VNI == 0 || len(vpc.Spec.CIDRs) == 0 {
+	if !netid.ValidVNI(vpc.Status.VNI) || len(vpc.Spec.CIDRs) == 0 {
 		return ctrl.Result{Requeue: true}, nil
 	}
 

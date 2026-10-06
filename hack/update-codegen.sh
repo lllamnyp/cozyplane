@@ -43,6 +43,18 @@ for api_group in "${API_GROUPS[@]}"; do
     kube::codegen::gen_helpers \
         --boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
         "${SCRIPT_ROOT}/api/${api_group}"
+
+    # gen_helpers defaults to unsafe casts for layout-compatible structs.
+    # Regenerate conversions without unsafe pointer reinterpretation. This
+    # remains a conversion contract, not a deep-copy contract for all fields.
+    if [[ "${api_group}" == "sdn" ]]; then
+        rm "${SCRIPT_ROOT}/api/sdn/v1alpha1/zz_generated.conversion.go"
+        (cd "${SCRIPT_ROOT}" && go run k8s.io/code-generator/cmd/conversion-gen \
+            --skip-unsafe \
+            --output-file zz_generated.conversion.go \
+            --go-header-file hack/boilerplate.go.txt \
+            "${THIS_PKG}/api/sdn/v1alpha1")
+    fi
 done
 
 # Extra upstream packages needed for OpenAPI definitions referenced by our types.
@@ -65,15 +77,13 @@ for api_group in "${API_GROUPS[@]}"; do
         echo "Skipping OpenAPI for CRD-served API group: ${api_group}"
     else
     echo "Generating OpenAPI for API group: ${api_group}"
-    set +o errexit
     kube::codegen::gen_openapi \
         "${OPENAPI_EXTRA_PKGS_FLAGS[@]}" \
         --output-dir "${SCRIPT_ROOT}/pkg/generated/${api_group}/openapi" \
         --output-pkg "${THIS_PKG}/pkg/generated/${api_group}/openapi" \
-        --report-filename "/dev/null" \
+        --report-filename "${SCRIPT_ROOT}/hack/api-rule-violations.report" \
         --boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
-        "${SCRIPT_ROOT}/api/${api_group}" || echo "Warning: OpenAPI generation had issues for ${api_group}, continuing..."
-    set -o errexit
+        "${SCRIPT_ROOT}/api/${api_group}"
     fi
 
     echo "Generating client code for API group: ${api_group}"
@@ -86,7 +96,32 @@ for api_group in "${API_GROUPS[@]}"; do
         --boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
         "${SCRIPT_ROOT}/api"
 
+    # InformerFor accepts a caller-provided constructor. A started informer
+    # cannot accept a transform; its error must not be silently discarded.
+    factory="${SCRIPT_ROOT}/pkg/generated/${api_group}/informers/externalversions/factory.go"
+    awk '
+      /^[[:space:]]*informer.SetTransform\(f.transform\)$/ {
+        print "\tif err := informer.SetTransform(f.transform); err != nil {"
+        print "\t\tpanic(err)"
+        print "\t}"
+        replaced++; next
+      }
+      { print }
+      END { if (replaced != 1) exit 1 }
+    ' "${factory}" > "${factory}.tmp"
+    mv "${factory}.tmp" "${factory}"
+    gofmt -w "${factory}"
+
     echo "Completed code generation for API group: ${api_group}"
 done
+
+# Structural tenant schemas and their chart payload have a single generator.
+# Pin the build-time tool separately from the runtime dependency graph.
+if [[ " ${API_GROUPS[*]} " == *" sdn "* ]]; then
+    (cd "${SCRIPT_ROOT}" && go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.19.0 \
+        crd paths=./api/sdn/v1alpha1 output:crd:dir=config/tenant-crd)
+    mkdir -p "${SCRIPT_ROOT}/chart/cozyplane/files/tenant-crd"
+    cp "${SCRIPT_ROOT}"/config/tenant-crd/*.yaml "${SCRIPT_ROOT}/chart/cozyplane/files/tenant-crd/"
+fi
 
 echo "Code generation complete for all API groups: ${API_GROUPS[*]}"

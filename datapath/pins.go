@@ -51,7 +51,9 @@ func reconcilePins() ([]string, error) {
 		}
 		if err == nil {
 			cerr := ms.Compatible(pinned) // the same test map reuse applies
-			pinned.Close()
+			if err := pinned.Close(); err != nil {
+				return removed, fmt.Errorf("close inspected map: %w", err)
+			}
 			if cerr == nil {
 				continue
 			}

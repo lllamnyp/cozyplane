@@ -27,13 +27,17 @@ import (
 // Used by the CNI plugin via the pinned map. Every pod sets this (0 for the
 // default/system network) so a reused ifindex never inherits a stale id.
 func SetPortNet(ifindex int, netID uint32) error {
+	index, err := Ifindex(ifindex)
+	if err != nil {
+		return err
+	}
 	m, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "ports"), nil)
 	if err != nil {
 		return fmt.Errorf("open pinned ports map: %w", err)
 	}
 	defer m.Close()
 
-	if err := m.Put(uint32(ifindex), netID); err != nil {
+	if err := m.Put(index, netID); err != nil {
 		return fmt.Errorf("set port net: %w", err)
 	}
 	return nil
@@ -45,6 +49,10 @@ func SetPortNet(ifindex int, netID uint32) error {
 // persistent Port has already been re-pointed to the target pod. ok is false
 // when the veth has no entry.
 func GetPortNet(ifindex int) (netID uint32, ok bool, err error) {
+	index, err := Ifindex(ifindex)
+	if err != nil {
+		return 0, false, err
+	}
 	m, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "ports"), nil)
 	if err != nil {
 		return 0, false, fmt.Errorf("open pinned ports map: %w", err)
@@ -52,7 +60,7 @@ func GetPortNet(ifindex int) (netID uint32, ok bool, err error) {
 	defer m.Close()
 
 	var v uint32
-	if err := m.Lookup(uint32(ifindex), &v); err != nil {
+	if err := m.Lookup(index, &v); err != nil {
 		if isNotExist(err) {
 			return 0, false, nil
 		}
@@ -63,13 +71,17 @@ func GetPortNet(ifindex int) (netID uint32, ok bool, err error) {
 
 // DelPortNet removes a veth's entry from the ports map.
 func DelPortNet(ifindex int) error {
+	index, err := Ifindex(ifindex)
+	if err != nil {
+		return err
+	}
 	m, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "ports"), nil)
 	if err != nil {
 		return fmt.Errorf("open pinned ports map: %w", err)
 	}
 	defer m.Close()
 
-	if err := m.Delete(uint32(ifindex)); err != nil && !isNotExist(err) {
+	if err := m.Delete(index); err != nil && !isNotExist(err) {
 		return fmt.Errorf("del port net: %w", err)
 	}
 	return nil

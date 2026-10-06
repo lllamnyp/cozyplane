@@ -38,6 +38,8 @@ type VPCStatusApplyConfiguration struct {
 	Phase *sdnv1alpha1.VPCPhase `json:"phase,omitempty"`
 	// Conditions represent the latest available observations.
 	Conditions []v1.ConditionApplyConfiguration `json:"conditions,omitempty"`
+	// BoundaryNodes acknowledges the revision loaded by each agent instance.
+	BoundaryNodes []VPCBoundaryNodeApplyConfiguration `json:"boundaryNodes,omitempty"`
 }
 
 // VPCStatusApplyConfiguration constructs a declarative configuration of the VPCStatus type for use with
@@ -71,6 +73,19 @@ func (b *VPCStatusApplyConfiguration) WithConditions(values ...*v1.ConditionAppl
 			panic("nil value passed to WithConditions")
 		}
 		b.Conditions = append(b.Conditions, *values[i])
+	}
+	return b
+}
+
+// WithBoundaryNodes adds the given value to the BoundaryNodes field in the declarative configuration
+// and returns the receiver, so that objects can be build by chaining "With" function invocations.
+// If called multiple times, values provided by each call will be appended to the BoundaryNodes field.
+func (b *VPCStatusApplyConfiguration) WithBoundaryNodes(values ...*VPCBoundaryNodeApplyConfiguration) *VPCStatusApplyConfiguration {
+	for i := range values {
+		if values[i] == nil {
+			panic("nil value passed to WithBoundaryNodes")
+		}
+		b.BoundaryNodes = append(b.BoundaryNodes, *values[i])
 	}
 	return b
 }

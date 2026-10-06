@@ -15,7 +15,7 @@ help: ## Display this help.
 ##@ Development
 
 .PHONY: generate
-generate: ## Run code generation (deepcopy, conversion, defaults, openapi, clientset).
+generate: ## Run code generation (helpers, OpenAPI, clientset, tenant CRDs and chart payload).
 	hack/update-codegen.sh
 
 .PHONY: fmt
@@ -35,5 +35,6 @@ test: fmt vet ## Run Go unit tests.
 .PHONY: build
 build: fmt vet ## Build all binaries.
 	go build -o bin/cozyplane-apiserver ./cmd/apiserver
+	go build -o bin/cozyplane-admission ./cmd/admission
 	go build -o bin/sdn-controller ./cmd/sdn-controller
 	go build -o bin/cozyplane-responder ./cmd/responder

@@ -37,14 +37,12 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/coreos/go-iptables/iptables"
 
@@ -109,10 +107,19 @@ func run(vpcIface, fabricIface, clusterDNS string, internalCIDRs []string, log *
 				return fmt.Errorf("dns redirect rule %v (v6=%v): %w", spec, fam.v6, err)
 			}
 		}
+		// A private chain inserted first also covers old ACCEPT rules in a
+		// recycled gateway netns. This pod owns its network namespace.
+		const inputChain = "COZYPLANE-INPUT"
+		if err := ipt.ClearChain("filter", inputChain); err != nil {
+			return fmt.Errorf("prepare input chain: %w", err)
+		}
 		for _, spec := range inputRules(vpcIface, fam.v6) {
-			if err := ipt.AppendUnique("filter", "INPUT", spec...); err != nil {
+			if err := ipt.AppendUnique("filter", inputChain, spec...); err != nil {
 				return fmt.Errorf("input rule %v (v6=%v): %w", spec, fam.v6, err)
 			}
+		}
+		if err := inputJumpFirst(ipt, inputChain); err != nil {
+			return fmt.Errorf("insert input policy first: %w", err)
 		}
 		for _, spec := range forwardRules(vpcIface, famCIDRs) {
 			if err := ipt.AppendUnique("filter", "FORWARD", spec...); err != nil {
@@ -125,10 +132,14 @@ func run(vpcIface, fabricIface, clusterDNS string, internalCIDRs []string, log *
 		}
 	}
 
+	var proxyErrors <-chan error
 	if clusterDNS != "" {
-		if err := runDNSProxy(net.JoinHostPort(clusterDNS, "53"), log); err != nil {
+		proxy, err := runDNSProxy(net.JoinHostPort(clusterDNS, "53"), log)
+		if err != nil {
 			return fmt.Errorf("start dns proxy: %w", err)
 		}
+		defer proxy.Close()
+		proxyErrors = proxy.errors
 	}
 
 	log.Info("gateway ready", "vpcIface", vpcIface, "fabricIface", fabricIface,
@@ -136,8 +147,12 @@ func run(vpcIface, fabricIface, clusterDNS string, internalCIDRs []string, log *
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
-	return nil
+	select {
+	case <-stop:
+		return nil
+	case err := <-proxyErrors:
+		return err
+	}
 }
 
 // masqueradeRules masquerades everything the gateway forwards out its fabric
@@ -193,7 +208,10 @@ func cidrsOfFamily(cidrs []string, v6 bool) []string {
 // inputRules restrict what the VPC side may address to the gateway itself:
 // the DNS proxy and reply traffic, nothing else.
 func inputRules(vpcIface string, v6 bool) [][]string {
-	var rules [][]string
+	rules := [][]string{
+		{"!", "-i", vpcIface, "-p", "udp", "--dport", "53", "-j", "DROP"},
+		{"!", "-i", vpcIface, "-p", "tcp", "--dport", "53", "-j", "DROP"},
+	}
 	if v6 {
 		// NDP is ICMPv6 — unlike ARP, ip6tables sees it, and dropping the
 		// neighbor solicitation/advertisement leaves the VPC leg's fe80::1
@@ -224,75 +242,6 @@ func forwardRules(vpcIface string, internalCIDRs []string) [][]string {
 	}
 	rules = append(rules, []string{"-i", vpcIface, "-j", "ACCEPT"})
 	return rules
-}
-
-// runDNSProxy serves :53 (UDP and TCP) and forwards each query to upstream
-// over its own sockets, which the node's Service machinery translates
-// (socket-LB or kube-proxy alike). Fire-and-forget goroutines per query.
-func runDNSProxy(upstream string, log *slog.Logger) error {
-	const timeout = 5 * time.Second
-
-	uconn, err := net.ListenUDP("udp", &net.UDPAddr{Port: 53})
-	if err != nil {
-		return fmt.Errorf("listen udp :53: %w", err)
-	}
-	go func() {
-		buf := make([]byte, 65535)
-		for {
-			n, client, err := uconn.ReadFromUDP(buf)
-			if err != nil {
-				log.Error("dns udp read", "err", err)
-				return
-			}
-			query := make([]byte, n)
-			copy(query, buf[:n])
-			go func(query []byte, client *net.UDPAddr) {
-				up, err := net.DialTimeout("udp", upstream, timeout)
-				if err != nil {
-					return
-				}
-				defer up.Close()
-				_ = up.SetDeadline(time.Now().Add(timeout))
-				if _, err := up.Write(query); err != nil {
-					return
-				}
-				resp := make([]byte, 65535)
-				n, err := up.Read(resp)
-				if err != nil {
-					return
-				}
-				_, _ = uconn.WriteToUDP(resp[:n], client)
-			}(query, client)
-		}
-	}()
-
-	tln, err := net.Listen("tcp", ":53")
-	if err != nil {
-		return fmt.Errorf("listen tcp :53: %w", err)
-	}
-	go func() {
-		for {
-			conn, err := tln.Accept()
-			if err != nil {
-				log.Error("dns tcp accept", "err", err)
-				return
-			}
-			go func(conn net.Conn) {
-				defer conn.Close()
-				up, err := net.DialTimeout("tcp", upstream, timeout)
-				if err != nil {
-					return
-				}
-				defer up.Close()
-				_ = conn.SetDeadline(time.Now().Add(timeout))
-				_ = up.SetDeadline(time.Now().Add(timeout))
-				go func() { _, _ = io.Copy(up, conn) }()
-				_, _ = io.Copy(conn, up)
-			}(conn)
-		}
-	}()
-
-	return nil
 }
 
 func splitCIDRs(s string) []string {

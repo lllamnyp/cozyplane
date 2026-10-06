@@ -23,10 +23,13 @@ package v1alpha1
 //
 // PortStatus is the controller-observed state of a Port.
 type PortStatusApplyConfiguration struct {
-	// Groups is the set of SecurityGroup numeric ids (1..63, within the Port's
+	// Groups is the set of SecurityGroup numeric ids (1..62, within the Port's
 	// VPC) this Port is a member of, resolved by the controller from the pod's
 	// labels. The agent folds it into the datapath membership bitmap. Empty
 	// means "no groups" — legacy allow-all intra-VPC ingress.
+	// [0] alone means a selected SG is pending/invalid: deny new SG-gated
+	// TCP/UDP admissions until all selected group IDs are resolved. It is not
+	// full protocol quarantine. All agents must support this before activation.
 	Groups []int32 `json:"groups,omitempty"`
 }
 

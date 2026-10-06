@@ -20,7 +20,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/lllamnyp/cozyplane/pkg/netid"
 	"slices"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -76,7 +78,7 @@ func (r *SecurityGroupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Allocate an id, or repair a duplicate (younger claim yields), or keep the
 	// current one.
 	id := sg.Status.ID
-	if id == 0 {
+	if !netid.ValidGroup(id) {
 		var err error
 		if id, err = r.allocateID(ctx, &sg); err != nil {
 			return ctrl.Result{}, err
@@ -194,6 +196,7 @@ func (r *SecurityGroupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // so membership holds steady instead of collapsing to "no groups".
 type PortMembershipReconciler struct {
 	client.Client
+	SentinelReady func(context.Context) (bool, error)
 }
 
 // podLabelsFor returns the labels to evaluate selectors against: the live pod's
@@ -233,19 +236,36 @@ func (r *PortMembershipReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	var ids []int32
 	for i := range groups.Items {
 		sg := &groups.Items[i]
-		if sg.Spec.VPCRef.Name != port.Spec.VPCRef.Name || sg.Status.ID == 0 {
+		if sg.Spec.VPCRef.Name != port.Spec.VPCRef.Name {
 			continue
 		}
 		sel, err := metav1.LabelSelectorAsSelector(&sg.Spec.PodSelector)
 		if err != nil {
 			logger.Error(err, "invalid podSelector", "securityGroup", sg.Name)
-			continue
+			ids = []int32{0}
+			break
 		}
 		if sel.Matches(labels.Set(podLabels)) {
+			if !netid.ValidGroup(sg.Status.ID) {
+				ids = []int32{0}
+				break
+			}
 			ids = append(ids, sg.Status.ID)
 		}
 	}
 	slices.Sort(ids)
+	if len(ids) == 1 && ids[0] == 0 {
+		if r.SentinelReady == nil {
+			return ctrl.Result{}, fmt.Errorf("pending SG policy activation is not configured")
+		}
+		ready, err := r.SentinelReady(ctx)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("check agent rollout: %w", err)
+		}
+		if !ready {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+	}
 
 	if slices.Equal(port.Status.Groups, ids) {
 		return ctrl.Result{}, nil

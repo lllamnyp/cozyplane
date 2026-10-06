@@ -15,6 +15,26 @@ they're discovered rather than leaving them only in issues.
 
 ## Immediate roadmap — what's genuinely open
 
+### CRD distribution and security follow-up — 2026-10-06
+
+- [ ] Merge the optional distroless control-plane target and chart image
+  selection. Private amd64/arm64 builds and scans passed; the controller and
+  admission ran on the Talos lab. Retain Debian for networking's external tools.
+- [ ] Review and publish the full `api.mode: crd` distribution, eleven generated
+  tenant schemas, shared admission strategies, TLS rotation and matching
+  two-phase PackageSource variants. Seventeen actual API cases passed on the
+  three-node Talos lab, including webhook outage/recovery and normal cleanup.
+  Review/merge and the required CRD CI lane remain open.
+- [ ] Complete regional certification beyond the acquired lab proofs: IPv4/IPv6
+  intra-VPC, split-horizon DNS, ServiceVIP, IPv4 Internet and FloatingIP closure,
+  directed peering revocation, automatic DHCPv6, VM migration and restart.
+  The lab's IPv4 DNS/underlay cannot certify native IPv6 DNS or Internet.
+- [ ] Adopt the published, scanned image pins in the release CI. Private lab
+  control-plane source `88423a3` and networking source `8146dce` were pulled
+  and exercised; the standard lab CI does not yet build the separate distroless
+  target. Unit/race checks and the global gosec scan passed. Short idle/load
+  memory windows do not certify absence of a long-running heap leak.
+
 The sections below are the full ledger, and most of it is ticked. This is the
 short list: what is actually left, in rough priority order. Revised **2026-07-14**,
 once the north-south arc closed (one declared boundary, metered, with the tenant's
@@ -108,8 +128,9 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
    `lb_ingress`, so `to_pod` sees an ordinary packet and NP applies unchanged (§6).
 4. **Per-VPC metadata endpoint + guest autoconfiguration** — design drafted in
    [vm-provisioning.md](vm-provisioning.md), awaiting review (§3).
-5. **Site-to-site VPN** ([#6](../../issues/6)) and **cross-family v4↔v6
-   translation** ([#9](../../issues/9)) — design drafts exist; neither is urgent
+5. **Site-to-site VPN** ([#6](../../issues/6)) is implemented through managed
+   WireGuard and route-based IPsec (the latter needs `CONFIG_XFRM_INTERFACE`);
+   **cross-family v4↔v6 translation** ([#9](../../issues/9)) remains a design draft
    (§3, §4).
 6. **SecurityGroup v2 leftovers**, all low priority: ICMP rules; peer-existence
    validation for peer refs; and **a real connection table to replace the TCP
@@ -238,7 +259,14 @@ split-horizon resolver already gives).
 - [x] **VPC NAT gateway in eBPF — a tenant egress identity** ([north-south.md](north-south.md) increment 2; dev-cluster-proven on the asymmetric triangle: SNAT on the pod's node, the address attracted by another, the client on a third). A VPC now leaves the cluster wearing **its own address**, drawn from its own pool — before, it was SNATed to the gateway pod's fabric IP and then re-SNATed by the cluster masquerade to the **node's**, so tenants were indistinguishable from the platform on the wire (tenet 8). The per-VPC **gateway pod is retired on the sanctioned path**: a gateway with a pool needs no pod, so no hairpin and no per-VPC SPOF. (It is *not* gone from the tree — a `nat.enabled` gateway with no `poolRef` still gets one, netns iptables and all, and still launders into the node's identity. Closing that is open work.) It could not simply be `masq_snat` with another address — that identifies a pod by its ADDRESS at the uplink, which is impossible for a VPC because tenant CIDRs overlap; the tenant is knowable only at the veth, which is what the gateway pod was really for. So the SNAT happens at the veth and the state lives on the pod's node, while the reply lands wherever the address is attracted — resolved by partitioning the port space per node (tenet 1 forbade the simpler "elect an egress node", which would have rebuilt the hairpin). `poolRef` and the `attach` verb carried the grant then; both retired with `ExternalPool` — the identity now rides owned delegated Services ([external-addresses.md](external-addresses.md))
 - [x] **The announcement layer deleted; `FloatingIP` is an EIP under the gateway** ([north-south.md](north-south.md) increment 3). Cozyplane **attracts nothing** (tenet 3): `float_announce`, `floating_arp`/`floating_ndp`, `AnnounceAddress`, the announcer election, the pool-eligibility annotation, `--floating-ha` and `ExternalPool.spec.advertisement` are all gone — that was MetalLB's L2 mode reimplemented inside a CNI. Something else must attract (a CCM assigning the address to a VNIC, MetalLB, a static route, or an address configured on a node); **delivery does not care**, because `from_uplink` runs at tc ingress ahead of the kernel's routing decision, so whichever node the address lands on finds the pod through `floating`/`nat_of` and reaches it over the overlay. A FloatingIP briefly drew from its **VPC's gateway's pool**; with `ExternalPool` deleted it mints its own delegated Service and the LB implementation allocates ([external-addresses.md](external-addresses.md)) — every external address still crosses one counted boundary (tenet 2)
 - [ ] **Inbound MTU on an encapsulated north-south path** — clamp the TCP MSS in the inbound SYN at the node that encapsulates it. Affects floating-HA's request half and `etp: Cluster` DSR identically (both Geneve-encap an external client's full-MTU packet; a v4 underlay fragments and reassembles, which works but costs). Shared, so solve once — [floating-ha.md](floating-ha.md) §7
-- [ ] Site-to-site VPN: authorized-forwarder role + per-VPC route table — [#6](../../issues/6)
+- [x] **A tenant appliance can be its VPC's door** (`VPCGateway.spec.appliance`) — the other half of the firewall story, and smaller than it looked. Off-VPC traffic is delivered to `gateways[vni]` **with its destination intact**, so whatever holds that entry already receives the VPC's egress and can route it; the entry is built from Ports carrying `spec.gateway`, and only `addGatewayLeg` could set it — agent namespace, reserved `.1`. Now the VPCGateway (already the VPC's one declared boundary) names the workload, the controller moves the flag onto that workload's Port **in this VPC**, and cozyplane runs no gateway pod alongside. No CNI change, no datapath change. Receiving is not sending: emitting a foreign source stays the `export`-gated `VPCBinding.allowForwarding` (docs/multi-attach.md). Dev-cluster-validated end to end — two VPCs, an appliance with a leg in each declared the door of both, ICMP at 0% loss and TCP gated by the source VPC's egress rule *and* the destination VPC's ingress rule
+- [x] Site-to-site and roadwarrior VPN: scoped forwarder, per-VPC routes,
+  managed WireGuard/IPsec, cert/EAP pools, live status/alerts, warm standby,
+  KubeVirt live-migration form factor and active-active ECMP+BGP/BFD; managed
+  multi-VPC hub via `VPNGateway.spec.additionalVPCRefs` (one leg, binding and
+  route set per served VPC; disjointness enforced). External
+  firewall/BGP and real migration exercises remain environment validation, not
+  missing implementation — [vpn.md](vpn.md)
 - [ ] Network policy / security groups within a VPC — **v1 + peered-group refs + north-south (world) done** ([security-groups.md](security-groups.md)): east-west group-to-group ingress, destination-side eBPF (`sg_members`/`sg_rules`, TCP SYN-gate, per-VPC id allocation, membership from stamped pod labels); **peered-VPC group refs** (`from: {group, vpc}`) authoritative via a Geneve identity TLV; **north-south `from: {cidr}`** (AWS-strict default-deny, kubelet exempt by NS_MARK path; all-addresses via SG_WORLD, specific ranges via an `sg_cidr` LPM); **east-west egress** (`egress: {to: {group, vpc}}`, symmetric default-deny, `sg_egress` mirror enforced beside ingress in to_pod + the TLV path); **north-south/external egress** (`egress: {to: {cidr}}`, source-side default-deny at `from_pod`'s gateway path via a loop-free `ns_egress_ok` + `sg_egress_cidr` LPM — plus the off-VPC-transit fix so the pod→gateway hop isn't re-gated as east-west, which had silently broken all grouped-pod TCP/UDP north-south egress) — all dev-cluster-validated. **label-follows membership DONE 2026-07-12** (live pod labels, not the claim-time snapshot; the snapshot survives as the fallback for a Port with no live pod, so a persistent VM Port holds membership steady between launchers — dev-cluster-validated: relabel a running pod out of its group and back). **v2 tail DONE 2026-07-13:** `from_pod` source-IP RPF (anti-spoof — a pod can no longer forge a co-VPC neighbour's address to borrow its groups; the fix closes it on every path, since the cross-node TLV's srcmap was itself computed from the spoofable source; dev-cluster-validated by delivery-capture), overlapping north-south CIDR union across groups ([#11](../../issues/11), compiler `unionContaining`, unit-tested), and floating-pod egress gating (`ns_egress_ok` now covers the floating path too). Still outstanding (lower priority): ICMP rules, peer-existence validation for peer refs, and a real connection table to replace the TCP SYN-gate (shared with NetworkPolicy and HostFirewall — solve once for all three, not three times). FQDN egress is **rejected** — a DNS-snooping engine is out of scope
 - [ ] Per-VPC metadata endpoint + guest autoconfiguration — **design draft: [vm-provisioning.md](vm-provisioning.md)** (awaiting review; also closes #8)
 - [x] Services in a VPC: per-VPC service VIPs + split-horizon DNS + net-scoped service NAT — **design: [services-in-vpc.md](services-in-vpc.md)** (reviewed; prioritized ahead of the KPR work)
@@ -343,6 +371,45 @@ install installs nothing — [#10](../../issues/10)'s endgame.
 ---
 
 ## Open issues index
+
+- [ ] Managed-boundary DNS after socket LB: the Talos CRD recipe reproduced
+  a query translated from the cluster DNS Service IP to its internal backend
+  being dropped before split-horizon steering. Align the boundary exception
+  with that steering predicate. Regression tests reproduce the old drop in both
+  families; real Talos kernel packet tests now verify TCP/UDP rewriting and
+  denial of other management/peer/external traffic. The rebuilt networking image
+  was published, pulled and exercised on all three Talos nodes: UDP/TCP DNS and
+  IPv4/IPv6 ServiceVIP pass. Merge remains pending.
+
+- [ ] Guest IPv6 configuration through the managed boundary: narrowly allow
+  local RS and DHCPv6 before a guest has its assigned VPC source. Old-object
+  packet tests reproduce the drop; the regenerated object passes malformed
+  packet and data-traffic denials on Talos. Actual DHCPv6 assigns the pinned
+  address and IPv4/IPv6 migration passes with 60/60 replies per family.
+  Source `8146dce` is published and running on the lab; merge remains pending.
+
+- [ ] Registry pull eligibility for the CRD lab image: the Debian 13 runtime
+  updates remove the observed CRITICAL findings, but unfixed HIGH findings
+  still need review against the destination registry's policy. A green scan
+  limited to fixable HIGH/CRITICAL findings is insufficient. The actual private
+  registry accepted the final image under its operator-selected Critical policy,
+  with no added CVE exception, and the three lab nodes pulled it. The full amd64
+  scan reports 0 CRITICAL and 50 HIGH occurrences (13 distinct unfixed CVEs).
+  Distribution review and production activation remain pending; see
+  [packaging.md](packaging.md).
+- [ ] Hardened active-active VPN routing: packaged FRR's privilege setup asks
+  for `SYS_ADMIN`, which the hardened appliance profile deliberately excludes.
+  Reproduced with both the previous Debian 12 image and Debian 13; do not add
+  that capability to certify the profile. Adapt FRR startup within the existing
+  capability boundary and verify the actual routing wrapper before certifying
+  this optional profile.
+
+- [x] Migration listener resource regression (B195): idle receive spin replaced
+  with bounded readiness polling; completed child contexts released; cancellation
+  and replacement ownership tested. Boundary notifications coalesced with bounded
+  ACK contexts; identical map and status writes skipped while drift repair remains.
+  Kernel, unit and race tests pass; corrective v4 image runs on the three lab agents.
+  This does not certify absence of every production leak or close the VM recipe.
 
 | # | Title | Area |
 |---|-------|------|

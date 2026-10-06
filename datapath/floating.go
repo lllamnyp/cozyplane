@@ -243,6 +243,41 @@ func (m *Manager) EnsureFloatingUplink(publicIP string) error {
 	return m.bindFloatUplink(link, ip, r.Gw)
 }
 
+// SetFloatingNextHopIPv4 configures connected external pools before the
+// manager starts. Routed external addresses keep their FIB next hop.
+func (m *Manager) SetFloatingNextHopIPv4(raw string) error {
+	if raw == "" {
+		m.floatingNextHopIPv4 = nil
+		return nil
+	}
+	ip := net.ParseIP(raw)
+	if ip == nil || ip.To4() == nil || !ip.IsGlobalUnicast() || ip.IsLoopback() {
+		return fmt.Errorf("floating next hop must be an IPv4 unicast router address")
+	}
+	m.floatingNextHopIPv4 = ip.To4()
+	return nil
+}
+
+func floatingNextHop(subnet *net.IPNet, firstHost, routeGateway, configured net.IP) (net.IP, error) {
+	if routeGateway != nil {
+		return routeGateway, nil
+	}
+	if configured == nil {
+		return firstHost, nil
+	}
+	if !subnet.Contains(configured) || configured.Equal(subnet.IP) {
+		return nil, fmt.Errorf("configured floating next hop is outside the external interface's host range")
+	}
+	broadcast := append(net.IP(nil), subnet.IP.To4()...)
+	for i := range broadcast {
+		broadcast[i] |= ^subnet.Mask[i]
+	}
+	if configured.Equal(broadcast) {
+		return nil, fmt.Errorf("configured floating next hop is a broadcast address")
+	}
+	return configured, nil
+}
+
 // bindFloatUplink attaches from_uplink at link's ingress and programs the egress
 // ifindex, the covering subnet and the off-subnet next-hop. gw is the FIB's next
 // hop for a routed address: the VIP is then off this link's subnet, so the
@@ -267,9 +302,9 @@ func (m *Manager) bindFloatUplink(link netlink.Link, ip, gw net.IP) error {
 		// break every floating and LB reply on the node.
 		return fmt.Errorf("floating uplink %s carries no subnet covering %s", link.Attrs().Name, anchor)
 	}
-	nh := firstHost
-	if gw != nil {
-		nh = gw
+	nh, err := floatingNextHop(subnet, firstHost, gw, m.floatingNextHopIPv4)
+	if err != nil {
+		return err
 	}
 
 	// Serialized: several watchers call this on the same event cascade, and a
@@ -328,7 +363,11 @@ func (m *Manager) bindFloatUplink(link netlink.Link, ip, gw net.IP) error {
 	// ifindex first: on a FIRST bind it leaves the window at (new link, nh 0),
 	// which falls back to a plain FIB lookup, rather than (default link, new
 	// nh), whose next-hop is not reachable there.
-	if err := m.objs.Params.Put(cfgFloatIfindex, uint32(idx)); err != nil {
+	index, err := Ifindex(idx)
+	if err != nil {
+		return err
+	}
+	if err := m.objs.Params.Put(cfgFloatIfindex, index); err != nil {
 		return fmt.Errorf("set floating uplink ifindex: %w", err)
 	}
 	if err := m.objs.Params.Put(cfgFloatNH, want.nh); err != nil {
@@ -586,13 +625,20 @@ func extLinksToPrune(have map[overlayLpmKey]overlayExtEgress, idx int, keep []ov
 // extEgressVal builds the map value: the link, its router, and its subnet for
 // the on/off-subnet test the datapath makes against a destination.
 func extEgressVal(idx int, subnet *net.IPNet, nh net.IP) (overlayExtEgress, error) {
+	index, err := Ifindex(idx)
+	if err != nil {
+		return overlayExtEgress{}, err
+	}
+	if _, _, err := cidrAddressPrefix(subnet); err != nil {
+		return overlayExtEgress{}, err
+	}
 	base := subnet.IP.Mask(subnet.Mask).To4()
 	mask := net.IP(subnet.Mask).To4()
 	if base == nil || mask == nil {
 		return overlayExtEgress{}, fmt.Errorf("ext link %s is not v4", subnet)
 	}
 	v := overlayExtEgress{
-		Ifindex: uint32(idx),
+		Ifindex: index,
 		Base:    binary.NativeEndian.Uint32(base),
 		Mask:    binary.NativeEndian.Uint32(mask),
 	}

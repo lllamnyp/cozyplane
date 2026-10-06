@@ -1,0 +1,9 @@
+{{- if eq .Values.api.mode "crd" }}
+{{- if not .Values.exportPolicy.enabled }}
+{{- fail "CRD mode requires exportPolicy.enabled=true" }}
+{{- end }}
+{{- range $path, $_ := .Files.Glob "files/tenant-crd/*.yaml" }}
+---
+{{ $.Files.Get $path }}
+{{- end }}
+{{- end }}

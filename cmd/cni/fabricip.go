@@ -203,7 +203,7 @@ func addOffset(base net.IP, n uint64) net.IP {
 	copy(out, base)
 	for i := len(out) - 1; i >= 0 && n > 0; i-- {
 		sum := uint64(out[i]) + n&0xff
-		out[i] = byte(sum)
+		out[i] = byte(sum & 0xff)
 		n >>= 8
 		n += sum >> 8
 	}

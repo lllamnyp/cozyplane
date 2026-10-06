@@ -331,6 +331,16 @@ prove it on the target runtime first.
 
 ## 4. Distribution: agents watch, controller compiles
 
+Boundary informer callbacks only enqueue a coalesced notification (capacity
+one). A single worker reads current informer state, programs the maps, then
+reports acknowledgements with a bounded request context. An API stall must
+not retain an unbounded queue of object notifications. The five-second repair
+tick remains, so real map drift and agent replacement are still detected.
+Stable VPC status is not sent again; changed agent acknowledgements remain
+observable and must not be filtered by a generation-only predicate.
+Stable boundary map entries are compared with their current values before
+writing. These BPF writes are kernel memory operations, not etcd disk writes.
+
 - **Agents** (per-node DaemonSet) watch `Port`/`SecurityGroup`/`VPC`/`Subnet`
   filtered to their node, and translate the slice into eBPF map state. They are
   the only writers of `Port/{bind,status}`.

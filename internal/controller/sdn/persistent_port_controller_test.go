@@ -86,8 +86,9 @@ func ppScheme(t *testing.T) *runtime.Scheme {
 	s := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(s)
 	_ = sdnv1alpha1.AddToScheme(s)
-	// Register the VMI GVK so the fake client can serve the unstructured object.
+	// Register both KubeVirt GVKs so the fake client can serve owner lookups.
 	s.AddKnownTypeWithName(vmiGVK, &unstructured.Unstructured{})
+	s.AddKnownTypeWithName(vmGVK, &unstructured.Unstructured{})
 	return s
 }
 
@@ -183,7 +184,7 @@ func TestCutoverFallsBackToPodLabel(t *testing.T) {
 	}
 }
 
-// No virt-launcher pods ⇒ the VM is gone ⇒ the persistent Port is GC'd.
+// No launcher pods and no owning VM means the persistent Port is GC'd.
 func TestPersistentPortGCWhenNoPods(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(ppScheme(t)).
 		WithObjects(persistentPort("vm", "192.168.0.2", "node-a")).

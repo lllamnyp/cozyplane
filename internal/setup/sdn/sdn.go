@@ -31,6 +31,8 @@ import (
 	vpcbindingstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/vpcbinding"
 	vpcgatewaystorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/vpcgateway"
 	vpcpeeringstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/vpcpeering"
+	vpnconnectionstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/vpnconnection"
+	vpngatewaystorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/vpngateway"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -60,11 +62,11 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOptionsGetter genericregistry.RESTOptionsGetter, auth authorizer.Authorizer) *genericapiserver.APIGroupInfo {
 	apiGroupInfo := genericapiserver.NewDefaultAPIGroupInfo(sdn.GroupName, scheme, metav1.ParameterCodec, codec)
 
-	vpcREST, vpcStatusREST, err := vpcstorage.NewREST(scheme, restOptionsGetter)
+	vpcREST, vpcStatusREST, err := vpcstorage.NewREST(scheme, restOptionsGetter, auth)
 	if err != nil {
 		panic(err)
 	}
-	vpcGatewayREST, vpcGatewayStatusREST, err := vpcgatewaystorage.NewREST(scheme, restOptionsGetter)
+	vpcGatewayREST, vpcGatewayStatusREST, err := vpcgatewaystorage.NewREST(scheme, restOptionsGetter, auth)
 	if err != nil {
 		panic(err)
 	}
@@ -90,11 +92,19 @@ func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOpt
 	}
 	portTwin.Exists = claim.StoreExists(serviceVIPREST.Store)
 	vipTwin.Exists = claim.StoreExists(portREST.Store)
-	securityGroupREST, securityGroupStatusREST, err := securitygroupstorage.NewREST(scheme, restOptionsGetter)
+	securityGroupREST, securityGroupStatusREST, err := securitygroupstorage.NewREST(scheme, restOptionsGetter, auth)
 	if err != nil {
 		panic(err)
 	}
 	hostFirewallREST, hostFirewallStatusREST, err := hostfirewallstorage.NewREST(scheme, restOptionsGetter)
+	if err != nil {
+		panic(err)
+	}
+	vpnGatewayREST, vpnGatewayStatusREST, err := vpngatewaystorage.NewREST(scheme, restOptionsGetter)
+	if err != nil {
+		panic(err)
+	}
+	vpnConnectionREST, vpnConnectionStatusREST, err := vpnconnectionstorage.NewREST(scheme, restOptionsGetter)
 	if err != nil {
 		panic(err)
 	}
@@ -117,6 +127,10 @@ func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOpt
 	v1alpha1storage["securitygroups/status"] = securityGroupStatusREST
 	v1alpha1storage["hostfirewalls"] = hostFirewallREST
 	v1alpha1storage["hostfirewalls/status"] = hostFirewallStatusREST
+	v1alpha1storage["vpngateways"] = vpnGatewayREST
+	v1alpha1storage["vpngateways/status"] = vpnGatewayStatusREST
+	v1alpha1storage["vpnconnections"] = vpnConnectionREST
+	v1alpha1storage["vpnconnections/status"] = vpnConnectionStatusREST
 	apiGroupInfo.VersionedResourcesStorageMap["v1alpha1"] = v1alpha1storage
 
 	return &apiGroupInfo

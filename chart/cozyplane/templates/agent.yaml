@@ -39,6 +39,9 @@ rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcs"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpcs/status"]
+    verbs: ["get", "update", "patch"]
   # VPCBindings authorize attachment; the plugin checks them at CNI ADD
   # (default-deny).
   - apiGroups: ["sdn.cozystack.io"]
@@ -49,6 +52,11 @@ rules:
   # The CNI plugin (same SA) also reads them to give a gateway pod its VPC leg.
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcgateways"]
+    verbs: ["get", "list", "watch"]
+  # VPNGateways: the agent reads status.routes and merges the connection-derived
+  # remote CIDRs into the same vpc_routes table it builds from VPCGateway routes.
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpngateways"]
     verbs: ["get", "list", "watch"]
   # VPCPeering halves: the agent programs the peers map from mutually-matched
   # specs (not status), so it only needs to observe them.
@@ -155,7 +163,11 @@ spec:
           args:
             - "--mtu={{ .Values.mtu }}"
             - "--geneve-port={{ .Values.genevePort }}"
+            {{- if .Values.egress.floatingNextHopIPv4 }}
+            - "--floating-next-hop-ipv4={{ .Values.egress.floatingNextHopIPv4 }}"
+            {{- end }}
             - "--cni-conf-name={{ .Values.cniConfName }}"
+            - "--write-cni-conf={{ .Values.writeCNIConf }}"
             {{- if .Values.egress.clusterCIDR }}
             # Cluster-egress masquerade: pod traffic leaving the cluster is
             # SNATed to the node address, giving pods an off-cluster return path.
@@ -174,6 +186,10 @@ spec:
               containerPort: 9411
               hostPort: 9411
           env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
             - name: NODE_NAME
               valueFrom:
                 fieldRef:

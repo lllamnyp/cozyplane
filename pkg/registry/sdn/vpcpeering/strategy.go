@@ -64,6 +64,18 @@ func SelectableFields(obj *sdn.VPCPeering) fields.Set {
 // is the reciprocal half, so no verb is checked on the peer VPC.
 const PeerVerb = "peer"
 
+// PortalManagedBy marks transport grants derived from operator-owned policy.
+const PortalManagedByLabel = "app.kubernetes.io/managed-by"
+const PortalManagedBy = "neosequentia-portal"
+
+func portalManaged(peering *sdn.VPCPeering) bool {
+	return peering.Labels[PortalManagedByLabel] == PortalManagedBy
+}
+
+func checkManagedPeering(ctx context.Context, auth authorizer.Authorizer, peering *sdn.VPCPeering) *field.Error {
+	return authz.CheckResourceVerb(ctx, auth, "manage-boundary", "vpcpeerings", "VPCPeering", peering.Namespace, peering.Name, field.NewPath("metadata", "labels").Key(PortalManagedByLabel))
+}
+
 type vpcPeeringStrategy struct {
 	runtime.ObjectTyper
 	names.NameGenerator
@@ -120,6 +132,11 @@ func (s vpcPeeringStrategy) Validate(ctx context.Context, obj runtime.Object) fi
 			errs = append(errs, err)
 		}
 	}
+	if portalManaged(peering) {
+		if err := checkManagedPeering(ctx, s.authz, peering); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	return errs
 }
 
@@ -139,15 +156,21 @@ func (vpcPeeringStrategy) AllowUnconditionalUpdate() bool {
 func (vpcPeeringStrategy) Canonicalize(obj runtime.Object) {
 }
 
-func (vpcPeeringStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+func (s vpcPeeringStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	// The refs pin the identity the reciprocal half consented to; changing them
 	// would silently re-point a live grant. Replace the object instead.
 	newPeering := obj.(*sdn.VPCPeering)
 	oldPeering := old.(*sdn.VPCPeering)
-	if newPeering.Spec != oldPeering.Spec {
-		return field.ErrorList{field.Forbidden(field.NewPath("spec"), "spec is immutable")}
+	var errs field.ErrorList
+	if portalManaged(oldPeering) || portalManaged(newPeering) {
+		if err := checkManagedPeering(ctx, s.authz, oldPeering); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return field.ErrorList{}
+	if newPeering.Spec != oldPeering.Spec {
+		errs = append(errs, field.Forbidden(field.NewPath("spec"), "spec is immutable"))
+	}
+	return errs
 }
 
 // WarningsOnUpdate returns warnings for the given update.
@@ -170,6 +193,16 @@ func (vpcPeeringStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old r
 	newPeering := obj.(*sdn.VPCPeering)
 	oldPeering := old.(*sdn.VPCPeering)
 	newPeering.Spec = oldPeering.Spec
+	// Status observations cannot remove or introduce the reserved ownership
+	// marker and thereby change authorization for the main resource.
+	if value, exists := oldPeering.Labels[PortalManagedByLabel]; exists {
+		if newPeering.Labels == nil {
+			newPeering.Labels = map[string]string{}
+		}
+		newPeering.Labels[PortalManagedByLabel] = value
+	} else {
+		delete(newPeering.Labels, PortalManagedByLabel)
+	}
 }
 
 func (vpcPeeringStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {

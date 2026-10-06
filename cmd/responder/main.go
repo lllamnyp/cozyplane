@@ -93,7 +93,8 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log.Printf("cluster domain %q, upstreams %v", domain, upstreams)
+	// #nosec G706 -- Both untrusted strings are quoted with %q, escaping control characters and newlines.
+	log.Printf("cluster domain %q, upstreams %q", domain, upstreams)
 
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
@@ -231,6 +232,7 @@ func run() error {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+				// #nosec G706 -- addr is built from a parsed node IP and fixed port; protocol is one of two literals.
 				log.Printf("listening on %s/%s", addr, proto)
 				if err := srv.ListenAndServe(); err != nil {
 					errc <- fmt.Errorf("listen %s/%s: %w", addr, proto, err)

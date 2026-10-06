@@ -19,6 +19,7 @@ package sdn
 import (
 	"context"
 	"fmt"
+	"github.com/lllamnyp/cozyplane/pkg/netid"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -128,7 +129,7 @@ func (r *VPCPeeringReconciler) getVPC(ctx context.Context, namespace, name strin
 }
 
 func vpcReady(vpc *sdnv1alpha1.VPC) bool {
-	return vpc != nil && vpc.Status.VNI != 0
+	return vpc != nil && netid.ValidVNI(vpc.Status.VNI)
 }
 
 func setCondition(status *sdnv1alpha1.VPCPeeringStatus, condType string, ok bool, reason, message string) {

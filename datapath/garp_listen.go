@@ -75,7 +75,7 @@ func ListLocalPortVeths() ([]LocalPortVeth, error) {
 // match (the caller should then drive cutover) and ctx.Err() on cancellation.
 //
 // The socket is bound to the announcement's ethertype (ARP or IPv6), so only
-// candidate frames are delivered; a 1s receive timeout lets the loop observe
+// candidate frames are delivered; a 100ms readiness wait lets the loop observe
 // cancellation. Best-effort by nature: a missed announcement just falls back to
 // the VMI-watch cutover.
 func WatchGuestAnnounce(ctx context.Context, ifindex int, expectMAC net.HardwareAddr, vmIP net.IP) error {
@@ -92,13 +92,31 @@ func WatchGuestAnnounce(ctx context.Context, ifindex int, expectMAC net.Hardware
 	if err := unix.Bind(fd, &unix.SockaddrLinklayer{Protocol: htons(ethProto), Ifindex: ifindex}); err != nil {
 		return fmt.Errorf("bind packet socket to ifindex %d: %w", ifindex, err)
 	}
-	tv := unix.Timeval{Sec: 1}
-	_ = unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv)
+	return watchGuestAnnounceSocket(ctx, fd, ifindex, expectMAC, vmIP, v4)
+}
 
+func watchGuestAnnounceSocket(ctx context.Context, fd, ifindex int, expectMAC net.HardwareAddr, vmIP net.IP, v4 bool) error {
+	if fd < 0 || fd > 2147483647 {
+		return fmt.Errorf("invalid announcement descriptor")
+	}
 	buf := make([]byte, 1500)
+	poll := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		nready, err := unix.Poll(poll, 100)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("poll on ifindex %d: %w", ifindex, err)
+		}
+		if nready == 0 {
+			continue
+		}
+		if poll[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
+			return fmt.Errorf("announcement socket on ifindex %d closed: poll events %d", ifindex, poll[0].Revents)
 		}
 		n, _, err := unix.Recvfrom(fd, buf, 0)
 		if err != nil {

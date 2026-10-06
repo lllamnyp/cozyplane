@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"github.com/lllamnyp/cozyplane/pkg/netid"
 	"log/slog"
 	"net"
 	"sync"
@@ -207,12 +208,12 @@ func desiredVPCIngress(gws []*sdnv1alpha1.VPCGateway, vpcs []*sdnv1alpha1.VPC) m
 	}
 	out := map[uint32]bool{}
 	for _, vpc := range vpcs {
-		if vpc.Status.VNI == 0 {
+		if !netid.ValidVNI(vpc.Status.VNI) {
 			continue
 		}
 		gw := sdnv1alpha1.EffectiveGateway(byNS[vpc.Namespace], vpc.Name)
 		if gw != nil && gw.Spec.Ingress.LoadBalancer {
-			out[uint32(vpc.Status.VNI)] = true
+			out[netid.VNI(vpc.Status.VNI)] = true
 		}
 	}
 	return out
@@ -228,12 +229,12 @@ func desiredVPCNAT(gws []*sdnv1alpha1.VPCGateway, vpcs []*sdnv1alpha1.VPC) map[u
 	}
 	out := map[uint32]datapath.NATIdentity{}
 	for _, vpc := range vpcs {
-		if vpc.Status.VNI == 0 {
+		if !netid.ValidVNI(vpc.Status.VNI) {
 			continue
 		}
 		gw := sdnv1alpha1.EffectiveGateway(byNS[vpc.Namespace], vpc.Name)
 		if gw != nil && gw.Spec.NAT.Enabled && (gw.Status.NATAddress != "" || gw.Status.NATAddress6 != "") {
-			out[uint32(vpc.Status.VNI)] = datapath.NATIdentity{V4: gw.Status.NATAddress, V6: gw.Status.NATAddress6}
+			out[netid.VNI(vpc.Status.VNI)] = datapath.NATIdentity{V4: gw.Status.NATAddress, V6: gw.Status.NATAddress6}
 		}
 	}
 	return out

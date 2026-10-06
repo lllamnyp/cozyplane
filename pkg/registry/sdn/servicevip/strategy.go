@@ -91,7 +91,7 @@ func (serviceVIPStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime
 // spoofed by naming one address and using another.
 func (serviceVIPStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	svip := obj.(*sdn.ServiceVIP)
-	var errs field.ErrorList
+	errs := validateVIPPorts(svip)
 
 	ip := net.ParseIP(svip.Spec.IP)
 	if ip == nil || ip.String() != svip.Spec.IP {
@@ -133,7 +133,7 @@ func (serviceVIPStrategy) Canonicalize(obj runtime.Object) {
 func (serviceVIPStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	newVIP := obj.(*sdn.ServiceVIP)
 	oldVIP := old.(*sdn.ServiceVIP)
-	var errs field.ErrorList
+	errs := validateVIPPorts(newVIP)
 	if newVIP.Spec.IP != oldVIP.Spec.IP {
 		errs = append(errs, field.Forbidden(field.NewPath("spec", "ip"),
 			"immutable: the ServiceVIP name is the claim on this address"))
@@ -168,7 +168,36 @@ func (serviceVIPStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old r
 }
 
 func (serviceVIPStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
-	return field.ErrorList{}
+	var errs field.ErrorList
+	for i, backend := range obj.(*sdn.ServiceVIP).Status.Backends {
+		for j, port := range backend.Ports {
+			p := field.NewPath("status", "backends").Index(i).Child("ports").Index(j)
+			errs = append(errs, validatePort(port.Protocol, port.Port, p)...)
+			if port.TargetPort < 1 || port.TargetPort > 65535 {
+				errs = append(errs, field.Invalid(p.Child("targetPort"), port.TargetPort, "must be between 1 and 65535"))
+			}
+		}
+	}
+	return errs
+}
+
+func validateVIPPorts(vip *sdn.ServiceVIP) field.ErrorList {
+	var errs field.ErrorList
+	for i, port := range vip.Spec.Ports {
+		errs = append(errs, validatePort(port.Protocol, port.Port, field.NewPath("spec", "ports").Index(i))...)
+	}
+	return errs
+}
+
+func validatePort(protocol string, port int32, p *field.Path) field.ErrorList {
+	var errs field.ErrorList
+	if protocol != "TCP" && protocol != "UDP" {
+		errs = append(errs, field.NotSupported(p.Child("protocol"), protocol, []string{"TCP", "UDP"}))
+	}
+	if port < 1 || port > 65535 {
+		errs = append(errs, field.Invalid(p.Child("port"), port, "must be between 1 and 65535"))
+	}
+	return errs
 }
 
 func (serviceVIPStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {

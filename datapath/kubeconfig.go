@@ -22,6 +22,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+
+	"github.com/lllamnyp/cozyplane/internal/atomicfile"
 )
 
 // PluginKubeconfig is where the agent publishes a kubeconfig for the CNI plugin.
@@ -32,7 +34,7 @@ const PluginKubeconfig = "/run/cozyplane/kubeconfig"
 // PluginToken is the host-visible copy of the agent's projected SA token,
 // referenced by the plugin kubeconfig (tokenFile) and refreshed by the agent
 // as kubelet rotates the source.
-const PluginToken = "/run/cozyplane/token"
+const PluginToken = "/run/cozyplane/token" // #nosec G101 -- Runtime file path, not an embedded credential.
 
 const saDir = "/var/run/secrets/kubernetes.io/serviceaccount"
 
@@ -56,14 +58,13 @@ func SyncPluginToken() (bool, error) {
 	if old, err := os.ReadFile(PluginToken); err == nil && string(old) == string(token) {
 		return false, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(PluginToken), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(PluginToken), 0o750); err != nil {
 		return false, err
 	}
-	tmp := PluginToken + ".tmp"
-	if err := os.WriteFile(tmp, token, 0o600); err != nil {
+	if err := atomicfile.Write(PluginToken, token); err != nil {
 		return false, err
 	}
-	return true, os.Rename(tmp, PluginToken)
+	return true, nil
 }
 
 func WritePluginKubeconfig() error {
@@ -98,12 +99,8 @@ users:
     tokenFile: %s
 `, net.JoinHostPort(host, port), base64.StdEncoding.EncodeToString(ca), PluginToken)
 
-	if err := os.MkdirAll(filepath.Dir(PluginKubeconfig), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(PluginKubeconfig), 0o750); err != nil {
 		return err
 	}
-	tmp := PluginKubeconfig + ".tmp"
-	if err := os.WriteFile(tmp, []byte(kc), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, PluginKubeconfig)
+	return atomicfile.Write(PluginKubeconfig, []byte(kc))
 }

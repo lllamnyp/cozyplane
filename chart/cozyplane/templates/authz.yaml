@@ -20,20 +20,25 @@ spec:
   variables:
     - name: ref
       expression: object.spec.vpcRef
+    - name: refNamespace
+      expression: >-
+        has(object.spec.vpcRef.namespace) && object.spec.vpcRef.namespace != '' ?
+          object.spec.vpcRef.namespace : object.metadata.namespace
     - name: refUnchanged
       expression: >-
         oldObject != null &&
-        oldObject.spec.vpcRef.namespace == object.spec.vpcRef.namespace &&
+        (has(oldObject.spec.vpcRef.namespace) && oldObject.spec.vpcRef.namespace != '' ?
+          oldObject.spec.vpcRef.namespace : oldObject.metadata.namespace) == variables.refNamespace &&
         oldObject.spec.vpcRef.name == object.spec.vpcRef.name
   validations:
     - expression: >-
         variables.refUnchanged ||
         authorizer.group('sdn.cozystack.io').resource('vpcs')
-          .namespace(variables.ref.namespace).name(variables.ref.name)
+          .namespace(variables.refNamespace).name(variables.ref.name)
           .check('export').allowed()
       reason: Forbidden
       messageExpression: >-
-        "creating a VPCBinding to VPC " + variables.ref.namespace + "/" +
+        "creating a VPCBinding to VPC " + variables.refNamespace + "/" +
         variables.ref.name + " requires the 'export' verb on that VPC " +
         "(sdn.cozystack.io vpcs)"
 ---

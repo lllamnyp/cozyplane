@@ -30,13 +30,17 @@ import (
 // eBPF redirect (through the to_pod hook), not a kernel-routing shortcut. Used
 // by the CNI plugin via the pinned map.
 func SetLocal(net_ uint32, podIP net.IP, ifindex int, mac net.HardwareAddr) error {
+	index, err := Ifindex(ifindex)
+	if err != nil {
+		return err
+	}
 	m, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "locals"), nil)
 	if err != nil {
 		return fmt.Errorf("open pinned locals map: %w", err)
 	}
 	defer m.Close()
 
-	ep := overlayEndpoint{Ifindex: uint32(ifindex)}
+	ep := overlayEndpoint{Ifindex: index}
 	copy(ep.Mac[:], mac)
 	key, err := localKey(net_, podIP)
 	if err != nil {

@@ -191,8 +191,12 @@ func buildDHCP6Reply(msg []byte, mac net.HardwareAddr, podIP net.IP, rdnss net.I
 }
 
 func appendOpt(b []byte, code uint16, body []byte) []byte {
+	if len(body) > 65535 {
+		return b
+	}
 	var hdr [4]byte
 	binary.BigEndian.PutUint16(hdr[0:2], code)
+	// #nosec G115 -- payloads longer than the uint16 wire length are rejected above.
 	binary.BigEndian.PutUint16(hdr[2:4], uint16(len(body)))
 	b = append(b, hdr[:]...)
 	return append(b, body...)

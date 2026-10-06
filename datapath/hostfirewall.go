@@ -62,16 +62,7 @@ func (m *Manager) syncHFRules(mp *ebpf.Map, entries []HFAllow) error {
 		if e.CIDR == nil {
 			continue
 		}
-		ones, _ := e.CIDR.Mask.Size()
-		ip := e.CIDR.IP
-		var bits uint32
-		if v4 := ip.To4(); v4 != nil {
-			ip = v4
-			bits = 96 + uint32(ones)
-		} else {
-			bits = uint32(ones)
-		}
-		a, err := addr128(ip)
+		a, bits, err := cidrAddressPrefix(e.CIDR)
 		if err != nil {
 			return fmt.Errorf("hf_allow range %q: %w", e.CIDR, err)
 		}

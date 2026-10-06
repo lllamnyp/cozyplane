@@ -48,6 +48,8 @@ most likely to set:
 - `image` — the cozyplane container image (digest-pinned by the release
   pipeline).
 - `mtu` — pod MTU (underlay MTU minus ~50 bytes of Geneve overhead).
+- `writeCNIConf` — defaults to true for standalone installations. Set false
+  when the platform owns a Multus/Cilium chain; no conflist is created or changed.
 - `cniConfName` — the CNI conflist filename; use a low prefix such as
   `00-cozyplane.conflist` to sort ahead of a co-installed CNI (e.g. Cilium).
 - `genevePort` — override only to avoid a clash with another overlay on 6081.
@@ -72,3 +74,8 @@ most likely to set:
 - RBAC for both components, the aggregated tenant roles (`cozyplane-tenant-edit` /
   `-view`, docs/multitenancy.md), and the export
   ValidatingAdmissionPolicy.
+
+Managed VPN appliances use privileged compatibility mode by default. On nodes
+whose kubelet admits the forwarding sysctls, set `vpn.hardenedAppliance=true` to
+drop privileged mode and retain only `NET_ADMIN`, `NET_RAW`, and
+`NET_BIND_SERVICE`.

@@ -19,9 +19,13 @@ package securitygroup
 import (
 	"context"
 	"errors"
+	"github.com/lllamnyp/cozyplane/pkg/netid"
+	"github.com/lllamnyp/cozyplane/pkg/registry/sdn/authz"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"net"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
+	metavalidation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -58,13 +62,13 @@ func SelectableFields(obj *sdn.SecurityGroup) fields.Set {
 type securityGroupStrategy struct {
 	runtime.ObjectTyper
 	names.NameGenerator
+	auth authorizer.Authorizer
 }
 
-// NewStrategy creates and returns a securityGroupStrategy instance. A group lives
-// in its VPC owner's namespace; owning the namespace is owning the VPC's policy,
-// so there is no virtual verb to check (contrast VPCPeering's `peer`).
-func NewStrategy(typer runtime.ObjectTyper) securityGroupStrategy {
-	return securityGroupStrategy{typer, names.SimpleNameGenerator}
+// NewStrategy preserves ordinary tenant policy permissions and separately
+// authorizes changes to operator-managed groups.
+func NewStrategy(typer runtime.ObjectTyper, auth authorizer.Authorizer) securityGroupStrategy {
+	return securityGroupStrategy{typer, names.SimpleNameGenerator, auth}
 }
 
 func (securityGroupStrategy) NamespaceScoped() bool {
@@ -83,18 +87,24 @@ func (securityGroupStrategy) PrepareForUpdate(ctx context.Context, obj, old runt
 	newSG.Status = oldSG.Status
 }
 
-func (securityGroupStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
+func (s securityGroupStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	sg := obj.(*sdn.SecurityGroup)
-	return validateSecurityGroup(sg)
+	errs := validateSecurityGroup(sg)
+	if err := authz.CheckManaged(ctx, s.auth, "securitygroups", obj, nil); err != nil {
+		errs = append(errs, err)
+	}
+	return errs
 }
 
 func validateSecurityGroup(sg *sdn.SecurityGroup) field.ErrorList {
 	var errs field.ErrorList
 	specPath := field.NewPath("spec")
+	errs = append(errs, metavalidation.ValidateLabelSelector(&sg.Spec.PodSelector, metavalidation.LabelSelectorValidationOptions{}, specPath.Child("podSelector"))...)
 	if sg.Spec.VPCRef.Name == "" {
 		errs = append(errs, field.Required(specPath.Child("vpcRef", "name"), "the local VPC name is required"))
 	}
 	for i, r := range sg.Spec.Ingress {
+		errs = append(errs, validatePorts(r.Ports, specPath.Child("ingress").Index(i).Child("ports"))...)
 		p := specPath.Child("ingress").Index(i).Child("from")
 		hasGroup := r.From.Group != ""
 		hasCIDR := r.From.CIDR != ""
@@ -121,6 +131,7 @@ func validateSecurityGroup(sg *sdn.SecurityGroup) field.ErrorList {
 		}
 	}
 	for i, r := range sg.Spec.Egress {
+		errs = append(errs, validatePorts(r.Ports, specPath.Child("egress").Index(i).Child("ports"))...)
 		p := specPath.Child("egress").Index(i).Child("to")
 		hasGroup := r.To.Group != ""
 		hasCIDR := r.To.CIDR != ""
@@ -146,6 +157,22 @@ func validateSecurityGroup(sg *sdn.SecurityGroup) field.ErrorList {
 	return errs
 }
 
+// Only an empty port list denotes all ports. Explicit zero and overflowing
+// ports must never reach the datapath's uint16 wildcard representation.
+func validatePorts(ports []sdn.SecurityGroupPort, path *field.Path) field.ErrorList {
+	var errs field.ErrorList
+	for i, port := range ports {
+		p := path.Index(i)
+		if port.Protocol != "TCP" && port.Protocol != "UDP" {
+			errs = append(errs, field.NotSupported(p.Child("protocol"), port.Protocol, []string{"TCP", "UDP"}))
+		}
+		if port.Port < 1 || port.Port > 65535 {
+			errs = append(errs, field.Invalid(p.Child("port"), port.Port, "must be between 1 and 65535"))
+		}
+	}
+	return errs
+}
+
 func (securityGroupStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string {
 	return nil
 }
@@ -161,10 +188,13 @@ func (securityGroupStrategy) AllowUnconditionalUpdate() bool {
 func (securityGroupStrategy) Canonicalize(obj runtime.Object) {
 }
 
-func (securityGroupStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+func (s securityGroupStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	newSG := obj.(*sdn.SecurityGroup)
 	oldSG := old.(*sdn.SecurityGroup)
 	errs := validateSecurityGroup(newSG)
+	if err := authz.CheckManaged(ctx, s.auth, "securitygroups", obj, old); err != nil {
+		errs = append(errs, err)
+	}
 	// The VPC binding is the group's identity anchor; changing it would
 	// re-home the group and orphan its allocated id. Replace instead.
 	if newSG.Spec.VPCRef != oldSG.Spec.VPCRef {
@@ -192,10 +222,15 @@ func (securityGroupStatusStrategy) PrepareForUpdate(ctx context.Context, obj, ol
 	newSG := obj.(*sdn.SecurityGroup)
 	oldSG := old.(*sdn.SecurityGroup)
 	newSG.Spec = oldSG.Spec
+	authz.PreserveManager(obj, old)
 }
 
 func (securityGroupStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
-	return field.ErrorList{}
+	id := obj.(*sdn.SecurityGroup).Status.ID
+	if id != 0 && !netid.ValidGroup(id) {
+		return field.ErrorList{field.Invalid(field.NewPath("status", "id"), id, "must be zero (pending) or between 1 and 62")}
+	}
+	return nil
 }
 
 func (securityGroupStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {

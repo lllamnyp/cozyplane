@@ -97,6 +97,7 @@ func hfCompilePorts(ports []sdnv1alpha1.HostFirewallPort) ([]hfPortRow, []string
 			continue
 		}
 		for port := int(lo); port <= int(hi); port++ {
+			// #nosec G115 -- lo and hi are validated in 0..65535 immediately before this bounded loop.
 			out = append(out, hfPortRow{proto: proto, port: uint16(port)})
 		}
 	}
