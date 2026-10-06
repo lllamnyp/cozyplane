@@ -265,7 +265,28 @@ func TestDesiredPeerLinksCarryCIDRs(t *testing.T) {
 		t.Fatalf("got %d links, want 1: %+v", len(links), links)
 	}
 	l := links[0]
-	if l.a != 100 || l.b != 101 || l.cidrA != "10.10.0.0/24" || l.cidrB != "10.20.0.0/24" {
+	if l.a != 100 || l.b != 101 || len(l.cidrsA) != 1 || len(l.cidrsB) != 1 || l.cidrsA[0] != "10.10.0.0/24" || l.cidrsB[0] != "10.20.0.0/24" {
 		t.Errorf("link = %+v, want {100 101 10.10.0.0/24 10.20.0.0/24}", l)
+	}
+}
+
+func TestDesiredPeerLinksCarryBothAddressFamilies(t *testing.T) {
+	a, b := vpcWith(100, "10.10.0.0/24"), vpcWith(101, "10.20.0.0/24")
+	a.Spec.CIDRs = append(a.Spec.CIDRs, "fd00:10::/64")
+	b.Spec.CIDRs = append(b.Spec.CIDRs, "fd00:20::/64")
+	links := desiredPeerLinks([]*sdnv1alpha1.VPCPeering{half("team-a", "to-b", "vpc-a", "team-b", "vpc-b"), half("team-b", "to-a", "vpc-b", "team-a", "vpc-a")}, vpcTable(map[string]*sdnv1alpha1.VPC{"team-a/vpc-a": a, "team-b/vpc-b": b}))
+	networks := desiredPeerNetworks(links)
+	if len(networks) != 4 {
+		t.Fatalf("dual-stack peering omitted delivery entries: %+v", networks)
+	}
+	want := map[string]uint32{"10.10.0.0/24": 100, "fd00:10::/64": 100, "10.20.0.0/24": 101, "fd00:20::/64": 101}
+	for _, entry := range networks {
+		if want[entry.CIDR] != entry.Net || entry.Scope == entry.Net {
+			t.Fatalf("wrong peer identity/scope: %+v", entry)
+		}
+		delete(want, entry.CIDR)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing dual-stack routes: %+v", want)
 	}
 }

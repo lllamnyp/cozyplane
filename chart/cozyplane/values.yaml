@@ -17,6 +17,7 @@ genevePort: 6081
 # low prefix (e.g. "00-cozyplane.conflist") to win over a co-installed CNI such
 # as Cilium (which ships 05-cilium.conflist).
 cniConfName: "10-cozyplane.conflist"
+writeCNIConf: true
 
 # Kube-apiserver endpoint the hostNetwork agent/responder dial. Empty = the
 # in-cluster kubernetes.default ClusterIP (10.96.0.1) — correct once a service
@@ -38,6 +39,9 @@ clusterDomain: ""
 # Cluster networking facts for pod egress to the outside world. Not reliably
 # discoverable in-cluster, so declared here.
 egress:
+  # Router for connected external IPv4 pools on a secondary link. Empty keeps
+  # the first-host convention. An explicit FIB gateway always takes priority.
+  floatingNextHopIPv4: ""
   # The cluster pod supernet(s), comma-separated for dual-stack (e.g.
   # "10.244.0.0/16,fd00:10:244::/56"). Enables the cluster-egress masquerade
   # (pods get an off-cluster return path) and is denied to VPC tenants at
@@ -52,8 +56,41 @@ egress:
   # (:53 only), so tenant pods resolve with a stock resolv.conf.
   clusterDNS: "10.96.0.10"
   # Additional cluster-internal networks VPC tenants must not reach through
-  # their gateways (e.g. the node/management network).
+  # their gateways (e.g. the node/management network). Also feeds the managed-VPN
+  # route-CIDR deny-set — include the node network here so it is covered.
   internalCIDRs: []
+
+# Managed VPN (issue #6, docs/vpn.md). The controller runs tunnel appliances for
+# VPNGateway/VPNConnection; these bound their placement and per-tenant scale.
+# Every appliance exposes per-connection metrics on the named `vpn-metrics`
+# port. When the VictoriaMetrics Operator VMPodScrape CRD is installed, this
+# chart automatically registers all `app=cozyplane-vpn-gateway` pods for scrape.
+vpn:
+  # Comma-separated "key=value" labels selecting a dedicated gateway node pool.
+  gatewayNodeSelector: ""
+  # Optional taint key tolerated with Exists/NoSchedule.
+  gatewayTolerationKey: ""
+  # Zero uses the controller defaults.
+  maxGatewaysPerNamespace: 0
+  maxConnectionsPerGateway: 0
+  # Opt in after the kubelet admits net.ipv4.ip_forward and
+  # net.ipv6.conf.all.forwarding as pod sysctls. Drops privileged mode and keeps
+  # only NET_ADMIN, NET_RAW and NET_BIND_SERVICE.
+  hardenedAppliance: false
+  observability:
+    podScrape:
+      enabled: true
+      interval: 30s
+    rules:
+      enabled: true
+      # Idle tunnels are valid for many installations, so this alert is opt-in.
+      noTraffic:
+        enabled: false
+        window: 30m
+    dashboard:
+      enabled: true
+      # Empty matches every Grafana instance visible to the operator.
+      instanceSelector: {}
 
 agent:
   priorityClassName: system-node-critical

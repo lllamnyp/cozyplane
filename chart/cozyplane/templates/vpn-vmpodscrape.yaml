@@ -1,0 +1,27 @@
+{{- if and .Values.vpn.observability.podScrape.enabled (.Capabilities.APIVersions.Has "operator.victoriametrics.com/v1beta1/VMPodScrape") }}
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: cozyplane-vpn-gateways
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cozyplane.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vpn
+spec:
+  namespaceSelector:
+    any: true
+  selector:
+    matchLabels:
+      app: cozyplane-vpn-gateway
+  podMetricsEndpoints:
+    - port: vpn-metrics
+      path: /metrics
+      interval: {{ .Values.vpn.observability.podScrape.interval }}
+      relabelConfigs:
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+        - sourceLabels: [__meta_kubernetes_pod_label_sdn_cozystack_io_vpn_gateway]
+          targetLabel: gateway
+{{- end }}

@@ -19,6 +19,8 @@ package vpcgateway
 import (
 	"context"
 	"errors"
+	"github.com/lllamnyp/cozyplane/pkg/registry/sdn/authz"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
 	"k8s.io/apimachinery/pkg/fields"
@@ -59,13 +61,13 @@ func SelectableFields(obj *sdn.VPCGateway) fields.Set {
 type vpcGatewayStrategy struct {
 	runtime.ObjectTyper
 	names.NameGenerator
+	auth authorizer.Authorizer
 }
 
-// NewStrategy creates and returns a vpcGatewayStrategy instance. The gateway
-// needs no escalation gate anymore: who may mint the public address it draws is
-// Service RBAC + the allocator's scoping (docs/external-addresses.md §8).
-func NewStrategy(typer runtime.ObjectTyper) vpcGatewayStrategy {
-	return vpcGatewayStrategy{typer, names.SimpleNameGenerator}
+// NewStrategy separately authorizes changes to operator-managed gateways.
+// Ordinary gateway address allocation remains governed by Service RBAC.
+func NewStrategy(typer runtime.ObjectTyper, auth authorizer.Authorizer) vpcGatewayStrategy {
+	return vpcGatewayStrategy{typer, names.SimpleNameGenerator, auth}
 }
 
 func (vpcGatewayStrategy) NamespaceScoped() bool {
@@ -89,6 +91,9 @@ func (vpcGatewayStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime
 func (s vpcGatewayStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	gw := obj.(*sdn.VPCGateway)
 	var errs field.ErrorList
+	if err := authz.CheckManaged(ctx, s.auth, "vpcgateways", obj, nil); err != nil {
+		errs = append(errs, err)
+	}
 	specPath := field.NewPath("spec")
 	if gw.Spec.VPCRef.Name == "" {
 		errs = append(errs, field.Required(specPath.Child("vpcRef", "name"), "the VPC name is required"))
@@ -113,6 +118,9 @@ func (vpcGatewayStrategy) Canonicalize(obj runtime.Object) {
 }
 
 func (s vpcGatewayStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+	if err := authz.CheckManaged(ctx, s.auth, "vpcgateways", obj, old); err != nil {
+		return field.ErrorList{err}
+	}
 	return field.ErrorList{}
 }
 
@@ -136,6 +144,7 @@ func (vpcGatewayStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old r
 	newPeering := obj.(*sdn.VPCGateway)
 	oldPeering := old.(*sdn.VPCGateway)
 	newPeering.Spec = oldPeering.Spec
+	authz.PreserveManager(obj, old)
 }
 
 func (vpcGatewayStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {

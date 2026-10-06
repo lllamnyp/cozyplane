@@ -18,6 +18,8 @@ package vpcpeering
 
 import (
 	"context"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
@@ -30,7 +32,7 @@ import (
 )
 
 // NewREST returns RESTStorage objects for VPCPeerings and their /status subresource.
-func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter, auth authorizer.Authorizer) (*registry.REST, *StatusREST, error) {
+func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter, auth authorizer.Authorizer) (*ManagedREST, *StatusREST, error) {
 	strategy := NewStrategy(scheme, auth)
 
 	store := &genericregistry.Store{
@@ -56,7 +58,37 @@ func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter, auth 
 	statusStore := *store
 	statusStore.UpdateStrategy = NewStatusStrategy(strategy)
 
-	return &registry.REST{Store: store}, &StatusREST{store: &statusStore}, nil
+	return &ManagedREST{REST: &registry.REST{Store: store}, auth: auth}, &StatusREST{store: &statusStore}, nil
+}
+
+// ManagedREST authorizes the current stored object inside delete validation,
+// including collection deletion, rather than a racy preliminary read.
+type ManagedREST struct {
+	*registry.REST
+	auth authorizer.Authorizer
+}
+
+func (r *ManagedREST) deletionCheck(check rest.ValidateObjectFunc) rest.ValidateObjectFunc {
+	return func(ctx context.Context, obj runtime.Object) error {
+		peering := obj.(*sdn.VPCPeering)
+		if portalManaged(peering) {
+			if err := checkManagedPeering(ctx, r.auth, peering); err != nil {
+				return apierrors.NewForbidden(sdn.Resource("vpcpeerings"), peering.Name, err)
+			}
+		}
+		if check != nil {
+			return check(ctx, obj)
+		}
+		return nil
+	}
+}
+
+func (r *ManagedREST) Delete(ctx context.Context, name string, check rest.ValidateObjectFunc, options *metav1.DeleteOptions) (runtime.Object, bool, error) {
+	return r.Store.Delete(ctx, name, r.deletionCheck(check), options)
+}
+
+func (r *ManagedREST) DeleteCollection(ctx context.Context, check rest.ValidateObjectFunc, options *metav1.DeleteOptions, listOptions *metainternalversion.ListOptions) (runtime.Object, error) {
+	return r.Store.DeleteCollection(ctx, r.deletionCheck(check), options, listOptions)
 }
 
 // StatusREST implements the REST endpoint for changing the status of a VPCPeering.

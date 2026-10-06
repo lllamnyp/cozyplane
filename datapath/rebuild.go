@@ -37,7 +37,14 @@ import (
 //
 // Format (versioned, order fixed):
 //
-//	cozyplane:1;net=<net-id>;gw=<0|1>;mac=<pod-iface MAC>;ips=<ip>[,<ip>]
+//	cozyplane:1;net=<net-id>;gw=<0|1>;fwd=<0|1>;mac=<pod-iface MAC>;ips=<ip>[,<ip>]
+//
+// `fwd` was added with multi-attach and is OPTIONAL on read: an alias written by
+// an earlier release has no such key and parses as fwd=0, which is what it was.
+// Without it a granted forwarding leg would silently lose PORT_F_FORWARD on the
+// first agent restart and start dropping its own transit traffic on the RPF
+// check — the failure would look like a datapath bug, hours after the change
+// that caused it.
 const vethAliasPrefix = "cozyplane:1;"
 
 // Host-side veth name prefixes (must match hostVethNameFor/gwHostVethNameFor in
@@ -59,8 +66,12 @@ func FormatVethAlias(rawNet uint32, ips []net.IP, mac net.HardwareAddr) string {
 	for _, ip := range ips {
 		ss = append(ss, ip.String())
 	}
-	return fmt.Sprintf("%snet=%d;gw=%d;mac=%s;ips=%s",
-		vethAliasPrefix, PortNet(rawNet), gw, mac, strings.Join(ss, ","))
+	fwd := 0
+	if rawNet&PortForwardFlag != 0 {
+		fwd = 1
+	}
+	return fmt.Sprintf("%snet=%d;gw=%d;fwd=%d;mac=%s;ips=%s",
+		vethAliasPrefix, PortNet(rawNet), gw, fwd, mac, strings.Join(ss, ","))
 }
 
 // parseVethAlias inverts FormatVethAlias. ok is false for an empty, foreign, or
@@ -87,6 +98,13 @@ func parseVethAlias(alias string) (rawNet uint32, ips []net.IP, mac net.Hardware
 	case "0":
 	case "1":
 		rawNet |= PortGatewayFlag
+	default:
+		return 0, nil, nil, false
+	}
+	switch fields["fwd"] {
+	case "", "0": // absent: written before multi-attach existed
+	case "1":
+		rawNet |= PortForwardFlag
 	default:
 		return 0, nil, nil, false
 	}
@@ -440,9 +458,9 @@ func rebuildVeth(l netlink.Link, idx int, rawNet uint32, ips []net.IP, mac net.H
 			return err
 		}
 	}
-	// Only a plain VPC pod has a fabric bridge (default pods are their fabric
-	// identity; a gateway VPC leg has none), and it has exactly one VPC IP.
-	if PortNet(rawNet) == 0 || rawNet&PortGatewayFlag != 0 || len(ips) != 1 {
+	// Only a VPC pod has a fabric bridge (a default pod IS its fabric identity),
+	// and a bridged leg carries exactly one VPC IP.
+	if PortNet(rawNet) == 0 || len(ips) != 1 {
 		return nil
 	}
 	fabric, err := fabricRouteIP(l, ips)
@@ -450,7 +468,17 @@ func rebuildVeth(l netlink.Link, idx int, rawNet uint32, ips []net.IP, mac net.H
 		return err
 	}
 	if fabric == "" {
-		return fmt.Errorf("no fabric route on VPC pod veth")
+		// No fabric route: this is not the pod's PRIMARY leg, so it has no
+		// bridge to rebuild. A gateway's VPC leg never had one, and with
+		// multi-attach neither does a secondary attachment — there is one
+		// fabric handle per pod and entry 0 owns it (docs/multi-attach.md).
+		//
+		// The route's presence is the signal, deliberately, and the gateway
+		// FLAG is not: a forwarding attachment carries that flag and may
+		// perfectly well be the primary leg, so testing the flag here would
+		// silently skip rebuilding a bridge that exists — the pod would come
+		// back from an agent restart unreachable on its own status.podIP.
+		return nil
 	}
 	// Heal the fabric IP's permanent neighbour (pods ADDed by a pre-neighbour
 	// CNI release lack it, and node-originated traffic — kubelet probes, DNS

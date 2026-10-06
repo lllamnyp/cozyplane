@@ -257,11 +257,14 @@ func syncMap[K, V comparable](mp *ebpf.Map, want map[K]V) error {
 	var key K
 	var val V
 	var stale []K
+	unchanged := make(map[K]bool)
 	it := mp.Iterate()
 	for it.Next(&key, &val) {
-		if _, ok := want[key]; !ok {
+		if desired, ok := want[key]; !ok {
 			k := key
 			stale = append(stale, k)
+		} else if desired == val {
+			unchanged[key] = true
 		}
 	}
 	if err := it.Err(); err != nil {
@@ -273,6 +276,9 @@ func syncMap[K, V comparable](mp *ebpf.Map, want map[K]V) error {
 		}
 	}
 	for k, v := range want {
+		if unchanged[k] {
+			continue
+		}
 		if err := mp.Put(&k, &v); err != nil {
 			return fmt.Errorf("put map entry: %w", err)
 		}

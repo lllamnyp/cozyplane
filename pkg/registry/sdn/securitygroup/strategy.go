@@ -19,6 +19,8 @@ package securitygroup
 import (
 	"context"
 	"errors"
+	"github.com/lllamnyp/cozyplane/pkg/registry/sdn/authz"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"net"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
@@ -58,13 +60,13 @@ func SelectableFields(obj *sdn.SecurityGroup) fields.Set {
 type securityGroupStrategy struct {
 	runtime.ObjectTyper
 	names.NameGenerator
+	auth authorizer.Authorizer
 }
 
-// NewStrategy creates and returns a securityGroupStrategy instance. A group lives
-// in its VPC owner's namespace; owning the namespace is owning the VPC's policy,
-// so there is no virtual verb to check (contrast VPCPeering's `peer`).
-func NewStrategy(typer runtime.ObjectTyper) securityGroupStrategy {
-	return securityGroupStrategy{typer, names.SimpleNameGenerator}
+// NewStrategy preserves ordinary tenant policy permissions and separately
+// authorizes changes to operator-managed groups.
+func NewStrategy(typer runtime.ObjectTyper, auth authorizer.Authorizer) securityGroupStrategy {
+	return securityGroupStrategy{typer, names.SimpleNameGenerator, auth}
 }
 
 func (securityGroupStrategy) NamespaceScoped() bool {
@@ -83,9 +85,13 @@ func (securityGroupStrategy) PrepareForUpdate(ctx context.Context, obj, old runt
 	newSG.Status = oldSG.Status
 }
 
-func (securityGroupStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
+func (s securityGroupStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	sg := obj.(*sdn.SecurityGroup)
-	return validateSecurityGroup(sg)
+	errs := validateSecurityGroup(sg)
+	if err := authz.CheckManaged(ctx, s.auth, "securitygroups", obj, nil); err != nil {
+		errs = append(errs, err)
+	}
+	return errs
 }
 
 func validateSecurityGroup(sg *sdn.SecurityGroup) field.ErrorList {
@@ -161,10 +167,13 @@ func (securityGroupStrategy) AllowUnconditionalUpdate() bool {
 func (securityGroupStrategy) Canonicalize(obj runtime.Object) {
 }
 
-func (securityGroupStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+func (s securityGroupStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	newSG := obj.(*sdn.SecurityGroup)
 	oldSG := old.(*sdn.SecurityGroup)
 	errs := validateSecurityGroup(newSG)
+	if err := authz.CheckManaged(ctx, s.auth, "securitygroups", obj, old); err != nil {
+		errs = append(errs, err)
+	}
 	// The VPC binding is the group's identity anchor; changing it would
 	// re-home the group and orphan its allocated id. Replace instead.
 	if newSG.Spec.VPCRef != oldSG.Spec.VPCRef {
@@ -192,6 +201,7 @@ func (securityGroupStatusStrategy) PrepareForUpdate(ctx context.Context, obj, ol
 	newSG := obj.(*sdn.SecurityGroup)
 	oldSG := old.(*sdn.SecurityGroup)
 	newSG.Spec = oldSG.Spec
+	authz.PreserveManager(obj, old)
 }
 
 func (securityGroupStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {

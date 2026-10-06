@@ -423,6 +423,113 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
+# A KubeVirt VM only sees NICs KubeVirt put in its domain, and spec.networks
+# admits only `pod` and `multus` — so a VM's secondary NIC goes through a
+# NetworkAttachmentDefinition and the plugin's delegate mode
+# (docs/kubevirt-multi-nic.md). No VM here: kind cannot host KubeVirt. What is
+# testable, and what actually breaks, is the plumbing underneath — the delegate
+# builds one leg, the primary keeps its own, and the two DELs stay apart.
+phase "Multus delegate: a secondary NIC through a NetworkAttachmentDefinition"
+if ! $K get crd network-attachment-definitions.k8s.cni.cncf.io >/dev/null 2>&1; then
+  skip "the cluster does not serve NetworkAttachmentDefinition (no Multus)"
+else
+  # The shim is generated from the VPCBinding, so it lands where attachment is
+  # already authorized. Nothing hand-written should be needed.
+  NAD=""
+  for _ in $(seq 1 10); do
+    NAD=$($K -n "$NS" get net-attach-def vb -o jsonpath='{.spec.config}' 2>/dev/null)
+    [ -n "$NAD" ] && break
+    sleep 2
+  done
+  case "$NAD" in
+    *'"type":"cozyplane"'*'"vpc":"'"$NS"'/vb"'*)
+      pass "the VPCBinding generated a NAD naming its VPC" ;;
+    "") fail "no NAD was generated for the binding" ;;
+    *)  fail "the generated NAD does not name the VPC: $NAD" ;;
+  esac
+
+  apply <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: d1
+  namespace: $NS
+  annotations:
+    # The primary leg — what a VM's \`pod: {}\` network is — plus a pin for the
+    # NIC Multus will build. netN names are reserved for delegation, so the
+    # primary invocation skips that entry instead of claiming the interface.
+    sdn.cozystack.io/networks: '[{"vpc":"va"},{"name":"net1","vpc":"vb","ip":"10.91.0.77"}]'
+    # What KubeVirt generates from spec.networks[].multus
+    k8s.v1.cni.cncf.io/networks: vb
+spec:
+  nodeName: $W2
+  containers: [{name: s, image: nicolaka/netshoot, command: [sh, -c, "$SRV"]}]
+EOF
+  if ! $K -n "$NS" wait --for=condition=Ready pod/d1 --timeout=180s >/dev/null 2>&1; then
+    fail "the pod with a delegated NIC never became ready"
+  else
+    IFS0=$($K -n "$NS" exec d1 -- ip -4 -o addr show eth0 2>/dev/null | grep -c 'inet ')
+    IFS1=$($K -n "$NS" exec d1 -- ip -4 -o addr show net1 2>/dev/null | grep -c 'inet ')
+    [ "$IFS0" = "1" ] && [ "$IFS1" = "1" ] \
+      && pass "both legs exist: eth0 from the annotation, net1 from the NAD" \
+      || fail "expected an address on eth0 and net1 (got eth0=$IFS0 net1=$IFS1)"
+
+    PIN=$($K -n "$NS" exec d1 -- ip -4 -o addr show net1 2>/dev/null | grep -o '10\.91\.0\.77')
+    [ "$PIN" = "10.91.0.77" ] \
+      && pass "the delegated NIC took the pinned address from the annotation entry" \
+      || fail "net1 did not take the pinned address"
+
+    # N default routes would have the kernel pick an egress interface by
+    # whatever metric it assigned. The secondary gets its own CIDR and no more.
+    DEFN=$($K -n "$NS" exec d1 -- ip route 2>/dev/null | grep -c '^default')
+    [ "$DEFN" = "1" ] \
+      && pass "one default route, on the primary leg only" \
+      || fail "got $DEFN default routes; the egress interface would be nondeterministic"
+
+    B1IP=$(vpcip b1)
+    served d1 "http://[$B1IP]:8080/" 2>/dev/null || served d1 "http://$B1IP:8080/" \
+      && pass "the delegated NIC carries east-west traffic in its own VPC" \
+      || fail "no traffic over the delegated NIC to $B1IP"
+
+    # The delegated Port must be tellable apart from the primary's, or a DEL
+    # releases the wrong address.
+    DIF=$($K get ports -l "sdn.cozystack.io/pod-name=d1,sdn.cozystack.io/ifname=net1" \
+          -o jsonpath='{.items[*].spec.vpcRef.name}' 2>/dev/null)
+    [ "$DIF" = "vb" ] \
+      && pass "the delegated Port is labelled with its interface, in the NAD's VPC" \
+      || fail "the delegated Port is not identifiable by interface (got '$DIF')"
+  fi
+
+  # THE security property: a NAD names a VPC, it does not grant one. A tenant
+  # who writes their own pointing at someone else's VPC must get nothing.
+  $K create ns "${NS}-rogue" >/dev/null 2>&1
+  apply <<EOF
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata: {name: stolen, namespace: ${NS}-rogue}
+spec:
+  config: '{"cniVersion":"1.0.0","name":"stolen","type":"cozyplane","vpc":"$NS/vb"}'
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: thief
+  namespace: ${NS}-rogue
+  annotations: {k8s.v1.cni.cncf.io/networks: stolen}
+spec:
+  nodeName: $W
+  containers: [{name: s, image: nicolaka/netshoot, command: [sleep, infinity]}]
+EOF
+  sleep 20
+  THIEFIP=$($K -n "${NS}-rogue" get pod thief -o jsonpath='{.status.podIP}' 2>/dev/null)
+  STOLEN=$($K get ports -l "sdn.cozystack.io/pod-namespace=${NS}-rogue" -o name 2>/dev/null)
+  [ -z "$STOLEN" ] \
+    && pass "a hand-written NAD naming another namespace's VPC is refused (no VPCBinding, no Port)" \
+    || fail "a hand-written NAD got a Port in an unauthorized namespace: $STOLEN (pod ip $THIEFIP)"
+  $K delete ns "${NS}-rogue" --wait=false >/dev/null 2>&1
+fi
+
+# ---------------------------------------------------------------------------
 phase "revocation: severing a live pod's VPC access"
 $K -n "$NS" delete vpcbinding va >/dev/null 2>&1
 sleep 10

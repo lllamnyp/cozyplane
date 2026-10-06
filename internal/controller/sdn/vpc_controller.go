@@ -19,15 +19,24 @@ package sdn
 import (
 	"context"
 	"fmt"
+	"slices"
+	"time"
 
+	"k8s.io/apimachinery/pkg/api/equality"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
+	"github.com/lllamnyp/cozyplane/pkg/boundaryidentity"
 )
 
 // firstVNI is the lowest network id handed out to VPCs. Ids below it are
@@ -54,7 +63,8 @@ type VPCReconciler struct {
 	// sharing a network id is a cross-tenant isolation break. Reconciles are
 	// serial (default MaxConcurrentReconciles), so a live list plus
 	// assign-before-return is race-free. Falls back to Client when nil (tests).
-	Reader client.Reader
+	Reader         client.Reader
+	AgentNamespace string
 }
 
 // reader returns the live API reader, or the (already live in tests) client.
@@ -79,6 +89,7 @@ func (r *VPCReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		}
 		return ctrl.Result{}, fmt.Errorf("fetch VPC: %w", err)
 	}
+	previousStatus := vpc.DeepCopy().Status
 
 	if vpc.Status.VNI == 0 {
 		vni, err := r.allocateVNI(ctx)
@@ -100,16 +111,107 @@ func (r *VPCReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		vpc.Status.VNI = vni
 	}
 	vpc.Status.Phase = sdnv1alpha1.VPCPhaseReady
-
-	if err := r.Status().Update(ctx, vpc); err != nil {
-		if apierrors.IsConflict(err) {
-			return ctrl.Result{Requeue: true}, nil
+	if vpc.Spec.Boundary != nil {
+		policy, transport, err := r.boundaryApplied(ctx, vpc)
+		if err != nil {
+			return ctrl.Result{}, err
 		}
-		return ctrl.Result{}, fmt.Errorf("update VPC status: %w", err)
+		for _, item := range []struct {
+			kind  string
+			ready bool
+		}{{"BoundaryReady", policy}, {"BoundaryTransportReady", transport}} {
+			status, reason := metav1.ConditionFalse, "AgentsPending"
+			if item.ready {
+				status, reason = metav1.ConditionTrue, "AllAgentsApplied"
+			}
+			meta.SetStatusCondition(&vpc.Status.Conditions, metav1.Condition{Type: item.kind, Status: status, Reason: reason, Message: reason, ObservedGeneration: vpc.Generation})
+		}
 	}
 
-	logger.Info("VPC ready", "name", vpc.Name, "vni", vpc.Status.VNI)
+	if !equality.Semantic.DeepEqual(previousStatus, vpc.Status) {
+		if err := r.Status().Update(ctx, vpc); err != nil {
+			if apierrors.IsConflict(err) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, fmt.Errorf("update VPC status: %w", err)
+		}
+
+		logger.Info("VPC ready", "name", vpc.Name, "vni", vpc.Status.VNI)
+	}
+	if vpc.Spec.Boundary != nil {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
 	return ctrl.Result{}, nil
+}
+
+// Acknowledgements are tied to the actual operator DaemonSet's current Pods,
+// never to tenant-supplied labels or previous agent instances.
+func (r *VPCReconciler) boundaryApplied(ctx context.Context, vpc *sdnv1alpha1.VPC) (bool, bool, error) {
+	if r.AgentNamespace == "" {
+		return false, false, nil
+	}
+	var ds appsv1.DaemonSet
+	if err := r.reader().Get(ctx, types.NamespacedName{Namespace: r.AgentNamespace, Name: "cozyplane-agent"}, &ds); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, false, nil
+		}
+		return false, false, err
+	}
+	if ds.Status.DesiredNumberScheduled < 1 {
+		return false, false, nil
+	}
+	var ports sdnv1alpha1.PortList
+	if err := r.reader().List(ctx, &ports); err != nil {
+		return false, false, err
+	}
+	identities := []boundaryidentity.PrimaryPort{}
+	for _, port := range ports.Items {
+		if port.Spec.Primary && port.Spec.VPCRef == (sdnv1alpha1.VPCRef{Namespace: vpc.Namespace, Name: vpc.Name}) {
+			identities = append(identities, boundaryidentity.PrimaryPort{UID: string(port.UID), IP: port.Spec.IP})
+		}
+	}
+	digest := boundaryidentity.Digest(identities)
+	selector, err := metav1.LabelSelectorAsSelector(ds.Spec.Selector)
+	if err != nil {
+		return false, false, err
+	}
+	var pods corev1.PodList
+	if err := r.reader().List(ctx, &pods, client.InNamespace(r.AgentNamespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
+		return false, false, err
+	}
+	policy, transport := true, true
+	nodes := map[string]bool{}
+	currentAgents := map[string]string{}
+	for _, pod := range pods.Items {
+		if pod.DeletionTimestamp != nil || !slices.ContainsFunc(pod.OwnerReferences, func(o metav1.OwnerReference) bool {
+			return o.UID == ds.UID && o.Kind == "DaemonSet" && o.Controller != nil && *o.Controller
+		}) {
+			continue
+		}
+		currentAgents[pod.Spec.NodeName] = string(pod.UID)
+		if pod.Spec.NodeName == "" || pod.Status.Phase != corev1.PodRunning || !slices.ContainsFunc(pod.Status.Conditions, func(c corev1.PodCondition) bool { return c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue }) {
+			policy, transport = false, false
+			continue
+		}
+		nodes[pod.Spec.NodeName] = true
+		idx := slices.IndexFunc(vpc.Status.BoundaryNodes, func(a sdnv1alpha1.VPCBoundaryNode) bool {
+			return a.Node == pod.Spec.NodeName && a.AgentUID == string(pod.UID) && a.Revision == vpc.Spec.Boundary.Revision && a.ObservedGeneration == vpc.Generation && a.PrimaryPortsDigest == digest
+		})
+		if idx < 0 {
+			policy, transport = false, false
+		} else if !vpc.Status.BoundaryNodes[idx].TransportReady {
+			transport = false
+		}
+	}
+	// Retired nodes and restarted agent instances must not leave an obsolete
+	// primary digest that prevents a later migration or rollback from completing.
+	vpc.Status.BoundaryNodes = slices.DeleteFunc(vpc.Status.BoundaryNodes, func(ack sdnv1alpha1.VPCBoundaryNode) bool {
+		return currentAgents[ack.Node] != ack.AgentUID
+	})
+	if len(nodes) != int(ds.Status.DesiredNumberScheduled) {
+		return false, false, nil
+	}
+	return policy, transport, nil
 }
 
 // allocateVNI returns the lowest VNI >= firstVNI not used by any other VPC.
