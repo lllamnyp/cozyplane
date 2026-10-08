@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
+	"github.com/lllamnyp/cozyplane/internal/sdnref"
 )
 
 // SecurityGroupReconciler allocates each SecurityGroup a per-VPC numeric id
@@ -76,7 +77,9 @@ func (r *SecurityGroupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Allocate an id, or repair a duplicate (younger claim yields), or keep the
 	// current one.
 	id := sg.Status.ID
-	if id == 0 {
+	if !sdnref.ObjectName(sg.Spec.VPCRef.Name) {
+		id = 0 // An unusable legacy anchor must not reserve an ID or start a scan.
+	} else if id == 0 {
 		var err error
 		if id, err = r.allocateID(ctx, &sg); err != nil {
 			return ctrl.Result{}, err

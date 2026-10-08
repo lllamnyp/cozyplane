@@ -56,6 +56,7 @@ import (
 	localv1alpha1 "github.com/lllamnyp/cozyplane/api/localsdn/v1alpha1"
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
 	"github.com/lllamnyp/cozyplane/datapath"
+	"github.com/lllamnyp/cozyplane/internal/sdnref"
 	localclientset "github.com/lllamnyp/cozyplane/pkg/generated/localsdn/clientset/versioned"
 	localinformers "github.com/lllamnyp/cozyplane/pkg/generated/localsdn/informers/externalversions"
 	sdnclientset "github.com/lllamnyp/cozyplane/pkg/generated/sdn/clientset/versioned"
@@ -1591,7 +1592,7 @@ func watchSecurityGroups(ctx context.Context, factory sdninformers.SharedInforme
 		// Per-VPC name -> id, for resolving from.group references (same VPC).
 		nameID := map[vpcKey]map[string]int32{}
 		for _, sg := range allSGs {
-			if sg.Status.ID == 0 {
+			if sg.Status.ID <= 0 || sg.Status.ID >= sdnv1alpha1.MaxSecurityGroupsPerVPC || !sdnref.NamespaceName(sg.Namespace) || !sdnref.ObjectName(sg.Spec.VPCRef.Name) {
 				continue
 			}
 			k := vpcKey{sg.Namespace, sg.Spec.VPCRef.Name}
@@ -1607,7 +1608,7 @@ func watchSecurityGroups(ctx context.Context, factory sdninformers.SharedInforme
 		var egressCidrRules []datapath.SGEgressCidr
 		nets := map[uint32]bool{}
 		for _, sg := range allSGs {
-			if sg.Status.ID == 0 {
+			if sg.Status.ID <= 0 || sg.Status.ID >= sdnv1alpha1.MaxSecurityGroupsPerVPC || !sdnref.NamespaceName(sg.Namespace) || !sdnref.ObjectName(sg.Spec.VPCRef.Name) {
 				continue
 			}
 			vpc, err := vpcs.Lister().VPCs(sg.Namespace).Get(sg.Spec.VPCRef.Name)
@@ -1622,6 +1623,9 @@ func watchSecurityGroups(ctx context.Context, factory sdninformers.SharedInforme
 				srcNet := net_ // same-VPC by default
 				switch {
 				case ing.From.Group != "":
+					if !validGroupPeerReference(ing.From) {
+						continue
+					}
 					// A peer-VPC ref resolves the group's id in the peer VPC's id
 					// space, keyed by the peer's VNI so it can't collide with a
 					// same-VPC id.
@@ -1642,11 +1646,14 @@ func watchSecurityGroups(ctx context.Context, factory sdninformers.SharedInforme
 				case isAnyCIDR(ing.From.CIDR):
 					allowed = 1 << uint(datapath.SGWorldGroup)
 				case ing.From.CIDR != "":
+					if len(ing.From.CIDR) > 64 {
+						continue
+					}
 					// A specific north-south range compiles into the sg_cidr LPM
 					// map (v2 stage 2), not the group-bitmap sg_rules.
 					_, ipnet, err := net.ParseCIDR(ing.From.CIDR)
 					if err != nil {
-						log.Warn("security group: bad cidr; rule ignored", "group", sg.Name, "cidr", ing.From.CIDR, "err", err)
+						log.Warn("security group: bad cidr; rule ignored", "group", sg.Name)
 						continue
 					}
 					cidrRules = append(cidrRules, compileCidrPorts(net_, ipnet, 1<<uint(sg.Status.ID), ing.Ports)...)
@@ -1665,15 +1672,18 @@ func watchSecurityGroups(ctx context.Context, factory sdninformers.SharedInforme
 				// A cidr destination (north-south egress) compiles into the
 				// sg_egress_cidr LPM, keyed from the source side.
 				if eg.To.CIDR != "" {
+					if len(eg.To.CIDR) > 64 {
+						continue
+					}
 					_, ipnet, err := net.ParseCIDR(eg.To.CIDR)
 					if err != nil {
-						log.Warn("security group: bad egress cidr; rule ignored", "group", sg.Name, "cidr", eg.To.CIDR, "err", err)
+						log.Warn("security group: bad egress cidr; rule ignored", "group", sg.Name)
 						continue
 					}
 					egressCidrRules = append(egressCidrRules, compileEgressCidrPorts(net_, ipnet, 1<<uint(sg.Status.ID), eg.Ports)...)
 					continue
 				}
-				if eg.To.Group == "" {
+				if !validGroupPeerReference(eg.To) {
 					continue
 				}
 				dstKey := k
@@ -1773,6 +1783,9 @@ func compileRulePorts(net_, srcNet uint32, group uint16, allowed uint64, ports [
 		return out
 	}
 	for _, pp := range ports {
+		if pp.Port < 0 || pp.Port > 65535 {
+			continue // Never narrow an invalid port into the any-port sentinel.
+		}
 		var proto uint8
 		switch pp.Protocol {
 		case "TCP":
@@ -1798,6 +1811,9 @@ func compileEgressPorts(srcNet, dstNet uint32, group uint16, allowedDst uint64, 
 		return out
 	}
 	for _, pp := range ports {
+		if pp.Port < 0 || pp.Port > 65535 {
+			continue
+		}
 		var proto uint8
 		switch pp.Protocol {
 		case "TCP":
@@ -1824,6 +1840,9 @@ func compileEgressCidrPorts(srcNet uint32, cidr *net.IPNet, allowedSrc uint64, p
 		return out
 	}
 	for _, pp := range ports {
+		if pp.Port < 0 || pp.Port > 65535 {
+			continue
+		}
 		var proto uint8
 		switch pp.Protocol {
 		case "TCP":
@@ -1856,6 +1875,9 @@ func compileCidrPorts(net_ uint32, cidr *net.IPNet, allowedGroups uint64, ports 
 		return out
 	}
 	for _, pp := range ports {
+		if pp.Port < 0 || pp.Port > 65535 {
+			continue
+		}
 		var proto uint8
 		switch pp.Protocol {
 		case "TCP":
