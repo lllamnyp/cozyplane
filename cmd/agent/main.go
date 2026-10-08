@@ -32,7 +32,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -84,23 +83,26 @@ const (
 
 func main() {
 	var (
-		nodeName      = os.Getenv("NODE_NAME")
-		mtu           int
-		vni           uint
-		cniConfName   string
-		genevePort    uint
-		clusterCIDR   string
-		internalCIDRs string
-		masqMode      string
-		vpcDNS        bool
-		clusterDNSIPs string
-		metricsAddr   string
-		metricsSecure bool
+		nodeName       = os.Getenv("NODE_NAME")
+		mtu            int
+		vni            uint
+		cniConfName    string
+		genevePort     uint
+		clusterCIDR    string
+		internalCIDRs  string
+		masqMode       string
+		vpcDNS         bool
+		clusterDNSIPs  string
+		metricsAddr    string
+		metricsSecure  bool
+		writeCNIConfig bool
 	)
 	flag.IntVar(&mtu, "mtu", 1450, "pod MTU (underlay MTU minus Geneve overhead)")
 	flag.UintVar(&vni, "vni", uint(datapath.DefaultVNI), "VNI for the default network")
 	flag.StringVar(&cniConfName, "cni-conf-name", defaultCNIConfFile,
 		"filename for the CNI conflist in /etc/cni/net.d (lower sorts first, winning over other CNIs)")
+	flag.BoolVar(&writeCNIConfig, "write-cni-conf", true,
+		"install CNI configuration; disable when the platform owns a CNI chain")
 	flag.UintVar(&genevePort, "geneve-port", datapath.GenevePort,
 		"Geneve UDP destination port (use a non-default port to coexist with another overlay on 6081)")
 	flag.StringVar(&clusterCIDR, "cluster-cidr", "",
@@ -129,13 +131,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(nodeName, mtu, uint32(vni), cniConfName, uint16(genevePort), clusterCIDR, internalCIDRs, masqMode, vpcDNS, clusterDNSIPs, metricsAddr, metricsSecure, log); err != nil {
+	if err := run(nodeName, mtu, uint32(vni), cniConfName, uint16(genevePort), clusterCIDR, internalCIDRs, masqMode, vpcDNS, clusterDNSIPs, metricsAddr, metricsSecure, writeCNIConfig, log); err != nil {
 		log.Error("agent failed", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort uint16, clusterCIDR, internalCIDRs, masqMode string, vpcDNS bool, clusterDNSIPs, metricsAddr string, metricsSecure bool, log *slog.Logger) error {
+func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort uint16, clusterCIDR, internalCIDRs, masqMode string, vpcDNS bool, clusterDNSIPs, metricsAddr string, metricsSecure, writeCNIConfig bool, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -469,11 +471,19 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		}
 	}
 
-	// Datapath is up and remotes are syncing; expose the CNI to kubelet.
-	if err := writeCNIConf(cniConfName, mtu); err != nil {
+	// Datapath is up; install configuration only when this agent owns it.
+	winner, err := configureCNIConf(cniConfDir, cniConfName, mtu, writeCNIConfig)
+	if err != nil {
 		return fmt.Errorf("write CNI conf: %w", err)
 	}
-	log.Info("CNI configuration installed; agent ready")
+	switch {
+	case !writeCNIConfig:
+		log.Info("CNI configuration writer disabled; agent ready")
+	case winner != "":
+		log.Info("CNI configuration left to another owner; agent ready", "owner", winner, "ours", cniConfName)
+	default:
+		log.Info("CNI configuration installed; agent ready")
+	}
 
 	<-ctx.Done()
 	log.Info("shutting down")
@@ -1475,18 +1485,6 @@ func severLocalPort(ctx context.Context, core kubernetes.Interface, localFactory
 		log.Info("severed local port (VPC access revoked)",
 			"ip", port.Spec.IP, "pod", port.Spec.PodNamespace+"/"+port.Spec.PodName)
 	}
-}
-
-func writeCNIConf(name string, mtu int) error {
-	if err := os.MkdirAll(cniConfDir, 0o755); err != nil {
-		return err
-	}
-	body := fmt.Sprintf(cniConfBody, mtu)
-	tmp := filepath.Join(cniConfDir, "."+name+".tmp")
-	if err := os.WriteFile(tmp, []byte(body), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, filepath.Join(cniConfDir, name))
 }
 
 func internalIP(node *corev1.Node) string {

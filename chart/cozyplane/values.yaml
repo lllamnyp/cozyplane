@@ -18,6 +18,11 @@ genevePort: 6081
 # as Cilium (which ships 05-cilium.conflist).
 cniConfName: "10-cozyplane.conflist"
 
+# Disable when the platform manages CNI configuration, including chains whose
+# winning name would otherwise sort after ours. Requires an agent supporting
+# --write-cni-conf; existing CNI files are preserved.
+writeCNIConf: true
+
 # Kube-apiserver endpoint the hostNetwork agent/responder dial. Empty = the
 # in-cluster kubernetes.default ClusterIP (10.96.0.1) — correct once a service
 # proxy serves it. When cozyplane is the CNI AND there is no kube-proxy, that

@@ -176,6 +176,9 @@ spec:
             - "--mtu={{ .Values.mtu }}"
             - "--geneve-port={{ .Values.genevePort }}"
             - "--cni-conf-name={{ .Values.cniConfName }}"
+            {{- if not .Values.writeCNIConf }}
+            - "--write-cni-conf=false"
+            {{- end }}
             {{- if .Values.egress.clusterCIDR }}
             # Cluster-egress masquerade: pod traffic leaving the cluster is
             # SNATed to the node address, giving pods an off-cluster return path.

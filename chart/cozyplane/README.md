@@ -48,6 +48,13 @@ most likely to set:
 - `image` — the cozyplane container image (digest-pinned by the release
   pipeline).
 - `mtu` — pod MTU (underlay MTU minus ~50 bytes of Geneve overhead).
+- `writeCNIConf` — defaults to `true`; set to `false` when the platform owns CNI
+  configuration (for example a Multus chain). This requires an agent image with
+  the `--write-cni-conf` flag. The agent leaves existing files untouched when
+  disabled. When enabled, an earlier foreign `.conf`, `.conflist` or `.json`
+  configuration keeps ownership; choosing an earlier cozyplane filename still
+  explicitly selects cozyplane as the default CNI. Configuration publication
+  uses exclusive temporary files and replaces the destination atomically.
 - `cniConfName` — the CNI conflist filename; use a low prefix such as
   `00-cozyplane.conflist` to sort ahead of a co-installed CNI (e.g. Cilium).
 - `genevePort` — override only to avoid a clash with another overlay on 6081.
