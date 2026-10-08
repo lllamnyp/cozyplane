@@ -43,6 +43,7 @@ type LocalPortVeth struct {
 	IPs     []net.IP
 	MAC     net.HardwareAddr
 	Ifindex int
+	Alias   string
 }
 
 // ListLocalPortVeths returns every local host veth carrying a rebuild alias.
@@ -64,7 +65,7 @@ func ListLocalPortVeths() ([]LocalPortVeth, error) {
 		if !ok {
 			continue
 		}
-		out = append(out, LocalPortVeth{Net: PortNet(rawNet), IPs: ips, MAC: mac, Ifindex: l.Attrs().Index})
+		out = append(out, LocalPortVeth{Net: PortNet(rawNet), IPs: ips, MAC: mac, Ifindex: l.Attrs().Index, Alias: l.Attrs().Alias})
 	}
 	return out, nil
 }

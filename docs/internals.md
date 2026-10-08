@@ -872,6 +872,15 @@ rebooted to clear bpffs ([#7](../../issues/7)). The agent now handles it:
   detach for the same reason, rather than only unlinking the pin.
   See [bringup-field-notes.md](bringup-field-notes.md) §9.
 
+- **Keep pod-hook order after peer CNI programming.** The agent revisits owned
+  pod veths every five seconds. Cozyplane runs first on tenant hooks; a peer CNI
+  runs first on the default fabric. Ordered hooks require no write. A move that
+  requires detach/re-attach first installs a pinned DROP guard, which remains
+  through failures or process interruption and is removed only after successful
+  classifier publication. Agent and CNI writers share a bounded host-file lock;
+  the reconciler verifies the scanned alias again under the lock before changing
+  a hook. Deleted-interface pins are reaped using kernel detachment evidence.
+
 - **The program pins are swapped, not re-made.** `cozyplane_from_pod` /
   `cozyplane_to_pod` are pinned **pin-aside-then-rename**, so the path is never
   absent. The CNI plugin opens them on every ADD, and a remove-then-pin gap is
