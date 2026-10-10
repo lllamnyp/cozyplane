@@ -1,3 +1,7 @@
+# One tenant API distribution per regional cluster. Never switch in-place.
+api:
+  mode: aggregated
+
 # Container image for all cozyplane components (agent, CNI plugin, controller).
 # Digest-pinned (no floating tag). Built and published by .github/workflows/
 # release.yml on every push to main; see docs/packaging.md for how the digest is
@@ -17,6 +21,7 @@ genevePort: 6081
 # low prefix (e.g. "00-cozyplane.conflist") to win over a co-installed CNI such
 # as Cilium (which ships 05-cilium.conflist).
 cniConfName: "10-cozyplane.conflist"
+writeCNIConf: true
 
 # Kube-apiserver endpoint the hostNetwork agent/responder dial. Empty = the
 # in-cluster kubernetes.default ClusterIP (10.96.0.1) — correct once a service
@@ -38,6 +43,9 @@ clusterDomain: ""
 # Cluster networking facts for pod egress to the outside world. Not reliably
 # discoverable in-cluster, so declared here.
 egress:
+  # Router for connected external IPv4 pools on a secondary link. Empty keeps
+  # the first-host convention. An explicit FIB gateway always takes priority.
+  floatingNextHopIPv4: ""
   # The cluster pod supernet(s), comma-separated for dual-stack (e.g.
   # "10.244.0.0/16,fd00:10:244::/56"). Enables the cluster-egress masquerade
   # (pods get an off-cluster return path) and is denied to VPC tenants at
@@ -52,8 +60,69 @@ egress:
   # (:53 only), so tenant pods resolve with a stock resolv.conf.
   clusterDNS: "10.96.0.10"
   # Additional cluster-internal networks VPC tenants must not reach through
-  # their gateways (e.g. the node/management network).
+  # their gateways (e.g. the node/management network). Also feeds the managed-VPN
+  # route-CIDR deny-set — include the node network here so it is covered.
   internalCIDRs: []
+
+# Managed VPN (issue #6, docs/vpn.md). The controller runs tunnel appliances for
+# VPNGateway/VPNConnection; these bound their placement and per-tenant scale.
+# Every appliance exposes per-connection metrics on the named `vpn-metrics`
+# port. When the VictoriaMetrics Operator VMPodScrape CRD is installed, this
+# chart automatically registers all `app=cozyplane-vpn-gateway` pods for scrape.
+vpn:
+  # Comma-separated "key=value" labels selecting a dedicated gateway node pool.
+  gatewayNodeSelector: ""
+  # Optional taint key tolerated with Exists/NoSchedule.
+  gatewayTolerationKey: ""
+  # Zero uses the controller defaults.
+  maxGatewaysPerNamespace: 0
+  maxConnectionsPerGateway: 0
+  # Opt in after the kubelet admits net.ipv4.ip_forward and
+  # net.ipv6.conf.all.forwarding as pod sysctls. Drops privileged mode and keeps
+  # only NET_ADMIN, NET_RAW and NET_BIND_SERVICE.
+  hardenedAppliance: false
+  # Prometheus-compatible VPN metrics are exposed by every tunnel appliance on
+  # its named vpn-metrics port. Resources below are rendered only when their
+  # respective operator CRDs are installed in the cluster.
+  observability:
+    podScrape:
+      # Keep appliance discovery on by default when VictoriaMetrics is present.
+      enabled: true
+      interval: 30s
+      scrapeTimeout: 10s
+      # Match the installation's VMAgent podScrapeSelector, if it has one.
+      additionalLabels: {}
+    rules:
+      enabled: true
+      # Match the installation's VMAlert ruleSelector, if it has one.
+      additionalLabels: {}
+      # Idle tunnels are valid for many installations, so this alert is opt-in.
+      noTraffic:
+        enabled: false
+        window: 30m
+    dashboard:
+      enabled: true
+      additionalLabels: {}
+      # Keep the operator's namespace boundary unless explicitly configured.
+      allowCrossNamespaceImport: false
+      # Empty matches Grafana instances in this release's namespace. When
+      # Grafana is elsewhere, opt in above and select the intended instance.
+      instanceSelector: {}
+
+# Observability (docs/observability.md). ALL OFF BY DEFAULT, matching
+# Cozystack's own posture (its Hubble ships disabled by default). Turn on only
+# what you want; each part is independent.
+observability:
+  # Per-flow events with verdicts and drop reasons: the flow_events ring buffer
+  # + flow_seen LRU in the datapath, the raw /flows loopback endpoint (read via
+  # cozyplane-flowctl), and the cozyplane_flow_* / cozyplane_flows_total series
+  # on each agent's :9411/metrics. Enabling adds ~14MiB of map memlock per node
+  # (visible in cozyplane_bpf_map_memlock_bytes).
+  flows: false
+  # DNS metrics from the split-horizon resolver: cozyplane_dns_{queries,
+  # responses}_total on the responder's :9413/metrics. Cheap (no datapath), but
+  # off by default so the node exposes no extra port unless asked.
+  dnsMetrics: false
 
 agent:
   # Bind address for the per-VPC Prometheus metrics (/metrics). The kubelet
@@ -87,6 +156,9 @@ agent:
       memory: 512Mi
 
 controller:
+  # Optional distroless control-plane image; empty uses the networking image.
+  # Agent and managed gateway image arguments always retain top-level image.
+  image: ""
   replicas: 1
   priorityClassName: system-cluster-critical
   resources:
@@ -109,11 +181,24 @@ exportPolicy:
 # before etcd, and before cozyplane's own aggregated apiserver, all of which run
 # as default-network pods.
 #
-# The tenant kinds (VPC, Port, SecurityGroup, HostFirewall, ...) are NOT CRDs.
-# They are served only by chart/cozyplane-apiserver: a group served by both a
-# CRD and an APIService makes the kube-apiserver's OpenAPI merge collide, and
-# `kubectl apply` then fails for every object in the group (docs/api-groups.md).
+# Tenant kinds use the explicit api.mode choice. CRD mode installs eleven
+# tenant CRDs and fail-closed admission; aggregated mode uses the separate
+# cozyplane-apiserver chart. Never install both for the same regional cluster.
 #
 # Disable only if you install these CRDs out-of-band.
 crds:
   enabled: true
+
+# CRD admission TLS uses cert-manager by default. An operator-provided Secret
+# requires its public CA bundle as well; skipping TLS verification is unsupported.
+admission:
+  replicas: 2
+  tls:
+    existingSecret: ""
+    caBundle: ""
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+    limits:
+      memory: 256Mi

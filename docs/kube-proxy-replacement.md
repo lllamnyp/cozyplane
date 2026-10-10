@@ -90,6 +90,10 @@ reuse plan, not a speculation.
 
 ## Architecture
 
+Security dependency checks must run inside `kpr/` as well as the main module: the parent `go test ./...` and `govulncheck ./...` exclude nested modules. KPR requires Go 1.26.8 or newer and patched dependency versions for its imported Cilium control plane, including eBPF/BTF parsing, packet decoders, gRPC, Unicode normalization, telemetry and etcd transport. Cilium v1.19.8 supports the patched eBPF library's removal of `btf.FlushKernelSpec`; keep the control plane and rebuilt socket-LB object on that same patch tag and validate the complete KPR build, tests and its separate vulnerability scan. Static symbol reachability is a review signal, not proof of a remotely exposed decoder or a live exploit.
+
+The prototype DaemonSet uses a dedicated read-only role for Services, EndpointSlices, Nodes, Pods and Namespaces. Its imported Cilium client also reads the kube-system namespace for its connection check; it needs no API mutations, Secret access or RBAC management. Additional Cilium policy controllers are disabled by the stubbed daemon configuration. Keep API discovery access supplied by Kubernetes' standard authenticated discovery role and allow only GET on `/readyz` for the client heartbeat. Node BPF/cgroup privileges remain required by this service proxy; they do not require a cluster-admin service-account token.
+
 A **new, separate Go module and binary**: `kpr/` (own `go.mod`) building
 `cozyplane-kpr`, deployed as its own DaemonSet.
 

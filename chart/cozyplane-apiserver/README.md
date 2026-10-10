@@ -12,37 +12,31 @@ etcd PKI). Splitting lets the CNI slot stay cert-manager-free and this chart
 install later, once cert-manager is up (in Cozystack: a component that
 `dependsOn` cert-manager).
 
-## The takeover
+## Exclusive distribution and bootstrap
 
-The cozyplane chart installs the group's **CRDs** (its `crds.enabled` default),
-so `sdn.cozystack.io` is served — and tenancy works — from the moment the CNI
-lands. Installing this chart creates an explicit `APIService` for
-`v1alpha1.sdn.cozystack.io`, which **atomically replaces** the CRDs' implicit
-serving of the group: from that moment every request goes to the aggregated
-server and its etcd. On a fresh cluster the CRD store is empty when that happens
-(tenants come later), so the takeover needs no migration. On a cluster with
-existing CRD-stored objects, export them first and re-apply after — the CRD
-store is not visible through the aggregated server:
+Set the same `api.mode` (`aggregated` by default, or `crd`) in both charts.
+Use one fresh regional cluster per distribution; changing a populated cluster
+in place or taking over its APIService is unsupported. The CNI chart serves
+FabricIP independently and installs tenant CRDs only in CRD mode.
 
-```sh
-kubectl get vpcs,ports,vpcbindings,vpcpeerings,securitygroups,floatingips,servicevips -A -o yaml > sdn-backup.yaml
-helm install cozyplane-apiserver ./chart/cozyplane-apiserver -n cozyplane-system
-kubectl apply -f sdn-backup.yaml
-kubectl -n <cozyplane-namespace> rollout restart deploy/cozyplane-controller ds/cozyplane-agent
-```
+Installation is deliberately two phases. Install the CNI chart first; in CRD
+mode its tenant webhook is fail-closed while the admission service is absent.
+Default-network bootstrap uses FabricIP and remains available. Install
+cert-manager next, then this chart in the same namespace and mode. In CRD mode
+this chart installs only the TLS admission service, its RBAC and certificates;
+it installs no aggregated server or dedicated etcd. In aggregated mode it
+installs the existing server/etcd distribution.
 
-(Strip `resourceVersion`/`uid`/`status` on re-apply, or use `kubectl create`.)
-
-The final restart is load-bearing: watch streams opened against the CRD serving
-survive the takeover (the kube-apiserver closes idle watches only after 30–60
-minutes), so without it the controller and agents keep watching the shadowed
-CRD store. Restart **after** the import so agent startup pruning sees a
-populated store and no-ops instead of tearing down live datapath state.
+For a standalone fixture without cert-manager, precreate a TLS Secret and pass
+the same `admission.tls.existingSecret` and public `admission.tls.caBundle` to
+both charts. No key material belongs in values or source control. See
+[CRD distribution](../../../docs/crd-distribution.md) for the required recipe
+and compatibility inventory. Never remove CRDs as a deployment shortcut.
 
 ## Requirements
 
-- cert-manager (serving certificate, etcd PKI).
-- For the production etcd: the aenix-io etcd-operator (`etcd.operator.enabled`),
+- cert-manager (serving certificates, aggregated etcd PKI), or an operator-provided admission TLS Secret for CRD mode.
+- For production aggregated etcd: the aenix-io etcd-operator (`etcd.operator.enabled`),
   replicated and PVC-backed. The default is a built-in single-pod etcd with
   emptyDir storage — dev/evaluation only; a pod reschedule erases every
   `sdn.cozystack.io` object.

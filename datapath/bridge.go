@@ -18,6 +18,7 @@ package datapath
 
 import (
 	"fmt"
+	"github.com/lllamnyp/cozyplane/internal/ipam"
 	"net"
 	"path/filepath"
 
@@ -29,7 +30,7 @@ import (
 // masquerades node->pod traffic to this address so a tenant pod never sees a
 // fabric/node address; the pod replies here and the eBPF datapath reverses it.
 // It must match linkLocalGW in the CNI plugin and LINK_LOCAL_GW in bpf/overlay.c.
-const GatewayIP = "169.254.1.1"
+const GatewayIP = ipam.BridgeIPv4
 
 // The dual-address bridge gives a VPC pod a unique fabric IP (its status.podIP,
 // from the node pod CIDR) while its interface carries the (tenant) VPC IP.
@@ -58,16 +59,32 @@ const GatewayIP = "169.254.1.1"
 // route, the entry lives and dies with the veth — the rebuild path never needs
 // to restore it.
 func AddBridge(fabricIP, vpcIP, hostVeth string, net_ uint32, podMAC net.HardwareAddr) error {
-	if err := addFabricRoute(fabricIP, hostVeth); err != nil {
-		return err
-	}
-	if err := addFabricNeigh(fabricIP, hostVeth, podMAC); err != nil {
-		return err
-	}
-	if err := setBridge(fabricIP, vpcIP, net_); err != nil {
-		return err
-	}
-	return nil
+	return withBridgeLock(func() error {
+		link, err := netlink.LinkByName(hostVeth)
+		if err != nil {
+			return err
+		}
+		raw, ips, _, valid := parseVethAlias(link.Attrs().Alias)
+		if valid {
+			matches := false
+			for _, ip := range ips {
+				matches = matches || ip.Equal(net.ParseIP(vpcIP))
+			}
+			if raw == QuarantineNet || PortNet(raw) != net_ || !matches {
+				return fmt.Errorf("bridge endpoint changed or was revoked")
+			}
+		}
+		if err := addFabricRoute(fabricIP, hostVeth); err != nil {
+			return err
+		}
+		if err := addFabricNeigh(fabricIP, hostVeth, podMAC); err != nil {
+			return err
+		}
+		if err := setBridge(fabricIP, vpcIP, hostVeth, net_); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 // addFabricNeigh pins fabricIP -> podMAC as a permanent neighbour on the veth.
@@ -101,12 +118,58 @@ func addFabricNeigh(fabricIP, hostVeth string, podMAC net.HardwareAddr) error {
 
 // DelBridge removes the fabric route and the bridges-map entry (idempotent).
 func DelBridge(fabricIP, hostVeth string) error {
-	rerr := delFabricRoute(fabricIP, hostVeth)
-	berr := delBridge(fabricIP)
-	if rerr != nil {
-		return rerr
+	return delOwnedBridge(fabricIP, hostVeth, [32]byte{})
+}
+
+// DelSandboxBridge also works after the old veth disappeared, and never acts
+// on a new sandbox which reclaimed the same address after controller GC.
+func DelSandboxBridge(fabricIP, hostVeth, containerID, ifName string) error {
+	witness := sandboxWitness(containerID, ifName)
+	if witness == ([32]byte{}) {
+		return fmt.Errorf("sandbox identity required for bridge cleanup")
 	}
-	return berr
+	return delOwnedBridge(fabricIP, hostVeth, witness)
+}
+
+func delOwnedBridge(fabricIP, hostVeth string, witness [32]byte) error {
+	return withBridgeLock(func() error {
+		owners, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "bridge_owners"), nil)
+		if err != nil {
+			return err
+		}
+		defer owners.Close()
+		key, err := addr128Str(fabricIP)
+		if err != nil {
+			return err
+		}
+		var owner overlayBridgeOwner
+		if err := owners.Lookup(key, &owner); err != nil {
+			if isNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if witness != ([32]byte{}) {
+			if owner.Sandbox != witness {
+				return nil
+			}
+		} else {
+			link, err := netlink.LinkByName(hostVeth)
+			if err != nil || uint32(link.Attrs().Index) != owner.Ifindex {
+				return nil
+			}
+		}
+		if err := delFabricRoute(fabricIP, hostVeth); err != nil {
+			return err
+		}
+		if err := delBridge(fabricIP); err != nil {
+			return err
+		}
+		if err := owners.Delete(key); err != nil && !isNotExist(err) {
+			return err
+		}
+		return nil
+	})
 }
 
 // addFabricRoute installs the /32 route fabricIP -> pod veth in the main table.
@@ -168,7 +231,7 @@ func fabricRoute(fabricIP string, ifindex int) (*netlink.Route, error) {
 // the fabric_of inverse ({net, vpcIP} -> fabricIP) the DNS steer keys on. A
 // cross-family pair (fabric-family fallback) gets no inverse: there is no
 // same-family fabric handle to rewrite a source to.
-func setBridge(fabricIP, vpcIP string, net_ uint32) error {
+func setBridge(fabricIP, vpcIP, hostVeth string, net_ uint32) error {
 	m, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "bridges"), nil)
 	if err != nil {
 		return fmt.Errorf("open pinned bridges map: %w", err)
@@ -184,8 +247,22 @@ func setBridge(fabricIP, vpcIP string, net_ uint32) error {
 		return fmt.Errorf("vpc IP: %w", err)
 	}
 	ep := overlayBridgeEp{Net: net_, VpcIp: vip}
+	owners, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "bridge_owners"), nil)
+	if err != nil {
+		return err
+	}
+	defer owners.Close()
+	link, err := netlink.LinkByName(hostVeth)
+	if err != nil {
+		return err
+	}
+	containerID, ifName := VethSandbox(link.Attrs().Alias)
+	owner := overlayBridgeOwner{Ifindex: uint32(link.Attrs().Index), Sandbox: sandboxWitness(containerID, ifName)}
 	if err := m.Put(fip, &ep); err != nil {
 		return fmt.Errorf("set bridge: %w", err)
+	}
+	if err := owners.Put(fip, &owner); err != nil {
+		return fmt.Errorf("record bridge owner: %w", err)
 	}
 
 	if sameFamily(fabricIP, vpcIP) {
@@ -216,16 +293,28 @@ func delBridge(fabricIP string) error {
 		return fmt.Errorf("fabric IP: %w", err)
 	}
 	var ep overlayBridgeEp
-	if err := m.Lookup(fip, &ep); err == nil {
-		if fm, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "fabric_of"), nil); err == nil {
+	lookupErr := m.Lookup(fip, &ep)
+	if lookupErr != nil && !isNotExist(lookupErr) {
+		return lookupErr
+	}
+	if lookupErr == nil {
+		fm, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "fabric_of"), nil)
+		if err != nil {
+			return err
+		}
+		defer fm.Close()
+		{
 			fk := overlayLocalKey{Net: ep.Net, Ip: ep.VpcIp}
 			var cur overlayAddr128
 			// Only remove the inverse if it still points at this fabric IP —
 			// a re-ADD may already have re-pointed it.
 			if err := fm.Lookup(&fk, &cur); err == nil && cur == fip {
-				_ = fm.Delete(&fk)
+				if err := fm.Delete(&fk); err != nil && !isNotExist(err) {
+					return err
+				}
+			} else if err != nil && !isNotExist(err) {
+				return err
 			}
-			fm.Close()
 		}
 	}
 	if err := m.Delete(fip); err != nil && !isNotExist(err) {

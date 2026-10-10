@@ -1,60 +1,84 @@
-/*
-Copyright 2026 The Cozyplane Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package main
 
 import (
 	"context"
-	"fmt"
+	corev1 "k8s.io/api/core/v1"
 	"log/slog"
+	"net"
+	"strings"
 	"sync/atomic"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
 	localv1alpha1 "github.com/lllamnyp/cozyplane/api/localsdn/v1alpha1"
+	"github.com/lllamnyp/cozyplane/datapath"
+	"github.com/lllamnyp/cozyplane/internal/podrepair"
 	localclientset "github.com/lllamnyp/cozyplane/pkg/generated/localsdn/clientset/versioned"
 )
 
-// A pod's FabricIP is DERIVED state, not a one-shot side effect of CNI ADD.
-//
-// `remotes` is keyed per address and fed from these objects, so a running pod
-// with no FabricIP is reachable only from its own node: every other node has no
-// entry for it and the packet is dropped. That is an outage with no local
-// symptom — the pod is Running and Ready, its own node's traffic works, and what
-// fails is every cross-node caller, including the admission webhooks in front of
-// it. Observed on the stand: eight long-lived pods lost their claims, and the
-// first sign was Helm upgrades timing out on webhooks (field notes §14).
-//
-// CNI ADD remains the allocator: it is what PICKS an address, and nothing here
-// second-guesses it. This only restores the record for an address a pod already
-// holds, which cannot race the allocator — a pod has no `status.podIP` until the
-// claim that chose it succeeded.
-//
-// Reclaiming the other direction (a claim whose pod is gone) is NOT here: the
-// controller's FabricIPReconciler already does it with a cluster-wide view, and
-// one reaper is the right number. N agents racing it would add contention and
-// no safety.
+// A Pod status address alone does not authorize reclaiming an IP. Require the
+// same address in a successfully rebuilt local endpoint, and never adopt a
+// conflicting claim. Legacy aliases repair with no invented sandbox identity.
+func healLocalFabricIPs(ctx context.Context, core kubernetes.Interface, local localclientset.Interface, node string, rebuilt []datapath.LocalFabricIP, log *slog.Logger) error {
+	ctx, cancel := context.WithTimeout(ctx, startupBestEffortTimeout)
+	defer cancel()
+	endpoints := map[string]datapath.LocalFabricIP{}
+	ambiguous := map[string]bool{}
+	for _, endpoint := range rebuilt {
+		if ip := net.ParseIP(endpoint.Address); ip != nil {
+			address := ip.String()
+			if previous, exists := endpoints[address]; exists && (previous.ContainerID != endpoint.ContainerID || previous.IfName != endpoint.IfName) {
+				ambiguous[address] = true
+			}
+			endpoints[address] = endpoint
+		}
+	}
+	candidates := make(map[string]struct{}, len(endpoints))
+	for address := range endpoints {
+		if !ambiguous[address] {
+			candidates[address] = struct{}{}
+		} else {
+			log.Warn("fabric repair refused ambiguous sandbox ownership", "address", address)
+		}
+	}
+	pods, err := podrepair.ListLocalRunningPodAddresses(ctx, core, node, candidates)
+	if err != nil {
+		return err
+	}
+	var missing, conflicts int64
+	for _, pod := range pods {
+		endpoint := endpoints[pod.Address]
+		name := localv1alpha1.FabricIPName(pod.Address)
+		existing, err := local.LocalV1alpha1().FabricIPs().Get(ctx, name, metav1.GetOptions{})
+		if err == nil {
+			if existing.Spec.PodUID != pod.UID || existing.Spec.Node != node {
+				conflicts++
+				log.Warn("fabric repair refused conflicting claim", "claim", name, "pod", pod.Namespace+"/"+pod.Name)
+			}
+			continue
+		}
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+		missing++
+		claim := &localv1alpha1.FabricIP{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{"local.sdn.cozystack.io/pod-uid": pod.UID, "local.sdn.cozystack.io/pod-namespace": pod.Namespace, "local.sdn.cozystack.io/node": node}}, Spec: localv1alpha1.FabricIPSpec{Address: pod.Address, Node: node, PodNamespace: pod.Namespace, PodName: pod.Name, PodUID: pod.UID, ContainerID: endpoint.ContainerID, IfName: endpoint.IfName}}
+		if _, err := local.LocalV1alpha1().FabricIPs().Create(ctx, claim, metav1.CreateOptions{}); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				continue
+			}
+			return err
+		}
+		fabricHealed.Add(1)
+		log.Warn("recreated missing FabricIP from rebuilt local endpoint", "address", pod.Address, "pod", pod.Namespace+"/"+pod.Name, "sandboxKnown", strings.TrimSpace(endpoint.ContainerID) != "")
+	}
+	fabricMissing.Store(missing)
+	fabricConflict.Store(conflicts)
+	return nil
+}
 
-// Gauges for the metrics endpoint. A missing claim is invisible from the pod's
-// own node, so a number is the only way this surfaces before the webhooks start
-// timing out.
 var (
 	fabricHealed   atomic.Uint64 // claims this agent re-created
 	fabricMissing  atomic.Int64  // pods on this node with an address and no claim, last pass
@@ -88,51 +112,17 @@ func healFabricIPs(ctx context.Context, client kubernetes.Interface, lc localcli
 	}
 }
 
-// healFabricIPsOnce re-creates the missing claims of this node's pods.
 func healFabricIPsOnce(ctx context.Context, client kubernetes.Interface, lc localclientset.Interface,
-	claims fabricIPGetter, nodeName string, log *slog.Logger) error {
-	pods, err := client.CoreV1().Pods("").List(ctx, metav1.ListOptions{
-		FieldSelector: "spec.nodeName=" + nodeName,
-	})
+	_ fabricIPGetter, nodeName string, log *slog.Logger, inventory ...func() ([]datapath.LocalFabricIP, error)) error {
+	read := datapath.SnapshotLocalFabricIPs
+	if len(inventory) != 0 {
+		read = inventory[0]
+	}
+	endpoints, err := read()
 	if err != nil {
-		return fmt.Errorf("list pods on %s: %w", nodeName, err)
+		return err
 	}
-
-	var missing, conflicts int64
-	for i := range pods.Items {
-		pod := &pods.Items[i]
-		for _, ip := range podFabricAddrs(pod) {
-			name := localv1alpha1.FabricIPName(ip)
-			switch existing, err := claims.Get(name); {
-			case err == nil:
-				// Held by a different pod: a genuine double allocation. Say so
-				// and leave both alone — deleting either would strand a running
-				// pod, and this agent cannot tell which claim is the honest one.
-				if existing.Spec.PodUID != "" && existing.Spec.PodUID != string(pod.UID) {
-					conflicts++
-					log.Warn("fabric IP claimed by a different pod",
-						"address", ip, "claim", name,
-						"held_by", existing.Spec.PodNamespace+"/"+existing.Spec.PodName,
-						"wanted_by", pod.Namespace+"/"+pod.Name)
-				}
-			case apierrors.IsNotFound(err):
-				missing++
-				if cerr := createFabricIP(ctx, lc, pod, ip, nodeName); cerr != nil {
-					log.Warn("re-create fabric IP", "address", ip, "pod", pod.Namespace+"/"+pod.Name, "err", cerr)
-					continue
-				}
-				fabricHealed.Add(1)
-				log.Info("re-created a missing fabric IP claim",
-					"address", ip, "pod", pod.Namespace+"/"+pod.Name,
-					"note", "the pod was unreachable from other nodes until now")
-			default:
-				return fmt.Errorf("get claim %s: %w", name, err)
-			}
-		}
-	}
-	fabricMissing.Store(missing)
-	fabricConflict.Store(conflicts)
-	return nil
+	return healLocalFabricIPs(ctx, client, lc, nodeName, endpoints, log)
 }
 
 // podFabricAddrs returns the underlay addresses a pod should hold claims for:
@@ -158,33 +148,4 @@ func podFabricAddrs(pod *corev1.Pod) []string {
 		out = append(out, pod.Status.PodIP) // older kubelets fill only the scalar
 	}
 	return out
-}
-
-// createFabricIP writes the claim CNI ADD would have written, with the same name,
-// labels and spec (cmd/cni/fabricip.go) so the two are indistinguishable to the
-// watchers and to the controller's reclaim.
-func createFabricIP(ctx context.Context, lc localclientset.Interface,
-	pod *corev1.Pod, ip, nodeName string) error {
-	fip := &localv1alpha1.FabricIP{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: localv1alpha1.FabricIPName(ip),
-			Labels: map[string]string{
-				localv1alpha1.LabelFabricPodUID:       string(pod.UID),
-				localv1alpha1.LabelFabricPodNamespace: pod.Namespace,
-				localv1alpha1.LabelFabricNode:         nodeName,
-			},
-		},
-		Spec: localv1alpha1.FabricIPSpec{
-			Address:      ip,
-			Node:         nodeName,
-			PodNamespace: pod.Namespace,
-			PodName:      pod.Name,
-			PodUID:       string(pod.UID),
-		},
-	}
-	_, err := lc.LocalV1alpha1().FabricIPs().Create(ctx, fip, metav1.CreateOptions{})
-	if apierrors.IsAlreadyExists(err) {
-		return nil // CNI ADD or another pass won the race; the record exists
-	}
-	return err
 }

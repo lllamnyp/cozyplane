@@ -1,1 +1,9 @@
 .git
+bin/
+.codex-*
+.serena
+.env
+.env.*
+!.env.example
+*.kubeconfig
+*.kubeconfig.*

@@ -18,16 +18,26 @@ limitations under the License.
 
 package v1alpha1
 
+import (
+	types "k8s.io/apimachinery/pkg/types"
+)
+
 // PortStatusApplyConfiguration represents a declarative configuration of the PortStatus type for use
 // with apply.
 //
 // PortStatus is the controller-observed state of a Port.
 type PortStatusApplyConfiguration struct {
-	// Groups is the set of SecurityGroup numeric ids (1..63, within the Port's
+	// Groups is the set of SecurityGroup numeric ids (1..62, within the Port's
 	// VPC) this Port is a member of, resolved by the controller from the pod's
 	// labels. The agent folds it into the datapath membership bitmap. Empty
 	// means "no groups" — legacy allow-all intra-VPC ingress.
+	// Zero denotes a selected group awaiting allocation: default-deny without
+	// granting rules. Resolved groups still union their permissions normally.
 	Groups []int32 `json:"groups,omitempty"`
+	// GroupRefs proves the current SecurityGroup UID behind each allocated ID.
+	GroupRefs []SecurityGroupMembershipApplyConfiguration `json:"groupRefs,omitempty"`
+	// GroupPodUID identifies the pod whose labels resolved this membership.
+	GroupPodUID *types.UID `json:"groupPodUID,omitempty"`
 }
 
 // PortStatusApplyConfiguration constructs a declarative configuration of the PortStatus type for use with
@@ -43,5 +53,26 @@ func (b *PortStatusApplyConfiguration) WithGroups(values ...int32) *PortStatusAp
 	for i := range values {
 		b.Groups = append(b.Groups, values[i])
 	}
+	return b
+}
+
+// WithGroupRefs adds the given value to the GroupRefs field in the declarative configuration
+// and returns the receiver, so that objects can be build by chaining "With" function invocations.
+// If called multiple times, values provided by each call will be appended to the GroupRefs field.
+func (b *PortStatusApplyConfiguration) WithGroupRefs(values ...*SecurityGroupMembershipApplyConfiguration) *PortStatusApplyConfiguration {
+	for i := range values {
+		if values[i] == nil {
+			panic("nil value passed to WithGroupRefs")
+		}
+		b.GroupRefs = append(b.GroupRefs, *values[i])
+	}
+	return b
+}
+
+// WithGroupPodUID sets the GroupPodUID field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the GroupPodUID field is set to the value of the last call.
+func (b *PortStatusApplyConfiguration) WithGroupPodUID(value types.UID) *PortStatusApplyConfiguration {
+	b.GroupPodUID = &value
 	return b
 }

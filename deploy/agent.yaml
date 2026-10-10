@@ -10,6 +10,10 @@ kind: ClusterRole
 metadata:
   name: cozyplane-agent
 rules:
+  # The CNI verifies persistent launcher ownership against the current VMI UID.
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachineinstances"]
+    verbs: ["get"]
   # The agent learns every node's addresses and readiness from Node objects, and
   # patches its OWN node with what only its FIB knows: the address host traffic
   # sources from (cozyplane.io/node-addresses). Without `patch` it is a silent
@@ -50,6 +54,12 @@ rules:
   # The CNI plugin (same SA) also reads them to give a gateway pod its VPC leg.
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcgateways"]
+    verbs: ["get", "list", "watch"]
+  # VPNGateways: the agent merges their status.routes (the connections' remote
+  # CIDRs toward the appliance leg) into the per-VPC route table
+  # (issue #6, docs/vpn.md §3.2).
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpngateways"]
     verbs: ["get", "list", "watch"]
   # VPCPeering halves: the agent programs the peers map from mutually-matched
   # specs (not status), so it only needs to observe them.
@@ -192,6 +202,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # DNS observability (docs/observability.md §D): opt-in. Set to "1"
+            # to serve cozyplane_dns_* on :9413; unset disables it (and the port).
+            - name: COZYPLANE_DNS_METRICS
+              value: "1"
             # CLUSTER_DOMAIN is autodetected from the kubelet-written search
             # path (dnsPolicy: ClusterFirstWithHostNet); set it to override.
             # Forward external names to the node's own upstreams, not the

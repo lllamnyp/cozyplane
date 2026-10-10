@@ -34,6 +34,7 @@ import (
 	"net"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
@@ -44,6 +45,29 @@ import (
 
 // TTL for authoritative answers, matching CoreDNS's kubernetes-zone default.
 const ttl = 5
+
+const (
+	MaxEndpoints     = 4096
+	MaxEndpointWork  = 65536
+	MaxServicePorts  = 4096
+	maxAnswerRecords = 4096
+)
+
+type answerBudget struct {
+	bytes   int
+	records int
+}
+
+func (b *answerBudget) add(section *[]dns.RR, record dns.RR) bool {
+	size := dns.Len(record)
+	if b.records >= maxAnswerRecords || size > dns.MaxMsgSize-b.bytes {
+		return false
+	}
+	b.bytes += size
+	b.records++
+	*section = append(*section, record)
+	return true
+}
 
 // Endpoint is one backend of a headless Service, already resolved to a Port
 // of the querying VPC.
@@ -64,7 +88,8 @@ type State interface {
 	// Endpoints lists a Service's endpoints resolved to Ports of the given
 	// VPC — the structural authz: backends outside the service's attached VPC
 	// do not exist here, whatever the annotation claims.
-	Endpoints(ns, svcName string, vpc sdnv1alpha1.VPCRef) []Endpoint
+	// An incomplete or oversized view must return an error, never partial data.
+	Endpoints(ns, svcName string, vpc sdnv1alpha1.VPCRef) ([]Endpoint, error)
 	// Peers lists the VPCs actively peered with vpc (VPCPeering halves whose
 	// status is Ready — matched, both VPCs Ready, CIDRs disjoint).
 	Peers(vpc sdnv1alpha1.VPCRef) []sdnv1alpha1.VPCRef
@@ -75,9 +100,13 @@ type State interface {
 
 // Resolver serves the per-net DNS view.
 type Resolver struct {
-	Domain    string   // cluster domain, e.g. "cluster.local"
-	Upstreams []string // "host:port" forwarders for non-cluster names
-	State     State
+	Domain     string   // cluster domain, e.g. "cluster.local"
+	Upstreams  []string // "host:port" forwarders for non-cluster names
+	State      State
+	Metrics    *DNSMetrics // optional; nil disables DNS observability
+	queryMu    sync.Mutex
+	queryTotal int
+	queryVPC   map[sdnv1alpha1.VPCRef]int
 }
 
 // ServeDNS implements dns.Handler.
@@ -97,17 +126,57 @@ func (r *Resolver) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	port := r.State.PortByFabricIP(canonIP(host))
 	if port == nil {
 		// Not a datapath-steered VPC query (someone dialed the node address
-		// directly): refuse rather than leak any view.
+		// directly): refuse rather than leak any view. Not a tenant query, so
+		// not metered.
 		r.reply(w, req, r.refused(req))
 		return
 	}
 
-	zone := dns.Fqdn(r.Domain)
-	if dns.IsSubDomain(zone, qname) {
-		r.reply(w, req, r.authoritative(req, q, qname, port))
+	// A steered VPC query: metered, attributed to the querying VPC (the only
+	// identity here — never the domain name).
+	vpc := port.Spec.VPCRef
+	r.Metrics.Query(q.Qtype, vpc)
+	if !r.acquireQuery(vpc) {
+		resp := r.failed(req)
+		r.reply(w, req, resp)
+		r.Metrics.Response(resp.Rcode, vpc)
 		return
 	}
-	r.forward(w, req)
+	defer r.releaseQuery(vpc)
+
+	zone := dns.Fqdn(r.Domain)
+	if dns.IsSubDomain(zone, qname) {
+		resp := r.authoritative(req, q, qname, port)
+		r.reply(w, req, resp)
+		r.Metrics.Response(resp.Rcode, vpc)
+		return
+	}
+	resp := r.forward(w, req)
+	r.Metrics.Response(resp.Rcode, vpc)
+}
+
+func (r *Resolver) acquireQuery(vpc sdnv1alpha1.VPCRef) bool {
+	r.queryMu.Lock()
+	defer r.queryMu.Unlock()
+	if r.queryTotal >= 256 || r.queryVPC[vpc] >= 16 {
+		return false
+	}
+	if r.queryVPC == nil {
+		r.queryVPC = map[sdnv1alpha1.VPCRef]int{}
+	}
+	r.queryTotal++
+	r.queryVPC[vpc]++
+	return true
+}
+
+func (r *Resolver) releaseQuery(vpc sdnv1alpha1.VPCRef) {
+	r.queryMu.Lock()
+	defer r.queryMu.Unlock()
+	r.queryTotal--
+	r.queryVPC[vpc]--
+	if r.queryVPC[vpc] == 0 {
+		delete(r.queryVPC, vpc)
+	}
 }
 
 // authoritative answers a cluster-domain name for the querying Port's VPC.
@@ -115,6 +184,7 @@ func (r *Resolver) authoritative(req *dns.Msg, q dns.Question, qname string, por
 	m := new(dns.Msg)
 	m.SetReply(req)
 	m.Authoritative = true
+	budget := &answerBudget{bytes: m.Len()}
 
 	// Strip the zone and dissect: <svc>.<ns>.svc | <host>.<svc>.<ns>.svc |
 	// _<port>._<proto>.<svc>.<ns>.svc. Anything else in the cluster domain is
@@ -153,6 +223,9 @@ func (r *Resolver) authoritative(req *dns.Msg, q dns.Question, qname string, por
 	if svcVPC != port.Spec.VPCRef && !containsVPC(r.State.Peers(port.Spec.VPCRef), svcVPC) {
 		return r.nxdomain(m)
 	}
+	if len(svc.Spec.Ports) > MaxServicePorts {
+		return r.failed(req)
+	}
 	// A non-headless attached Service resolves to its ServiceVIP — the
 	// ClusterIP-equivalent allocated from the VPC's own space, load-balanced
 	// by the datapath. The cluster ClusterIP never appears inside a tenant.
@@ -164,29 +237,42 @@ func (r *Resolver) authoritative(req *dns.Msg, q dns.Question, qname string, por
 		}
 		if srvProto != "" {
 			for _, p := range svc.Spec.Ports {
+				if p.Port < 1 || p.Port > 65535 {
+					continue
+				}
 				if !strings.EqualFold(p.Name, srvPort) || !strings.EqualFold(string(p.Protocol), srvProto) {
 					continue
 				}
 				if q.Qtype == dns.TypeSRV || q.Qtype == dns.TypeANY {
-					m.Answer = append(m.Answer, &dns.SRV{
+					if !budget.add(&m.Answer, &dns.SRV{
 						Hdr:    dns.RR_Header{Name: req.Question[0].Name, Rrtype: dns.TypeSRV, Class: dns.ClassINET, Ttl: ttl},
 						Weight: 100,
 						Port:   uint16(p.Port),
 						Target: dns.Fqdn(fmt.Sprintf("%s.%s.svc.%s", svcName, ns, r.Domain)),
-					})
+					}) {
+						return r.failed(req)
+					}
 				}
 				if rr := addrRecord(dns.Fqdn(fmt.Sprintf("%s.%s.svc.%s", svcName, ns, r.Domain)), dns.TypeA, vip); rr != nil {
-					m.Extra = append(m.Extra, rr)
+					if !budget.add(&m.Extra, rr) {
+						return r.failed(req)
+					}
 				}
 				if rr := addrRecord(dns.Fqdn(fmt.Sprintf("%s.%s.svc.%s", svcName, ns, r.Domain)), dns.TypeAAAA, vip); rr != nil {
-					m.Extra = append(m.Extra, rr)
+					if !budget.add(&m.Extra, rr) {
+						return r.failed(req)
+					}
 				}
 			}
 		} else {
-			addAddr(m, q, req.Question[0].Name, vip)
+			if !addAddr(m, budget, q, req.Question[0].Name, vip) {
+				return r.failed(req)
+			}
 		}
 		if len(m.Answer) == 0 {
-			m.Ns = append(m.Ns, r.soa())
+			if !budget.add(&m.Ns, r.soa()) {
+				return r.failed(req)
+			}
 		}
 		return m
 	}
@@ -194,7 +280,10 @@ func (r *Resolver) authoritative(req *dns.Msg, q dns.Question, qname string, por
 	// Backends resolve within the service's own VPC (for a peered query, the
 	// peer's Ports — reachable natively, and unambiguous because peered CIDRs
 	// are disjoint by construction).
-	eps := r.State.Endpoints(ns, svcName, svcVPC)
+	eps, err := r.State.Endpoints(ns, svcName, svcVPC)
+	if err != nil || len(eps) > MaxEndpoints {
+		return r.failed(req)
+	}
 	if !svc.Spec.PublishNotReadyAddresses {
 		ready := eps[:0]
 		for _, e := range eps {
@@ -208,11 +297,15 @@ func (r *Resolver) authoritative(req *dns.Msg, q dns.Question, qname string, por
 	owner := req.Question[0].Name // preserve the client's case
 	switch {
 	case srvProto != "":
-		r.answerSRV(m, q, owner, svc, eps, srvPort, srvProto)
+		if !r.answerSRV(m, budget, q, owner, svc, eps, srvPort, srvProto) {
+			return r.failed(req)
+		}
 	case hostname != "":
 		for _, e := range eps {
 			if e.Hostname == hostname {
-				addAddr(m, q, owner, e.IP)
+				if !addAddr(m, budget, q, owner, e.IP) {
+					return r.failed(req)
+				}
 			}
 		}
 		if !hasHostname(eps, hostname) {
@@ -220,13 +313,20 @@ func (r *Resolver) authoritative(req *dns.Msg, q dns.Question, qname string, por
 		}
 	default:
 		for _, e := range eps {
-			addAddr(m, q, owner, e.IP)
+			if !addAddr(m, budget, q, owner, e.IP) {
+				return r.failed(req)
+			}
 		}
 		if q.Qtype == dns.TypeSRV {
 			// Bare-name SRV: one record per endpoint x declared port.
 			for _, e := range eps {
 				for _, p := range svc.Spec.Ports {
-					m.Answer = append(m.Answer, srvRecord(owner, e, uint16(p.Port), r.Domain, svcName, ns))
+					if p.Port < 1 || p.Port > 65535 {
+						continue
+					}
+					if !budget.add(&m.Answer, srvRecord(owner, e, uint16(p.Port), r.Domain, svcName, ns)) {
+						return r.failed(req)
+					}
 				}
 			}
 		}
@@ -234,31 +334,43 @@ func (r *Resolver) authoritative(req *dns.Msg, q dns.Question, qname string, por
 	if len(m.Answer) == 0 {
 		// The name exists (the service is attached) but yields no records of
 		// this type: NODATA, not NXDOMAIN, so negative caching stays correct.
-		m.Ns = append(m.Ns, r.soa())
+		if !budget.add(&m.Ns, r.soa()) {
+			return r.failed(req)
+		}
 	}
 	return m
 }
 
 // answerSRV handles the _port._proto.<svc>... form.
-func (r *Resolver) answerSRV(m *dns.Msg, q dns.Question, owner string, svc *corev1.Service, eps []Endpoint, srvPort, srvProto string) {
+func (r *Resolver) answerSRV(m *dns.Msg, budget *answerBudget, q dns.Question, owner string, svc *corev1.Service, eps []Endpoint, srvPort, srvProto string) bool {
 	for _, p := range svc.Spec.Ports {
+		if p.Port < 1 || p.Port > 65535 {
+			continue
+		}
 		if !strings.EqualFold(p.Name, srvPort) || !strings.EqualFold(string(p.Protocol), srvProto) {
 			continue
 		}
 		for _, e := range eps {
 			if q.Qtype == dns.TypeSRV || q.Qtype == dns.TypeANY {
-				m.Answer = append(m.Answer, srvRecord(owner, e, uint16(p.Port), r.Domain, svc.Name, svc.Namespace))
+				if !budget.add(&m.Answer, srvRecord(owner, e, uint16(p.Port), r.Domain, svc.Name, svc.Namespace)) {
+					return false
+				}
 			}
 			// Additional section: the target's address records.
 			hdrName := targetName(e, r.Domain, svc.Name, svc.Namespace)
 			if rr := addrRecord(hdrName, dns.TypeA, e.IP); rr != nil {
-				m.Extra = append(m.Extra, rr)
+				if !budget.add(&m.Extra, rr) {
+					return false
+				}
 			}
 			if rr := addrRecord(hdrName, dns.TypeAAAA, e.IP); rr != nil {
-				m.Extra = append(m.Extra, rr)
+				if !budget.add(&m.Extra, rr) {
+					return false
+				}
 			}
 		}
 	}
+	return true
 }
 
 func targetName(e Endpoint, domain, svc, ns string) string {
@@ -287,9 +399,9 @@ func addrRecord(name string, qtype uint16, ip net.IP) dns.RR {
 	return nil
 }
 
-func addAddr(m *dns.Msg, q dns.Question, owner string, ip net.IP) {
+func addAddr(m *dns.Msg, budget *answerBudget, q dns.Question, owner string, ip net.IP) bool {
 	if q.Qtype != dns.TypeA && q.Qtype != dns.TypeAAAA && q.Qtype != dns.TypeANY {
-		return
+		return true
 	}
 	qtype := q.Qtype
 	if qtype == dns.TypeANY {
@@ -299,8 +411,9 @@ func addAddr(m *dns.Msg, q dns.Question, owner string, ip net.IP) {
 		}
 	}
 	if rr := addrRecord(owner, qtype, ip); rr != nil {
-		m.Answer = append(m.Answer, rr)
+		return budget.add(&m.Answer, rr)
 	}
+	return true
 }
 
 func hasHostname(eps []Endpoint, hostname string) bool {
@@ -333,7 +446,9 @@ func containsVPC(refs []sdnv1alpha1.VPCRef, want sdnv1alpha1.VPCRef) bool {
 
 // forward relays a non-cluster name to the node's upstream resolvers over the
 // same transport the client used, returning the first response.
-func (r *Resolver) forward(w dns.ResponseWriter, req *dns.Msg) {
+// forward relays a non-cluster name upstream and returns the reply it sent, so
+// the caller can meter its rcode.
+func (r *Resolver) forward(w dns.ResponseWriter, req *dns.Msg) *dns.Msg {
 	proto := "udp"
 	if _, ok := w.RemoteAddr().(*net.TCPAddr); ok {
 		proto = "tcp"
@@ -346,11 +461,12 @@ func (r *Resolver) forward(w dns.ResponseWriter, req *dns.Msg) {
 		}
 		in.Id = req.Id
 		r.reply(w, req, in)
-		return
+		return in
 	}
 	m := new(dns.Msg)
 	m.SetRcode(req, dns.RcodeServerFailure)
 	r.reply(w, req, m)
+	return m
 }
 
 func (r *Resolver) nxdomain(m *dns.Msg) *dns.Msg {
@@ -363,6 +479,12 @@ func (r *Resolver) nxdomain(m *dns.Msg) *dns.Msg {
 func (r *Resolver) refused(req *dns.Msg) *dns.Msg {
 	m := new(dns.Msg)
 	m.SetRcode(req, dns.RcodeRefused)
+	return m
+}
+
+func (r *Resolver) failed(req *dns.Msg) *dns.Msg {
+	m := new(dns.Msg)
+	m.SetRcode(req, dns.RcodeServerFailure)
 	return m
 }
 

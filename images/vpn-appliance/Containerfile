@@ -1,0 +1,5 @@
+# syntax=docker/dockerfile:1
+# OCI wrapper for the bootable disk assembled by build-containerdisk.sh.
+# KubeVirt containerDisk requires the boot disk at /disk/disk.img.
+FROM scratch
+COPY disk.img /disk/disk.img

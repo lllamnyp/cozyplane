@@ -311,10 +311,17 @@ only tenant-relevant read that existed beforehand was a cluster-scoped one.
    its eleventh ConfigMap. And it is a real quota, not a gate: observed usage is
    written back to `status.used`.
 
-   **Usage is counted by LISTing through the loopback client, not a shared
-   informer.** kube-apiserver trades exactness for cheapness there; staleness in a
-   quota means over-admission. Creates here are rare — a tenant makes a VPC, not a
-   VPC per request — so we buy exactness at a price nobody pays.
+   The stock admission plugin checks ResourceQuota.status.used and charges
+   each admitted create. It does not call the registered evaluator usage lister
+   on each request. Its external quota usage controller maintains the observed
+   counts; the registered live lister is available for explicit UsageStats
+   calls and must not be confused with a per-create freshness guarantee.
+
+   The registered usage lister reads pages of 128, within a 65,536-object/page
+   budget and a 30-second deadline. It retains only name, namespace and UID,
+   discarding tenant specs and annotations. Any list, continuation or budget
+   error returns no partial count to its caller. These bounds harden that helper;
+   they do not change the stock admission plugin's accounting or cache behavior.
 
    **Deliberately not quota'd:** `Port` (one per pod — pods are *already* the unit
    Kubernetes quotas) and `ServiceVIP` (one per attached Service — `count/services`

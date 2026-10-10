@@ -1,3 +1,7 @@
+> Validation scope: lab results and earlier source hashes below describe their
+> original branches. They do not certify this combined integration. Its current
+> build, race, kernel and deployment checks are recorded separately.
+
 # cozyplane — roadmap
 
 A living checklist of what is built and what is outstanding. It complements the
@@ -7,13 +11,167 @@ design docs (`design.md`, `control-plane.md`, `internals.md`, `live-migration.md
 **How to read it.** A ticked box is merged on `main` and exercised by the e2e
 suite or validated on a real cluster; where a real-cluster validation happened
 it's noted. An unticked box is planned work; where a GitHub issue tracks it, the
-number is linked (e.g. [#7](../../issues/7)). Keep this file honest — tick a box
+number is linked (e.g. [#7](../../issues/7)). Security-audit checkboxes added during the local audit record verified working-tree behavior; they do not imply a commit, merge, or deployment. Keep this file honest — tick a box
 only when the thing actually works end to end, and add outstanding items here as
 they're discovered rather than leaving them only in issues.
 
 ---
 
+- [x] Local extended IPsec tunnel validation: dedicated Debian KVM guest under
+  Docker Desktop with XFRM interfaces, real IKEv2 peers, IPv4/IPv6, multi-VPC
+  authorization, 1/8/16-peer load, ten-minute soak, impairment/recovery, rekey,
+  certificate/EAP pools, credential revocation and appliance failover. Review
+  fixes and ordinary cleanup passed on the final image/kernel; see
+  `test/ipsec-validation.md` for phase-specific provenance, losses and kernel/
+  availability limits. This tick records working-tree validation only.
+- [ ] Qualify IPsec on a real external cluster/provider and native Windows
+  IKEv2 clients; merge remains outstanding.
+- [x] Local VPN monitoring contract: WireGuard/IPsec exposition, VictoriaMetrics
+  HTTP ingestion, HA aggregation, missing-target/family/dependency alerts and
+  Grafana queries tested; see `test/vpn-monitoring-validation.md`. Working-tree
+  validation only; real VMAgent/VMAlert/Grafana selection remains to verify.
+
+- [ ] WireGuard workstation backend: stable client pools, per-connection VPC grants,
+  public client configuration and confirmed revocation implemented locally.
+  Docker Desktop integration, native Windows application traffic, 1/8/16-client
+  load, ten-minute soak, packet impairment and adversarial review passed; see
+  `test/wireguard-client-validation.md` for losses and availability limits.
+  Real-cluster validation and merge remain outstanding.
+
+- [x] Security audit SEC223: bound FloatingIP admission, legacy index keys and status diagnostics; verify ownership-preserving withdrawal, valid recovery and agent projection. Main module Linux race/vet passed locally.
+- [x] Security audit SEC224: prevent predecessor Pod and sandbox Ports from masking or replacing current ServiceVIP backends; reuse bounded sandbox proofs and verify list-order independence. Main module Linux race/vet passed locally.
+
+- [x] Security audit SEC217: reproduce generic-store metadata diagnostic amplification; reject the first malformed entry before aggregation, preserve existing hooks and valid metadata, and verify all resources and `/status` stores behaviorally.
+- [ ] Security audit SEC218: reproduce request-option diagnostic amplification through the actual Kubernetes HTTP handlers; reject malformed field managers before body reads/SDK validation while preserving standard authentication, authorization, APIStatus and valid options.
+
+- [x] Security audit SEC188: reproduce route saturation with real packets and prevent incomplete routing snapshots from falling back to cleartext NAT; verify unresolved next hops, receive-side route precedence and recovery.
+- [x] Security audit SEC189: preserve explicit VPN route precedence at the Geneve receive hook when a default gateway is co-located; verify actual destination MAC and unavailable-next-hop drops in both families.
+- [x] Security audit SEC190: verify accepted VPN prefixes remain blackhole routes while the appliance has no Ready Port, rather than disappearing from controller status and allowing ordinary egress.
+- [x] Security audit SEC191: verify quota/input rejection retains previously accepted VPN prefixes as blackholes after draining appliance authorization; reproduce the status transition before qualifying the fix.
+- [x] Security hardening 192: verify an explicit remote route fails closed when Geneve transport configuration is absent, with a positive encapsulation control in both families.
+- [x] Security audit SEC193: bound actual-cache VPN peer copies to configured quota plus one overflow witness, excluding terminating peers before the limit; verify complete fitting-set recovery and cache independence.
+
+- [x] Security audit: guard whole NetworkPolicy and SecurityGroup updates so failed identity/membership insertion cannot revert an endpoint to allow; test real map exhaustion, replacement and recovery in the kernel.
+
+- [x] Security audit: verify same-sandbox ordinary CNI ADD concurrency and rollback; bound any host serialization resources and wait.
+
+- [x] Security audit: measure guest listener Port candidate work and scope current lister reads to local VNI/IP claims.
+- [x] Security audit: verify and bound stalled live SDN requests during sever acknowledgement, preserving the address barrier and parent context.
+- [x] Security audit: reproduce retained Port notifications during sever acknowledgement stalls; coalesce API work while preserving immediate proven-owner quarantine and unrelated routes.
+- [x] Security audit: verify revocation recovery without new events when SDK resync is disabled; retry sever acknowledgements and forwarding grants through their coalesced workers.
+- [x] Security audit: reproduce cumulative legacy ownership delays during binding withdrawal; bound a complete legacy phase and preserve current consent at publication.
+- [x] Security audit: confirm current consent after a protected legacy ownership read; preserve replacement endpoints and verify attachment withdrawal and scoped recovery in the kernel.
+- [x] Security audit: verify best-effort startup request lifetime for DNS discovery, node-address advertisement and missing-FabricIP repair with real stalled HTTP requests.
+- [x] Security audit: verify native VPC delivery when an address equals a fabric/global alias; retain SecurityGroups, owner scopes and sanctioned host/resolver paths. Local real-kernel and global race tests passed; no existing-cluster deployment.
+- [x] Security audit: verify VPC fabric-route reconstruction when fabric and VPC addresses coincide; real IPv4/IPv6 route, pinned-map rebuild/revocation controls and full global race/vet validation passed locally.
+- [x] Security audit: bound startup FabricIP repair Pod snapshots and skip reads without rebuilt candidates; actual SDK HTTP behavior/allocations and full Linux agent/IPAM race suites plus vet verified locally.
+- [x] Security audit: verify stalled Pod requests in shared legacy ownership joins outside guest cutover.
+- [x] Security audit: verify forwarding grant updates with mixed proven and uncertain legacy endpoints.
+- [x] Security audit: verify mixed UID-owned and uncertain legacy endpoints during revocation; preserve partial quarantine and address barriers.
+- [x] Security audit: verify proven-owner revocation during core API failure and preserve legacy ownership requirements.
+- [x] Security audit: verify migration FabricIP joins; scope target/legacy claim retrieval by local node, consumer namespace and full container ID.
+- [x] Security audit: bound guest-announcement API stalls; retain the per-Port listener through bounded cutover work and verify child cancellation with a real HTTP client.
+- [x] Security audit: scope bulk revocation FabricIP claim retrieval by Pod UID and full sandbox/interface and measure copied rows and allocations.
+- [x] Security audit: bound repeated migration source-forward scheduling and timer/goroutine retention by current forwarding entries and verify expiry ownership.
+- [x] Security audit: bound Pod-label snapshots before serialization in CNI and VM cutover writers; preserve complete selector identity and pinned IP/MAC.
+- [x] Security audit: protect pod-namespace interfaces from stale DEL when a namespace path is reused; verify live host peer sandbox ownership.
+
 ## Immediate roadmap — what's genuinely open
+
+### CRD distribution and security follow-up — 2026-10-06
+
+- [ ] Merge the optional distroless control-plane target and chart image
+  selection. Private amd64/arm64 builds and scans passed; the controller and
+  admission ran on the Talos lab. Retain Debian for networking's external tools.
+- [ ] Review and publish the full `api.mode: crd` distribution, eleven generated
+  tenant schemas, shared admission strategies, TLS rotation and matching
+  two-phase PackageSource variants. Seventeen actual API cases passed on the
+  three-node Talos lab, including webhook outage/recovery and normal cleanup.
+  Review/merge and the required CRD CI lane remain open.
+- [ ] Complete regional certification beyond the acquired lab proofs: IPv4/IPv6
+  intra-VPC, split-horizon DNS, ServiceVIP, IPv4 Internet and FloatingIP closure,
+  directed peering revocation, automatic DHCPv6, VM migration and restart.
+  The lab's IPv4 DNS/underlay cannot certify native IPv6 DNS or Internet.
+- [ ] Adopt the published, scanned image pins in the release CI. Private lab
+  control-plane source `88423a3` and networking source `8146dce` were pulled
+  and exercised; the standard lab CI does not yet build the separate distroless
+  target. Unit/race checks and the global gosec scan passed. Short idle/load
+  memory windows do not certify absence of a long-running heap leak.
+
+- [x] SecurityGroup reference budgets: bound admission and legacy controller,
+  cache and agent consumers before hashing/lookup; preserve cleanup, immutable
+  VPC anchors and unrelated tenants' policies (SEC-226).
+
+- [x] ServiceVIP candidate lookup: replace the whole-VPC Port copy with bounded
+  indexed Pod candidates; verify current-generation/sandbox fences, missing-index
+  refusal, retarget/deletion, and a cache dataset exceeding 250 MiB (SEC-225).
+
+- [x] Security audit: verify and enforce concurrent first-allocation uniqueness for a persistent VM NIC across nodes; preserve one pinned IP/MAC and staged target binding.
+
+- [x] Security audit: coalesce agent metrics collection into an immutable one-second response snapshot; verify burst collection counts, refresh, failure retries and bounded response size.
+
+- [x] Security audit: exclude malformed/oversized legacy VPCs from peering grants and network delivery replay so they cannot retain unrelated historical routes; verify informer replay and controller readiness.
+
+- [x] Security audit: bound and validate VPC CIDR input in aggregated admission and CNI; isolate oversized legacy VPCs from healthy network replay and retain legacy cleanup updates.
+
+- [x] Security audit: reclaim counters of disappeared VPC VNIs from bounded kernel maps; preserve live per-CPU values and prevent stale seeders from restoring retired scopes.
+
+- [x] Security audit: preserve a same-UID Port rebound during failed CNI ADD rollback with resourceVersion preconditions; verify conditional deletion and successful local annotation updates using fake clients.
+
+- [x] Security audit: confirm persistent VM launcher absence live before Port GC; verify delayed cache, UID ownership, failed reads, finalizer and identity preservation.
+- [x] Security audit: revoke fallback/appliance gateway projections on boundary-only changes; require effective boundary authority and preserve appliance doors without NAT allocation.
+- [x] Security audit: avoid repeated identical VPC status writes while retaining live duplicate-VNI checks and allocation/repair updates.
+- [x] Security audit: index peering controller reciprocal and VPC-event cache reads by complete current references; verify scoped copies, retarget, deletion and consent.
+- [x] Security audit: remove quadratic CIDR overlap reparsing shared by peering agent/controller/responder; verify parity against pairwise definition and measure actual allocations.
+- [x] Security audit: reap terminal Pod FabricIP and ephemeral Port claims even while Pod history remains; verify live reader confirmation, nonterminal preservation and VM identity exemption.
+- [x] Security audit: scope fallback Gateway reconciliation to the current VPC boundary index; verify copied rows and oldest-first withdrawal/recovery with fake clients.
+- [x] Security audit: index VPN credential Secret notifications by namespace/current reference; verify scoped copies, all authentication modes, reference removal and deletion revocation.
+
+- [x] Security audit: reject CNI attachment/claim/rebind against a terminating or unassigned VPC before mutation; fake-client resolution and persistent identity preservation verified locally with real CNI veth tests enabled.
+
+- [x] Security audit: require current VPC/VNI and non-terminating canonical Port claims in the gateway map; real informers with a fake clientset locally verify VPC deletion/recreation and claim recovery.
+
+- [x] Security audit: bound VPN pool/DNS/BGP and per-connection prefix admission before validation loops, and apply gateway collection preflight to legacy objects; real validator benchmark and boundary/refusal tests verified locally.
+
+- [x] Security audit: preflight managed VPN prefix input before configuration, check quotas before expansion/filtering and bound rejection diagnostics; local fake-client tests verify authorization withdrawal and recovery.
+
+- [x] Security audit: stop VPNConnection status observations from immediately scheduling another appliance poll; fake-client status reflection and real workqueue tests retain config/deletion/retarget notifications locally.
+
+- [x] Security audit: index VPN VPC/Port notifications and peer lookups by current references; local fake-client tests verify scoped copies, retarget/deletion and keep live quota checks.
+
+- [x] Security audit: withdraw owned VPN appliance/grant/endpoints on VPNGateway or VPC deletion start, observe VPC lifecycle, and locally verify creation refusal and existing authorization cleanup.
+
+- [x] Security audit: scope VPCGateway conflict and VPC/Port event cache lookups to the referenced VPC; fake indexed client verifies copied rows, unrelated gateway exclusion and reference changes locally.
+
+- [x] Security audit: withdraw ingress/NAT and retire owned gateway resources when a VPC starts deleting; verified locally with projection and fake-client lifecycle tests, without deployment or commit.
+
+- [x] Security audit: index route/appliance Pod notifications by selector namespaces and match labels; verify scoped cache rows, cross-namespace selection and label-removal events.
+
+- [x] Security audit: index FloatingIP conflict/event lookups by scoped target and reconcile Ready contenders on retarget; verify event fan-out and copied rows with fake cache indexes.
+
+- [x] Security audit: share FloatingIP oldest-binding arbitration between controller and agent; reject stale losing status, normalize targets and verify pending winner/deletion promotion.
+
+- [x] Security audit: withdraw stale FloatingIP SNAT on retarget and reconcile both map directions including orphan reverse entries; verify real kernel maps, ownership and capacity refusal.
+
+- [x] Security audit: verify current live VPC/VNI and canonical non-terminating target claims for FloatingIP controller and agent; test recreation/deletion and preserve cluster-wide delivery.
+
+- [x] Security audit: remove recursive EndpointSlice family replacement through a stale informer cache; test FloatingIP/NAT replacement and ownership conflicts.
+
+- [x] Security audit: enforce current VPC claims in managed VPN single/active-active appliance resolution; verify legitimate ownership chain and stale VNI/address/deletion.
+
+- [x] Security audit: bound controller route inputs/work/diagnostics and index candidate Ports by pod identity; verify refusal, recovery and benchmark actual resolution.
+
+- [x] Security audit: scope VPC/VPN route projection to the gateway's current live VPC VNI and canonical Port claims; verify stale VNI/ref/address and deletion with actual informers.
+
+- [x] Security audit: enforce the sole VPC boundary for explicit routes in controller and agent, and prevent losing gateways from clearing the winning appliance door; test promotion and stale status.
+
+- [x] Security audit: resolve VPC route/appliance next hops only from current pod-UID and VPC-VNI claims; test predecessor, deletion and replacement behavior.
+
+- [x] Security audit: apply the VPN route CIDR deny-set to directly authored VPCGateway routes; verify reserved/default/invalid and configured internal prefixes with controller behavior tests.
+
+- [x] Security audit: host-firewall updates retain default-deny when map
+  synchronization fails, including first enable and partial replacement; verify
+  actual BPF ingress and egress with deliberately undersized rule maps.
 
 The sections below are the full ledger, and most of it is ticked. This is the
 short list: what is actually left, in rough priority order. Revised **2026-07-14**,
@@ -108,8 +266,9 @@ built (a tenant persona, a tenant that can see itself, a ceiling).
    `lb_ingress`, so `to_pod` sees an ordinary packet and NP applies unchanged (§6).
 4. **Per-VPC metadata endpoint + guest autoconfiguration** — design drafted in
    [vm-provisioning.md](vm-provisioning.md), awaiting review (§3).
-5. **Site-to-site VPN** ([#6](../../issues/6)) and **cross-family v4↔v6
-   translation** ([#9](../../issues/9)) — design drafts exist; neither is urgent
+5. **Site-to-site VPN** ([#6](../../issues/6)) is implemented through managed
+   WireGuard and route-based IPsec (the latter needs `CONFIG_XFRM_INTERFACE`);
+   **cross-family v4↔v6 translation** ([#9](../../issues/9)) remains a design draft
    (§3, §4).
 6. **SecurityGroup v2 leftovers**, all low priority: ICMP rules; peer-existence
    validation for peer refs; and **a real connection table to replace the TCP
@@ -220,6 +379,7 @@ split-horizon resolver already gives).
 - [x] Per-VPC traffic counters in the datapath hooks (metering/billing foundation): a PERCPU `vpc_counters` map keyed by net, `count_dir` in `from_pod` (tx) and `to_pod` (rx east-west); the agent serves them as Prometheus text on `:9411/metrics` labeled by VPC (e2e-covered) — [#2](../../issues/2)
 - [x] **North-south metering — every crossing, by the door it used** ([north-south.md](north-south.md) increment 0; closes #2's north-south half; dev-cluster-measured). `ns_packets[door][in]`/`ns_bytes[door][in]` on the same per-VPC counter, served as `cozyplane_vpc_ns_{bytes,packets}_total{...,door,direction}`. Until now the boundary was unaccounted: a tenant could pull terabytes out through a floating address or a LoadBalancer Service and cozyplane could not say it happened. The constraint that had blocked it: every door's *egress* leaves through `from_pod`, which hosts **no BPF-to-BPF callee** (its frame is ~496 of the 512-byte limit — the reason `count_dir` lives in `to_pod`), so `count_ns` is `__always_inline` on the narrow terminal paths only. Loads on 6.8 and 6.12. Also surfaced: an **in-cluster client never crosses the LB door** — socket-LB rewrites its `connect()` to the backend, so it takes the fabric bridge instead
 - [x] Netfilter made conditional (#10): cluster-egress masquerade moved to eBPF (`--masquerade=bpf` default; ct-tracked SNAT at the uplink incl. ICMP echo + errors, e2e-proved with the kernel rule absent), and the FORWARD ACCEPT installs only where kube-proxy's `KUBE-FORWARD` exists — **cozyplane touches netfilter only if the cluster's kube-proxy does**. It cannot be removed entirely under an iptables kube-proxy: ClusterIP replies must traverse the client node's conntrack — [#10](../../issues/10)
+- [ ] **Flow observability — per-flow events with verdicts and reasons** ([observability.md](observability.md), design accepted as increment 0 of its own plan): a `flow_events` ring buffer (the repo's first) + `flow_seen` LRU dedup, emission at the ~20 policy/routing drop sites (including the two isolation drops that are silent today, and the anti-spoof drop finally distinct from `sg_drops`) and per-flow allow verdicts at the `count_dir`/`count_ns` points; agent-side enrichment (VNI→VPC, address→pod via the responder's indexer pattern), raw `/flows` + `/flows/stream` on the node loopback (operator-only via `flowctl` exec), `cozyplane_flows_total{verdict,reason,direction,...}` plus `port_distribution`/`tcp_flags`/`icmp` distribution series on `:9411/metrics`, and DNS metrics from the resolver on `:9413`. Operator-only (R9); chart default off; kind-6.8 verifier is the gate. **Scope line held: no L7 HTTP/Kafka/Envoy — that is Cilium's `kubeovn-cilium` variant, which never coexists with cozyplane; only DNS is instrumented, from the resolver that already sees it**
 - [x] **Cross-node node↔pod on a spoof-guarding underlay (OCI)** — the pod's *reply* to a hostNetwork client (pod→node) fell to the kernel and left the wire pod-sourced, which OCI anti-spoofing drops; every cross-node admission webhook hung, wedging cert-manager + ~60 HRs. Fix: a `node_remotes` map (node address → its Geneve endpoint) + `from_pod` encapsulates a default-network pod's traffic to a node over the overlay (gated to the pod-veth path so the uplink-egress hook doesn't re-encap Geneve outer frames); agent learns node addresses from InternalIPs + a `cozyplane.io/node-addresses` annotation (covers multi-NIC nodes where the host sources from a non-InternalIP NIC). Also `CFG_MASQ_IP`: the cluster-egress masquerade SNATs from the **default-route** address, not the InternalIP, so a masqueraded packet is valid for the NIC it egresses (fixed pod→internet on the dev cluster). dev-cluster-validated: full platform converges (90/90 HRs). Diagnosis in [bringup-field-notes.md](bringup-field-notes.md#5-admission-webhooks-fail-cross-node--podnode-reply-un-encapsulated-fixed)
 
 ## 3. VPC features — peering, egress, floating IPs
@@ -237,8 +397,15 @@ split-horizon resolver already gives).
 - [x] **`VPCGateway` — the VPC's declared north-south boundary** ([north-south.md](north-south.md) increment 1; dev-cluster-validated deny-then-admit: refused with no gateway, refused with a gateway that declines, delivered the moment it admits — the Service unchanged throughout). A kind, not a field: `VPC.spec.egress.natGateway` was a bool on an object the tenant owns, so **a tenant granted itself internet**. Creating a gateway needed the **`attach` verb on the referenced `ExternalPool`** then (the `export`/`peer` escalation-gate pattern); both retired with the pool — address governance is Service RBAC + the allocator's scoping ([external-addresses.md](external-addresses.md)). A VPC has exactly one boundary (oldest wins; `EffectiveGateway` lives in the API package because the controller, the CNI and the agent must agree on it without coordinating). **Tenet 7 is enforced:** `vpc_ingress[net]` gates `lb_ingress`, so a `Service type=LB` can no longer open a door into a tenant's VPC just by naming its pod as a backend — refusals counted in `ns_denied[door]`, kept out of the byte meter because a refused packet did not cross
 - [x] **VPC NAT gateway in eBPF — a tenant egress identity** ([north-south.md](north-south.md) increment 2; dev-cluster-proven on the asymmetric triangle: SNAT on the pod's node, the address attracted by another, the client on a third). A VPC now leaves the cluster wearing **its own address**, drawn from its own pool — before, it was SNATed to the gateway pod's fabric IP and then re-SNATed by the cluster masquerade to the **node's**, so tenants were indistinguishable from the platform on the wire (tenet 8). The per-VPC **gateway pod is retired on the sanctioned path**: a gateway with a pool needs no pod, so no hairpin and no per-VPC SPOF. (It is *not* gone from the tree — a `nat.enabled` gateway with no `poolRef` still gets one, netns iptables and all, and still launders into the node's identity. Closing that is open work.) It could not simply be `masq_snat` with another address — that identifies a pod by its ADDRESS at the uplink, which is impossible for a VPC because tenant CIDRs overlap; the tenant is knowable only at the veth, which is what the gateway pod was really for. So the SNAT happens at the veth and the state lives on the pod's node, while the reply lands wherever the address is attracted — resolved by partitioning the port space per node (tenet 1 forbade the simpler "elect an egress node", which would have rebuilt the hairpin). `poolRef` and the `attach` verb carried the grant then; both retired with `ExternalPool` — the identity now rides owned delegated Services ([external-addresses.md](external-addresses.md))
 - [x] **The announcement layer deleted; `FloatingIP` is an EIP under the gateway** ([north-south.md](north-south.md) increment 3). Cozyplane **attracts nothing** (tenet 3): `float_announce`, `floating_arp`/`floating_ndp`, `AnnounceAddress`, the announcer election, the pool-eligibility annotation, `--floating-ha` and `ExternalPool.spec.advertisement` are all gone — that was MetalLB's L2 mode reimplemented inside a CNI. Something else must attract (a CCM assigning the address to a VNIC, MetalLB, a static route, or an address configured on a node); **delivery does not care**, because `from_uplink` runs at tc ingress ahead of the kernel's routing decision, so whichever node the address lands on finds the pod through `floating`/`nat_of` and reaches it over the overlay. A FloatingIP briefly drew from its **VPC's gateway's pool**; with `ExternalPool` deleted it mints its own delegated Service and the LB implementation allocates ([external-addresses.md](external-addresses.md)) — every external address still crosses one counted boundary (tenet 2)
-- [ ] **Inbound MTU on an encapsulated north-south path** — clamp the TCP MSS in the inbound SYN at the node that encapsulates it. Affects floating-HA's request half and `etp: Cluster` DSR identically (both Geneve-encap an external client's full-MTU packet; a v4 underlay fragments and reassembles, which works but costs). Shared, so solve once — [floating-ha.md](floating-ha.md) §7
-- [ ] Site-to-site VPN: authorized-forwarder role + per-VPC route table — [#6](../../issues/6)
+- [x] **Inbound MTU on encapsulated north-south and VPN paths** — a shared bounded TCP-option parser clamps oversized MSS on bare SYNs before FloatingIP, DSR, Geneve and VPN encapsulation. The generated object is kernel-verifier gated in CI; PMTU remains the non-TCP fallback — [floating-ha.md](floating-ha.md) §7
+- [x] **A tenant appliance can be its VPC's door** (`VPCGateway.spec.appliance`) — the other half of the firewall story, and smaller than it looked. Off-VPC traffic is delivered to `gateways[vni]` **with its destination intact**, so whatever holds that entry already receives the VPC's egress and can route it; the entry is built from Ports carrying `spec.gateway`, and only `addGatewayLeg` could set it — agent namespace, reserved `.1`. Now the VPCGateway (already the VPC's one declared boundary) names the workload, the controller moves the flag onto that workload's Port **in this VPC**, and cozyplane runs no gateway pod alongside. No CNI change, no datapath change. Receiving is not sending: emitting a foreign source stays the `export`-gated `VPCBinding.allowForwarding` (docs/multi-attach.md). Dev-cluster-validated end to end — two VPCs, an appliance with a leg in each declared the door of both, ICMP at 0% loss and TCP gated by the source VPC's egress rule *and* the destination VPC's ingress rule
+- [x] Site-to-site and roadwarrior VPN: scoped forwarder, per-VPC routes,
+  managed WireGuard/IPsec, cert/EAP pools, live status/alerts, warm standby,
+  KubeVirt live-migration form factor and active-active ECMP+BGP/BFD; managed
+  multi-VPC hub via `VPNGateway.spec.additionalVPCRefs` (one leg, binding and
+  route set per served VPC; disjointness enforced). External
+  firewall/BGP and real migration exercises remain environment validation, not
+  missing implementation — [vpn.md](vpn.md)
 - [ ] Network policy / security groups within a VPC — **v1 + peered-group refs + north-south (world) done** ([security-groups.md](security-groups.md)): east-west group-to-group ingress, destination-side eBPF (`sg_members`/`sg_rules`, TCP SYN-gate, per-VPC id allocation, membership from stamped pod labels); **peered-VPC group refs** (`from: {group, vpc}`) authoritative via a Geneve identity TLV; **north-south `from: {cidr}`** (AWS-strict default-deny, kubelet exempt by NS_MARK path; all-addresses via SG_WORLD, specific ranges via an `sg_cidr` LPM); **east-west egress** (`egress: {to: {group, vpc}}`, symmetric default-deny, `sg_egress` mirror enforced beside ingress in to_pod + the TLV path); **north-south/external egress** (`egress: {to: {cidr}}`, source-side default-deny at `from_pod`'s gateway path via a loop-free `ns_egress_ok` + `sg_egress_cidr` LPM — plus the off-VPC-transit fix so the pod→gateway hop isn't re-gated as east-west, which had silently broken all grouped-pod TCP/UDP north-south egress) — all dev-cluster-validated. **label-follows membership DONE 2026-07-12** (live pod labels, not the claim-time snapshot; the snapshot survives as the fallback for a Port with no live pod, so a persistent VM Port holds membership steady between launchers — dev-cluster-validated: relabel a running pod out of its group and back). **v2 tail DONE 2026-07-13:** `from_pod` source-IP RPF (anti-spoof — a pod can no longer forge a co-VPC neighbour's address to borrow its groups; the fix closes it on every path, since the cross-node TLV's srcmap was itself computed from the spoofable source; dev-cluster-validated by delivery-capture), overlapping north-south CIDR union across groups ([#11](../../issues/11), compiler `unionContaining`, unit-tested), and floating-pod egress gating (`ns_egress_ok` now covers the floating path too). Still outstanding (lower priority): ICMP rules, peer-existence validation for peer refs, and a real connection table to replace the TCP SYN-gate (shared with NetworkPolicy and HostFirewall — solve once for all three, not three times). FQDN egress is **rejected** — a DNS-snooping engine is out of scope
 - [ ] Per-VPC metadata endpoint + guest autoconfiguration — **design draft: [vm-provisioning.md](vm-provisioning.md)** (awaiting review; also closes #8)
 - [x] Services in a VPC: per-VPC service VIPs + split-horizon DNS + net-scoped service NAT — **design: [services-in-vpc.md](services-in-vpc.md)** (reviewed; prioritized ahead of the KPR work)
@@ -344,6 +511,45 @@ install installs nothing — [#10](../../issues/10)'s endgame.
 
 ## Open issues index
 
+- [ ] Managed-boundary DNS after socket LB: the Talos CRD recipe reproduced
+  a query translated from the cluster DNS Service IP to its internal backend
+  being dropped before split-horizon steering. Align the boundary exception
+  with that steering predicate. Regression tests reproduce the old drop in both
+  families; real Talos kernel packet tests now verify TCP/UDP rewriting and
+  denial of other management/peer/external traffic. The rebuilt networking image
+  was published, pulled and exercised on all three Talos nodes: UDP/TCP DNS and
+  IPv4/IPv6 ServiceVIP pass. Merge remains pending.
+
+- [ ] Guest IPv6 configuration through the managed boundary: narrowly allow
+  local RS and DHCPv6 before a guest has its assigned VPC source. Old-object
+  packet tests reproduce the drop; the regenerated object passes malformed
+  packet and data-traffic denials on Talos. Actual DHCPv6 assigns the pinned
+  address and IPv4/IPv6 migration passes with 60/60 replies per family.
+  Source `8146dce` is published and running on the lab; merge remains pending.
+
+- [ ] Registry pull eligibility for the CRD lab image: the Debian 13 runtime
+  updates remove the observed CRITICAL findings, but unfixed HIGH findings
+  still need review against the destination registry's policy. A green scan
+  limited to fixable HIGH/CRITICAL findings is insufficient. The actual private
+  registry accepted the final image under its operator-selected Critical policy,
+  with no added CVE exception, and the three lab nodes pulled it. The full amd64
+  scan reports 0 CRITICAL and 50 HIGH occurrences (13 distinct unfixed CVEs).
+  Distribution review and production activation remain pending; see
+  [packaging.md](packaging.md).
+- [ ] Hardened active-active VPN routing: packaged FRR's privilege setup asks
+  for `SYS_ADMIN`, which the hardened appliance profile deliberately excludes.
+  Reproduced with both the previous Debian 12 image and Debian 13; do not add
+  that capability to certify the profile. Adapt FRR startup within the existing
+  capability boundary and verify the actual routing wrapper before certifying
+  this optional profile.
+
+- [x] Migration listener resource regression (B195): idle receive spin replaced
+  with bounded readiness polling; completed child contexts released; cancellation
+  and replacement ownership tested. Boundary notifications coalesced with bounded
+  ACK contexts; identical map and status writes skipped while drift repair remains.
+  Kernel, unit and race tests pass; corrective v4 image runs on the three lab agents.
+  This does not certify absence of every production leak or close the VM recipe.
+
 | # | Title | Area |
 |---|-------|------|
 | [#1](../../issues/1) | Gate `VPCPeering` creation on a `peer` virtual verb | Peering / RBAC |
@@ -361,3 +567,201 @@ install installs nothing — [#10](../../issues/10)'s endgame.
 | [#13](../../issues/13) | LoadBalancer ingress (etp: Local, source-preserving); NodePort decoupled, low priority | Services |
 | [#14](../../issues/14) | Public IPs on the default network: supersede cozy-proxy (1:1 NAT for a net-0 VM) | North-south / Services |
 | [#15](../../issues/15) | v6 VPC egress dead with a pooled VPCGateway; v6 VPC NAT missing | North-south / IPv6 |
+
+Security audit (2026-10-07): findings, local fixes and actual verification are recorded in SECURITY-AUDIT.txt. The following checked items indicate working-tree implementations verified locally, not merges or production rollouts. Isolated kernel tests cover tunnel-source authorization with real skb metadata and positive IPv6 NDP/DHCP paths. No live-cluster rollout or security-completeness claim has been made.
+
+- [x] FabricIP sandbox ownership: ADD retry reuse, stale DEL isolation, Running-Pod stale-address GC after grace, and agent repair from rebuilt endpoint state. Fake-client behaviour tests and isolated Linux veth retry tests pass; no live-cluster rollout.
+
+- [x] Verify pinned upstream CNI plugin archives during image construction; isolated amd64/arm64 CNI-stage builds pass.
+
+- [x] Bridge owner witness and shared writer lock for DEL versus GC/address-reuse races; isolated kernel route/map/concurrency tests pass.
+- [x] Preserve active Port sandbox identity during migration staging and update
+  it from the active launcher's FabricIP at cutover; behaviour regression tests.
+- [x] Select persistent local veths by sandbox at cutover; reject ambiguous
+  legacy endpoints instead of resurrecting a stale sandbox.
+- [x] Require controller leader election with one cluster-wide Lease to prevent
+  duplicate tenant identities during HA and rolling updates; runtime test.
+- [x] Protect guest-announcement cutover from stale Port listeners and address
+  reuse with live UID/resourceVersion checks and behavioural tests.
+- [x] SecurityGroup membership verifies Pod UID before following live labels;
+  pod-name reuse cannot grant a predecessor the replacement's group identity.
+- [x] APIService reconciliation revokes a previous insecureSkipTLSVerify setting
+  when switching to verified TLS; behaviour test of existing registrations.
+- [x] Validate SecurityGroup selectors and port bounds in the aggregated API;
+  legacy malformed port rules fail closed in all four compiler paths.
+- [x] Serialize locals ownership checks/deletes with SetLocal to prevent stale
+  DEL/sever from removing an endpoint replaced during migration.
+- [x] Restrict IPv6 link-local ingress exceptions to validated NDP/DHCPv6;
+  reject link-local application sources rather than bypassing SecurityGroups.
+- [x] Refuse FabricIP self-heal with ambiguous rebuilt sandbox ownership.
+- [x] Verify default-network rebuild against effective host-route ownership;
+  replace stale host routes during an authorized CNI ADD.
+- [x] Keep selected pending SecurityGroups default-deny when group identities
+  are exhausted, and retry allocation after capacity becomes available.
+- [x] Reject workload impersonation of bridge and hairpin source addresses
+  before any forwarding grant or RPF exception.
+
+- [x] Security audit: policy compilers preserve pinned enforcement until all input caches synchronize; replay one complete snapshot afterwards.
+
+- [x] Security audit: serialize FabricIP/node route reconciliation, revoke missing-node routes and prune stale pinned net-0 routes after initial list.
+
+- [x] Security audit: migration-forward cleanup owns its installation, revocation clears it, and startup removes forwards whose timers died with the previous agent.
+
+- [x] Security audit: VPC Port route notifications and migration moves reject obsolete cache events.
+
+- [x] Security audit: binding reconciliation distinguishes raw port flags from stripped network identity, preserving platform gateway and quarantine state.
+
+- [x] Security audit: idle guest-announcement listeners wait for socket readiness instead of consuming a CPU per staged VM.
+
+- [x] Security audit: durable staged-local state and Port UID witnesses; revoke/synchronize all owned migration legs, including legacy endpoints with verified sandbox or launcher ownership.
+- [x] Bound lifetime metric cardinality and warning caches during VPC/policy churn; verify overflow accounting and RA/DHCPv6 worker/socket lifecycle.
+- [x] Serialize CNI forwarding publication with grant reconciliation; keep hooks fail-closed during initialization and prevent bridge recreation after revocation.
+- [x] Coalesce policy notifications into bounded pending work; verify event bursts and updates received during compilation.
+- [x] Arm policy bootstrap guards for new/recreated maps and interrupted first startup before exposing programs.
+- [x] Drain old Port UID veths on replacement events and orphaned owned veths after complete cache sync, including missed migration-target deletions.
+- [x] Bound NetworkPolicy pair/CIDR compilation and expanded desired policy maps before allocation exceeds map capacity; reject whole oversized snapshots under deny guard.
+- [x] Bound SG CIDR containment work with a scoped prefix index and verify union semantics against the previous containment definition.
+- [x] Preflight full SG and HostFirewall compilation budgets before peer/port products allocate large row arrays; retain deny guards on rejection.
+- [x] Bound and cancel IPsec VICI status collection; refuse queued concurrent scrapes and oversized streams, close the HTTP server on shutdown.
+- [x] Reject strongSwan implicit wildcard, subnet/range and encoded/regex identity forms consistently at API, controller and appliance boundaries.
+- [x] Replace quadratic peering reciprocal scans with an index and coalesce cache-ready reconciliation without weakening two-sided consent.
+- [x] Supervise and reap charon during bootstrap and shutdown; bound VICI initialization and configuration calls.
+- [x] Bound auxiliary HTTP request bodies as well as headers/keep-alives; verify slow GET bodies release connections while flow streaming remains functional.
+- [x] Detect equivalent IP/FQDN/email IKE identities before loading two differently authorized connections.
+- [x] Extend authenticated-identity deduplication to certificate DN attribute aliases and spacing; reject ambiguous DN syntax.
+- [x] Supervise FRR child death during socket readiness and reap all children after startup failure or shutdown.
+- [x] Persist VNI reservations across VPC deletion and controller restart; bound allocation below Geneve flag bits and verify concurrent reservations.
+- [x] Exclude reserved bridge/hairpin identities from FabricIP, Port and ServiceVIP allocation and explicit workload claims.
+- [x] Bound authoritative DNS query concurrency, endpoint scans and synthesized SRV response products before large allocation.
+- [x] Bound idle DNS TCP connections before per-connection worker/frame allocation and verify slot release over repeated connections.
+- [x] Require current Service UID ownership for backend EndpointSlices in ServiceVIP and headless DNS.
+- [x] Bind existing ServiceVIP claims to current Service/VPC UIDs and claim VNI; replace stale generations with conditional deletion.
+
+- [x] Bound ServiceVIP backend construction and controller expansion, replace Cartesian scans with an index and coalesce cache-ready projection.
+
+- [x] Admit and validate DNS UDP packets before the library creates per-packet workers; bound floods and verify malformed-input slot release.
+
+- [x] Verify persistent Port claim VNI against the current VPC before rebinding; preserve pinned identity on generation mismatch.
+
+- [x] Persist HostFirewall modes independently of params recreation, seed legacy state before pin reconciliation and restore missing host identity before program publication.
+
+- [x] Require current VPC claim VNI and nonempty Pod target UID for ServiceVIP/headless DNS backends and current VPC identity for DNS query sources.
+
+- [x] Bound automatic CNI Port allocation conflicts and check cancellation during address selection.
+
+- [x] Apply pool network/gateway reservations to explicit and reused ordinary Ports; include the final usable ServiceVIP candidate in small pools.
+- [x] Index exact DNS peering pairs, deduplicate declarations and bound per-query authorization work and retained peers.
+
+- [x] Scope occupied-address checks to current VNI claims; avoid cluster-wide Port lists during ServiceVIP collision repair.
+
+- [x] Bound live IPAM claim-list pages, scan counts and cancellation before constructing occupied-address state.
+
+- [x] Prove SecurityGroup numeric membership with current group and Pod UIDs, rejecting recycled/duplicate IDs and stale legacy status.
+
+- [x] Guard registered local VPC endpoints whose SecurityGroup membership is missing; publish explicit zero membership only after controller identity resolution.
+- [x] Fence local SecurityGroup membership with Port UID and sandbox witnesses; keep CNI activation last during address replacement and verify stale-snapshot rejection/recovery in the kernel.
+- [x] Index membership group/Port/pod reverse lookups and bound selector resolution before conversion; retain default-deny on oversized or malformed input and verify recovery.
+- [x] Page and bound live SecurityGroup ID allocation/duplicate scans, consuming all continuations before assigning IDs.
+- [x] Fence GC and binding-revocation Port deletes with UID/resourceVersion; confirm cache-missing Nodes live before releasing sever barriers.
+- [x] Keep VPCBinding targets immutable so retargeting cannot discard the original revocation/reaping barrier; verify aggregated and actual admission CEL behavior.
+- [x] Verify receiving veth ownership before it can consume a replacement endpoint's SecurityGroup permissions, including fabric/floating address translation and default-network reuse.
+- [x] Index GC reverse lookups by claiming Pod and Node so ordinary workload/heartbeat events do not copy every cluster claim.
+- [x] Confirm remaining binding grants and revocation targets with complete bounded live scans before releasing reap barriers.
+- [x] Bound sandbox witness hashing and eliminate its measured per-Port snapshot heap allocation without changing valid digests.
+- [x] Release guest-announcement child contexts when listeners finish naturally, including socket failures and successful announcements.
+- [x] Filter unrelated guest-announcement traffic in the kernel and verify receiver CPU under a real ARP flood as well as IPv4/IPv6 announcement acceptance.
+- [x] Bound auxiliary HTTP connections before allocating workers; verify admission recovery and shutdown while the budget is exhausted.
+- [x] Gate unsupported SCTP traffic so selected NetworkPolicy/SecurityGroup endpoints cannot bypass default-deny; retain existing unisolated and plumbing behavior.
+- [x] Reject unsupported SCTP in selected HostFirewall directions, including node-to-remote-pod egress; keep UDP-only transport/reply exemptions and node plumbing separate.
+- [x] Bound gateway, route, FloatingIP and service-uplink notification work, preserve pinned forwarding during incomplete initial lists, and replay complete caches.
+- [x] Reconcile NAT reverse ownership and shards from complete bounded snapshots; remove rotated/orphan addresses and fence cleanup against replacement VPC ownership.
+- [x] Refresh NAT shard routes on node underlay endpoint changes or withdrawals even when readiness stays unchanged.
+- [x] Remove quadratic gateway projection scans within a namespace while preserving the oldest live boundary and namespace separation; measure CPU and allocations.
+- [x] Keep HostFirewall/LB tail-call targets alive across agent descriptor closure and populate slots before CNI classifier publication; verify actual kernel lifetime.
+- [x] Bound route compilation before copying/expansion and reject over-capacity route maps before deleting the last complete snapshot; test failure and recovery.
+
+- [x] Keep a pinned DROP guard during live TCX reordering; kernel tests verify attach failure, retry, interruption cleanup and repeated link/FD lifetime.
+
+- [x] Reap detached TCX bpffs pins after a missed CNI DEL; kernel tests cover deleted veths, directory batches, active hooks and foreign pins.
+
+- [x] Harden the registered UsageStats helper with bounded live pages, deadline and lightweight identities; tests preserve exact counts and scan errors. Stock admission uses status.used rather than invoking this helper per create.
+
+- [x] Bound FabricIP sandbox ownership lists at ADD/DEL, including UID-less teardown; tests cover complete pages and no partial-scan mutation.
+
+- [x] Bound scoped forwarding grant unions and discard no large union for unrestricted grants; admission/CNI/kernel tests cover malformed legacy inputs, bounded errors and owner-authorized revocation.
+
+- [x] Normalize IPv4-mapped CIDR masks once across route/forwarding/policy LPM keys and SecurityGroup containment; verify real kernel insertion and packet verdicts.
+
+- [x] Page CNI binding authorization lists and retain only bounded matching forwarding state; incomplete scans must not grant attachment or forwarding.
+
+- [x] Resolve cached binding grants once per local consumer/VPC key, skip unrelated grants and avoid forwarding unions for DNS attachment checks; measure CPU/heap and verify grant replacement/revocation.
+
+- [x] Bound remaining CNI Port ownership and gateway consent lists; confirm complete scans before reuse, rebind or teardown and reject ambiguous persistent NIC claims without changing their identities.
+
+- [x] Bound networks annotation decoding before allocating the full entry list; apply the same contract to delegates and reject duplicate interface pins with bounded errors.
+
+- [x] Enforce NetworkPolicy and HostFirewall CIDR packet-family identity in the shared RFC 6052 address space; kernel tests reject cross-family authorization and retain valid IPv4/IPv6 permissions, exclusions and fail-closed legacy keys.
+
+- [x] Enforce specific SecurityGroup ingress/egress CIDR family identity; real kernel packets verify positive permissions, cross-family rejection and legacy-key denial within the verifier stack budget.
+- [x] Enforce scoped forwarding packet-family identity with a dedicated ifindex/family LPM key; real packets verify origin anti-spoof drops, map recreation/replay and descriptor lifetime across repeated clear/replay.
+
+- [x] Reap obsolete ordinary primary-invocation Port sandbox claims after grace and live FabricIP/Pod confirmation; behavior tests preserve VM pins, legacy/delegate uncertainty, dual-stack transitions and the sever barrier.
+
+- [x] Reconcile own VPC CIDRs without retained update/restart history; kernel and informer tests cover all prefixes, peering preservation, shared capacity preflight, concurrent writers and bounded replay after cache synchronization or capacity release.
+
+- [x] Security audit SEC194: bound live VPN namespace-quota pages/time and compute oldest-wins rank without retained payloads/sorting; reject absent/replaced targets and partial/cancelled scans.
+
+- [x] Security audit SEC195: resolve VPN appliance Ports by current spec pod index, avoid Port work without owned Ready pods, verify two replicas/retarget/removal and no broad fallback on a missing index.
+
+- [x] Security audit SEC196: select the current sandbox for VPN and explicit/default VPC next hops when FabricIP status witnesses agree; verify reuse per pod version, cancellation and legacy compatibility.
+
+- [x] Security audit SEC197: bound VPN object-reference names at admission and before legacy queue/index/lookup/configuration work; verify actual queue/cache behavior, diagnostics, teardown/recovery and valid reference compatibility.
+
+- [x] Security audit SEC198: page and bound live VNI duplicate/bootstrap scans; preserve complete high-water, orphan/terminating claims and duplicate ownership proofs, rejecting partial results.
+
+- [x] Security audit SEC199: reject false VNI reservation success when a retry helper loses an interrupted counter attempt; require an independently confirmed Lease write and preserve cancellation/request-timeout errors.
+
+- [x] Security audit SEC200: bound VPCGateway VPC references on create/update, before legacy indexes/queues/lookups; verify real workqueue retention, cache removal/recovery and unresolved status cleanup.
+
+- [x] Security audit SEC201: bound optional gateway selector namespaces and route inputs before admission/index expansion; preserve blackholes for legacy invalid next hops and verify cache/lookup/recovery behavior.
+
+- [x] Security audit SEC202: avoid copying all VPC Ports for gateway healing; select only related claims for owned Ready system Pods, preserve deletion fences and verify missing-index/retarget/recovery behavior.
+
+- [x] Security audit SEC188 availability: isolate route capacity overflow by owner namespace with fair budgets and explicit scoped fail-closed guards; verify unrelated IPv4/IPv6 NAT, protected-prefix drops, recovery and bounded guard memory/CPU.
+
+- [x] Security audit SEC203: reproduce and close accepted VPN prefix fallback when credentials/configuration fail before the appliance is realized; preserve complete protected intent, retry errors, ownership fences and explicit withdrawal.
+
+- [x] Security audit SEC204: bound WireGuard key/endpoint input before admission, legacy serialization and appliance parsing; behavior tests and allocation benchmarks, no key material in rejection diagnostics.
+
+- [x] Security audit SEC205: stop route prefix work after an owner is already rejected, retaining all its current scope denials; actual admission/informer work-budget regression.
+
+- [x] Validation follow-up: complete Linux race suite and Helm checks pass; all BPF/netlink packages pass with kernel gates enabled in isolated containers. Preserve failed/interrupted global invocations separately in the audit journal.
+
+- [x] Security audit SEC206: reproduce and bound IPsec default proposal expansion across peers before credentials/serialization; gateway and connection admission plus legacy/appliance behavior tests and allocation measurements.
+
+- [x] Security audit SEC207: measure and scope persistent Port launcher/VMI event lookups by consumer namespace and VM name; actual cache tests, retarget/deletion and pinned identity preservation.
+
+- [x] Security audit SEC208: reproduce and bound repeated IPsec Secret credential payloads before JSON serialization; preserve exact valid credentials and verify VICI rejects oversized inputs without commands.
+
+- [x] Security audit SEC209 hardening: bound auxiliary HTTP request headers below Go's default one-MiB budget; real TCP rejection, valid authentication header and recovery tests.
+
+- [x] Validation follow-up SEC209: complete Linux agent consumer suite passes with race detection, including the isolated kernel-enabled run; prior WSL interruptions remain separately recorded.
+
+- [x] Security audit SEC210: reproduce and bound IPsec identity/address scalars before admission, parsing, normalization and repeated serialization; preserve bounded exact identity compatibility and diagnostics.
+
+- [x] Security audit SEC211: bound VPN remote-prefix admission Status diagnostics to the first invalid index without echoing input; native APIStatus and valid dual-family recovery tests pass. Linux race validation tracked in the audit journal.
+- [x] Security audit SEC212: bound SecurityGroup admission diagnostic amplification; real APIStatus, valid rule recovery and immutable VPC anchors tested on Windows and Linux with race detection.
+- [x] Security audit HARDENING213: bound HostFirewall invalid-rule API diagnostics and CIDR parsing; native valid exception/range recovery tests pass, Linux race follow-up recorded in the audit journal.
+- [x] Security audit SEC214: bound VPN pool-overlap and invalid mode/spec API diagnostics; pool/DNS/BGP and mode recovery tests pass natively and on Linux with race detection.
+- [x] Security audit SEC215: enforce VICI's one-byte pool section-name budget at API, controller and appliance boundaries; actual wire/encoder and pre-credential/pre-kernel tests pass with race detection.
+- [x] Security audit HARDENING216: fix flowctl producer retention on scanner failure/cancellation; real pipe, valid stream recovery and producer joins pass five repetitions with Linux race detection.
+
+- [x] Security audit SEC219: reject unusable peering references before authorization and legacy index/replay work; API, real cache, controller, agent and responder regression suites pass with race detection.
+
+- [x] Security audit SEC220: bound binding references and immutable-target diagnostics before authorization and legacy NAD/grant-key work; bounded real APIStatus, exact legacy cleanup authority and healthy recovery pass with race detection.
+
+- [x] Kernel validation transport: pace the 512-event sever fixture against informer-cache delivery in batches below the fake watcher's 100-event ceiling, without waiting for the blocked acknowledgement or handler; the complete agent kernel/race suite passes in its own fresh container.
+
+- [x] Security audit SEC221: patch the separate KPR module's vulnerable dependencies; Cilium and its rebuilt socket-LB object use v1.19.8, static build/vet and complete kernel/race tests pass, the separate vulnerability scan reports zero findings and module hashes verify.
+
+- [x] Security audit SEC222: replace the prototype KPR cluster-admin binding with explicit read-only API permissions established from its own reconciler and imported Cilium cells; actual manifest rule coverage verifies required reads and rejects mutations, credentials and RBAC management, including with race detection.

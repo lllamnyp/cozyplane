@@ -15,8 +15,9 @@ help: ## Display this help.
 ##@ Development
 
 .PHONY: generate
-generate: ## Run code generation (deepcopy, conversion, defaults, openapi, clientset).
-	hack/update-codegen.sh
+generate: ## Run code generation (helpers, OpenAPI, clientset, tenant CRDs and chart payload).
+	bash hack/update-codegen.sh
+	bash hack/update-local-crds.sh
 
 .PHONY: fmt
 fmt: ## Run go fmt against code.
@@ -35,5 +36,14 @@ test: fmt vet ## Run Go unit tests.
 .PHONY: build
 build: fmt vet ## Build all binaries.
 	go build -o bin/cozyplane-apiserver ./cmd/apiserver
+	go build -o bin/cozyplane-admission ./cmd/admission
 	go build -o bin/sdn-controller ./cmd/sdn-controller
 	go build -o bin/cozyplane-responder ./cmd/responder
+	go build -o bin/cozyplane-flowctl ./cmd/flowctl
+	go build -o bin/cozyplane-agent ./cmd/agent
+	go build -o bin/cozyplane ./cmd/cni
+	go build -o bin/cozyplane-gateway ./cmd/gateway
+	go build -o bin/cozyplane-vpn-gateway ./cmd/vpn-gateway
+	go build -o bin/cozyplane-vpn-gateway-ipsec ./cmd/vpn-gateway-ipsec
+	go build -o bin/cozyplane-vpn-routing ./cmd/vpn-routing
+	cd kpr && go build -o ../bin/cozyplane-kpr .

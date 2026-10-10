@@ -18,6 +18,7 @@ package vpcbinding
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,12 +29,112 @@ import (
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
 	"github.com/lllamnyp/cozyplane/api/sdn/install"
+	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
 )
 
 type recordingAuthorizer struct {
 	allow bool
 	calls int
 	last  authorizer.Attributes
+}
+
+type consumerVPCOnlyAuthorizer struct{}
+
+func TestBindingForwardingPrefixInputBudget(t *testing.T) {
+	scheme := runtime.NewScheme()
+	install.Install(scheme)
+	strategy := NewStrategy(scheme, &recordingAuthorizer{allow: true})
+	ctx := request.WithUser(t.Context(), &user.DefaultInfo{Name: "network-owner"})
+	old := binding("consumer", "owner", "net")
+	for _, size := range []int{sdnv1alpha1.MaxForwardingPrefixes, sdnv1alpha1.MaxForwardingPrefixes + 1} {
+		updated := old.DeepCopy()
+		updated.Spec.AllowForwarding = true
+		updated.Spec.ForwardingCIDRs = make([]string, size)
+		for i := range updated.Spec.ForwardingCIDRs {
+			updated.Spec.ForwardingCIDRs[i] = "10.0.0.0/24"
+		}
+		for _, errs := range []int{len(strategy.Validate(ctx, updated)), len(strategy.ValidateUpdate(ctx, updated, old))} {
+			if (errs != 0) != (size > sdnv1alpha1.MaxForwardingPrefixes) {
+				t.Fatalf("size=%d errors=%d", size, errs)
+			}
+		}
+	}
+}
+
+func TestBindingRejectsMalformedForwardingWithSmallErrors(t *testing.T) {
+	scheme := runtime.NewScheme()
+	install.Install(scheme)
+	strategy := NewStrategy(scheme, &recordingAuthorizer{allow: true})
+	ctx := request.WithUser(t.Context(), &user.DefaultInfo{Name: "network-owner"})
+	old := binding("consumer", "owner", "net")
+	for _, prefix := range []string{"not-a-cidr", strings.Repeat("x", 1<<20)} {
+		updated := old.DeepCopy()
+		updated.Spec.AllowForwarding = true
+		updated.Spec.ForwardingCIDRs = []string{prefix}
+		for _, errs := range []string{strategy.Validate(ctx, updated).ToAggregate().Error(), strategy.ValidateUpdate(ctx, updated, old).ToAggregate().Error()} {
+			if len(errs) == 0 || len(errs) > 256 {
+				t.Fatal("admission error copied untrusted prefix", len(errs))
+			}
+		}
+	}
+}
+
+func TestMalformedLegacyBindingCanStillBeRevokedByOwner(t *testing.T) {
+	scheme := runtime.NewScheme()
+	install.Install(scheme)
+	ctx := request.WithUser(t.Context(), &user.DefaultInfo{Name: "network-owner"})
+	for _, mode := range []string{"oversized", "invalid CIDR"} {
+		old := binding("consumer", "owner", "net")
+		old.Finalizers = []string{"sdn.cozystack.io/reap-ports"}
+		old.Spec.AllowForwarding = true
+		old.Spec.ForwardingCIDRs = []string{"not-a-cidr"}
+		if mode == "oversized" {
+			old.Spec.ForwardingCIDRs = make([]string, sdnv1alpha1.MaxForwardingPrefixes+1)
+		}
+		for _, change := range []string{"disable forwarding", "remove reap finalizer"} {
+			updated := old.DeepCopy()
+			if change == "disable forwarding" {
+				updated.Spec.AllowForwarding = false
+			} else {
+				updated.Finalizers = nil
+			}
+			for _, allow := range []bool{true, false} {
+				auth := &recordingAuthorizer{allow: allow}
+				errs := NewStrategy(scheme, auth).ValidateUpdate(ctx, updated, old)
+				if (len(errs) == 0) != allow || auth.calls != 1 {
+					t.Fatalf("legacy=%s change=%s allow=%v calls=%d errors=%v", mode, change, allow, auth.calls, errs)
+				}
+			}
+		}
+	}
+}
+
+func (consumerVPCOnlyAuthorizer) Authorize(_ context.Context, attrs authorizer.Attributes) (authorizer.Decision, string, error) {
+	if attrs.GetNamespace() == "consumer" && attrs.GetName() == "owned" {
+		return authorizer.DecisionAllow, "", nil
+	}
+	return authorizer.DecisionDeny, "no authority on original VPC", nil
+}
+
+func TestBindingCannotRetargetRevocationBarrier(t *testing.T) {
+	scheme := runtime.NewScheme()
+	install.Install(scheme)
+	ctx := request.WithUser(t.Context(), &user.DefaultInfo{Name: "consumer-admin"})
+	old := binding("consumer", "owner", "shared")
+	old.Finalizers = []string{"sdn.cozystack.io/reap-ports"}
+	for _, dropFinalizer := range []bool{false, true} {
+		updated := old.DeepCopy()
+		updated.Spec.VPCRef = sdn.VPCRef{Namespace: "consumer", Name: "owned"}
+		if dropFinalizer {
+			updated.Finalizers = nil
+		}
+		if errs := NewStrategy(scheme, consumerVPCOnlyAuthorizer{}).ValidateUpdate(ctx, updated, old); len(errs) == 0 {
+			t.Fatalf("retargeting original revocation barrier admitted; remove finalizer=%v", dropFinalizer)
+		}
+		if errs := NewStrategy(scheme, &recordingAuthorizer{allow: true}).ValidateUpdate(ctx, updated, old); len(errs) == 0 {
+			t.Fatal("authorized retarget loses the original Ports' durable reaping target")
+		}
+	}
 }
 
 func (a *recordingAuthorizer) Authorize(_ context.Context, attrs authorizer.Attributes) (authorizer.Decision, string, error) {
@@ -89,8 +190,8 @@ func TestBindingCreateRequiresExportVerb(t *testing.T) {
 
 // A metadata/finalizer write (the controller's reap finalizer) leaves vpcRef
 // unchanged and must not need the export verb — the same refUnchanged guard
-// the VAP applies. Retargeting the ref re-checks.
-func TestBindingUpdateChecksOnlyOnRefChange(t *testing.T) {
+// the VAP applies. Retargeting the ref is rejected to preserve the reap target.
+func TestBindingMetadataUpdatesDoNotRequireExport(t *testing.T) {
 	scheme := runtime.NewScheme()
 	install.Install(scheme)
 	ctx := request.WithUser(context.Background(), &user.DefaultInfo{Name: "cozyplane-controller"})
@@ -112,5 +213,50 @@ func TestBindingUpdateChecksOnlyOnRefChange(t *testing.T) {
 	retargeted.Spec.VPCRef.Name = "vpc-other"
 	if errs := s.ValidateUpdate(ctx, retargeted, old); len(errs) == 0 {
 		t.Fatal("retargeting vpcRef without the export verb should be rejected")
+	}
+}
+
+func TestBindingCreatedWithReapFinalizer(t *testing.T) {
+	scheme := runtime.NewScheme()
+	install.Install(scheme)
+	b := binding("consumer", "owner", "vpc")
+	s := NewStrategy(scheme, nil)
+	s.PrepareForCreate(t.Context(), b)
+	s.PrepareForCreate(t.Context(), b)
+	if len(b.Finalizers) != 1 || b.Finalizers[0] != "sdn.cozystack.io/reap-ports" {
+		t.Fatalf("grant has no durable revocation finalizer: %v", b.Finalizers)
+	}
+}
+
+func TestBindingGrantChangesRequireExport(t *testing.T) {
+	scheme := runtime.NewScheme()
+	install.Install(scheme)
+	ctx := request.WithUser(context.Background(), &user.DefaultInfo{Name: "consumer-admin"})
+	for _, change := range []struct {
+		name   string
+		mutate func(*sdn.VPCBinding)
+	}{
+		{"enable forwarding", func(b *sdn.VPCBinding) { b.Spec.AllowForwarding = true }},
+		{"remove CIDR restriction", func(b *sdn.VPCBinding) { b.Spec.ForwardingCIDRs = nil }},
+		{"widen CIDR restriction", func(b *sdn.VPCBinding) { b.Spec.ForwardingCIDRs = []string{"0.0.0.0/0"} }},
+		{"remove reap finalizer", func(b *sdn.VPCBinding) { b.Finalizers = nil }},
+	} {
+		t.Run(change.name, func(t *testing.T) {
+			old := binding("consumer", "owner", "shared")
+			old.Spec.ForwardingCIDRs = []string{"10.50.0.0/16"}
+			old.Finalizers = []string{"sdn.cozystack.io/reap-ports"}
+			updated := old.DeepCopy()
+			change.mutate(updated)
+			denied := &recordingAuthorizer{}
+			if errs := NewStrategy(scheme, denied).ValidateUpdate(ctx, updated, old); len(errs) == 0 {
+				t.Fatal("consumer without export was allowed to change the grant")
+			}
+			if denied.calls != 1 || denied.last.GetNamespace() != "owner" {
+				t.Fatal("export must be checked against the VPC owner")
+			}
+			if errs := NewStrategy(scheme, &recordingAuthorizer{allow: true}).ValidateUpdate(ctx, updated, old); len(errs) != 0 {
+				t.Fatalf("owner's authorized change rejected: %v", errs)
+			}
+		})
 	}
 }

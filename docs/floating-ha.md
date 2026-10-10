@@ -193,6 +193,17 @@ the `etp: Cluster` DSR path carries the identical exposure, so this wants solvin
 
 ## 8. One target, one address
 
+FloatingIP admission checks VPC and optional address-claim names as Kubernetes
+DNS subdomains (253 bytes), targets as unzoned IP addresses (at most 64 bytes),
+and optional load-balancer classes as qualified names (at most 317 bytes).
+Checks run before parsing, indexing or reference lookup; diagnostics never echo
+invalid input. IPv6 aliases and IPv4-mapped spellings still arbitrate by their
+canonical address. Legacy invalid specs stay Pending and withdraw their owned
+Service, using UID/resourceVersion preconditions. Metadata-only cleanup remains
+possible when an existing invalid spec is unchanged, and a valid update restores
+normal reconciliation. The agent validates the winning binding before delivery;
+an invalid winner does not promote a younger binding to its address.
+
 A floating IP is a **bijection**, and only its forward half is keyed by the public
 address. The reverse half — `floating_egress`, which SNATs the pod's replies — is
 keyed by the target's `{net, VPC IP}` **alone**. So two FloatingIPs bound to one
@@ -207,6 +218,22 @@ last. It is refused in the controller instead: the oldest binding owns the targe
 `Pending` with `TargetExclusive=False` rather than being allocated an address it
 would only use to break its predecessor. Deleting the winner frees the target, and
 the loser is re-queued and takes it.
+
+The agent computes the same oldest non-terminating binding directly from metadata,
+independently of stale controller status. An older binding waiting for an address
+still owns its target; a younger binding's old address cannot be projected in its
+place. Target comparison uses canonical IPs, including equivalent IPv6 spellings.
+Selection is indexed by namespace/VPC/target, so unrelated bindings do not multiply
+the scan. Removing the winner promotes its successor without admitting both.
+
+Controller conflict lookup and binding-event notifications use a cache field
+index on VPC name and canonical target IP, scoped by namespace. A binding change
+reconciles only contenders for its old/new targets, including Ready contenders
+whose ownership can change. Status churn on unrelated Pending bindings does not
+fan out across the cluster. The informer handler maps both old and new objects.
+The contender watch ignores status-only updates; creation, deletion, canonical
+target/VPC changes and ownership-age changes still trigger arbitration. The
+primary FloatingIP watch continues reconciling the changed binding itself.
 
 This predates the decoupling — the reverse map was always keyed this way — and it
 surfaced only because the e2e (wrongly) pointed four addresses at one pod.

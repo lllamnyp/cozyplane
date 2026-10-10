@@ -1,0 +1,3 @@
+# Fresh regional cluster only; pair with cozyplane.apiserver variant crd.
+api:
+  mode: crd

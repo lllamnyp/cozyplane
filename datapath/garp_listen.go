@@ -39,10 +39,16 @@ import (
 
 // LocalPortVeth is a host-side pod/gateway veth with a rebuild alias.
 type LocalPortVeth struct {
-	Net     uint32
-	IPs     []net.IP
-	MAC     net.HardwareAddr
-	Ifindex int
+	Name        string
+	Net         uint32
+	IPs         []net.IP
+	MAC         net.HardwareAddr
+	Ifindex     int
+	Alias       string
+	PortUID     string
+	ContainerID string
+	IfName      string
+	RawNet      uint32
 }
 
 // ListLocalPortVeths returns every local host veth carrying a rebuild alias.
@@ -57,6 +63,9 @@ func ListLocalPortVeths() ([]LocalPortVeth, error) {
 	var out []LocalPortVeth
 	for _, l := range links {
 		name := l.Attrs().Name
+		if l.Type() != "veth" {
+			continue
+		}
 		if !strings.HasPrefix(name, podVethPrefix) && !strings.HasPrefix(name, gwVethPrefix) {
 			continue
 		}
@@ -64,7 +73,8 @@ func ListLocalPortVeths() ([]LocalPortVeth, error) {
 		if !ok {
 			continue
 		}
-		out = append(out, LocalPortVeth{Net: PortNet(rawNet), IPs: ips, MAC: mac, Ifindex: l.Attrs().Index})
+		cid, iface := VethSandbox(l.Attrs().Alias)
+		out = append(out, LocalPortVeth{Name: name, Net: PortNet(rawNet), IPs: ips, MAC: mac, Ifindex: l.Attrs().Index, Alias: l.Attrs().Alias, PortUID: VethPortIdentity(l.Attrs().Alias).UID, ContainerID: cid, IfName: iface, RawNet: rawNet})
 	}
 	return out, nil
 }
@@ -75,10 +85,14 @@ func ListLocalPortVeths() ([]LocalPortVeth, error) {
 // match (the caller should then drive cutover) and ctx.Err() on cancellation.
 //
 // The socket is bound to the announcement's ethertype (ARP or IPv6), so only
-// candidate frames are delivered; a 1s receive timeout lets the loop observe
+// candidate frames are delivered; a 100ms readiness wait lets the loop observe
 // cancellation. Best-effort by nature: a missed announcement just falls back to
 // the VMI-watch cutover.
 func WatchGuestAnnounce(ctx context.Context, ifindex int, expectMAC net.HardwareAddr, vmIP net.IP) error {
+	filter, err := guestAnnouncementFilter(expectMAC, vmIP)
+	if err != nil {
+		return err
+	}
 	v4 := vmIP.To4() != nil
 	ethProto := uint16(0x86dd) // IPv6
 	if v4 {
@@ -89,21 +103,46 @@ func WatchGuestAnnounce(ctx context.Context, ifindex int, expectMAC net.Hardware
 		return fmt.Errorf("packet socket: %w", err)
 	}
 	defer unix.Close(fd)
+	prog := unix.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]}
+	if err := unix.SetsockoptSockFprog(fd, unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &prog); err != nil {
+		return fmt.Errorf("filter announcement socket: %w", err)
+	}
 	if err := unix.Bind(fd, &unix.SockaddrLinklayer{Protocol: htons(ethProto), Ifindex: ifindex}); err != nil {
 		return fmt.Errorf("bind packet socket to ifindex %d: %w", ifindex, err)
 	}
-	tv := unix.Timeval{Sec: 1}
-	_ = unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv)
+	return watchGuestAnnounceSocket(ctx, fd, ifindex, expectMAC, vmIP, v4)
+}
 
+func watchGuestAnnounceSocket(ctx context.Context, fd, ifindex int, expectMAC net.HardwareAddr, vmIP net.IP, v4 bool) error {
+	if fd < 0 || fd > 2147483647 {
+		return fmt.Errorf("invalid announcement descriptor")
+	}
 	buf := make([]byte, 1500)
+	poll := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		nready, err := unix.Poll(poll, 100)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("poll announcement socket: %w", err)
+		}
+		if nready == 0 {
+			continue
+		}
+		if poll[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
+			return fmt.Errorf("announcement socket closed: poll events %#x", poll[0].Revents)
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		n, _, err := unix.Recvfrom(fd, buf, 0)
 		if err != nil {
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK || err == unix.EINTR {
-				continue // timeout tick or interrupted — re-check ctx and retry
+				continue // re-poll; another receive must never busy-spin
 			}
 			return fmt.Errorf("recv on ifindex %d: %w", ifindex, err)
 		}
@@ -111,6 +150,57 @@ func WatchGuestAnnounce(ctx context.Context, ifindex int, expectMAC net.Hardware
 			return nil
 		}
 	}
+}
+
+// Every accepted frame is a candidate for the existing userspace recognizer.
+// Reject noise before socket queueing so a staged guest cannot spin the agent.
+func guestAnnouncementFilter(mac net.HardwareAddr, ip net.IP) ([]unix.SockFilter, error) {
+	if len(mac) != 6 || ip.To16() == nil {
+		return nil, fmt.Errorf("invalid guest announcement identity")
+	}
+	minimum := uint32(78)
+	if ip.To4() != nil {
+		minimum = 42
+	}
+	filter := []unix.SockFilter{
+		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_LEN},
+		{Code: unix.BPF_JMP | unix.BPF_JGE | unix.BPF_K, K: minimum, Jf: 255},
+	}
+	equal := func(size uint16, offset, value uint32) {
+		filter = append(filter,
+			unix.SockFilter{Code: unix.BPF_LD | size | unix.BPF_ABS, K: offset},
+			unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: value, Jf: 255})
+	}
+	if v4 := ip.To4(); v4 != nil {
+		equal(unix.BPF_H, 12, unix.ETH_P_ARP)
+		equal(unix.BPF_H, 14, 1)
+		equal(unix.BPF_H, 16, unix.ETH_P_IP)
+		equal(unix.BPF_H, 18, 0x0604)
+		filter = append(filter,
+			unix.SockFilter{Code: unix.BPF_LD | unix.BPF_H | unix.BPF_ABS, K: 20},
+			unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: 1, Jt: 1},
+			unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: 2, Jf: 255})
+		equal(unix.BPF_W, 22, binary.BigEndian.Uint32(mac[:4]))
+		equal(unix.BPF_H, 26, uint32(binary.BigEndian.Uint16(mac[4:])))
+		equal(unix.BPF_W, 28, binary.BigEndian.Uint32(v4))
+	} else {
+		equal(unix.BPF_H, 12, unix.ETH_P_IPV6)
+		equal(unix.BPF_B, 20, 58)
+		equal(unix.BPF_B, 54, 136)
+		equal(unix.BPF_W, 6, binary.BigEndian.Uint32(mac[:4]))
+		equal(unix.BPF_H, 10, uint32(binary.BigEndian.Uint16(mac[4:])))
+		v6 := ip.To16()
+		for i := 0; i < 16; i += 4 {
+			equal(unix.BPF_W, uint32(62+i), binary.BigEndian.Uint32(v6[i:i+4]))
+		}
+	}
+	filter = append(filter, unix.SockFilter{Code: unix.BPF_RET | unix.BPF_K, K: 1500}, unix.SockFilter{Code: unix.BPF_RET | unix.BPF_K})
+	for i := range filter {
+		if filter[i].Jf == 255 {
+			filter[i].Jf = uint8(len(filter) - i - 2)
+		}
+	}
+	return filter, nil
 }
 
 // guestAnnouncedItself reports whether frame is the migrated guest announcing

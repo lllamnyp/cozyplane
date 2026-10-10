@@ -18,9 +18,14 @@ package vpc
 
 import (
 	"context"
+	"github.com/lllamnyp/cozyplane/pkg/registry/sdn/authz"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
 	"github.com/lllamnyp/cozyplane/pkg/registry"
+	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/registry/generic"
@@ -29,8 +34,8 @@ import (
 )
 
 // NewREST returns RESTStorage objects for VPCs and their /status subresource.
-func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter) (*registry.REST, *StatusREST, error) {
-	strategy := NewStrategy(scheme)
+func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter, auth authorizer.Authorizer) (*BoundaryREST, *StatusREST, error) {
+	strategy := NewStrategy(scheme, auth)
 
 	store := &genericregistry.Store{
 		NewFunc:                   func() runtime.Object { return &sdn.VPC{} },
@@ -46,6 +51,7 @@ func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter) (*reg
 		TableConvertor: rest.NewDefaultTableConvertor(sdn.Resource("vpcs")),
 	}
 
+	registry.InstallMetadataValidation(store)
 	options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: GetAttrs}
 	if err := store.CompleteWithOptions(options); err != nil {
 		return nil, nil, err
@@ -55,7 +61,37 @@ func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter) (*reg
 	statusStore := *store
 	statusStore.UpdateStrategy = NewStatusStrategy(strategy)
 
-	return &registry.REST{Store: store}, &StatusREST{store: &statusStore}, nil
+	return &BoundaryREST{REST: &registry.REST{Store: store}, auth: auth}, &StatusREST{store: &statusStore}, nil
+}
+
+// BoundaryREST checks the actual object in the store's delete validation, so a
+// concurrent policy update cannot race an earlier read-only authorization check.
+type BoundaryREST struct {
+	*registry.REST
+	auth authorizer.Authorizer
+}
+
+func (r *BoundaryREST) deletionCheck(check rest.ValidateObjectFunc) rest.ValidateObjectFunc {
+	return func(ctx context.Context, obj runtime.Object) error {
+		v := obj.(*sdn.VPC)
+		if v.Spec.Boundary != nil {
+			if err := authz.CheckVPCVerb(ctx, r.auth, "manage-boundary", v.Namespace, v.Name, field.NewPath("spec", "boundary")); err != nil {
+				return apierrors.NewForbidden(sdn.Resource("vpcs"), v.Name, err)
+			}
+		}
+		if check != nil {
+			return check(ctx, obj)
+		}
+		return nil
+	}
+}
+
+func (r *BoundaryREST) Delete(ctx context.Context, name string, check rest.ValidateObjectFunc, options *metav1.DeleteOptions) (runtime.Object, bool, error) {
+	return r.Store.Delete(ctx, name, r.deletionCheck(check), options)
+}
+
+func (r *BoundaryREST) DeleteCollection(ctx context.Context, check rest.ValidateObjectFunc, options *metav1.DeleteOptions, listOptions *metainternalversion.ListOptions) (runtime.Object, error) {
+	return r.Store.DeleteCollection(ctx, r.deletionCheck(check), options, listOptions)
 }
 
 // StatusREST implements the REST endpoint for changing the status of a VPC.

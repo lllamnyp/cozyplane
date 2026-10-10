@@ -1,5 +1,15 @@
 # Host firewall
 
+### Admission diagnostics
+
+Aggregated API create/update validation reports the first invalid rule field,
+including its index, without repeating CIDR or protocol text. CIDRs and
+exceptions have a 64-byte parsing budget. Valid dual-family peers, exceptions,
+empty peer/port defaults, TCP/UDP and inclusive port ranges of at most 64 ports
+retain their semantics. This is diagnostic hardening for operator-authored
+objects; it does not give tenants access to this cluster-scoped kind or change
+the agent's compilation and map budgets.
+
 > One of three policy layers; flow ownership and the node-origin trust
 > model are recorded in [policy-layers.md](policy-layers.md).
 
@@ -65,6 +75,12 @@ selecting object union open. A node selected by none is untouched. Rules
 are allow-only; `except` carves holes exactly as NetworkPolicy `ipBlock`
 does (longer deny prefix, allow-wins at equal prefix, unions across
 policies stay monotonic).
+
+Unsupported SCTP traffic is also denied in each selected direction, including
+temporary default-deny during synchronization. SCTP allow rules and stateful
+SCTP forwarding remain unsupported. Unselected directions and the existing
+node-to-node plumbing exemption remain open. SCTP must never borrow UDP's
+Geneve-port or reply-pin exemptions, even with identical ports and addresses.
 
 ### What is never gated (baseline, non-negotiable)
 
@@ -148,7 +164,7 @@ to *invoke* policy it could never afford to inline).
 `hf_ingress` in one screen:
 
 ```
-parse; only TCP/UDP considered (everything else falls through open)
+parse; TCP/UDP/SCTP considered (other protocols retain plumbing behavior)
 src ∈ hf_self && dst ∉ hf_self?          → node-originated egress passing
                                             from_pod's fall-through: if UDP,
                                             write the hf_ct reply-pin; OK
@@ -206,14 +222,26 @@ retries, and the next query re-pins.
 | `hf_ct` | LRU_HASH | `{self, peer, sport(be), dport(be), proto}` → 1 (the `np_ct` shape). Written on BOTH admitted directions, so each direction's reply passes the other's gate |
 | `hf_drops` | PERCPU_ARRAY(2) | drops by direction → `cozyplane_hf_drops_total{direction}` |
 
-`CFG_HF_ENABLED` / `CFG_HF_EG_ENABLED` (params 9/10) arm each direction
+`CFG_HF_ENABLED` / `CFG_HF_EG_ENABLED` (durable `hf_modes` cells 0/1,
+mirrored into legacy params 9/10) arm each direction
 independently — an Egress-only object leaves ingress open, and vice versa; the
 tail calls fire when either is set. `CFG_HF_ENABLED` arms the tail calls and pin writes; the agent
-sets it **after** the rule sync on enable and **before** clearing on
-disable, so there is no fail-open window. `CFG_GENEVE_PORT` carries the
-overlay port for the baseline exemption. Like `np_allow`, `hf_allow`
-overflow is fail-closed by construction (isolation is the flag, the map
-holds allows) — `cozyplane_hf_sync_errors_total` counts sync failures.
+uses mode **2** before changing an isolated direction's rules: new gated
+flows are denied independently of partially updated allow entries. A successful
+sync switches to mode **1** (enforce the complete rules); failure retains mode 2,
+including on first enable and across agent restart. Mode **0** disables the
+direction before clearing its entries. Baseline exemptions remain in all modes.
+The shared lb_prog ProgramArray is pinned in bpffs too: a program's kernel
+reference alone does not preserve its tail-call slots after the agent closes
+its last userspace map descriptor. The pin keeps both firewall targets (and LB
+targets) available during agent downtime. Startup populates all four slots
+before publishing either CNI classifier pin, so a concurrent ADD cannot attach
+a newly published classifier with missing firewall targets. Compatible restarts
+reuse the bounded four-slot map and replace its targets; they do not retain an
+additional program array per restart.
+`CFG_GENEVE_PORT` carries the overlay port for the baseline exemption.
+`cozyplane_hf_sync_errors_total` counts sync failures; an operator must reduce
+an oversized ruleset before its permitted flows can resume.
 
 ## Agent
 
@@ -222,12 +250,14 @@ the sdn factory, mutex'd full recompute on any event): list all
 HostFirewalls, match `spec.nodeSelector` against **this node's** labels
 (each agent compiles only its own node's view — no cross-node identity, no
 coordination), union the matching objects' rules into `hf_allow` entries,
-diff-sync, then flip `CFG_HF_ENABLED`. Node label changes re-trigger the
+arm the temporary default-deny mode, diff-sync, then enable the complete rules.
+Node label changes re-trigger the
 same recompute (the agent watches its own Node object). `hf_self` is fed
 alongside the existing self-`SetNPNode` call, same address set.
 
 Compilation notes:
 - empty `from` ⇒ `0.0.0.0/0` + `::/0` rows; empty `ports` ⇒ any-port rows
+- CIDR rows use the key's former padding byte as packet-family identity (`4` or `6`). Both directions query the actual packet family, independently of its RFC 6052 address representation. An IPv6 allow cannot admit IPv4, and IPv4 cannot admit native IPv6 in `64:ff9b::/96`. Legacy rows with zero in this byte stay fail-closed until complete reconciliation replaces them.
   for both TCP and UDP (NetworkPolicy's defaulting).
 - `except` ⇒ longer-prefix deny rows per `{proto, port}` of the rule;
   equal-key allow-wins dedupe across policies (the `np_cidr` union rule).
@@ -279,12 +309,12 @@ gate; a node-originated UDP flow is gated first and pins on admit, so its
 reply passes the ingress gate. TCP is SYN-gated in both directions.
 
 Datapath: `hf_eallow` (an LPM twin of `hf_allow`), `CFG_HF_EG_ENABLED`
-(params 10, armed after sync like ingress). Two enforcement points:
+(`hf_modes` cell 1, mirrored into legacy params 10, armed after sync like ingress). Two enforcement points:
 node→external rides the existing `hf_ingress` node-originated arm (the
 uplink-egress fall-through), which gains the gate ahead of its pin write;
 node→remote-pod leaves through `from_pod`'s remotes-hit encap, which
 tail-calls a new `cozyplane_hf_egress` program (lb_prog slot 3) for
-TCP/UDP node-sourced flows — it re-resolves the remote and performs the
+TCP/UDP/SCTP node-sourced flows — it re-resolves the remote and performs the
 encap itself on admit (a tail call never returns), drops on deny, and an
 unpopulated slot falls through open to the inline encap.
 
@@ -294,7 +324,8 @@ unpopulated slot falls through open to the inline encap.
   CIDRs in v1. Pod fabric CIDRs are cluster-assigned and non-overlapping,
   so "all pods" is expressible today; identity-based peers can reuse the
   `np_ident` machinery later if wanted.
-- **SCTP**, matching the rest of the datapath.
+- **SCTP allow rules and stateful forwarding**; selected directions reject
+  SCTP rather than allowing it to bypass isolation.
 - Gating **node→node** (see baseline) and **loopback/link-local** self
   addresses (`hf_self` is the Node-object address set).
 - **Audit mode**. `hf_drops` + a `kubectl delete` is the v1 story.
@@ -314,3 +345,27 @@ Deletion reopens. Real-cluster validation on the dev cluster follows the
 NetworkPolicy playbook: workers first, allow-all → narrow, with the
 monitoring scrape path (Prometheus pod → node:9411/10250) as the live
 proof that pod→node gating works and is openable.
+### Compilation resource limits
+
+Before expanding peers, exceptions and port ranges, the compiler budgets at
+most 65536 rows in each direction and 1048576 input operations. An oversized
+snapshot is rejected as a whole and both host-firewall directions retain
+temporary default-deny until a complete bounded snapshot succeeds. No partial
+ruleset is installed. Desired maps also stop at their actual kernel capacity.
+
+### Durable firewall modes across map recreation
+
+HostFirewall modes live in a dedicated pinned three-cell hf_modes array
+(ingress, egress, initialized) instead of depending on recreation of params.
+Before reconciling any incompatible pins, startup seeds it from legacy params
+when no initialized witness exists. An absent legacy params map with retained
+firewall pins has ambiguous isolation: startup uses temporary deny in both
+directions until a complete policy snapshot is available. A genuinely fresh
+node remains disabled until policies select it. The mode pin is never silently
+removed on incompatibility. Every rule transition updates durable mode and
+legacy params together; the latter keeps old attached programs enforcing
+during an upgrade. A missing selected direction rule map re-arms temporary
+deny before new programs are exposed. If hf_self was lost while enforcement
+is active, startup reconstructs host addresses from netlink before publication;
+it fails rather than publishing an empty or oversized identity view. API/node
+plumbing exemptions otherwise retain their existing semantics.

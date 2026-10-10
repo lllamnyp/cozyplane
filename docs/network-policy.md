@@ -1,5 +1,14 @@
 # NetworkPolicy on the default network (net 0)
 
+Identity, allow and CIDR maps are updated under a shared enforcement guard (params slot 12). Before any mutation, new NP-gated flows on this node are denied, even when their identity row is missing. The guard clears only when all three syncs succeed; failure retains it across restart. A later complete sync restores policy. This temporarily affects otherwise unisolated net-0 endpoints too, because a missing identity cannot distinguish them from an isolated endpoint omitted by a failed sync. Local-node probes and protocol exemptions remain available. Oversized rulesets must be reduced to recover.
+
+SCTP allowances remain unsupported and warn without emitting rules. SCTP packets
+nevertheless enter the policy gate: an isolated endpoint or an incomplete
+snapshot must refuse them, rather than letting an unsupported L4 protocol bypass
+default-deny. Unisolated endpoints and the existing local-node exemption retain
+their behavior. This is rejection of unsupported traffic, not SCTP allow-rule,
+NAT or stateful-association support.
+
 > One of three policy layers; flow ownership across
 > NetworkPolicy/SecurityGroup/HostFirewall is recorded in
 > [policy-layers.md](policy-layers.md).
@@ -93,7 +102,7 @@ u32s.
 |-----|-----|-------|
 | `np_ident` | fabric IP (addr128) | `{u64 identity, u32 flags}` — flags: ING_ISOLATED, EG_ISOLATED |
 | `np_allow` | LPM `{prefixlen, u8 dir, u8 proto, u64 dst_id, u64 src_id} + u16 port suffix` | presence = allow. The port is a big-endian LPM *suffix* (increment 3): an exact port is a /16, any-port is /0, and an `endPort` range decomposes into ≤ 31 maximal aligned prefixes — ranges cost O(log) entries and the datapath one probe per peer id instead of exact+any-port pairs |
-| `np_cidr` | LPM `{prefixlen, u8 dir, u8 proto, u16 port, u64 id, addr128}` | allow / deny (ipBlock `except` = longer deny prefix; port 0 = any, probed second) |
+| `np_cidr` | LPM `{prefixlen, u8 dir, u8 proto, u16 port, u64 id, addr128}` | allow / deny (ipBlock `except` = longer deny prefix; port 0 = any, probed second). The direction byte also carries a family tag: `dir | 0x40` for IPv4, `dir | 0x80` for IPv6, so an IPv6 prefix cannot match internally encoded IPv4. Legacy untagged rows cannot authorize either new query. |
 | `np_ct` | `{addr128 ×2, ports, proto}` LRU | UDP reply-pin (written at the admitted direction) |
 | `np_drops` | direction | drop counter (metrics, like `sg_drops`) |
 
@@ -103,9 +112,9 @@ ANY_POD** (`namespaceSelector: {}` — any pod source, i.e. src resolves in
 `np_ident`), so "allow all within reason" costs O(subjects), not
 O(subjects × peers).
 
-**`np_allow` sizing (decided 2026-07-11)**: overflow is *inherently
-fail-closed* — isolation is a flag in `np_ident` and `np_allow` holds only
-allows, so a full map can only over-drop, never over-admit. Hence: HASH with
+**`np_allow` sizing (decided 2026-07-11)**: the whole-snapshot update guard
+keeps overflow fail-closed even if identities or CIDR exceptions cannot be
+installed completely. Hence: HASH with
 `NO_PREALLOC` and a generous ceiling (~512k entries ≈ 12MB worst case), a
 sync-error metric plus an agent log naming the policy whose entries didn't
 fit (no silent caps), and cardinality controlled upstream by the identity
@@ -262,8 +271,9 @@ separate policy unions, unlike SG's symmetric-pair admission).
 
    Harness notes for reruns: cyclonus hardcodes `.svc.cluster.local`
    (dev cluster domain is `cozy.local`) → `--destination-type pod-ip`;
-   SCTP servers flag every isolated pod's whole row+column (we gate only
-   TCP/UDP) → `--server-protocol TCP,UDP`; its state verifier fatals on
+   The historical run excluded SCTP servers (then ungated); current hardening
+   denies SCTP on isolated endpoints but does not implement SCTP allowances,
+   so the support suite still uses `--server-protocol TCP,UDP`. Its state verifier fatals on
    stale half-terminated x/y/z namespaces from a previous run.
 
    **Scale**: `BenchmarkCompileNetworkPolicies` — 5000 pods / 120 shapes /
@@ -284,5 +294,18 @@ this work, since built: [host-firewall.md](host-firewall.md).
    label-set hash (see "The model"); the claims-allocated kind remains the
    documented evolution path if compact ids are ever needed.
 3. **`np_allow`**: NO_PREALLOC HASH, ~512k ceiling, loud overflow (metric +
-   log), fail-closed by construction; cardinality controlled by the identity
+   log), fail-closed under the update guard; cardinality controlled by the identity
    label filter. (See the sizing note under "Maps".)
+### Compilation resource bounds
+
+Identity-pair expansion is bounded before materializing a quadratic ruleset.
+Each compilation retains at most 65536 identities, raw pair rules and CIDR rows
+per category. An oversized snapshot is rejected in full and arms the existing
+node-wide NP deny guard until a complete bounded snapshot succeeds; partial
+rules are never applied. The datapath also limits desired map construction to
+each map's actual capacity before allocating expanded port-prefix rows. This
+avoids exhausting the agent heap before the kernel can report map saturation.
+
+Inputs are capped at 65536 objects per kind and identity/peer comparisons and
+rule insertions have a 1048576-operation budget per compilation. Duplicate
+rules also consume this budget, so deduplication cannot hide unbounded CPU work.

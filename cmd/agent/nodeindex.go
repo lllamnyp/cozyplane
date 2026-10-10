@@ -17,11 +17,29 @@ limitations under the License.
 package main
 
 import (
+	"net"
 	"sort"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 )
+
+func removedNodeAddresses(old, current []net.IP) []net.IP {
+	var removed []net.IP
+	for _, previous := range old {
+		present := false
+		for _, next := range current {
+			if previous.Equal(next) {
+				present = true
+				break
+			}
+		}
+		if !present {
+			removed = append(removed, previous)
+		}
+	}
+	return removed
+}
 
 // nodePoolIndex is the agent's view of which nodes are Ready.
 //

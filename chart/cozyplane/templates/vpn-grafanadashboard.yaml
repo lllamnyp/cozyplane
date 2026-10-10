@@ -1,0 +1,529 @@
+{{- if and .Values.vpn.observability.dashboard.enabled (.Capabilities.APIVersions.Has "grafana.integreatly.org/v1beta1/GrafanaDashboard") }}
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDashboard
+metadata:
+  name: cozyplane-vpn
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cozyplane.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vpn
+    {{- with .Values.vpn.observability.dashboard.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  allowCrossNamespaceImport: {{ .Values.vpn.observability.dashboard.allowCrossNamespaceImport }}
+  instanceSelector:
+    {{- toYaml .Values.vpn.observability.dashboard.instanceSelector | nindent 4 }}
+  json: |-
+    {
+      "title": "Cozyplane VPN",
+      "uid": "cozyplane-vpn",
+      "tags": [
+        "cozyplane",
+        "vpn"
+      ],
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "30s",
+      "templating": {
+        "list": [
+          {
+            "name": "DS_PROMETHEUS",
+            "label": "Metrics datasource",
+            "type": "datasource",
+            "query": "prometheus",
+            "refresh": 1,
+            "current": {},
+            "multi": false,
+            "includeAll": false
+          },
+          {
+            "name": "namespace",
+            "label": "Namespace",
+            "type": "query",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "${DS_PROMETHEUS}"
+            },
+            "definition": "label_values(cozyplane_vpn_connection_last_handshake_timestamp_seconds{job=\"cozyplane-vpn-gateways\"}, namespace)",
+            "query": {
+              "query": "label_values(cozyplane_vpn_connection_last_handshake_timestamp_seconds{job=\"cozyplane-vpn-gateways\"}, namespace)",
+              "refId": "Namespace"
+            },
+            "includeAll": true,
+            "allValue": ".*",
+            "multi": true,
+            "current": {
+              "text": "All",
+              "value": "$__all"
+            }
+          },
+          {
+            "name": "gateway",
+            "label": "Gateway",
+            "type": "query",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "${DS_PROMETHEUS}"
+            },
+            "definition": "label_values(cozyplane_vpn_connection_last_handshake_timestamp_seconds{job=\"cozyplane-vpn-gateways\",namespace=~\"$namespace\"}, gateway)",
+            "query": {
+              "query": "label_values(cozyplane_vpn_connection_last_handshake_timestamp_seconds{job=\"cozyplane-vpn-gateways\",namespace=~\"$namespace\"}, gateway)",
+              "refId": "Gateway"
+            },
+            "includeAll": true,
+            "allValue": ".*",
+            "multi": true,
+            "current": {
+              "text": "All",
+              "value": "$__all"
+            }
+          },
+          {
+            "name": "connection",
+            "label": "Connection",
+            "type": "query",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "${DS_PROMETHEUS}"
+            },
+            "definition": "label_values(cozyplane_vpn_connection_last_handshake_timestamp_seconds{job=\"cozyplane-vpn-gateways\",namespace=~\"$namespace\",gateway=~\"$gateway\"}, connection)",
+            "query": {
+              "query": "label_values(cozyplane_vpn_connection_last_handshake_timestamp_seconds{job=\"cozyplane-vpn-gateways\",namespace=~\"$namespace\",gateway=~\"$gateway\"}, connection)",
+              "refId": "Connection"
+            },
+            "includeAll": true,
+            "allValue": ".*",
+            "multi": true,
+            "current": {
+              "text": "All",
+              "value": "$__all"
+            }
+          }
+        ]
+      },
+      "panels": [
+        {
+          "id": 1,
+          "title": "Connection state",
+          "type": "stat",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 0
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "targets": [
+            {
+              "expr": "max by (cluster, namespace, gateway, connection, backend) (cozyplane_vpn_connection_up{job=\"cozyplane-vpn-gateways\",namespace=~\"$namespace\",gateway=~\"$gateway\",connection=~\"$connection\"})",
+              "refId": "A",
+              "legendFormat": "{{ "{{" }}namespace{{ "}}" }}/{{ "{{" }}gateway{{ "}}" }}/{{ "{{" }}connection{{ "}}" }} {{ "{{" }}backend{{ "}}" }}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "mappings": [
+                {
+                  "type": "value",
+                  "options": {
+                    "0": {
+                      "text": "Down",
+                      "color": "red"
+                    },
+                    "1": {
+                      "text": "Up",
+                      "color": "green"
+                    }
+                  }
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "red",
+                    "value": null
+                  },
+                  {
+                    "color": "green",
+                    "value": 1
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 2,
+          "title": "Handshake / IKE establishment age",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 16,
+            "x": 8,
+            "y": 0
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "targets": [
+            {
+              "expr": "time() - (max by (cluster, namespace, gateway, connection, backend) (cozyplane_vpn_connection_last_handshake_timestamp_seconds{job=\"cozyplane-vpn-gateways\",namespace=~\"$namespace\",gateway=~\"$gateway\",connection=~\"$connection\"}) > 0)",
+              "legendFormat": "{{ "{{" }}namespace{{ "}}" }}/{{ "{{" }}gateway{{ "}}" }}/{{ "{{" }}connection{{ "}}" }} {{ "{{" }}backend{{ "}}" }}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "orange",
+                    "value": 300
+                  },
+                  {
+                    "color": "red",
+                    "value": 600
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 3,
+          "title": "Traffic rate",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 9,
+            "w": 12,
+            "x": 0,
+            "y": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "targets": [
+            {
+              "expr": "sum by (cluster, namespace, gateway, connection, backend) (rate(cozyplane_vpn_connection_rx_bytes_total{job=\"cozyplane-vpn-gateways\",namespace=~\"$namespace\",gateway=~\"$gateway\",connection=~\"$connection\"}[$__rate_interval]))",
+              "legendFormat": "{{ "{{" }}namespace{{ "}}" }}/{{ "{{" }}gateway{{ "}}" }}/{{ "{{" }}connection{{ "}}" }} {{ "{{" }}backend{{ "}}" }}",
+              "refId": "A"
+            },
+            {
+              "expr": "sum by (cluster, namespace, gateway, connection, backend) (rate(cozyplane_vpn_connection_tx_bytes_total{job=\"cozyplane-vpn-gateways\",namespace=~\"$namespace\",gateway=~\"$gateway\",connection=~\"$connection\"}[$__rate_interval]))",
+              "legendFormat": "{{ "{{" }}connection{{ "}}" }} tx",
+              "refId": "B"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "Bps"
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 4,
+          "title": "IPsec packet rate",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 9,
+            "w": 12,
+            "x": 12,
+            "y": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "targets": [
+            {
+              "expr": "sum by (cluster, namespace, gateway, connection, backend) (rate(cozyplane_vpn_connection_rx_packets_total{job=\"cozyplane-vpn-gateways\",namespace=~\"$namespace\",gateway=~\"$gateway\",connection=~\"$connection\"}[$__rate_interval]))",
+              "legendFormat": "{{ "{{" }}namespace{{ "}}" }}/{{ "{{" }}gateway{{ "}}" }}/{{ "{{" }}connection{{ "}}" }} {{ "{{" }}backend{{ "}}" }}",
+              "refId": "A"
+            },
+            {
+              "expr": "sum by (cluster, namespace, gateway, connection, backend) (rate(cozyplane_vpn_connection_tx_packets_total{job=\"cozyplane-vpn-gateways\",namespace=~\"$namespace\",gateway=~\"$gateway\",connection=~\"$connection\"}[$__rate_interval]))",
+              "legendFormat": "{{ "{{" }}connection{{ "}}" }} tx",
+              "refId": "B"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "pps"
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 5,
+          "title": "Appliance restarts",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 17
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "targets": [
+            {
+              "expr": "max by (cluster, namespace, pod) (increase(kube_pod_container_status_restarts_total{namespace=~\"$namespace\",container=\"vpn-gateway\"}[5m])) * on (cluster, namespace, pod) group_left (gateway) (max by (cluster, namespace, gateway, pod) (cozyplane_vpn_gateway_connections{job=\"cozyplane-vpn-gateways\",namespace=~\"$namespace\",gateway=~\"$gateway\"}) >= bool 0)",
+              "legendFormat": "{{ "{{" }}namespace{{ "}}" }}/{{ "{{" }}gateway{{ "}}" }}/{{ "{{" }}pod{{ "}}" }}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 6,
+          "title": "Scrape health per appliance",
+          "type": "stat",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 25
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "targets": [
+            {
+              "expr": "min by (cluster, namespace, gateway, pod) (up{job=\"cozyplane-vpn-gateways\",namespace=~\"$namespace\",gateway=~\"$gateway\"})",
+              "legendFormat": "{{ "{{" }}namespace{{ "}}" }}/{{ "{{" }}gateway{{ "}}" }}/{{ "{{" }}pod{{ "}}" }}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "mappings": [
+                {
+                  "type": "value",
+                  "options": {
+                    "0": {
+                      "text": "Unavailable",
+                      "color": "red"
+                    },
+                    "1": {
+                      "text": "Healthy",
+                      "color": "green"
+                    }
+                  }
+                }
+              ]
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 7,
+          "title": "Configured connections per appliance",
+          "type": "stat",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 25
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "targets": [
+            {
+              "expr": "max by (cluster, namespace, gateway, pod) (cozyplane_vpn_gateway_connections{job=\"cozyplane-vpn-gateways\",namespace=~\"$namespace\",gateway=~\"$gateway\"})",
+              "legendFormat": "{{ "{{" }}namespace{{ "}}" }}/{{ "{{" }}gateway{{ "}}" }}/{{ "{{" }}pod{{ "}}" }}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 8,
+          "title": "IPsec XFRM telemetry health",
+          "type": "stat",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 25
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "targets": [
+            {
+              "expr": "min by (cluster, namespace, gateway, pod) (cozyplane_vpn_ipsec_xfrm_collection_success{job=\"cozyplane-vpn-gateways\",namespace=~\"$namespace\",gateway=~\"$gateway\"})",
+              "legendFormat": "{{ "{{" }}namespace{{ "}}" }}/{{ "{{" }}gateway{{ "}}" }}/{{ "{{" }}pod{{ "}}" }}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "mappings": [
+                {
+                  "type": "value",
+                  "options": {
+                    "0": {
+                      "text": "Unavailable",
+                      "color": "red"
+                    },
+                    "1": {
+                      "text": "Healthy",
+                      "color": "green"
+                    }
+                  }
+                }
+              ]
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 9,
+          "title": "IPsec XFRM errors / second",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 33
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "targets": [
+            {
+              "expr": "sum by (cluster, namespace, gateway, reason) (rate(cozyplane_vpn_ipsec_xfrm_errors_total{job=\"cozyplane-vpn-gateways\",namespace=~\"$namespace\",gateway=~\"$gateway\"}[$__rate_interval]))",
+              "legendFormat": "{{ "{{" }}namespace{{ "}}" }}/{{ "{{" }}gateway{{ "}}" }} {{ "{{" }}reason{{ "}}" }}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops"
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 10,
+          "title": "Appliance CPU (cores)",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 41
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "targets": [
+            {
+              "expr": "max by (cluster, namespace, pod) (rate(container_cpu_usage_seconds_total{namespace=~\"$namespace\",container=\"vpn-gateway\"}[$__rate_interval])) * on (cluster, namespace, pod) group_left (gateway) (max by (cluster, namespace, gateway, pod) (cozyplane_vpn_gateway_connections{job=\"cozyplane-vpn-gateways\",namespace=~\"$namespace\",gateway=~\"$gateway\"}) >= bool 0)",
+              "legendFormat": "{{ "{{" }}namespace{{ "}}" }}/{{ "{{" }}gateway{{ "}}" }}/{{ "{{" }}pod{{ "}}" }}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 11,
+          "title": "Appliance memory working set",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 41
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "targets": [
+            {
+              "expr": "max by (cluster, namespace, pod) (container_memory_working_set_bytes{namespace=~\"$namespace\",container=\"vpn-gateway\"}) * on (cluster, namespace, pod) group_left (gateway) (max by (cluster, namespace, gateway, pod) (cozyplane_vpn_gateway_connections{job=\"cozyplane-vpn-gateways\",namespace=~\"$namespace\",gateway=~\"$gateway\"}) >= bool 0)",
+              "legendFormat": "{{ "{{" }}namespace{{ "}}" }}/{{ "{{" }}gateway{{ "}}" }}/{{ "{{" }}pod{{ "}}" }}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes"
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 12,
+          "title": "Undiscovered appliances in selected namespaces",
+          "type": "table",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 49
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "targets": [
+            {
+              "expr": "(max by (cluster, namespace, pod) (kube_pod_container_info{namespace=~\"$namespace\",container=\"vpn-gateway\"}) unless on (cluster, namespace, pod) max by (cluster, namespace, pod) (up{job=\"cozyplane-vpn-gateways\"})) unless on (cluster, namespace, pod) kube_pod_deletion_timestamp",
+              "legendFormat": "{{ "{{" }}namespace{{ "}}" }}/{{ "{{" }}pod{{ "}}" }}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            },
+            "overrides": []
+          }
+        }
+      ]
+    }
+{{- end }}

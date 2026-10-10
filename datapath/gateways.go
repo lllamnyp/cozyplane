@@ -69,5 +69,5 @@ func (m *Manager) AttachOverlay() error {
 	if m.geneveIfindex == 0 {
 		return fmt.Errorf("geneve device not initialized")
 	}
-	return AttachIngress(m.geneveIfindex, m.objs.CozyplaneFromOverlay)
+	return attachIngressFirst(m.geneveIfindex, m.objs.CozyplaneFromOverlay)
 }

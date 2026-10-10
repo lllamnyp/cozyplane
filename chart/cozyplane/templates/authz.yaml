@@ -1,8 +1,8 @@
 {{- if .Values.exportPolicy.enabled }}
 # Gate VPCBinding creation on the 'export' verb of the referenced VPC. This is
 # the escalation gate that stops a tenant binding to a VPC it doesn't own (see
-# docs/control-plane.md §6). The 'export' check is only required when vpcRef is
-# set or changed, so the controller's finalizer writes are not blocked.
+# docs/control-plane.md §6). Changing any grant field or removing the reap
+# finalizer requires 'export'; unrelated metadata updates remain permitted.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -20,20 +20,30 @@ spec:
   variables:
     - name: ref
       expression: object.spec.vpcRef
-    - name: refUnchanged
+    - name: refNamespace
+      expression: >-
+        has(object.spec.vpcRef.namespace) && object.spec.vpcRef.namespace != '' ?
+          object.spec.vpcRef.namespace : object.metadata.namespace
+    - name: grantUnchanged
       expression: >-
         oldObject != null &&
-        oldObject.spec.vpcRef.namespace == object.spec.vpcRef.namespace &&
-        oldObject.spec.vpcRef.name == object.spec.vpcRef.name
+        oldObject.spec == object.spec &&
+        (!has(oldObject.metadata.finalizers) ||
+         !oldObject.metadata.finalizers.exists(f, f == 'sdn.cozystack.io/reap-ports') ||
+         (has(object.metadata.finalizers) &&
+          object.metadata.finalizers.exists(f, f == 'sdn.cozystack.io/reap-ports')))
   validations:
+    - expression: oldObject == null || object.spec.vpcRef == oldObject.spec.vpcRef
+      reason: Invalid
+      message: "spec.vpcRef is immutable; delete and recreate the binding"
     - expression: >-
-        variables.refUnchanged ||
+        variables.grantUnchanged ||
         authorizer.group('sdn.cozystack.io').resource('vpcs')
-          .namespace(variables.ref.namespace).name(variables.ref.name)
+          .namespace(variables.refNamespace).name(variables.ref.name)
           .check('export').allowed()
       reason: Forbidden
       messageExpression: >-
-        "creating a VPCBinding to VPC " + variables.ref.namespace + "/" +
+        "creating or changing a VPCBinding grant to VPC " + variables.refNamespace + "/" +
         variables.ref.name + " requires the 'export' verb on that VPC " +
         "(sdn.cozystack.io vpcs)"
 ---

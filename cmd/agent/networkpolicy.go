@@ -32,6 +32,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -134,7 +135,11 @@ type npCompiled struct {
 	allows   []datapath.NPAllow
 	cidrs    []datapath.NPCidr
 	warnings []string
+	err      error
 }
+
+const npCompileLimit = 65536
+const npCompileWorkLimit = 1 << 20
 
 // npEntityLabel is the reserved namespaceSelector key that names an entity
 // peer (docs/policy-layers.md § entities) — the vocabulary upstream
@@ -184,12 +189,12 @@ func npSelectorWarnings(policy string, sel *metav1.LabelSelector, warns *[]strin
 	}
 	for k := range sel.MatchLabels {
 		if npFilteredLabel(k) {
-			*warns = append(*warns, fmt.Sprintf("%s: selector key %q is identity-filtered and matches nothing", policy, k))
+			addCompileWarnings(warns, fmt.Sprintf("%s: selector key %q is identity-filtered and matches nothing", policy, k))
 		}
 	}
 	for _, e := range sel.MatchExpressions {
 		if npFilteredLabel(e.Key) {
-			*warns = append(*warns, fmt.Sprintf("%s: selector key %q is identity-filtered and matches nothing", policy, e.Key))
+			addCompileWarnings(warns, fmt.Sprintf("%s: selector key %q is identity-filtered and matches nothing", policy, e.Key))
 		}
 	}
 }
@@ -220,22 +225,30 @@ func npCompilePorts(policy string, ports []networkingv1.NetworkPolicyPort, warns
 			case corev1.ProtocolUDP:
 				proto = 17
 			default:
-				*warns = append(*warns, fmt.Sprintf("%s: protocol %q not served (TCP/UDP only)", policy, *p.Protocol))
+				addCompileWarnings(warns, fmt.Sprintf("%s: protocol %q not served (TCP/UDP only)", policy, *p.Protocol))
 				continue
 			}
 		}
 		if p.Port == nil {
+			if p.EndPort != nil {
+				*warns = append(*warns, fmt.Sprintf("%s: endPort without port — entry compiled closed", policy))
+				continue
+			}
 			out = append(out, npPort{proto: proto, port: 0})
 			continue
 		}
-		if p.Port.IntValue() == 0 {
-			*warns = append(*warns, fmt.Sprintf("%s: named port %q not served — entry compiled closed", policy, p.Port.String()))
+		if p.Port.Type != intstr.Int {
+			addCompileWarnings(warns, fmt.Sprintf("%s: named port %q not served — entry compiled closed", policy, p.Port.String()))
 			continue
 		}
-		item := npPort{proto: proto, port: uint16(p.Port.IntValue())}
+		if p.Port.IntVal < 1 || p.Port.IntVal > 65535 {
+			*warns = append(*warns, fmt.Sprintf("%s: port %d out of range — entry compiled closed", policy, p.Port.IntVal))
+			continue
+		}
+		item := npPort{proto: proto, port: uint16(p.Port.IntVal)}
 		if p.EndPort != nil {
 			if *p.EndPort < int32(item.port) || *p.EndPort > 65535 {
-				*warns = append(*warns, fmt.Sprintf("%s: bad endPort %d — entry compiled closed", policy, *p.EndPort))
+				addCompileWarnings(warns, fmt.Sprintf("%s: bad endPort %d — entry compiled closed", policy, *p.EndPort))
 				continue
 			}
 			item.endPort = uint16(*p.EndPort)
@@ -249,6 +262,23 @@ func npCompilePorts(policy string, ports []networkingv1.NetworkPolicyPort, warns
 // policies in, identity rows + allow pairs + warnings out.
 func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*networkingv1.NetworkPolicy) npCompiled {
 	var c npCompiled
+	work := 0
+	spend := func() bool {
+		work++
+		if work > npCompileWorkLimit {
+			c.err = fmt.Errorf("NetworkPolicy compilation exceeds %d operations", npCompileWorkLimit)
+			return false
+		}
+		return true
+	}
+	if len(pods) > npCompileLimit || len(nss) > npCompileLimit || len(nps) > npCompileLimit {
+		c.err = fmt.Errorf("NetworkPolicy input exceeds %d objects per kind", npCompileLimit)
+		return c
+	}
+	work, c.err = npInputWork(pods, nss, nps)
+	if c.err != nil {
+		return c
+	}
 
 	nsLabels := map[string]labels.Set{}
 	for _, ns := range nss {
@@ -283,12 +313,15 @@ func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*
 
 		subjectSel, err := metav1.LabelSelectorAsSelector(&np.Spec.PodSelector)
 		if err != nil {
-			c.warnings = append(c.warnings, fmt.Sprintf("%s: bad podSelector: %v", policy, err))
+			addCompileWarnings(&c.warnings, fmt.Sprintf("%s: bad podSelector: %v", policy, err))
 			continue
 		}
 		npSelectorWarnings(policy, &np.Spec.PodSelector, &c.warnings)
 		var subjects []uint64
 		for id, info := range registry {
+			if !spend() {
+				return c
+			}
 			if info.ns == np.Namespace && subjectSel.Matches(info.lbls) {
 				subjects = append(subjects, id)
 			}
@@ -321,6 +354,9 @@ func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*
 			var ids []uint64
 			var blocks []*networkingv1.IPBlock
 			for _, peer := range peers {
+				if !spend() {
+					return nil, nil
+				}
 				if peer.IPBlock != nil {
 					blocks = append(blocks, peer.IPBlock)
 					continue
@@ -335,7 +371,7 @@ func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*
 						if dir == datapath.NPDirIn {
 							where = "ingress"
 						}
-						c.warnings = append(c.warnings, fmt.Sprintf(
+						addCompileWarnings(&c.warnings, fmt.Sprintf(
 							"%s: entity %q is not served as an %s peer (node-destined egress is HostFirewall's; see docs/policy-layers.md): rule compiled closed",
 							policy, name, where))
 						continue
@@ -351,10 +387,13 @@ func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*
 					// Same-namespace pod peers.
 					sel, err := metav1.LabelSelectorAsSelector(peer.PodSelector)
 					if err != nil {
-						c.warnings = append(c.warnings, fmt.Sprintf("%s: bad peer podSelector: %v", policy, err))
+						addCompileWarnings(&c.warnings, fmt.Sprintf("%s: bad peer podSelector: %v", policy, err))
 						continue
 					}
 					for id, info := range registry {
+						if !spend() {
+							return nil, nil
+						}
 						if info.ns == np.Namespace && sel.Matches(info.lbls) {
 							ids = append(ids, id)
 						}
@@ -365,18 +404,21 @@ func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*
 				default:
 					nsSel, err := metav1.LabelSelectorAsSelector(peer.NamespaceSelector)
 					if err != nil {
-						c.warnings = append(c.warnings, fmt.Sprintf("%s: bad peer namespaceSelector: %v", policy, err))
+						addCompileWarnings(&c.warnings, fmt.Sprintf("%s: bad peer namespaceSelector: %v", policy, err))
 						continue
 					}
 					podSel := labels.Everything()
 					if peer.PodSelector != nil {
 						podSel, err = metav1.LabelSelectorAsSelector(peer.PodSelector)
 						if err != nil {
-							c.warnings = append(c.warnings, fmt.Sprintf("%s: bad peer podSelector: %v", policy, err))
+							addCompileWarnings(&c.warnings, fmt.Sprintf("%s: bad peer podSelector: %v", policy, err))
 							continue
 						}
 					}
 					for id, info := range registry {
+						if !spend() {
+							return nil, nil
+						}
 						nsl, ok := nsLabels[info.ns]
 						if !ok || !nsSel.Matches(nsl) {
 							continue
@@ -404,10 +446,11 @@ func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*
 					continue
 				}
 				if int(p.endPort)-int(p.port) >= 64 {
-					c.warnings = append(c.warnings, fmt.Sprintf("%s: ipBlock endPort range %d-%d wider than 64 — compiled closed", policy, p.port, p.endPort))
+					addCompileWarnings(&c.warnings, fmt.Sprintf("%s: ipBlock endPort range %d-%d wider than 64 — compiled closed", policy, p.port, p.endPort))
 					continue
 				}
 				for q := uint32(p.port); q <= uint32(p.endPort); q++ {
+					// #nosec G115 -- q is bounded by the uint16 endPort, including the maximum endpoint.
 					out = append(out, npPort{proto: p.proto, port: uint16(q)})
 				}
 			}
@@ -421,10 +464,14 @@ func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*
 			for _, b := range blocks {
 				_, cidr, err := net.ParseCIDR(strings.TrimSpace(b.CIDR))
 				if err != nil {
-					c.warnings = append(c.warnings, fmt.Sprintf("%s: bad ipBlock cidr %q: %v", policy, b.CIDR, err))
+					addCompileWarnings(&c.warnings, fmt.Sprintf("%s: bad ipBlock cidr %q: %v", policy, b.CIDR, err))
 					continue
 				}
 				for _, p := range ports {
+					if len(c.cidrs) >= npCompileLimit || !spend() {
+						c.err = fmt.Errorf("NetworkPolicy CIDR expansion exceeds compilation budget")
+						return
+					}
 					c.cidrs = append(c.cidrs, datapath.NPCidr{
 						ID: self, Dir: dir, Proto: p.proto, Port: p.port,
 						CIDR: cidr, Allow: true,
@@ -433,10 +480,14 @@ func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*
 				for _, exs := range b.Except {
 					_, ex, err := net.ParseCIDR(strings.TrimSpace(exs))
 					if err != nil {
-						c.warnings = append(c.warnings, fmt.Sprintf("%s: bad ipBlock except %q: %v", policy, exs, err))
+						addCompileWarnings(&c.warnings, fmt.Sprintf("%s: bad ipBlock except %q: %v", policy, exs, err))
 						continue
 					}
 					for _, p := range ports {
+						if len(c.cidrs) >= npCompileLimit || !spend() {
+							c.err = fmt.Errorf("NetworkPolicy CIDR expansion exceeds compilation budget")
+							return
+						}
 						c.cidrs = append(c.cidrs, datapath.NPCidr{
 							ID: self, Dir: dir, Proto: p.proto, Port: p.port,
 							CIDR: ex, Allow: false,
@@ -460,23 +511,37 @@ func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*
 				} else {
 					peerIDs, blocks = resolvePeers(rule.From, datapath.NPDirIn)
 				}
+				if c.err != nil {
+					return c
+				}
 				if len(ports) == 0 {
 					continue
 				}
 				for _, dst := range subjects {
 					for _, src := range peerIDs {
 						for _, p := range ports {
-							allows[datapath.NPAllow{
+							key := datapath.NPAllow{
 								DstID:   dst,
 								SrcID:   src,
 								Dir:     datapath.NPDirIn,
 								Proto:   p.proto,
 								Port:    p.port,
 								EndPort: p.endPort,
-							}] = true
+							}
+							if !spend() {
+								return c
+							}
+							if !allows[key] && len(allows) >= npCompileLimit {
+								c.err = fmt.Errorf("NetworkPolicy rules exceed %d rows", npCompileLimit)
+								return c
+							}
+							allows[key] = true
 						}
 					}
 					compileBlocks(blocks, dst, datapath.NPDirIn, ports)
+					if c.err != nil {
+						return c
+					}
 				}
 			}
 		}
@@ -493,23 +558,37 @@ func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*
 				} else {
 					peerIDs, blocks = resolvePeers(rule.To, datapath.NPDirEg)
 				}
+				if c.err != nil {
+					return c
+				}
 				if len(ports) == 0 {
 					continue
 				}
 				for _, src := range subjects {
 					for _, dst := range peerIDs {
 						for _, p := range ports {
-							allows[datapath.NPAllow{
+							key := datapath.NPAllow{
 								DstID:   dst, // the peer side for egress
 								SrcID:   src, // the isolated subject
 								Dir:     datapath.NPDirEg,
 								Proto:   p.proto,
 								Port:    p.port,
 								EndPort: p.endPort,
-							}] = true
+							}
+							if !spend() {
+								return c
+							}
+							if !allows[key] && len(allows) >= npCompileLimit {
+								c.err = fmt.Errorf("NetworkPolicy rules exceed %d rows", npCompileLimit)
+								return c
+							}
+							allows[key] = true
 						}
 					}
 					compileBlocks(blocks, src, datapath.NPDirEg, ports)
+					if c.err != nil {
+						return c
+					}
 				}
 			}
 		}
@@ -524,6 +603,10 @@ func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*
 				continue
 			}
 			seen[pip.IP] = true
+			if len(c.idents) >= npCompileLimit {
+				c.err = fmt.Errorf("NetworkPolicy identities exceed %d rows", npCompileLimit)
+				return c
+			}
 			c.idents = append(c.idents, datapath.NPIdent{IP: ip, ID: id, Flags: flags[id]})
 		}
 	}
@@ -534,8 +617,7 @@ func compileNetworkPolicies(pods []*corev1.Pod, nss []*corev1.Namespace, nps []*
 }
 
 // npSyncErrors counts failed map syncs, exposed as
-// cozyplane_np_sync_errors_total: an np_allow that didn't fit only ever
-// over-drops (fail-closed), but it must never be silent.
+// cozyplane_np_sync_errors_total. Failed updates retain the BPF deny guard.
 var npSyncErrors atomic.Uint64
 
 // watchNetworkPolicies compiles NetworkPolicies into the pinned NP maps on
@@ -547,7 +629,7 @@ func watchNetworkPolicies(ctx context.Context, client kubernetes.Interface, mgr 
 	nsInformer := factory.Core().V1().Namespaces()
 
 	var mu sync.Mutex
-	warned := map[string]bool{}
+	var warned compileWarnings
 	resync := func() {
 		mu.Lock()
 		defer mu.Unlock()
@@ -572,25 +654,28 @@ func watchNetworkPolicies(ctx context.Context, client kubernetes.Interface, mgr 
 		}
 
 		c := compileNetworkPolicies(pods, nss, nps)
-		for _, w := range c.warnings {
-			if !warned[w] { // once per distinct warning, not per resync
-				warned[w] = true
-				log.Warn("networkpolicy compile", "warning", w)
+		if c.err != nil {
+			log.Error("reject NetworkPolicy compilation; arming deny guard", "err", c.err)
+			if err := mgr.BlockNetworkPolicy(); err != nil {
+				log.Error("arm NetworkPolicy deny guard", "err", err)
 			}
-		}
-		if err := mgr.SyncNPIdents(c.idents); err != nil {
-			log.Error("sync np_ident", "err", err)
 			npSyncErrors.Add(1)
+			return
 		}
-		if err := mgr.SyncNPAllows(c.allows); err != nil {
-			log.Error("sync np_allow (a full map only over-drops — fail-closed)", "err", err)
-			npSyncErrors.Add(1)
+		warnings, truncated := warned.update(c.warnings)
+		for _, w := range warnings {
+			log.Warn("networkpolicy compile", "warning", w)
 		}
-		if err := mgr.SyncNPCidrs(c.cidrs); err != nil {
-			log.Error("sync np_cidr (a full map only over-drops — fail-closed)", "err", err)
+		if truncated {
+			log.Warn("networkpolicy compile warnings truncated", "limit", maxCompileWarnings)
+		}
+		if err := mgr.ApplyNetworkPolicy(c.idents, c.allows, c.cidrs); err != nil {
+			log.Error("apply NetworkPolicy; update guard retained", "err", err)
 			npSyncErrors.Add(1)
 		}
 	}
+	resync = resyncAfterCacheSync(ctx, resync, npInformer.Informer().HasSynced,
+		podInformer.Informer().HasSynced, nsInformer.Informer().HasSynced)
 
 	handler := cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(any) { resync() },

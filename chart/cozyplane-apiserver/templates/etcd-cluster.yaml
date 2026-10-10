@@ -1,3 +1,4 @@
+{{- if eq .Values.api.mode "aggregated" }}
 {{- /* Operator-managed etcd for the aggregated apiserver (etcd-operator.cozystack.io
        v1alpha2). PVC-backed by default; `etcd.operator.persistent: false` gives a
        tmpfs member instead, for an install with no storage layer.
@@ -133,4 +134,6 @@ spec:
     peer:
       certManager:
         issuerRef: { name: cozyplane-etcd-peer-issuer, kind: Issuer }
+{{- end }}
+
 {{- end }}

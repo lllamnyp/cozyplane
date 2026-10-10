@@ -123,8 +123,8 @@ func TestAPIServiceDesired(t *testing.T) {
 	if spec["group"] != sdnGroup || spec["version"] != sdnVersion {
 		t.Errorf("group/version = %v/%v, want %s/%s", spec["group"], spec["version"], sdnGroup, sdnVersion)
 	}
-	if _, ok := spec["insecureSkipTLSVerify"]; ok {
-		t.Error("insecureSkipTLSVerify set although CA injection was requested")
+	if value, ok := spec["insecureSkipTLSVerify"]; !ok || value != false {
+		t.Error("verified registration must explicitly revoke a stored TLS bypass")
 	}
 	if annotations["cert-manager.io/inject-ca-from"] != "cozy-cozyplane/serving-cert" {
 		t.Errorf("ca injection annotation = %v", annotations["cert-manager.io/inject-ca-from"])

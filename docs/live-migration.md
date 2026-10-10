@@ -134,6 +134,13 @@ to accept and documented in `internals.md`.
 
 ## Lifecycle / GC
 
+Migration announcement listeners must sleep while their socket is idle and
+observe cancellation within 100 ms. A nonblocking socket with `SO_RCVTIMEO`
+does not provide that wait: readiness polling is required before receiving.
+Every listener releases its child context on success, receive failure, and
+cancellation. A finishing listener may remove only its own registration;
+it must not remove a replacement started after cancellation.
+
 Ports are cluster-scoped, so a namespaced VMI ownerRef can't GC them. The
 persistent-Port controller owns the lifecycle: it **keeps** the Port while any
 virt-launcher pod (or the VMI) for its identity exists, and **deletes** it once
@@ -170,3 +177,130 @@ target, the same guest keeps running, and an in-VPC peer reaches it throughout
 (the IP never moved from the guest's view). Repeat on the default network (no VPC)
 for the non-VPC case. Contrast with the earlier masquerade test, which could not
 show preservation because the guest IP was NATed.
+Guest-announcement listeners retain the Port UID and observed resourceVersion.
+Cutover first reads the live Port and rejects replacement, termination, or a
+changed binding. The patch includes UID/resourceVersion preconditions so a late
+announcement cannot move a different claim that reused the same address/name.
+
+### Source-forward lifetime
+
+Each source-forward installation owns its cleanup lease. Expiry of an older move cannot delete a newer move, including a later move to the same target. Revocation and local cutover remove the forward immediately. Migration forwards are temporary propagation aids: agent load clears retained entries before attaching the new programs, so a crash cannot make them permanent.
+
+Port event handlers reread the current informer object before applying routes or migration updates. A delayed deletion for a replaced Port cannot remove its replacement, and a source-forward installation requires the event to remain current.
+
+Guest-announcement sockets use readiness polling while idle. The nonblocking receive path must not retry EAGAIN in a busy loop per staged VM; poll periodically checks cancellation and bounds idle CPU use.
+
+Each listener also cancels its child context when the receive worker finishes,
+including a successful announcement or socket failure. Removing the listener
+from the running map alone does not release its registration on the long-lived
+agent context. Retries must not retain finished child contexts until shutdown.
+
+The packet socket installs a bounded classic BPF filter for the expected
+announcement shape, pinned MAC and IP before receiving. Unrelated ARP/IPv6
+traffic is rejected in the kernel instead of waking a userspace poll/receive
+loop per frame. Both ARP announcement opcodes and IPv6 Neighbor Advertisements
+remain accepted. A filter installation failure closes the listener and leaves
+the controller-driven cutover fallback; it never falls back to an unfiltered
+socket. The existing live Port/sandbox ownership checks still govern cutover.
+
+### Staged endpoint ownership and revocation
+
+VPC veth aliases record the owning Port UID and whether local delivery is staged. CNI writes that identity before publishing maps. A staged alias never restores a locals entry on agent restart; cutover clears staging on the chosen sandbox, while move-away stages the old endpoint durably. Binding revocation and Port termination quarantine every local veth owned by that Port, including targets without locals, and synchronize forwarding rights for staged legs too. A stale Port UID cannot sever a replacement address owner. Legacy ownership must be proven by its sandbox, or by a live FabricIP-to-launcher/VMI UID join before adoption; an ambiguous endpoint is not adopted. A quarantined veth cannot be reactivated by an ADD retry; re-grant requires a new sandbox.
+
+Guest-driven cutover rechecks the live endpoint and its sandbox claim, joins
+the claim to the protected launcher owner, and updates the Port's pod/sandbox
+binding together with placement. It must not enable local delivery using the
+old source container ID while waiting for the controller to observe the move.
+Secondary NICs prove their sandbox through the primary FabricIP claim and keep
+their own interface name; their Port generation is still distinct.
+
+Deleting an old Port generation still drains its own veths when its name has
+already been reused; it never removes the replacement's routes or endpoints.
+After the complete Port cache is ready, grant reconciliation quarantines local
+veths whose recorded Port UID no longer exists. This covers a staged target
+that missed deletion while its agent was down. Missing or partial caches never
+authorize orphan cleanup. Unidentified legacy endpoints require ownership proof.
+
+### VPC generation during persistent attachment
+
+Rebinding a persistent Port also verifies that its claim name encodes the
+current VPC VNI and pinned address. A VPC recreated under the same name has
+a different, durably reserved VNI; a Port of the previous network cannot be
+rekeyed into it. CNI refuses that attachment before changing pod identity,
+and preserves the old Port, IP and MAC for explicit reconciliation. Matching
+VMI UID, namespace and VPC name alone does not establish network generation.
+
+Persistent Port GC confirms an empty verified launcher cache view with the live
+API reader before deleting the claim. The confirmation keeps the same namespace,
+VM-name label and verified VMI owner UID filter: a foreign or replacement VM
+launcher cannot retain the old claim. A verified live launcher defers GC and
+requeues while the informer catches up; a failed live list preserves the Port
+and returns an error. Deletion still uses UID/resourceVersion preconditions
+and the sever finalizer. This confirmation never reallocates the VM IP or MAC.
+
+### Persistent NIC creation transaction
+
+Within a VNI, persistent Port creation checks the current namespace/VM/VPC/NIC identity in a paged etcd snapshot before writing. The transaction compares the modification revision of every Port key in that VNI with the snapshot revision, alongside the existing Port/ServiceVIP address guards. A concurrent creation or identity-affecting update invalidates the snapshot; eight retries and a 65,536-claim/128-per-page scan ceiling bound the work. The allocation client caps each gRPC response at 16 MiB, and each scan stops before decoding more than 64 MiB of stored data; exceeding either limit fails ADD without a partial allocation. This includes legacy claims without adding an index, lease or historical reservation. Empty-collection compares admit the first claim. A matching claim returns AlreadyExists with the actual holding Port name, so ADD can fetch it, verify the instance UID and pinned IP/MAC, and bind or stage it. NIC identity fields are immutable through normal and status updates; pinned VM MAC changes are refused. Unrelated status changes within a busy VNI may cause a bounded retry or an ADD failure for kubelet to retry; they cannot permit a second identity.
+
+### Migration cleanup resource budget
+
+Repeated moves of the same VM address must retain one current expiry record, rather than a goroutine and timer for every event within the grace window. The migration forwarding map has 1024 entries, so expiry state is admitted up to the actual map capacity even if another loader cleared kernel entries while old owners remain. Generation leases still fence old cleanup against replacement and same-target ABA. The agent can sweep current installation timestamps from its existing five-second reconciliation ticker after the fifteen-second propagation grace; expiry runs under the migration lock, preserves newer installations, and retries failed deletion on the next sweep. Revocation and local cutover stay immediate. This caps retained scheduling state and cleanup scan work independently of event rate. Behavior tests reproduce the former 2000-event/2000-goroutine burst. Current-owner sweeps, same-target renewal, concurrent replacement, deletion retry and 1200-address churn are verified against real kernel maps. Expiry normally occurs 15–20 seconds after installation, subject to scheduling; no real-time deadline is claimed.
+
+### Guest cutover request lifetime
+
+A guest-announcement worker must keep its per-Port registration while validating and patching the live API binding. Releasing that registration before API work finishes allows the two-second reconciliation loop to create another worker for the same Port when the API stalls. Cutover API work must use the listener child context and a five-second total deadline; endpoint or Port replacement cancels both packet reception and in-flight API requests. Remove the registration on worker completion only if it still refers to that worker, preserving replacement listeners. This bounds overlapping cutover work per current Port and releases request/goroutine state on cancellation. Real HTTP-client tests reproduce the former early slot release and ignored child cancellation. Tests verify cancellation, a five-second stalled-request deadline, failed receive, and 25 cancellation cycles without descriptor or goroutine growth.
+
+### Migration sandbox claim lookup work
+
+Persistent Port event lookup: a launcher or VMI event
+must select only current Ports with the exact consumer namespace and VM name,
+using a composite cache index registered before the watches. A common VM name
+in another tenant must not cause its payloads to be copied on every event.
+Retargeting and deletion remove old memberships; missing indexes cannot fall
+back to a cluster scan. Include terminating and old-generation Ports in the
+notification set so existing reconciliation/UID fences still decide cleanup.
+The index stores current objects only and never changes pinned IP or MAC.
+
+Guest-driven cutover and legacy veth adoption identify the target launcher through a FabricIP claim matching the local node, consumer namespace and full container ID. Those joins must retrieve that tuple from the current informer index instead of copying every cluster claim. Interface and protected Pod/VMI UID checks remain in launcherClaimPod, including the primary-claim join for secondary NICs. The tuple lookup does not assume globally unique container IDs across nodes or namespaces. Index updates/deletions must remove old memberships; missing indexes cannot authorize a broader scan or adoption. Both paths now retrieve only current tuple members. Behavior tests cover index retarget/deletion, full sandbox scoping and secondary NIC ownership through the primary claim; the 10,005-claim benchmark falls from 474,233 to 72 allocated bytes per lookup.
+
+### Revocation API dependency
+
+Revocation of an endpoint carrying the exact Port UID should quarantine it using the live alias witness even when the core Pod API is unavailable. An unused Pod read must not delay this proven-owner path. Legacy endpoints still require the existing sandbox or protected launcher/instance ownership proof before adoption. Real kernel tests verify quarantine despite Pod API errors, replacement-owner preservation, failed legacy proof with the finalizer retained, and 100 idempotent cleanup calls without descriptor growth.
+
+### Mixed endpoint revocation
+
+A legacy endpoint with unverified ownership must not prevent quarantine of other endpoints carrying the exact Port UID. Revocation should drain proven generations before attempting uncertain legacy adoption, while retaining the sever finalizer if any ownership or cleanup step fails. No uncertain endpoint may be adopted or quarantined just because it shares a VPC address. Kernel tests reproduce the former all-or-nothing rejection. Both inventory orders now drain UID-owned and independently proven legacy endpoints, retain the uncertain endpoint and finalizer, and preserve descriptor counts through repeated retries.
+
+### Mixed endpoint forwarding updates
+
+A failure to establish legacy ownership must not keep stale forwarding grants on endpoints already carrying the exact Port UID. Binding reconciliation must still apply current forwarding consent to verified endpoints without granting rights to uncertain aliases. Reconciliation now completes the UID-owned batch before any legacy lookup, then applies individually verified legacy grants in a second batch. Kernel TCP tests verify foreign-source refusal after withdrawal, scoped re-grant through current informer updates, and stable descriptors over 50 repeated passes.
+
+Persistent-NIC client concurrency tests must model the server-side NIC uniqueness contract for both identical and differing candidate schedules. Even after simultaneous empty identity lookups, later occupancy scans can legally observe different snapshots and propose different address keys; the registry transaction remains the allocation authority.
+
+### Legacy ownership request lifetime
+
+The launcher ownership join is also called before guest listeners exist and by binding/revocation reconciliation. Those calls can receive the long-lived agent context, so the guest cutover deadline alone does not bound them. A stalled live Pod read must terminate within a five-second ownership-read budget while preserving the caller context and refusing unproven adoption. Real HTTP tests reproduce the former unbounded read, verify expiration with a healthy parent, preserve a shorter parent deadline and drain 25 cancellation cycles without descriptor or goroutine growth. This bounds each read, not every informer backlog or the sum of many independent reads.
+
+### Guest candidate lookup work
+
+The two-second guest listener reconciler needs Ports corresponding to local endpoint inventory. Ports use registry-enforced canonical allocation names derived from the full VNI and IP; candidate reads use the existing lister key lookup instead of copying the complete cluster Port cache. A recorded alias UID must match the current object, and legacy candidates still need the sandbox and protected launcher proof before cutover. No broader scan may substitute for an absent claim. Behavior tests cover overlapping IPv4/IPv6 VNIs, replacement UID ordering, duplicates, missing or mismatched claims, inactive inventory and actual primary/secondary veth ownership. The 10,002-Port benchmark decreases from 474,233 to 488 allocated bytes per lookup; this measures transient work, not a permanent leak.
+
+### Sever acknowledgement request lifetime
+
+The Port watch acknowledges completed local revocation through live SDN reads and a resource-version-checked update. These requests share a five-second operation deadline, including conflict retries, instead of inheriting the agent lifetime. Failed confirmation retains the sever barrier and preserves the healthy parent context. A lost write response cannot prove whether the API server committed the already-validated update. Real generated-client tests cover stalled initial/confirmation reads, a stalled PUT response, shorter parent deadlines and 25 cancellation cycles with stable descriptors and goroutines. This budget does not make client-go's notification ring globally bounded.
+
+### Sever acknowledgement notification work
+
+A per-request deadline alone still caused one API retry for every old notification of a terminating Port. The real watch retained 17.2 MB after 512 updates, stalled an unrelated route and delayed proven-owner quarantine. The callback now applies UID-proven quarantine immediately and coalesces API acknowledgement/legacy proof work into one cache-driven worker with one pending notification. Its index contains only current terminating claims; no event history is retained. Initial cache replay quarantines all proven owners before API work. Kernel/informer tests verify prompt quarantine and unrelated route delivery, small retained heap after the burst, one conditional acknowledgement PUT after API recovery, replacement-UID preservation and index membership cleanup through 1,000 claims. Deletion and migration source-forward witnesses remain in their existing handlers. This concerns acknowledgement stalls, not a guarantee that all informer buffers or all other callbacks are bounded.
+
+### Revocation retry without a new event
+
+The agent creates SDK informers with resync disabled. In this configuration client-go ignores a handler's requested 15-second resync period, so that option did not retry a transient API or datapath failure. Sever acknowledgement and forwarding reconciliation now own a 15-second retry tick after complete cache synchronization, keeping one pending pass and stopping the ticker on cancellation. Real HTTP/informer/kernel tests recover acknowledgement and remove stale forwarding permission without a new watched-object change. Scheduling tests cover cache readiness, blocked passes with 10,000 notifications and multiple ticks, cancellation, and 100 worker lifetimes without retained goroutines. Ordinary route-event processing and informer factory defaults remain unchanged. Binding reconciliation does read its current snapshots every 15 seconds; it does not rewrite unchanged grants or periodically replay all routes.
+
+### Aggregate legacy ownership work
+
+Binding reconciliation applies UID-proven endpoints before legacy ownership reads, but a sequence of stalled legacy reads previously delayed the next pass after a new grant withdrawal. The complete legacy phase now shares one five-second child deadline, preserves the healthy agent context and stops further reads after expiration. This bounds cumulative HTTP waiting, not all kernel scheduling or lock delays. Real informer/HTTP/kernel tests withdraw proven-owner forwarding in about 5.4 seconds despite three stalled legacy endpoints. Unproven endpoints remain unadopted and can be retried on later passes; the current sandbox/Pod/VMI checks and batching remain in place.
+
+### Consent after a legacy ownership read
+
+A protected launcher proof identifies an endpoint owner; it does not preserve the forwarding grant that existed when the HTTP read started. Before publishing the verified legacy batch, reconciliation reads current bindings once and resolves grants for the verified Ports only. Current Port UID, address, VPC and namespace are checked again; a missing, replaced or terminating Port quarantines only the proven old alias. Attachment withdrawal uses the same ownership-fenced cleanup and forwarding withdrawal uses the batch diff. Kernel tests release a valid Pod response only after the informer observes withdrawal. They also cover Port termination/replacement, a recreated physical veth with a different sandbox, scoped consent recovery and 50 repeated reconciliations with stable descriptors. These are current-cache checks, not a transaction across API watches and kernel publication.

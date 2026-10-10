@@ -35,6 +35,7 @@ func EnsureBPFFS() error {
 		return nil
 	}
 
+	// #nosec G301 -- Fixed shared bpffs mount point; directory is root-owned and never writable by other users.
 	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", mountpoint, err)
 	}

@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"github.com/lllamnyp/cozyplane/api/sdn"
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
 )
 
@@ -37,7 +38,7 @@ import (
 // holds that IP, the FloatingIP liveness gate.
 func livePort(vpcNS, vpc, ip, node string) *sdnv1alpha1.Port {
 	return &sdnv1alpha1.Port{
-		ObjectMeta: metav1.ObjectMeta{Name: "port-" + ip},
+		ObjectMeta: metav1.ObjectMeta{Name: sdn.PortName(100, ip)},
 		Spec: sdnv1alpha1.PortSpec{
 			VPCRef: sdnv1alpha1.VPCRef{Namespace: vpcNS, Name: vpc},
 			IP:     ip,
@@ -58,8 +59,19 @@ func floatingIP(ns, name, vpc, target string) *sdnv1alpha1.FloatingIP {
 
 func fipClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
+	// Supply the live VPC that real IPAM claims refer to in these fixtures.
+	refs := map[sdnv1alpha1.VPCRef]bool{}
+	for _, obj := range objs {
+		if f, ok := obj.(*sdnv1alpha1.FloatingIP); ok {
+			refs[sdnv1alpha1.VPCRef{Namespace: f.Namespace, Name: f.Spec.VPCRef.Name}] = true
+		}
+	}
+	for ref := range refs {
+		objs = append(objs, vpcWithCIDRs(ref.Namespace, ref.Name, 100, "10.0.0.0/16"))
+	}
 	return fake.NewClientBuilder().
 		WithScheme(gatewayScheme(t)). // registers client-go (Services) + sdn
+		WithIndex(&sdnv1alpha1.FloatingIP{}, floatingTargetIndex, floatingTargetIndexKeys).
 		WithObjects(objs...).
 		WithStatusSubresource(&sdnv1alpha1.FloatingIP{}, &corev1.Service{}).
 		Build()

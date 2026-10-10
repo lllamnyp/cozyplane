@@ -171,3 +171,6 @@ Apache-2.0 (see [LICENSE](LICENSE)), with two carve-outs dictated by the kernel:
   [Cilium](https://github.com/cilium/cilium)'s `bpf/bpf_sock.c` (dual
   GPL-2.0/BSD-2-Clause; kernel license string "Dual BSD/GPL") — see
   `kpr/build-bpf.sh` for provenance and the pinned tag.
+
+Additional interface design: [several VPCs on one Pod](docs/multi-attach.md)
+and [additional KubeVirt NICs](docs/kubevirt-multi-nic.md).

@@ -10,3 +10,12 @@ bpf/vmlinux.h
 /cozyplane-agent
 /cozyplane-apiserver
 /sdn-controller
+
+# Local operator credentials, VPN material and workstation tooling.
+/.codex-*
+/.serena/
+.env
+.env.*
+!.env.example
+*.kubeconfig
+*.kubeconfig.*

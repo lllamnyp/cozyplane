@@ -18,9 +18,9 @@ package main
 
 import (
 	"context"
+	"github.com/lllamnyp/cozyplane/pkg/netid"
 	"log/slog"
 	"net"
-	"sync"
 
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/tools/cache"
@@ -46,11 +46,7 @@ func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFa
 	gws := factory.Sdn().V1alpha1().VPCGateways()
 	vpcs := factory.Sdn().V1alpha1().VPCs()
 
-	var mu sync.Mutex
 	resync := func() {
-		mu.Lock()
-		defer mu.Unlock()
-
 		allGWs, err := gws.Lister().List(labels.Everything())
 		if err != nil {
 			log.Error("list vpcgateways", "err", err)
@@ -63,6 +59,30 @@ func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFa
 		}
 		desired := desiredVPCIngress(allGWs, allVPCs)
 
+		current, err := mgr.VPCIngresses()
+		if err != nil {
+			log.Error("read vpc_ingress map", "err", err)
+			return
+		}
+		for net := range desired {
+			if !current[net] {
+				if err := mgr.SetVPCIngress(net); err != nil {
+					log.Error("open vpc ingress", "vni", net, "err", err)
+					continue
+				}
+				log.Info("VPC admits LoadBalancer ingress", "vni", net)
+			}
+		}
+		for net := range current {
+			if !desired[net] {
+				if err := mgr.DelVPCIngress(net); err != nil {
+					log.Error("close vpc ingress", "vni", net, "err", err)
+					continue
+				}
+				log.Info("VPC no longer admits LoadBalancer ingress", "vni", net)
+			}
+		}
+
 		// The VPC's egress identity, and this node's slice of its port space.
 		// Every node programs the WHOLE shard table: any node may be the one the
 		// fabric hands a reply to, and it must know which node's connection table
@@ -74,6 +94,34 @@ func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFa
 		if err != nil {
 			log.Error("read vpc_nat map", "err", err)
 			return
+		}
+		shardNodes := make([]net.IP, min(len(order), datapath.NATShards))
+		for i := range shardNodes {
+			if order[i] == selfName {
+				shardNodes[i] = net.ParseIP(selfIP)
+			} else {
+				shardNodes[i] = nodeIPs.get(order[i])
+			}
+		}
+		if err := mgr.SyncNATReverse(wantNAT, shardNodes); err != nil {
+			log.Error("sync NAT reverse projection", "err", err)
+			return
+		}
+		// Retire removed identities before publishing replacements. A node
+		// without a current shard must not keep sending with a previous one.
+		for vni, id := range curNAT {
+			_, wanted := wantNAT[vni]
+			if wanted && selfShard >= 0 && selfShard < datapath.NATShards {
+				continue
+			}
+			if wanted {
+				// Retire local SNAT only; reverse routing remains valid here.
+				id = datapath.NATIdentity{}
+			}
+			if err := mgr.DelVPCNAT(vni, id.V4, id.V6); err != nil {
+				log.Error("del vpc nat", "vni", vni, "err", err)
+				return
+			}
 		}
 		for vni, id := range wantNAT {
 			// The FIB decides which link serves the identity: on a multi-NIC node
@@ -99,35 +147,6 @@ func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFa
 					continue
 				}
 			}
-			for i, n := range order {
-				if i >= datapath.NATShards {
-					break
-				}
-				// nodeIPIndex holds only the OTHER nodes — it exists to feed
-				// `remotes`, and watchNodes skips self. But the shard table must
-				// name every node INCLUDING this one, or the reverse lookup misses
-				// on exactly the node that holds the flow: the reply falls through
-				// to the kernel, which ARPs for an address the node itself
-				// announces. (It did. That is how this was found.)
-				ip := nodeIPs.get(n)
-				if n == selfName {
-					ip = net.ParseIP(selfIP)
-				}
-				if ip == nil {
-					continue
-				}
-				// One shard table per family: a reply arrives addressed to the v4
-				// or the v6 identity, and each demuxes through nat_owner by its own
-				// address.
-				for _, addr := range []string{id.V4, id.V6} {
-					if addr == "" {
-						continue
-					}
-					if err := mgr.SetNATOwner(addr, uint16(i), ip); err != nil {
-						log.Error("set nat owner", "addr", addr, "shard", i, "err", err)
-					}
-				}
-			}
 			// Nothing here ATTRACTS the address (docs/north-south.md, tenet 3):
 			// the platform must make the fabric hand it to a node — a CCM, a
 			// static route, an address configured on a node. Whichever node it
@@ -137,47 +156,10 @@ func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFa
 				log.Info("VPC egresses as its own address", "vni", vni, "v4", id.V4, "v6", id.V6)
 			}
 		}
-		for vni, id := range curNAT {
-			if _, ok := wantNAT[vni]; !ok {
-				if err := mgr.DelVPCNAT(vni, id.V4, id.V6); err != nil {
-					log.Error("del vpc nat", "vni", vni, "err", err)
-					continue
-				}
-				for i := range datapath.NATShards {
-					for _, addr := range []string{id.V4, id.V6} {
-						if addr != "" {
-							_ = mgr.DelNATOwner(addr, uint16(i))
-						}
-					}
-				}
-				log.Info("VPC lost its egress identity", "vni", vni, "v4", id.V4, "v6", id.V6)
-			}
-		}
 
-		current, err := mgr.VPCIngresses()
-		if err != nil {
-			log.Error("read vpc_ingress map", "err", err)
-			return
-		}
-		for net := range desired {
-			if !current[net] {
-				if err := mgr.SetVPCIngress(net); err != nil {
-					log.Error("open vpc ingress", "vni", net, "err", err)
-					continue
-				}
-				log.Info("VPC admits LoadBalancer ingress", "vni", net)
-			}
-		}
-		for net := range current {
-			if !desired[net] {
-				if err := mgr.DelVPCIngress(net); err != nil {
-					log.Error("close vpc ingress", "vni", net, "err", err)
-					continue
-				}
-				log.Info("VPC no longer admits LoadBalancer ingress", "vni", net)
-			}
-		}
 	}
+
+	resync = resyncAfterCacheSync(ctx, resync, gws.Informer().HasSynced, vpcs.Informer().HasSynced)
 
 	onAny := cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(any) { resync() },
@@ -187,32 +169,38 @@ func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFa
 	_, _ = gws.Informer().AddEventHandler(onAny)
 	// The node set decides both the port shards and the announcer.
 	nodes.onChange(resync)
+	// A Ready node can change or lose its underlay endpoint without changing
+	// the shard order. Refresh routes after the endpoint index publishes it.
+	nodeIPs.onChange(resync)
 	// VPCs too: the gate is keyed by VNI, which the VPC's status carries.
 	_, _ = vpcs.Informer().AddEventHandler(onAny)
+}
 
-	go func() {
-		if cache.WaitForCacheSync(ctx.Done(), gws.Informer().HasSynced, vpcs.Informer().HasSynced) {
-			resync()
-		}
-	}()
+// gatewayCandidatesByVPC prevents unrelated gateways in the same namespace
+// from multiplying each VPC projection scan. Selection still uses the shared
+// EffectiveGateway rule, including termination and deterministic tie-breaking.
+func gatewayCandidatesByVPC(gws []*sdnv1alpha1.VPCGateway) map[sdnv1alpha1.VPCRef][]sdnv1alpha1.VPCGateway {
+	byVPC := map[sdnv1alpha1.VPCRef][]sdnv1alpha1.VPCGateway{}
+	for _, g := range gws {
+		key := sdnv1alpha1.VPCRef{Namespace: g.Namespace, Name: g.Spec.VPCRef.Name}
+		byVPC[key] = append(byVPC[key], *g)
+	}
+	return byVPC
 }
 
 // desiredVPCIngress is the set of VNIs whose boundary admits LoadBalancer ingress.
 // A VPC's boundary is its OLDEST gateway (EffectiveGateway) — a second gateway
 // cannot open a door the first one closed.
 func desiredVPCIngress(gws []*sdnv1alpha1.VPCGateway, vpcs []*sdnv1alpha1.VPC) map[uint32]bool {
-	byNS := map[string][]sdnv1alpha1.VPCGateway{}
-	for _, g := range gws {
-		byNS[g.Namespace] = append(byNS[g.Namespace], *g)
-	}
+	byVPC := gatewayCandidatesByVPC(gws)
 	out := map[uint32]bool{}
 	for _, vpc := range vpcs {
-		if vpc.Status.VNI == 0 {
+		if !netid.ValidVNI(vpc.Status.VNI) || !vpc.DeletionTimestamp.IsZero() {
 			continue
 		}
-		gw := sdnv1alpha1.EffectiveGateway(byNS[vpc.Namespace], vpc.Name)
+		gw := sdnv1alpha1.EffectiveGateway(byVPC[sdnv1alpha1.VPCRef{Namespace: vpc.Namespace, Name: vpc.Name}], vpc.Name)
 		if gw != nil && gw.Spec.Ingress.LoadBalancer {
-			out[uint32(vpc.Status.VNI)] = true
+			out[netid.VNI(vpc.Status.VNI)] = true
 		}
 	}
 	return out
@@ -222,18 +210,15 @@ func desiredVPCIngress(gws []*sdnv1alpha1.VPCGateway, vpcs []*sdnv1alpha1.VPC) m
 // address(es) their traffic wears on the wire — a v4 and/or a v6 (docs/north-south.md
 // §6a). A VPC's boundary is its OLDEST gateway.
 func desiredVPCNAT(gws []*sdnv1alpha1.VPCGateway, vpcs []*sdnv1alpha1.VPC) map[uint32]datapath.NATIdentity {
-	byNS := map[string][]sdnv1alpha1.VPCGateway{}
-	for _, g := range gws {
-		byNS[g.Namespace] = append(byNS[g.Namespace], *g)
-	}
+	byVPC := gatewayCandidatesByVPC(gws)
 	out := map[uint32]datapath.NATIdentity{}
 	for _, vpc := range vpcs {
-		if vpc.Status.VNI == 0 {
+		if !netid.ValidVNI(vpc.Status.VNI) || !vpc.DeletionTimestamp.IsZero() {
 			continue
 		}
-		gw := sdnv1alpha1.EffectiveGateway(byNS[vpc.Namespace], vpc.Name)
+		gw := sdnv1alpha1.EffectiveGateway(byVPC[sdnv1alpha1.VPCRef{Namespace: vpc.Namespace, Name: vpc.Name}], vpc.Name)
 		if gw != nil && gw.Spec.NAT.Enabled && (gw.Status.NATAddress != "" || gw.Status.NATAddress6 != "") {
-			out[uint32(vpc.Status.VNI)] = datapath.NATIdentity{V4: gw.Status.NATAddress, V6: gw.Status.NATAddress6}
+			out[netid.VNI(vpc.Status.VNI)] = datapath.NATIdentity{V4: gw.Status.NATAddress, V6: gw.Status.NATAddress6}
 		}
 	}
 	return out

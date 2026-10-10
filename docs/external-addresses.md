@@ -129,6 +129,28 @@ spec:
 
 ## 5. The VPCGateway NAT identity — a backend-less sibling
 
+FloatingIP and NAT EndpointSlice family changes use one ownership-checked delete
+with UID/resourceVersion preconditions followed by a direct create of the new
+slice. They do not recursively re-read the informer cache after deletion: the
+cache may still contain the old slice while writes go directly to the API. A
+delete/create conflict returns to controller reconciliation for retry, without
+adopting a replacement object or spinning/growing the stack on stale cache data.
+
+FloatingIP target liveness and agent projection require the current live VPC and
+a non-terminating Port whose canonical address claim matches that VPC's allocated
+VNI. A Port left from a predecessor VPC cannot satisfy the new object's target.
+The agent waits for the VPC cache, watches VPC changes, and retires mappings when
+the VPC or target claim is removed or enters deletion; an allocated public address
+may remain held by its Service while target delivery is dark.
+
+Floating datapath updates reconcile complete forward and reverse projections.
+Retargeting a public address withdraws the predecessor target's SNAT entry only
+while it still names that public address. Reconciliation also prunes reverse
+entries left without a corresponding forward claim, including after an agent
+restart. Both desired maps are checked against their actual kernel capacity and
+the 1:1 ownership/family rules before either map is changed. A rejected projection
+preserves the previous snapshot; writes across two kernel maps are not atomic.
+
 A NAT identity is **not** egress-only. When a VPC pod egresses SNAT'd to it, the reply
 comes back *addressed to it*, and that reply must be attracted to a node for
 `vpc_nat_reverse` to un-NAT it. So the NAT identity needs the **same** allocation +

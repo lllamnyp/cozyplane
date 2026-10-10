@@ -51,10 +51,15 @@ func reconcilePins() ([]string, error) {
 		}
 		if err == nil {
 			cerr := ms.Compatible(pinned) // the same test map reuse applies
-			pinned.Close()
+			if err := pinned.Close(); err != nil {
+				return removed, fmt.Errorf("close inspected map: %w", err)
+			}
 			if cerr == nil {
 				continue
 			}
+		}
+		if name == "hf_modes" {
+			return removed, fmt.Errorf("refuse removal of incompatible durable host-firewall modes")
 		}
 		if err := os.Remove(path); err != nil {
 			return removed, fmt.Errorf("remove incompatible pin %s: %w", name, err)

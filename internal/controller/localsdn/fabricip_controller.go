@@ -19,6 +19,8 @@ package localsdn
 import (
 	"context"
 	"fmt"
+	"net"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -45,6 +47,20 @@ import (
 // GC, which has keyed on UID from the start.)
 type FabricIPReconciler struct {
 	client.Client
+	Reader      client.Reader
+	GracePeriod time.Duration
+}
+
+const fabricIPGracePeriod = 5 * time.Minute
+
+const fabricIPPodIndex = "cozyplane.fabricip.pod"
+
+func fabricIPPodKeys(obj client.Object) []string {
+	fip := obj.(*localv1alpha1.FabricIP)
+	if fip.Spec.PodNamespace == "" || fip.Spec.PodName == "" {
+		return nil
+	}
+	return []string{fip.Spec.PodNamespace + "/" + fip.Spec.PodName}
 }
 
 // +kubebuilder:rbac:groups=local.sdn.cozystack.io,resources=fabricips,verbs=get;list;watch;create;delete
@@ -67,7 +83,11 @@ func (r *FabricIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	var pod corev1.Pod
-	err := r.Get(ctx, types.NamespacedName{Namespace: fip.Spec.PodNamespace, Name: fip.Spec.PodName}, &pod)
+	reader := r.Reader
+	if reader == nil {
+		reader = r.Client
+	}
+	err := reader.Get(ctx, types.NamespacedName{Namespace: fip.Spec.PodNamespace, Name: fip.Spec.PodName}, &pod)
 	switch {
 	case apierrors.IsNotFound(err):
 		// The pod is gone: reclaim.
@@ -77,14 +97,39 @@ func (r *FabricIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		// A pod with this name exists. It is only the SAME pod if the UID
 		// matches — otherwise the name was reused and this claim belongs to a
 		// dead predecessor, which is exactly the case that must still be reaped.
-		if fip.Spec.PodUID == "" || string(pod.UID) == fip.Spec.PodUID {
+		if fip.Spec.PodUID == "" {
 			return ctrl.Result{}, nil
 		}
-		logger.Info("reclaiming fabric IP: pod name reused by a different UID",
-			"address", fip.Spec.Address, "pod", fip.Spec.PodName)
+		if string(pod.UID) == fip.Spec.PodUID {
+			if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+				break // completed Pod history cannot retain an allocation indefinitely
+			}
+			if pod.Status.Phase != corev1.PodRunning || len(pod.Status.PodIPs) == 0 || fip.CreationTimestamp.IsZero() {
+				return ctrl.Result{}, nil
+			}
+			ip := net.ParseIP(fip.Spec.Address)
+			if ip == nil {
+				return ctrl.Result{}, nil
+			}
+			for _, current := range pod.Status.PodIPs {
+				if ip.Equal(net.ParseIP(current.IP)) {
+					return ctrl.Result{}, nil
+				}
+			}
+			grace := r.GracePeriod
+			if grace <= 0 {
+				grace = fabricIPGracePeriod
+			}
+			if remaining := grace - time.Since(fip.CreationTimestamp.Time); remaining > 0 {
+				return ctrl.Result{RequeueAfter: remaining}, nil
+			}
+			logger.Info("reclaiming stale sandbox fabric IP", "address", fip.Spec.Address, "pod", fip.Spec.PodName)
+		} else {
+			logger.Info("reclaiming fabric IP: pod name reused by a different UID", "address", fip.Spec.Address, "pod", fip.Spec.PodName)
+		}
 	}
 
-	if err := r.Delete(ctx, &fip); err != nil && !apierrors.IsNotFound(err) {
+	if err := r.Delete(ctx, &fip, client.Preconditions{UID: &fip.UID, ResourceVersion: &fip.ResourceVersion}); err != nil && !apierrors.IsNotFound(err) {
 		return ctrl.Result{}, fmt.Errorf("reclaim FabricIP %s: %w", fip.Name, err)
 	}
 	logger.Info("reclaimed fabric IP", "address", fip.Spec.Address,
@@ -100,7 +145,7 @@ func (r *FabricIPReconciler) mapPodToFabricIPs(ctx context.Context, obj client.O
 		return nil
 	}
 	var fips localv1alpha1.FabricIPList
-	if err := r.List(ctx, &fips); err != nil {
+	if err := r.List(ctx, &fips, client.MatchingFields{fabricIPPodIndex: pod.Namespace + "/" + pod.Name}); err != nil {
 		return nil
 	}
 	var reqs []ctrl.Request
@@ -114,6 +159,9 @@ func (r *FabricIPReconciler) mapPodToFabricIPs(ctx context.Context, obj client.O
 }
 
 func (r *FabricIPReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &localv1alpha1.FabricIP{}, fabricIPPodIndex, fabricIPPodKeys); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&localv1alpha1.FabricIP{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.mapPodToFabricIPs)).

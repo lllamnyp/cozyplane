@@ -83,6 +83,41 @@ func TestLpmKeyRejectsGarbage(t *testing.T) {
 	}
 }
 
+func TestLpmKeyMappedIPv4EqualsNative(t *testing.T) {
+	for _, pair := range [][2]string{{"::ffff:0.0.0.0/96", "0.0.0.0/0"}, {"::ffff:192.0.2.17/120", "192.0.2.17/24"}, {"::ffff:192.0.2.17/128", "192.0.2.17/32"}} {
+		mapped, err := lpmKey(101, pair[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		native, err := lpmKey(101, pair[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mapped != native {
+			t.Errorf("%s key=%+v differs from %s key=%+v", pair[0], mapped, pair[1], native)
+		}
+	}
+}
+
+func TestCIDRPrefixNativeAndInvalidMasks(t *testing.T) {
+	for _, input := range []string{"::ffff:192.0.2.17/64", "::ffff:192.0.2.17/95", "2001:db8::17/48", "192.0.2.17/24"} {
+		key, err := lpmKey(101, input)
+		if err != nil || key.Prefixlen > 160 {
+			t.Fatal(input, key, err)
+		}
+	}
+	for _, input := range []*net.IPNet{
+		nil,
+		{IP: net.ParseIP("2001:db8::1"), Mask: net.CIDRMask(24, 32)},
+		{IP: net.IP{192, 0, 2, 1}, Mask: net.CIDRMask(64, 128)},
+		{IP: net.IP{192, 0, 2, 1}, Mask: net.IPMask{255, 0, 255, 0}},
+	} {
+		if _, _, err := cidrAddressPrefix(input); err == nil {
+			t.Fatal("invalid internal CIDR accepted", input)
+		}
+	}
+}
+
 // addr128 <-> IP round-trips for both families (v4 via NAT64, v6 native).
 func TestAddr128RoundTrips(t *testing.T) {
 	for _, s := range []string{"10.20.30.40", "2001:db8::1"} {

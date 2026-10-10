@@ -65,14 +65,22 @@ type FabricIPSpec struct {
 	Node string `json:"node,omitempty"`
 
 	// PodNamespace, PodName and PodUID identify the claimant. The UID is the
-	// load-bearing one: GC keys on it, so a pod that reuses a name can never
-	// have its address reaped by the previous occupant's DEL.
+	// identity used by GC, so a pod that reuses a name cannot keep the previous
+	// occupant's claims alive. DEL uses the sandbox identity below.
 	// +optional
 	PodNamespace string `json:"podNamespace,omitempty"`
 	// +optional
 	PodName string `json:"podName,omitempty"`
 	// +optional
 	PodUID string `json:"podUID,omitempty"`
+
+	// ContainerID and IfName identify the CNI sandbox allocation. Pod UID alone
+	// is insufficient: a pod can replace its sandbox without changing its UID.
+	// Empty ContainerID denotes a legacy or repaired claim, never released by DEL.
+	// +optional
+	ContainerID string `json:"containerID,omitempty"`
+	// +optional
+	IfName string `json:"ifName,omitempty"`
 }
 
 // +genclient

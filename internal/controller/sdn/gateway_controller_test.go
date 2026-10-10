@@ -43,9 +43,15 @@ func gatewayScheme(t *testing.T) *runtime.Scheme {
 	return s
 }
 
+func gatewayClientBuilder(scheme *runtime.Scheme) *fake.ClientBuilder {
+	return fake.NewClientBuilder().WithScheme(scheme).
+		WithIndex(&sdnv1alpha1.VPCGateway{}, gatewayVPCIndex, gatewayVPCKeys).
+		WithIndex(&sdnv1alpha1.Port{}, vpnAppliancePodIndex, vpnAppliancePodKeys)
+}
+
 func egressVPC(ns, name string, vni int32, egress bool) *sdnv1alpha1.VPC {
 	return &sdnv1alpha1.VPC{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, UID: types.UID("vpc-" + ns + "-" + name)},
 		Spec:       sdnv1alpha1.VPCSpec{CIDRs: []string{"10.10.0.0/24"}},
 		Status:     sdnv1alpha1.VPCStatus{VNI: vni},
 	}
@@ -69,7 +75,7 @@ func natGateway(ns, name, vpcName string) *sdnv1alpha1.VPCGateway {
 // lands (docs/north-south.md §6a, #15).
 func dualStackVPC(ns, name string, vni int32) *sdnv1alpha1.VPC {
 	return &sdnv1alpha1.VPC{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, UID: types.UID("vpc-" + ns + "-" + name)},
 		Spec:       sdnv1alpha1.VPCSpec{CIDRs: []string{"10.10.0.0/24", "fd00:10::/64"}},
 		Status:     sdnv1alpha1.VPCStatus{VNI: vni},
 	}
@@ -103,7 +109,7 @@ func gatewayReconciler(c client.Client) *GatewayReconciler {
 
 func TestGatewayDeploymentCreated(t *testing.T) {
 	scheme := gatewayScheme(t)
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(egressVPC("team-a", "vpc-a", 100, true), natGateway("team-a", "door", "vpc-a")).Build()
+	c := gatewayClientBuilder(scheme).WithObjects(egressVPC("team-a", "vpc-a", 100, true), natGateway("team-a", "door", "vpc-a")).Build()
 	r := gatewayReconciler(c)
 
 	key := types.NamespacedName{Namespace: "team-a", Name: "vpc-a"}
@@ -122,14 +128,14 @@ func TestGatewayDeploymentCreated(t *testing.T) {
 		t.Errorf("strategy = %q, want Recreate (the .1 Port claim cannot roll)", dep.Spec.Strategy.Type)
 	}
 	sc := dep.Spec.Template.Spec.Containers[0].SecurityContext
-	if sc == nil || sc.Privileged == nil || !*sc.Privileged {
-		t.Error("gateway container must be privileged (iptables/sysctls in its own netns)")
+	if sc == nil || sc.Privileged == nil || *sc.Privileged || sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+		t.Error("gateway container must use bounded capabilities without privilege escalation")
 	}
 }
 
 func TestGatewayNotCreatedWithoutOptIn(t *testing.T) {
 	scheme := gatewayScheme(t)
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(egressVPC("team-a", "vpc-a", 100, false)).Build() // no VPCGateway: no door
+	c := gatewayClientBuilder(scheme).WithObjects(egressVPC("team-a", "vpc-a", 100, false)).Build() // no VPCGateway: no door
 	r := gatewayReconciler(c)
 
 	key := types.NamespacedName{Namespace: "team-a", Name: "vpc-a"}
@@ -151,7 +157,7 @@ func TestGatewayDeletedOnDisableAndVPCDeletion(t *testing.T) {
 	scheme := gatewayScheme(t)
 	vpc := egressVPC("team-a", "vpc-a", 100, true)
 	gw := natGateway("team-a", "door", "vpc-a")
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(vpc, gw).Build()
+	c := gatewayClientBuilder(scheme).WithObjects(vpc, gw).Build()
 	r := gatewayReconciler(c)
 	ctx := context.Background()
 	key := types.NamespacedName{Namespace: "team-a", Name: "vpc-a"}
@@ -197,7 +203,7 @@ func TestGatewayDeletedOnDisableAndVPCDeletion(t *testing.T) {
 // handles its egress.
 func TestGatewayDeletedForV4VPCWithNATIdentity(t *testing.T) {
 	scheme := gatewayScheme(t)
-	c := fake.NewClientBuilder().WithScheme(scheme).
+	c := gatewayClientBuilder(scheme).
 		WithObjects(egressVPC("team-a", "vpc-a", 100, true), natGatewayWithAddr("team-a", "door", "vpc-a", "203.0.113.5")).
 		Build()
 	r := gatewayReconciler(c)
@@ -217,7 +223,7 @@ func TestGatewayDeletedForV4VPCWithNATIdentity(t *testing.T) {
 // lands. Deleting it here black-holes v6 (dual-stack hides it: v4 keeps working).
 func TestGatewayKeptForV6VPCWithNATIdentity(t *testing.T) {
 	scheme := gatewayScheme(t)
-	c := fake.NewClientBuilder().WithScheme(scheme).
+	c := gatewayClientBuilder(scheme).
 		WithObjects(dualStackVPC("team-a", "vpc-a", 100), natGatewayWithAddr("team-a", "door", "vpc-a", "203.0.113.5")).
 		Build()
 	r := gatewayReconciler(c)
@@ -235,7 +241,7 @@ func TestGatewayKeptForV6VPCWithNATIdentity(t *testing.T) {
 // eBPF identity retires the pod — every family is served in eBPF now.
 func TestGatewayDeletedForDualStackWithBothIdentities(t *testing.T) {
 	scheme := gatewayScheme(t)
-	c := fake.NewClientBuilder().WithScheme(scheme).
+	c := gatewayClientBuilder(scheme).
 		WithObjects(dualStackVPC("team-a", "vpc-a", 100),
 			natGatewayWithAddrs("team-a", "door", "vpc-a", "203.0.113.5", "2001:db8::5")).
 		Build()
@@ -259,7 +265,7 @@ func TestGatewayDeletedForV6VPCWithV6Identity(t *testing.T) {
 		Spec:       sdnv1alpha1.VPCSpec{CIDRs: []string{"fd00:10::/64"}},
 		Status:     sdnv1alpha1.VPCStatus{VNI: 100},
 	}
-	c := fake.NewClientBuilder().WithScheme(scheme).
+	c := gatewayClientBuilder(scheme).
 		WithObjects(v6vpc, natGatewayWithAddrs("team-a", "door", "vpc-a", "", "2001:db8::5")).
 		Build()
 	r := gatewayReconciler(c)
@@ -284,26 +290,31 @@ func TestSeveredGatewayPodIsRecreated(t *testing.T) {
 		sdnv1alpha1.LabelVPC:          "vpc-a",
 		sdnv1alpha1.LabelVPCNamespace: "team-a",
 	}
+	dep := gatewayReconciler(nil).deployment(vpc)
+	dep.UID = "gateway-deployment"
+	rs := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "gateway-replicaset", Namespace: "cozy-cozyplane", UID: "gateway-replicaset", OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(dep, appsv1.SchemeGroupVersion.WithKind("Deployment"))}}}
 	readyPod := func(name string) *corev1.Pod {
 		return &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "cozy-cozyplane", Labels: labels},
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "cozy-cozyplane", UID: types.UID(name), Labels: labels, OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(rs, appsv1.SchemeGroupVersion.WithKind("ReplicaSet"))}},
 			Status: corev1.PodStatus{Conditions: []corev1.PodCondition{
 				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
 			}},
 		}
 	}
+	labels[sdnv1alpha1.LabelPodUID] = "gw-healthy"
 	gwPort := &sdnv1alpha1.Port{
 		ObjectMeta: metav1.ObjectMeta{Name: "v100.10-10-0-1", Labels: labels},
 		Spec: sdnv1alpha1.PortSpec{
-			VPCRef:  sdnv1alpha1.VPCRef{Namespace: "team-a", Name: "vpc-a"},
-			IP:      "10.10.0.1",
-			PodName: "gw-healthy",
-			Gateway: true,
+			VPCRef:       sdnv1alpha1.VPCRef{Namespace: "team-a", Name: "vpc-a"},
+			IP:           "10.10.0.1",
+			PodName:      "gw-healthy",
+			PodNamespace: "cozy-cozyplane",
+			Gateway:      true,
 		},
 	}
 
-	c := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(vpc, natGateway("team-a", "door", "vpc-a"), readyPod("gw-healthy"), readyPod("gw-severed"), gwPort).Build()
+	c := gatewayClientBuilder(scheme).
+		WithObjects(vpc, dep, rs, natGateway("team-a", "door", "vpc-a"), readyPod("gw-healthy"), readyPod("gw-severed"), gwPort).Build()
 	r := gatewayReconciler(c)
 
 	key := types.NamespacedName{Namespace: "team-a", Name: "vpc-a"}
@@ -323,7 +334,7 @@ func TestSeveredGatewayPodIsRecreated(t *testing.T) {
 
 func TestGatewayWaitsForVNI(t *testing.T) {
 	scheme := gatewayScheme(t)
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(egressVPC("team-a", "vpc-a", 0, true), natGateway("team-a", "door", "vpc-a")).Build()
+	c := gatewayClientBuilder(scheme).WithObjects(egressVPC("team-a", "vpc-a", 0, true), natGateway("team-a", "door", "vpc-a")).Build()
 	r := gatewayReconciler(c)
 
 	key := types.NamespacedName{Namespace: "team-a", Name: "vpc-a"}

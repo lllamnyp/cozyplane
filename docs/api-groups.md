@@ -242,3 +242,78 @@ say. Revisit then; the group can grow.
    painful. The shim is no longer forced; revisit if etcd's operational cost
    bites again. (The group naming still leaves the door open: CRs the shim
    persisted would live in `local.sdn.cozystack.io`.)
+
+### FabricIP sandbox ownership (2026-10-07)
+
+CNI attachment resolution requires a live VPC with a positive assigned VNI.
+Annotation, delegated and gateway attachment paths reject a VPC already deleting
+before allocation or interface setup. The claim/rebind helper also checks the
+resolved VPC before any claim mutation, preserving persistent IP/MAC and launcher
+ownership on refusal. This checks the observed lifecycle state; it does not make
+VPC reads, claims and namespace setup one atomic API transaction.
+
+The allocation owner is (containerID, ifName), with Pod UID retained for indexing and GC. ADD reuses an existing claim of that sandbox, including retries; rollback releases only claims created by that attempt. DEL removes bridges and claims only for its sandbox, with UID/resourceVersion preconditions. Legacy claims without sandbox identity are retained by DEL and left to GC.
+
+GC also reaps claims not listed in a matching Running Pod status.podIPs after a five-minute grace period, and requeues younger claims. The agent repairs missing claims only for current local Pod status addresses actually present in successfully rebuilt local endpoint state. Existing conflicting claims are reported and preserved. New veth aliases retain sandbox metadata through forwarding updates; legacy rebuilt links can be repaired without inventing a container ID.
+Persistent Port sandbox metadata follows the active launcher at cutover. A
+staged target ADD preserves source identity. The cutover controller obtains the
+container ID from the active launcher's FabricIP and validates its pod UID and
+node, without copying the fabric address into the Port.
+
+### IPAM work budgets
+
+Startup FabricIP repair joins rebuilt local endpoints to live Pod status under
+one five-second child budget, covering the Pod list and all FabricIP reads and
+creations. Shorter parents remain effective and the child is cancelled on return.
+A timeout reports failure while preserving the healthy agent parent and foreign
+claims. Real HTTP tests verify blocked LIST/GET/POST, cumulative request delays,
+shorter deadlines and cancellation resource cleanup.
+
+Repair snapshot memory/CPU audit is in progress: skip API work without rebuilt
+candidates, filter Running Pods on the local node, and bound pages and total
+work without retaining the whole Pod history. Preserve per-endpoint ownership,
+ambiguous-sandbox refusal and foreign claims; a continuation/error must never
+permit allocation from partial occupancy or destructive repair.
+
+Aggregated VPN admission rejects more than 128 address pools per gateway,
+16 DNS servers per pool, 64 BGP neighbors or 4,096 remote CIDRs per connection
+before walking those collections. This bounds the pairwise pool-overlap
+validation. Controller preflight applies the same gateway collection limits to
+legacy objects; its stricter aggregate prefix budget still includes every peer
+and selected pool. These are admission/runtime limits, not a new API field or a
+per-tenant reservation in the shared datapath maps.
+
+Automatic CNI Port allocation checks cancellation during address selection and
+walks at most 65536 candidates and issues at most 256 allocation attempts. Repeated
+conflicts cannot turn one ADD into an unbounded API/CPU loop on a large IPv6
+pool. An exhausted work budget returns an error; it never deletes an existing
+claim or substitutes a different address for an explicit request. Explicit
+address claims retain their single-attempt semantics. FabricIP and ServiceVIP
+allocators retain their existing independent candidate budgets.
+
+
+Allocation occupancy follows the canonical claim name for the current VPC VNI.
+A predecessor VPC with the same namespace/name cannot exhaust the new pool or
+force a current ServiceVIP to yield to an old Port. Current claims, including
+terminating claims, still reserve their addresses until deletion completes.
+The Port-always-wins repair reads the exact current Port claim directly rather
+than listing every Port in the cluster. Previous claims are left for their
+own lifecycle cleanup, without changing persistent workload IP/MAC identity.
+
+
+Live Port/ServiceVIP occupancy scans request pages of 128 claims, retain only
+address membership, and process at most 65,536 claims and 512 pages per kind.
+Oversized pages, non-progressing continuation tokens, exceeded budgets or
+cancellation refuse the allocation before any claim is created. Complete scans
+are required: an API error cannot publish a partially checked address. These
+bounds also apply to the ServiceVIP allocator cluster-wide scan; installations
+above that scan budget must partition or revise allocation before growing it.
+The API server and informer cache have independent object and response limits.
+
+FabricIP GC also releases claims with a matching Pod UID whose phase is
+Succeeded or Failed, without waiting for the Pod object to be deleted. It uses
+the live Pod reader and conditional UID/resourceVersion deletion. This avoids
+retaining addresses for completed Jobs when a CNI DEL was missed. Unknown and
+Pending phases alone do not authorize reclamation.
+
+FabricIP sandbox lookups at ADD and DEL use the same 128-item/65,536-object/512-page live scan budget. Preserve the Pod UID selector when supplied; a UID-less DEL may scan cluster claims but retains only exact containerID/ifName matches. Complete the scan before reusing/allocating an address or deleting claims/bridges. Errors, cancellation and incomplete continuations return no partial ownership result; sandbox and UID/resourceVersion checks remain authoritative.

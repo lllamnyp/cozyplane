@@ -17,6 +17,7 @@ limitations under the License.
 package datapath
 
 import (
+	"errors"
 	"fmt"
 	"net"
 
@@ -41,15 +42,45 @@ type HFAllow struct {
 	Allow bool
 }
 
-// SyncHFAllows makes hf_allow (ingress) exactly `entries` (full-state diff).
-func (m *Manager) SyncHFAllows(entries []HFAllow) error {
-	return m.syncHFRules(m.objs.HfAllow, entries)
+// BlockHostFirewall protects a compiler rejection whose isolation directions
+// cannot be safely inferred from a partial snapshot.
+func (m *Manager) BlockHostFirewall() error {
+	m.hfMu.Lock()
+	defer m.hfMu.Unlock()
+	return errors.Join(m.setHFMode(cfgHFEnabled, uint32(2)), m.setHFMode(cfgHFEgEnabled, uint32(2)))
 }
 
-// SyncHFEgressAllows makes hf_eallow (egress) exactly `entries`. Same key
-// shape; the address is the DESTINATION.
-func (m *Manager) SyncHFEgressAllows(entries []HFAllow) error {
-	return m.syncHFRules(m.objs.HfEallow, entries)
+// ApplyHFIngress updates ingress under temporary default-deny. A failed sync
+// leaves that mode armed, rather than exposing partial or obsolete permissions.
+func (m *Manager) ApplyHFIngress(on bool, entries []HFAllow) error {
+	return m.applyHFDirection(m.objs.HfAllow, cfgHFEnabled, on, entries)
+}
+
+// ApplyHFEgress is the egress equivalent; its rules match destinations.
+func (m *Manager) ApplyHFEgress(on bool, entries []HFAllow) error {
+	return m.applyHFDirection(m.objs.HfEallow, cfgHFEgEnabled, on, entries)
+}
+
+func (m *Manager) applyHFDirection(mp *ebpf.Map, index uint32, on bool, entries []HFAllow) error {
+	m.hfMu.Lock()
+	defer m.hfMu.Unlock()
+	mode := uint32(0)
+	if on {
+		mode = 2 // BPF denies new gated flows even if partial rules allow them.
+	}
+	if err := m.setHFMode(index, mode); err != nil {
+		return fmt.Errorf("set host firewall transition mode: %w", err)
+	}
+	if !on {
+		entries = nil
+	}
+	if err := m.syncHFRules(mp, entries); err != nil {
+		return err
+	}
+	if on {
+		return m.setHFMode(index, uint32(1))
+	}
+	return nil
 }
 
 // syncHFRules is the shared full-state diff. A v4 range lives in NAT64 form
@@ -62,22 +93,14 @@ func (m *Manager) syncHFRules(mp *ebpf.Map, entries []HFAllow) error {
 		if e.CIDR == nil {
 			continue
 		}
-		ones, _ := e.CIDR.Mask.Size()
-		ip := e.CIDR.IP
-		var bits uint32
-		if v4 := ip.To4(); v4 != nil {
-			ip = v4
-			bits = 96 + uint32(ones)
-		} else {
-			bits = uint32(ones)
-		}
-		a, err := addr128(ip)
+		a, bits, family, err := cidrPolicyPrefix(e.CIDR)
 		if err != nil {
 			return fmt.Errorf("hf_allow range %q: %w", e.CIDR, err)
 		}
 		key := overlayHfAllowKey{
 			Prefixlen: 32 + bits,
 			Proto:     e.Proto,
+			Pad:       family,
 			Port:      htons(e.Port),
 			Src:       a,
 		}
@@ -88,7 +111,9 @@ func (m *Manager) syncHFRules(mp *ebpf.Map, entries []HFAllow) error {
 		if prev, ok := want[key]; ok && prev == 1 {
 			continue
 		}
-		want[key] = v
+		if err := putDesired(mp, want, key, v); err != nil {
+			return err
+		}
 	}
 	return syncMap(mp, want)
 }
@@ -102,21 +127,11 @@ func (m *Manager) SyncHFSelf(ips []net.IP) error {
 		if err != nil {
 			return fmt.Errorf("hf self IP: %w", err)
 		}
-		want[a] = 1
+		if err := putDesired(m.objs.HfSelf, want, a, uint8(1)); err != nil {
+			return err
+		}
 	}
 	return syncMap(m.objs.HfSelf, want)
-}
-
-// SetHFEnabled arms (or disarms) host-firewall INGRESS enforcement;
-// SetHFEgressEnabled the egress half. The caller orders these against the
-// rule syncs — set after syncing on enable, clear before wiping on disable —
-// so there is no fail-open window.
-func (m *Manager) SetHFEnabled(on bool) error {
-	return m.objs.Params.Put(cfgHFEnabled, boolToU32(on))
-}
-
-func (m *Manager) SetHFEgressEnabled(on bool) error {
-	return m.objs.Params.Put(cfgHFEgEnabled, boolToU32(on))
 }
 
 func boolToU32(b bool) uint32 {

@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 
 	"github.com/cilium/ebpf"
+	"github.com/vishvananda/netlink"
 )
 
 // SetLocal records a local pod (its host-veth ifindex and pod-interface MAC) in
@@ -30,13 +31,38 @@ import (
 // eBPF redirect (through the to_pod hook), not a kernel-routing shortcut. Used
 // by the CNI plugin via the pinned map.
 func SetLocal(net_ uint32, podIP net.IP, ifindex int, mac net.HardwareAddr) error {
+	if _, err := Ifindex(ifindex); err != nil {
+		return err
+	}
+	return withBridgeLock(func() error { return setLocal(net_, podIP, ifindex, mac) })
+}
+
+func setLocal(net_ uint32, podIP net.IP, ifindex int, mac net.HardwareAddr) error {
+	index, err := Ifindex(ifindex)
+	if err != nil {
+		return err
+	}
+
+	link, err := netlink.LinkByIndex(ifindex)
+	if err != nil {
+		return fmt.Errorf("find local endpoint: %w", err)
+	}
+	{
+		if VethPortIdentity(link.Attrs().Alias).Staged {
+			return nil
+		}
+		if raw, _, _, valid := parseVethAlias(link.Attrs().Alias); valid && (raw == QuarantineNet || PortNet(raw) != net_) {
+			return fmt.Errorf("local endpoint state changed before map update")
+		}
+	}
 	m, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "locals"), nil)
 	if err != nil {
 		return fmt.Errorf("open pinned locals map: %w", err)
 	}
 	defer m.Close()
 
-	ep := overlayEndpoint{Ifindex: uint32(ifindex)}
+	cid, iface := VethSandbox(link.Attrs().Alias)
+	ep := overlayEndpoint{Ifindex: index, SgOwner: SGEndpointOwner(VethPortIdentity(link.Attrs().Alias).UID, cid, iface)}
 	copy(ep.Mac[:], mac)
 	key, err := localKey(net_, podIP)
 	if err != nil {
@@ -74,6 +100,25 @@ func GetLocal(net_ uint32, podIP net.IP) (ifindex int, mac net.HardwareAddr, fou
 
 // DelLocal removes a pod from the locals map.
 func DelLocal(net_ uint32, podIP net.IP) error {
+	return withBridgeLock(func() error { return delLocal(net_, podIP) })
+}
+
+// Compare and delete under the same cross-process lock as SetLocal. A stale
+// sandbox cannot delete the migration target's entry after a separate lookup.
+func DelLocalIfOwned(net_ uint32, podIP net.IP, ifindices map[int]bool) error {
+	return withBridgeLock(func() error {
+		index, _, found, err := GetLocal(net_, podIP)
+		if err != nil {
+			return err
+		}
+		if !found || !ifindices[index] {
+			return nil
+		}
+		return delLocal(net_, podIP)
+	})
+}
+
+func delLocal(net_ uint32, podIP net.IP) error {
 	m, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "locals"), nil)
 	if err != nil {
 		return fmt.Errorf("open pinned locals map: %w", err)

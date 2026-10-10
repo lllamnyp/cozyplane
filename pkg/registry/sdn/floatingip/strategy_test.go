@@ -62,9 +62,8 @@ func TestValidateFloatingIPSpec(t *testing.T) {
 		{"missing target", fipWith("tenant-a", ""), true},
 		{"target is not an address", fipWith("tenant-a", "the-web-vm"), true},
 		{"target is a CIDR", fipWith("tenant-a", "10.10.0.0/24"), true},
-		// Non-canonical never matches a Port, whose spec.ip the Port strategy
-		// already pins to canonical form.
-		{"non-canonical v6", fipWith("tenant-a", "fd00:0a::0005"), true},
+		// Replay normalizes valid IP spelling before matching canonical Port claims.
+		{"normalized v6", fipWith("tenant-a", "fd00:0a::0005"), false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -85,8 +84,8 @@ func TestValidateUpdateRatchets(t *testing.T) {
 
 	unchanged := legacy.DeepCopy()
 	unchanged.Spec.LoadBalancerClass = "metallb"
-	if errs := s.ValidateUpdate(context.Background(), unchanged, legacy); len(errs) != 0 {
-		t.Fatalf("editing another field on a legacy object should be allowed, got %v", errs)
+	if errs := s.ValidateUpdate(context.Background(), unchanged, legacy); len(errs) == 0 {
+		t.Fatal("changing legacy spec requires a usable target")
 	}
 
 	repaired := legacy.DeepCopy()

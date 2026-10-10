@@ -3,14 +3,27 @@
 # manifest for the kind e2e — do NOT apply on a cluster running full Cilium
 # (both claim the cgroup root and the /sys/fs/bpf pin namespace).
 #
-# RBAC is cluster-admin here to keep the prototype e2e free of whack-a-mole; the
-# scoped role lives in chart/cozyplane-kpr (no cilium.io — nothing kpr wires
-# reads or writes that group).
+# The service proxy reads Kubernetes state; it does not mutate API objects or
+# read credentials. Cilium policy controllers are disabled in kpr/main.go.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: cozyplane-kpr
   namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cozyplane-kpr
+rules:
+  - apiGroups: [""]
+    resources: [services, nodes, pods, namespaces]
+    verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  - nonResourceURLs: [/readyz]
+    verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -19,7 +32,7 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: cluster-admin
+  name: cozyplane-kpr
 subjects:
   - kind: ServiceAccount
     name: cozyplane-kpr

@@ -81,7 +81,9 @@ func (m *Manager) SyncServiceVIPs(entries []SvcEntry) error {
 		if e.Affinity {
 			val.Flags = svcFAffinity
 		}
-		want[key] = val
+		if err := putDesired(m.objs.SvcVips, want, key, val); err != nil {
+			return err
+		}
 	}
 
 	var key overlaySvcKey

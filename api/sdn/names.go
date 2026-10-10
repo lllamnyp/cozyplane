@@ -17,17 +17,21 @@ limitations under the License.
 package sdn
 
 import (
+	"encoding/hex"
 	"fmt"
+	"net/netip"
 	"strconv"
 	"strings"
+
+	"github.com/lllamnyp/cozyplane/pkg/netid"
 )
 
 // Claim names. A Port ("v<vni>.<escaped-ip>") and a ServiceVIP
 // ("sv<vni>.<escaped-ip>") are cluster-scoped and named by the address they
 // hold: the name IS the allocation claim. etcd name uniqueness serializes
 // same-kind allocators, and the aggregated registry rejects a create whose
-// twin name (the same <vni>.<ip> under the other kind's prefix) exists, so
-// the two kinds can never hold the same {VNI, IP}.
+// twin name (the same <vni>.<ip> under the other kind's prefix) exists.
+// That cross-kind GET is not atomic; controllers also repair concurrent claims.
 
 // ClaimPrefixPort and ClaimPrefixServiceVIP are the kind discriminators in
 // front of the shared <vni>.<escaped-ip> claim.
@@ -36,14 +40,19 @@ const (
 	ClaimPrefixServiceVIP = "sv"
 )
 
-// EscapeIP maps an address to its object-name form. Both the v4 dot and the
-// v6 colon are invalid in a Kubernetes object name, so both become '-'
-// (10.0.0.2 -> 10-0-0-2, fd00:10::2 -> fd00-10--2). The escaping is not
-// reversible and need not be: the address is carried in the spec, the name
-// only has to be unique per VNI — which it is for addresses in canonical
-// form.
+// EscapeIP retains valid legacy names. Edge-compressed IPv6 addresses need an
+// alternate encoding because DNS labels cannot start/end with '-'. The x prefix
+// is disjoint from hexadecimal IPv6 and numeric IPv4 legacy suffixes. Callers
+// validate canonical address strings; invalid addresses remain invalid names.
 func EscapeIP(ip string) string {
-	return strings.NewReplacer(".", "-", ":", "-").Replace(ip)
+	escaped := strings.NewReplacer(".", "-", ":", "-").Replace(ip)
+	if strings.HasPrefix(escaped, "-") || strings.HasSuffix(escaped, "-") {
+		if addr, err := netip.ParseAddr(ip); err == nil && addr.Is6() && addr.Zone() == "" {
+			bytes := addr.As16()
+			return "x" + hex.EncodeToString(bytes[:])
+		}
+	}
+	return escaped
 }
 
 // PortName is the claim name of a Port on ip in the VPC with the given VNI.
@@ -70,7 +79,7 @@ func ParseClaim(prefix, name string) (vni int32, escapedIP string, ok bool) {
 		return 0, "", false
 	}
 	n, err := strconv.ParseInt(vniStr, 10, 32)
-	if err != nil || n <= 0 {
+	if err != nil || n < int64(netid.FirstVNI) || n > int64(netid.LastVNI) {
 		return 0, "", false
 	}
 	return int32(n), esc, true

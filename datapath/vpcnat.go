@@ -72,10 +72,11 @@ func (m *Manager) SetVPCNAT(net_ uint32, natIP4, natIP6 string, portBase, portSp
 	if err != nil {
 		return fmt.Errorf("nat v6 address: %w", err)
 	}
-	v := overlayVpcNat{Ip: ip4, Ip6: ip6, PortBase: portBase, PortSpan: portSpan}
-	if err := m.objs.VpcNat.Put(net_, &v); err != nil {
-		return fmt.Errorf("set vpc_nat for net %d: %w", net_, err)
+	var previous overlayVpcNat
+	if err := m.objs.VpcNat.Lookup(net_, &previous); err != nil && !isNotExist(err) {
+		return fmt.Errorf("read previous vpc_nat for net %d: %w", net_, err)
 	}
+	v := overlayVpcNat{Ip: ip4, Ip6: ip6, PortBase: portBase, PortSpan: portSpan}
 	// The reverse direction's first question: whose address is this? One entry per
 	// family, since a reply arrives addressed to one of them.
 	for _, ip := range []struct {
@@ -88,6 +89,35 @@ func (m *Manager) SetVPCNAT(net_ uint32, natIP4, natIP6 string, portBase, portSp
 		if err := m.objs.NatOf.Put(&ip.a, net_); err != nil {
 			return fmt.Errorf("set nat_of for net %d: %w", net_, err)
 		}
+	}
+	if err := m.objs.VpcNat.Put(net_, &v); err != nil {
+		return fmt.Errorf("set vpc_nat for net %d: %w", net_, err)
+	}
+	for _, old := range []overlayAddr128{previous.Ip, previous.Ip6} {
+		if old != (overlayAddr128{}) && old != ip4 && old != ip6 {
+			if err := m.delNATReverseOwner(old, net_); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// All NAT projection writers run in the agent's single boundary worker.
+// Never remove an address that a replacement VPC already owns.
+func (m *Manager) delNATReverseOwner(ip overlayAddr128, netID uint32) error {
+	var owner uint32
+	if err := m.objs.NatOf.Lookup(ip, &owner); err != nil {
+		if isNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read nat_of ownership: %w", err)
+	}
+	if owner != netID {
+		return nil
+	}
+	if err := m.objs.NatOf.Delete(ip); err != nil && !isNotExist(err) {
+		return fmt.Errorf("delete nat_of ownership: %w", err)
 	}
 	return nil
 }
@@ -102,10 +132,62 @@ func (m *Manager) DelVPCNAT(net_ uint32, natIP4, natIP6 string) error {
 			continue
 		}
 		if ip, err := addr128Str(s); err == nil {
-			if err := m.objs.NatOf.Delete(&ip); err != nil && !isNotExist(err) {
-				return fmt.Errorf("del nat_of for %s: %w", s, err)
+			if err := m.delNATReverseOwner(ip, net_); err != nil {
+				return err
 			}
 		}
+	}
+	return nil
+}
+
+// SyncNATReverse reconciles both reverse maps from complete identities and the
+// current ordered node endpoints. Nil endpoints have no routing authority.
+// Preflight both desired maps before pruning or publishing either one.
+func (m *Manager) SyncNATReverse(identities map[uint32]NATIdentity, nodes []net.IP) error {
+	wantOwners := map[overlayNatShardKey]uint32{}
+	wantNetworks := map[overlayAddr128]uint32{}
+	for netID, identity := range identities {
+		if netID == 0 {
+			return fmt.Errorf("NAT identity cannot belong to default network")
+		}
+		for family, address := range []string{identity.V4, identity.V6} {
+			if address == "" {
+				continue
+			}
+			ip := net.ParseIP(address)
+			if ip == nil || (family == 0) != (ip.To4() != nil) {
+				return fmt.Errorf("invalid NAT family %d address %q", family, address)
+			}
+			key, _ := addr128(ip)
+			if owner, found := wantNetworks[key]; found && owner != netID {
+				return fmt.Errorf("NAT address %s belongs to multiple VPCs", address)
+			}
+			if err := putDesired(m.objs.NatOf, wantNetworks, key, netID); err != nil {
+				return err
+			}
+			for shard, node := range nodes {
+				if shard >= NATShards {
+					break
+				}
+				if node == nil {
+					continue
+				}
+				v4 := node.To4()
+				if v4 == nil {
+					return fmt.Errorf("NAT shard %d node endpoint is not IPv4", shard)
+				}
+				ownerKey := overlayNatShardKey{Ip: key, Shard: uint16(shard)}
+				if err := putDesired(m.objs.NatOwner, wantOwners, ownerKey, binary.BigEndian.Uint32(v4)); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if err := syncMap(m.objs.NatOwner, wantOwners); err != nil {
+		return fmt.Errorf("sync NAT shards: %w", err)
+	}
+	if err := syncMap(m.objs.NatOf, wantNetworks); err != nil {
+		return fmt.Errorf("sync NAT networks: %w", err)
 	}
 	return nil
 }

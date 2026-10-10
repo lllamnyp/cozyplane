@@ -14,6 +14,10 @@ metadata:
   labels:
     {{- include "cozyplane.labels" . | nindent 4 }}
 rules:
+  # The CNI verifies persistent launcher ownership against the current VMI UID.
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachineinstances"]
+    verbs: ["get"]
   # The agent learns remote pod CIDRs + addresses from Node objects, and patches
   # its own Node to advertise the address host traffic sources from (node_remotes).
   - apiGroups: [""]
@@ -39,6 +43,9 @@ rules:
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcs"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpcs/status"]
+    verbs: ["get", "update", "patch"]
   # VPCBindings authorize attachment; the plugin checks them at CNI ADD
   # (default-deny).
   - apiGroups: ["sdn.cozystack.io"]
@@ -49,6 +56,11 @@ rules:
   # The CNI plugin (same SA) also reads them to give a gateway pod its VPC leg.
   - apiGroups: ["sdn.cozystack.io"]
     resources: ["vpcgateways"]
+    verbs: ["get", "list", "watch"]
+  # VPNGateways: the agent reads status.routes and merges the connection-derived
+  # remote CIDRs into the same vpc_routes table it builds from VPCGateway routes.
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["vpngateways"]
     verbs: ["get", "list", "watch"]
   # VPCPeering halves: the agent programs the peers map from mutually-matched
   # specs (not status), so it only needs to observe them.
@@ -68,9 +80,11 @@ rules:
   # FabricIPs: the CNI plugin claims/releases underlay addresses through this SA
   # (the agent writes its kubeconfig), the agent watches them. deletecollection
   # serves a failed ADD's rollback; it reaches nothing list+delete could not.
+  # update lets the agent record a recovered sandbox on a legacy claim
+  # (cmd/agent/legacy_sandbox.go) instead of deleting and recreating it.
   - apiGroups: ["local.sdn.cozystack.io"]
     resources: ["fabricips"]
-    verbs: ["get", "list", "watch", "create", "delete", "deletecollection"]
+    verbs: ["get", "list", "watch", "create", "update", "delete", "deletecollection"]
   # HostFirewalls: the agent compiles the objects selecting its node into the
   # hf_allow map and arms enforcement (docs/host-firewall.md).
   - apiGroups: ["sdn.cozystack.io"]
@@ -175,7 +189,13 @@ spec:
           args:
             - "--mtu={{ .Values.mtu }}"
             - "--geneve-port={{ .Values.genevePort }}"
+            {{- if .Values.egress.floatingNextHopIPv4 }}
+            - "--floating-next-hop-ipv4={{ .Values.egress.floatingNextHopIPv4 }}"
+            {{- end }}
             - "--cni-conf-name={{ .Values.cniConfName }}"
+            {{- if not .Values.writeCNIConf }}
+            - "--write-cni-conf=false"
+            {{- end }}
             {{- if .Values.egress.clusterCIDR }}
             # Cluster-egress masquerade: pod traffic leaving the cluster is
             # SNATed to the node address, giving pods an off-cluster return path.
@@ -192,12 +212,20 @@ spec:
             # agent.metricsBindAddress — how to scrape, and why not 0.0.0.0).
             - "--metrics-bind-address={{ .Values.agent.metricsBindAddress }}"
             - "--metrics-secure={{ .Values.agent.metricsSecure }}"
+            {{- if .Values.observability.flows }}
+            # Flow observability (docs/observability.md): flow events + /flows.
+            - "--flows=true"
+            {{- end }}
           ports:
             # Per-VPC traffic metrics (#2), Prometheus text at /metrics.
             - name: metrics
               containerPort: 9411
               hostPort: 9411
           env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
@@ -242,11 +270,23 @@ spec:
           image: {{ .Values.image }}
           imagePullPolicy: {{ .Values.imagePullPolicy }}
           command: ["/usr/local/bin/cozyplane-responder"]
+          {{- if .Values.observability.dnsMetrics }}
+          ports:
+            # DNS observability (docs/observability.md §D): Prometheus text at
+            # /metrics — bounded, address-free aggregates (qtype/rcode by VPC).
+            - name: dns-metrics
+              containerPort: 9413
+              hostPort: 9413
+          {{- end }}
           env:
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            {{- if .Values.observability.dnsMetrics }}
+            - name: COZYPLANE_DNS_METRICS
+              value: "1"
+            {{- end }}
             {{- if .Values.kubeApiServer.host }}
             - name: KUBERNETES_SERVICE_HOST
               value: {{ .Values.kubeApiServer.host | quote }}

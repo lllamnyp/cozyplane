@@ -19,9 +19,14 @@ package vpcbinding
 import (
 	"context"
 	"errors"
+	"slices"
+
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
+	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
+	"github.com/lllamnyp/cozyplane/internal/vpnlimits"
 	"github.com/lllamnyp/cozyplane/pkg/registry/sdn/authz"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
@@ -76,6 +81,13 @@ func (vpcBindingStrategy) NamespaceScoped() bool {
 }
 
 func (vpcBindingStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
+	// Install atomically with the grant, before a CNI can consume it. An
+	// asynchronous controller update leaves a create/delete revocation race.
+	b := obj.(*sdn.VPCBinding)
+	const reapFinalizer = "sdn.cozystack.io/reap-ports"
+	if !slices.Contains(b.Finalizers, reapFinalizer) {
+		b.Finalizers = append(b.Finalizers, reapFinalizer)
+	}
 }
 
 func (vpcBindingStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
@@ -90,6 +102,24 @@ const ExportVerb = "export"
 
 func (s vpcBindingStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	binding := obj.(*sdn.VPCBinding)
+	if errs := vpnlimits.ReferenceErrors(binding.Spec.VPCRef.Name, field.NewPath("spec", "vpcRef", "name"), true); len(errs) != 0 {
+		return errs
+	}
+	if errs := vpnlimits.NamespaceReferenceErrors(binding.Spec.VPCRef.Namespace, field.NewPath("spec", "vpcRef", "namespace")); len(errs) != 0 {
+		return errs
+	}
+	if len(binding.Spec.ForwardingCIDRs) > sdnv1alpha1.MaxForwardingPrefixes {
+		return field.ErrorList{field.TooMany(field.NewPath("spec", "forwardingCIDRs"), len(binding.Spec.ForwardingCIDRs), sdnv1alpha1.MaxForwardingPrefixes)}
+	}
+	if binding.Spec.AllowForwarding {
+		if err := sdnv1alpha1.ValidateForwardingPrefixes(binding.Spec.ForwardingCIDRs); err != nil {
+			return field.ErrorList{field.Invalid(field.NewPath("spec", "forwardingCIDRs"), "", err.Error())}
+		}
+	}
+	return s.checkExport(ctx, binding)
+}
+
+func (s vpcBindingStrategy) checkExport(ctx context.Context, binding *sdn.VPCBinding) field.ErrorList {
 	ref := binding.Spec.VPCRef
 	ns := ref.Namespace
 	if ns == "" {
@@ -118,12 +148,26 @@ func (vpcBindingStrategy) Canonicalize(obj runtime.Object) {
 }
 
 func (s vpcBindingStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
-	// Retargeting vpcRef needs a fresh export check; metadata/finalizer writes
-	// (the controller's reap finalizer) must pass unchecked — the same
-	// refUnchanged guard the VAP applies.
+	// Every grant change needs the owner's authority, including enabling or
+	// widening forwarding without retargeting the VPC. Removing the reap
+	// finalizer also needs that authority: otherwise a consumer can bypass
+	// revocation. Other metadata-only writes remain permitted.
 	newB, oldB := obj.(*sdn.VPCBinding), old.(*sdn.VPCBinding)
-	if newB.Spec.VPCRef == oldB.Spec.VPCRef {
-		return field.ErrorList{}
+	if newB.Spec.VPCRef != oldB.Spec.VPCRef {
+		return field.ErrorList{field.Invalid(field.NewPath("spec", "vpcRef"), nil, "is immutable; delete and recreate the binding")}
+	}
+	const reapFinalizer = "sdn.cozystack.io/reap-ports"
+	removesReap := slices.Contains(oldB.Finalizers, reapFinalizer) && !slices.Contains(newB.Finalizers, reapFinalizer)
+	if equality.Semantic.DeepEqual(newB.Spec, oldB.Spec) {
+		if removesReap {
+			return s.checkExport(ctx, newB)
+		}
+		return nil
+	}
+	// Input validation must not trap a malformed legacy grant in an enabled
+	// state. This exception only removes authority; owner authorization remains.
+	if oldB.Spec.AllowForwarding && !newB.Spec.AllowForwarding && slices.Equal(oldB.Spec.ForwardingCIDRs, newB.Spec.ForwardingCIDRs) {
+		return s.checkExport(ctx, newB)
 	}
 	return s.Validate(ctx, obj)
 }

@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
+	"github.com/lllamnyp/cozyplane/internal/vpnlimits"
 )
 
 // VPCPeeringReconciler surfaces a peering half's liveness in its status: it is
@@ -61,12 +62,15 @@ func (r *VPCPeeringReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	localVPC := r.getVPC(ctx, peering.Namespace, peering.Spec.VPCRef.Name)
-	peerVPC := r.getVPC(ctx, peering.Spec.PeerRef.Namespace, peering.Spec.PeerRef.Name)
+	var localVPC, peerVPC *sdnv1alpha1.VPC
+	if vpnlimits.PeeringReferences(peering.Namespace, peering.Spec.VPCRef.Name, peering.Spec.PeerRef.Namespace, peering.Spec.PeerRef.Name) {
+		localVPC = r.getVPC(ctx, peering.Namespace, peering.Spec.VPCRef.Name)
+		peerVPC = r.getVPC(ctx, peering.Spec.PeerRef.Namespace, peering.Spec.PeerRef.Name)
+	}
 
 	// Peered traffic is routed natively: overlapping VPCs may coexist, but
 	// they can never peer. The agents enforce the same rule in the datapath.
-	disjoint := localVPC != nil && peerVPC != nil &&
+	disjoint := vpcReady(localVPC) && vpcReady(peerVPC) &&
 		!sdnv1alpha1.CIDRsOverlap(localVPC.Spec.CIDRs, peerVPC.Spec.CIDRs)
 
 	status := sdnv1alpha1.VPCPeeringStatus{Phase: sdnv1alpha1.VPCPeeringPhasePending}
@@ -106,8 +110,11 @@ func (r *VPCPeeringReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 // findReciprocal returns the half in the peer namespace that references this
 // half's VPC back, or nil.
 func (r *VPCPeeringReconciler) findReciprocal(ctx context.Context, peering *sdnv1alpha1.VPCPeering) (*sdnv1alpha1.VPCPeering, error) {
+	if !vpnlimits.PeeringReferences(peering.Namespace, peering.Spec.VPCRef.Name, peering.Spec.PeerRef.Namespace, peering.Spec.PeerRef.Name) {
+		return nil, nil
+	}
 	var list sdnv1alpha1.VPCPeeringList
-	if err := r.List(ctx, &list, client.InNamespace(peering.Spec.PeerRef.Namespace)); err != nil {
+	if err := r.List(ctx, &list, client.InNamespace(peering.Spec.PeerRef.Namespace), client.MatchingFields{peeringPairIndex: peeringPairKey(peering.Spec.PeerRef, peering.LocalRef())}); err != nil {
 		return nil, fmt.Errorf("list vpcpeerings in peer namespace: %w", err)
 	}
 	for i := range list.Items {
@@ -120,6 +127,9 @@ func (r *VPCPeeringReconciler) findReciprocal(ctx context.Context, peering *sdnv
 }
 
 func (r *VPCPeeringReconciler) getVPC(ctx context.Context, namespace, name string) *sdnv1alpha1.VPC {
+	if !vpnlimits.NamespaceName(namespace) || !vpnlimits.ObjectName(name) {
+		return nil
+	}
 	vpc := &sdnv1alpha1.VPC{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, vpc); err != nil {
 		return nil
@@ -128,7 +138,8 @@ func (r *VPCPeeringReconciler) getVPC(ctx context.Context, namespace, name strin
 }
 
 func vpcReady(vpc *sdnv1alpha1.VPC) bool {
-	return vpc != nil && vpc.Status.VNI != 0
+	return vpc != nil && vpc.DeletionTimestamp.IsZero() && vpc.Status.VNI > 0 && vpc.Status.VNI < 1<<22 &&
+		sdnv1alpha1.ValidateVPCCIDRs(vpc.Spec.CIDRs) == nil
 }
 
 func setCondition(status *sdnv1alpha1.VPCPeeringStatus, condType string, ok bool, reason, message string) {
@@ -160,6 +171,12 @@ func statusEqual(a, b sdnv1alpha1.VPCPeeringStatus) bool {
 // object, a half must be re-reconciled when its reciprocal half appears or
 // disappears (in another namespace) and when either referenced VPC changes.
 func (r *VPCPeeringReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &sdnv1alpha1.VPCPeering{}, peeringPairIndex, peeringPairKeys); err != nil {
+		return err
+	}
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &sdnv1alpha1.VPCPeering{}, peeringVPCIndex, peeringVPCKeys); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&sdnv1alpha1.VPCPeering{}).
 		Watches(&sdnv1alpha1.VPCPeering{}, handler.EnqueueRequestsFromMapFunc(r.mapToReciprocal)).
@@ -172,11 +189,11 @@ func (r *VPCPeeringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // point back at it — the reciprocal's status depends on this half's existence.
 func (r *VPCPeeringReconciler) mapToReciprocal(ctx context.Context, obj client.Object) []ctrl.Request {
 	peering, ok := obj.(*sdnv1alpha1.VPCPeering)
-	if !ok {
+	if !ok || !vpnlimits.PeeringReferences(peering.Namespace, peering.Spec.VPCRef.Name, peering.Spec.PeerRef.Namespace, peering.Spec.PeerRef.Name) {
 		return nil
 	}
 	var list sdnv1alpha1.VPCPeeringList
-	if err := r.List(ctx, &list, client.InNamespace(peering.Spec.PeerRef.Namespace)); err != nil {
+	if err := r.List(ctx, &list, client.InNamespace(peering.Spec.PeerRef.Namespace), client.MatchingFields{peeringPairIndex: peeringPairKey(peering.Spec.PeerRef, peering.LocalRef())}); err != nil {
 		return nil
 	}
 	var reqs []ctrl.Request
@@ -197,7 +214,7 @@ func (r *VPCPeeringReconciler) mapVPCToPeerings(ctx context.Context, obj client.
 		return nil
 	}
 	var list sdnv1alpha1.VPCPeeringList
-	if err := r.List(ctx, &list); err != nil {
+	if err := r.List(ctx, &list, client.MatchingFields{peeringVPCIndex: peeringRefKey(sdnv1alpha1.VPCRef{Namespace: vpc.Namespace, Name: vpc.Name})}); err != nil {
 		return nil
 	}
 	ref := sdnv1alpha1.VPCRef{Namespace: vpc.Namespace, Name: vpc.Name}
