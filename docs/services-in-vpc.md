@@ -316,3 +316,102 @@ etcd pods (or VM-hosted members) in `vpc-a`, Services annotated into the VPC:
 auto-projects, and the resolver's authz proof is structural: it only answers
 with backends that are Ports of the *querying* net, so a stray annotation
 without a real binding yields nothing (Ports of that net wouldn't exist).
+### Resolver resource budgets
+
+All authenticated DNS queries, including authoritative cluster-domain lookups,
+share a nonblocking admission limit of 256 active queries and 16 per VPC.
+Excess requests return SERVFAIL, with no waiting queue. Endpoint resolution
+retains at most 4096 endpoints and scans at most 65536 slice/endpoint/Port
+entries per lookup. Services expose at most 4096 declared ports to this resolver.
+Each synthesized answer retains at most 4096 records and 65535 uncompressed
+wire bytes; SRV endpoint/port products stop as soon as this budget is exceeded.
+An oversized or incomplete view returns SERVFAIL rather than a partial DNS
+answer. Normal UDP truncation and TCP replies remain supported.
+
+DNS TCP sockets have an independent shared limit of 256 across node IPs.
+Connections accepted over this limit close immediately, before the DNS library
+creates a reader worker or a frame buffer. Closing a connection releases its
+slot exactly once. Read/write timeouts also cover clients that never send a
+query; query admission alone cannot bound those connections.
+
+Backend EndpointSlices must be in the Service's namespace, carry its service
+label and a controller reference to the current Service UID. Both ServiceVIP
+materialization and headless DNS reject unowned slices and slices left over
+from a deleted Service with the same name. Manually managed slices must declare
+that current Service controller reference too; a label alone is insufficient
+generation evidence. Pod target UID checks remain independent.
+
+ServiceVIPs record `sdn.cozystack.io/service-uid` and `sdn.cozystack.io/vpc-uid`
+annotations when created. A Service or VPC recreation cannot inherit a prior
+generation's backends or VIP claim. The controller replaces a stale or legacy
+claim with a fresh object using UID/resourceVersion delete preconditions; DNS
+checks both current generations before returning its address, and the agent
+checks the VPC generation and VNI encoded in the claim name before programming
+the VIP. Terminating VPCs/VIPs are excluded. Controller identity reads use the
+live API reader so a cached predecessor cannot delete a successor's claim.
+
+### ServiceVIP reconciliation budgets
+
+Backend resolution must select only the current claims for Pods referenced by
+owned EndpointSlices, using a namespace/name cache index and the current VPC
+and Pod UID filters. No endpoint means no Port list. Repeated endpoint references
+reuse their candidate list only during the reconciliation. Limit each cache
+query to the remaining work budget plus one overflow witness, and reject the
+entire backend view on overflow or a missing index. The current VPC generation,
+sandbox proof and deterministic claim selection still govern eligibility.
+This avoids copying unrelated Port payloads from a large VPC on every Service
+update, without retaining event history or changing allocation and cleanup.
+
+The controller limits a Service to 4096 declared ports, 4096 resolved backends
+and 65536 input or expansion operations per reconciliation. Invalid and
+duplicate input also consumes work. Oversized endpoint views clear the VIP
+backend status and return an error; no partial or stale backend set is kept.
+The agent preflights at most 65536 objects and 1048576 input rows per snapshot,
+with at most 16384 service-port entries. It indexes backend ports once instead
+of scanning the port/backend/target-port Cartesian product, retaining at most
+16 backends per entry during construction. Unsupported protocols and invalid
+port numbers are excluded. A rejected snapshot clears tenant VIP entries; net-0
+KPR entries remain independently owned. Initial projection waits for complete
+VIP/VPC caches; one pending notification and a fixed 100ms interval coalesce
+event bursts, including VPC deletion, without retaining an event backlog.
+
+DNS UDP packets share 256 worker slots across node IPs, acquired in the raw
+reader before spawning a library worker. Overflow, malformed packets and
+headers rejected by the library default acceptance rules are dropped there.
+Accepted packets are fully decoded before handoff so each worker reaches its
+handler and releases its slot on return; the library invalid-message callback
+also releases a slot if a later decode unexpectedly fails. This transport
+limit includes packets that have not yet passed VPC authentication. There is
+no user-space waiting queue for overflow traffic.
+
+### Backend network and Pod generation
+
+ServiceVIP candidate groups include the exact Pod UID. A predecessor Port sharing
+the Pod name cannot hide the current generation. Within a generation, a positive
+FabricIP witness of the current sandbox excludes obsolete ContainerID claims
+before the GC grace period expires, using the same proof as gateway routing.
+Pod and FabricIP proof reads are counted in the existing work budget and reused
+only inside the reconciliation. Failed reads reject the whole backend view;
+missing legacy witnesses retain the existing compatibility behavior. Ties among
+eligible claims use creation time then name, independently of API list order.
+
+Backend Ports and DNS query-source Ports must have a claim name matching the
+current VPC VNI and address. A Port retained from a deleted VPC cannot be
+projected into its successor merely because the VPC name matches. EndpointSlice
+Pod target references must carry a nonempty UID matching the selected Port
+Pod UID, including manually managed slices; a reused Pod name alone cannot
+select a new backend. Missing current VPC state fails DNS resolution closed.
+
+
+
+### DNS peering work budget
+
+DNS peering authorization uses an index of the exact local/remote VPC pair.
+Repeated declarations of the same peer are checked once and return one peer,
+including negative reciprocal results. Each lookup admits at most 65,536 object
+and CIDR-comparison steps and retains at most 4,096 distinct peers. Exceeding
+either budget returns no peer authorization, never a partially authorized view.
+Both live reciprocal declarations and live, disjoint VPCs remain required;
+cached Ready status alone is insufficient. Removing a reciprocal declaration
+takes effect on the next lookup, without retaining a positive result across
+queries. The informer cache itself remains governed by Kubernetes object limits.

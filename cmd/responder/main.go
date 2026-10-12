@@ -25,8 +25,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/lllamnyp/cozyplane/internal/httpserver"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -44,6 +46,8 @@ import (
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
 	"github.com/lllamnyp/cozyplane/datapath"
 	"github.com/lllamnyp/cozyplane/internal/responder"
+	"github.com/lllamnyp/cozyplane/internal/serviceidentity"
+	"github.com/lllamnyp/cozyplane/internal/vpnlimits"
 	localclient "github.com/lllamnyp/cozyplane/pkg/generated/localsdn/clientset/versioned"
 	localinformers "github.com/lllamnyp/cozyplane/pkg/generated/localsdn/informers/externalversions"
 	sdnclient "github.com/lllamnyp/cozyplane/pkg/generated/sdn/clientset/versioned"
@@ -51,11 +55,14 @@ import (
 )
 
 const (
-	fabricIPIndex = "fabricIP" // on FabricIPs: the underlay address
-	podUIDIndex   = "podUID"   // on Ports: the claiming pod
-	podIndex      = "pod"
-	svcIndex      = "service"
-	localVPCIndex = "localVPC"
+	fabricIPIndex    = "fabricIP" // on FabricIPs: the underlay address
+	podUIDIndex      = "podUID"   // on Ports: the claiming pod
+	podIndex         = "pod"
+	svcIndex         = "service"
+	localVPCIndex    = "localVPC"
+	peeringPairIndex = "peeringPair"
+	maxPeeringWork   = 65536
+	maxDNSPeers      = 4096
 )
 
 func main() {
@@ -93,7 +100,8 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log.Printf("cluster domain %q, upstreams %v", domain, upstreams)
+	// #nosec G706 -- Both untrusted strings are quoted with %q, escaping control characters and newlines.
+	log.Printf("cluster domain %q, upstreams %q", domain, upstreams)
 
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
@@ -126,15 +134,11 @@ func run() error {
 	defer close(stop)
 
 	sdnFactory := sdninformers.NewSharedInformerFactory(sdn, 0)
+	vpcInf := sdnFactory.Sdn().V1alpha1().VPCs().Informer()
 	peeringInf := sdnFactory.Sdn().V1alpha1().VPCPeerings().Informer()
 	if err := peeringInf.AddIndexers(cache.Indexers{
-		localVPCIndex: func(obj any) ([]string, error) {
-			p, ok := obj.(*sdnv1alpha1.VPCPeering)
-			if !ok {
-				return nil, nil
-			}
-			return []string{p.Namespace + "/" + p.Spec.VPCRef.Name}, nil
-		},
+		localVPCIndex:    peeringLocalIndexFunc,
+		peeringPairIndex: peeringPairIndexFunc,
 	}); err != nil {
 		return err
 	}
@@ -151,6 +155,7 @@ func run() error {
 		return err
 	}
 	portInf := sdnFactory.Sdn().V1alpha1().Ports().Informer()
+	bindingInf := sdnFactory.Sdn().V1alpha1().VPCBindings().Informer()
 	if err := portInf.AddIndexers(cache.Indexers{
 		podUIDIndex: func(obj any) ([]string, error) {
 			p, ok := obj.(*sdnv1alpha1.Port)
@@ -212,15 +217,28 @@ func run() error {
 	sdnFactory.Start(stop)
 	localFactory.Start(stop)
 	kubeFactory.Start(stop)
-	if !cache.WaitForCacheSync(stop, portInf.HasSynced, svcInf.HasSynced, epsInf.HasSynced, peeringInf.HasSynced, svipInf.HasSynced, fipInf.HasSynced) {
+	if !cache.WaitForCacheSync(stop, vpcInf.HasSynced, portInf.HasSynced, bindingInf.HasSynced, svcInf.HasSynced, epsInf.HasSynced, peeringInf.HasSynced, svipInf.HasSynced, fipInf.HasSynced) {
 		return fmt.Errorf("informer caches did not sync")
 	}
 
-	state := &informerState{ports: portInf.GetIndexer(), svcs: svcInf.GetIndexer(), eps: epsInf.GetIndexer(), peerings: peeringInf.GetIndexer(), svips: svipInf.GetIndexer(), fips: fipInf.GetIndexer()}
+	state := &informerState{vpcs: vpcInf.GetIndexer(), bindings: bindingInf.GetIndexer(), ports: portInf.GetIndexer(), svcs: svcInf.GetIndexer(), eps: epsInf.GetIndexer(), peerings: peeringInf.GetIndexer(), svips: svipInf.GetIndexer(), fips: fipInf.GetIndexer()}
 	res := &responder.Resolver{Domain: domain, Upstreams: upstreams, State: state}
+
+	// DNS observability (docs/observability.md §D): opt-in like the rest of
+	// observability (off by default, matching Cozystack's Hubble posture). When
+	// enabled, count and serve the query/response aggregates on a distinct port
+	// (the agent already holds :9411/:9412 in this shared hostNetwork namespace).
+	// Disabled, the resolver never counts and binds no extra port.
+	if os.Getenv("COZYPLANE_DNS_METRICS") == "1" {
+		metrics := responder.NewDNSMetrics()
+		res.Metrics = metrics // nil-safe when unset
+		go serveDNSMetrics(metrics, nodeName)
+	}
 
 	var wg sync.WaitGroup
 	errc := make(chan error, 8)
+	tcpSlots := make(chan struct{}, 256)
+	udpSlots := make(chan struct{}, 256)
 	for _, ip := range []string{nodeIP, nodeIP6} {
 		if ip == "" {
 			continue
@@ -228,10 +246,26 @@ func run() error {
 		addr := net.JoinHostPort(ip, fmt.Sprint(datapath.ResolverPort))
 		for _, proto := range []string{"udp", "tcp"} {
 			srv := &dns.Server{Addr: addr, Net: proto, Handler: res, ReusePort: true}
+			if proto == "udp" {
+				installDNSUDPAdmission(srv, udpSlots)
+			}
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+				// #nosec G706 -- addr is built from a parsed node IP and fixed port; protocol is one of two literals.
 				log.Printf("listening on %s/%s", addr, proto)
+				if proto == "tcp" {
+					listener, err := listenDNSTCP(addr, tcpSlots)
+					if err != nil {
+						errc <- fmt.Errorf("listen %s/%s: %w", addr, proto, err)
+						return
+					}
+					srv.Listener = listener
+					if err := srv.ActivateAndServe(); err != nil {
+						errc <- fmt.Errorf("serve %s/%s: %w", addr, proto, err)
+					}
+					return
+				}
 				if err := srv.ListenAndServe(); err != nil {
 					errc <- fmt.Errorf("listen %s/%s: %w", addr, proto, err)
 				}
@@ -239,6 +273,26 @@ func run() error {
 		}
 	}
 	return <-errc
+}
+
+// dnsMetricsAddr is where the responder serves its DNS metrics. Distinct from
+// the agent's :9411 (same hostNetwork namespace) and its :9412 flow loopback.
+const dnsMetricsAddr = ":9413"
+
+// serveDNSMetrics exposes the resolver's DNS counters as Prometheus text.
+func serveDNSMetrics(m *responder.DNSMetrics, node string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+		var b strings.Builder
+		m.WriteMetrics(&b, node)
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		_, _ = w.Write([]byte(b.String()))
+	})
+	log.Printf("serving DNS metrics on %s/metrics", dnsMetricsAddr)
+	srv := httpserver.New(dnsMetricsAddr, mux)
+	if err := srv.ListenAndServe(); err != nil {
+		log.Printf("dns metrics server: %v", err)
+	}
 }
 
 // nodeInternalIPs returns the node's InternalIP per family.
@@ -284,6 +338,8 @@ func upstreamsFromResolvConf(path string) ([]string, error) {
 
 // informerState implements responder.State over the shared informer indexes.
 type informerState struct {
+	vpcs     cache.Indexer
+	bindings cache.Indexer
 	fips     cache.Indexer
 	ports    cache.Indexer
 	svcs     cache.Indexer
@@ -295,13 +351,25 @@ type informerState struct {
 // ServiceVIPFor returns the VIP materialized for the service in the given
 // VPC, nil while none exists (the controller may still be allocating).
 func (s *informerState) ServiceVIPFor(ns, name string, vpc sdnv1alpha1.VPCRef) net.IP {
+	if s.svips == nil || s.svcs == nil {
+		return nil
+	}
+	object, found, err := s.svcs.GetByKey(ns + "/" + name)
+	if err != nil || !found {
+		return nil
+	}
+	service, ok := object.(*corev1.Service)
+	if !ok {
+		return nil
+	}
+	currentVPC := s.liveVPC(vpc)
 	objs, err := s.svips.ByIndex(svcIndex, ns+"/"+name)
 	if err != nil {
 		return nil
 	}
 	for _, obj := range objs {
 		sv, ok := obj.(*sdnv1alpha1.ServiceVIP)
-		if !ok || sv.Spec.VPCRef != vpc {
+		if !ok || !serviceidentity.MatchesService(sv, service) || !serviceidentity.MatchesVPC(sv, currentVPC) {
 			continue
 		}
 		return net.ParseIP(sv.Spec.IP)
@@ -314,19 +382,97 @@ func (s *informerState) ServiceVIPFor(ns, name string, vpc sdnv1alpha1.VPCRef) n
 // reciprocal, both VPCs are Ready, and the CIDRs are disjoint (the status
 // controller owns those semantics — one source of truth with the datapath).
 func (s *informerState) Peers(vpc sdnv1alpha1.VPCRef) []sdnv1alpha1.VPCRef {
-	objs, err := s.peerings.ByIndex(localVPCIndex, vpc.Namespace+"/"+vpc.Name)
-	if err != nil {
+	if s.peerings == nil || !vpnlimits.NamespaceName(vpc.Namespace) || !vpnlimits.ObjectName(vpc.Name) {
 		return nil
 	}
+	objs, err := s.peerings.ByIndex(localVPCIndex, vpc.Namespace+"/"+vpc.Name)
+	if err != nil || len(objs) > maxPeeringWork {
+		return nil
+	}
+	local := s.liveVPC(vpc)
+	if local == nil || len(local.Spec.CIDRs) > maxPeeringWork {
+		return nil
+	}
+	work := len(objs)
+	seen := map[sdnv1alpha1.VPCRef]bool{}
 	var out []sdnv1alpha1.VPCRef
 	for _, obj := range objs {
 		p, ok := obj.(*sdnv1alpha1.VPCPeering)
-		if !ok || p.Status.Phase != sdnv1alpha1.VPCPeeringPhaseReady {
+		if !ok || !p.DeletionTimestamp.IsZero() || p.Status.Phase != sdnv1alpha1.VPCPeeringPhaseReady || !vpnlimits.PeeringReferences(p.Namespace, p.Spec.VPCRef.Name, p.Spec.PeerRef.Namespace, p.Spec.PeerRef.Name) {
 			continue
 		}
-		out = append(out, p.Spec.PeerRef)
+		if seen[p.Spec.PeerRef] {
+			continue
+		}
+		seen[p.Spec.PeerRef] = true
+		reciprocals, err := s.peerings.ByIndex(peeringPairIndex, peeringPairKey(p.Spec.PeerRef, vpc))
+		if err != nil {
+			continue
+		}
+		if len(reciprocals) > maxPeeringWork-work {
+			return nil
+		}
+		work += len(reciprocals)
+		if len(reciprocals) == 0 {
+			continue
+		}
+		remote := s.liveVPC(p.Spec.PeerRef)
+		if remote == nil {
+			continue
+		}
+		if len(remote.Spec.CIDRs) > (maxPeeringWork-work)/len(local.Spec.CIDRs) {
+			return nil
+		}
+		work += len(local.Spec.CIDRs) * len(remote.Spec.CIDRs)
+		if sdnv1alpha1.CIDRsOverlap(local.Spec.CIDRs, remote.Spec.CIDRs) {
+			continue
+		}
+		for _, object := range reciprocals {
+			if reciprocal, ok := object.(*sdnv1alpha1.VPCPeering); ok && p.Matches(reciprocal) {
+				if len(out) >= maxDNSPeers {
+					return nil
+				}
+				out = append(out, p.Spec.PeerRef)
+				break
+			}
+		}
 	}
 	return out
+}
+
+func peeringPairKey(local, remote sdnv1alpha1.VPCRef) string {
+	return local.Namespace + "/" + local.Name + "/" + remote.Namespace + "/" + remote.Name
+}
+
+func peeringPairIndexFunc(obj any) ([]string, error) {
+	p, ok := obj.(*sdnv1alpha1.VPCPeering)
+	if !ok || !vpnlimits.PeeringReferences(p.Namespace, p.Spec.VPCRef.Name, p.Spec.PeerRef.Namespace, p.Spec.PeerRef.Name) {
+		return nil, nil
+	}
+	return []string{peeringPairKey(p.LocalRef(), p.Spec.PeerRef)}, nil
+}
+
+func peeringLocalIndexFunc(obj any) ([]string, error) {
+	p, ok := obj.(*sdnv1alpha1.VPCPeering)
+	if !ok || !vpnlimits.PeeringReferences(p.Namespace, p.Spec.VPCRef.Name, p.Spec.PeerRef.Namespace, p.Spec.PeerRef.Name) {
+		return nil, nil
+	}
+	return []string{p.Namespace + "/" + p.Spec.VPCRef.Name}, nil
+}
+
+func (s *informerState) liveVPC(ref sdnv1alpha1.VPCRef) *sdnv1alpha1.VPC {
+	if s.vpcs == nil {
+		return nil
+	}
+	object, found, err := s.vpcs.GetByKey(ref.Namespace + "/" + ref.Name)
+	if err != nil || !found {
+		return nil
+	}
+	vpc, ok := object.(*sdnv1alpha1.VPC)
+	if !ok || !vpc.DeletionTimestamp.IsZero() || vpc.Status.VNI == 0 || len(vpc.Spec.CIDRs) == 0 {
+		return nil
+	}
+	return vpc
 }
 
 // detectClusterDomain parses kubelet's search path for the "svc.<domain>"
@@ -355,18 +501,50 @@ func (s *informerState) PortByFabricIP(ip string) *sdnv1alpha1.Port {
 		return nil
 	}
 	fip, ok := fobjs[0].(*localv1alpha1.FabricIP)
-	if !ok || fip.Spec.PodUID == "" {
+	if !ok || !fip.DeletionTimestamp.IsZero() || fip.Spec.PodUID == "" {
 		return nil
 	}
 	objs, err := s.ports.ByIndex(podUIDIndex, fip.Spec.PodUID)
 	if err != nil || len(objs) == 0 {
 		return nil
 	}
-	p, ok := objs[0].(*sdnv1alpha1.Port)
-	if !ok {
-		return nil
+	var result *sdnv1alpha1.Port
+	for _, obj := range objs {
+		p, ok := obj.(*sdnv1alpha1.Port)
+		if !ok || !serviceidentity.MatchesPortVPC(p, s.liveVPC(p.Spec.VPCRef)) || !s.bindingExists(p.Spec.PodNamespace, p.Spec.VPCRef) {
+			continue
+		}
+		if fip.Spec.ContainerID != "" {
+			if p.Annotations[sdnv1alpha1.AnnotationContainerID] != fip.Spec.ContainerID ||
+				p.Annotations[sdnv1alpha1.AnnotationCNIIfName] != fip.Spec.IfName ||
+				p.Annotations[sdnv1alpha1.AnnotationCNIPrimary] != "true" {
+				continue
+			}
+		} else if p.Annotations[sdnv1alpha1.AnnotationCNIPrimary] == "false" {
+			continue
+		}
+		if result != nil {
+			return nil
+		} // ambiguous legacy or invalid duplicate primary
+		result = p
 	}
-	return p
+	return result
+}
+
+func (s *informerState) bindingExists(namespace string, vpc sdnv1alpha1.VPCRef) bool {
+	if s.bindings == nil {
+		return false
+	}
+	objects, err := s.bindings.ByIndex(cache.NamespaceIndex, namespace)
+	if err != nil {
+		return false
+	}
+	for _, obj := range objects {
+		if binding, ok := obj.(*sdnv1alpha1.VPCBinding); ok && sdnv1alpha1.BindingAuthorizesAttachment(binding, namespace, vpc.Namespace, vpc.Name) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *informerState) Service(ns, name string) *corev1.Service {
@@ -375,40 +553,78 @@ func (s *informerState) Service(ns, name string) *corev1.Service {
 		return nil
 	}
 	svc, ok := obj.(*corev1.Service)
-	if !ok {
+	if !ok || !svc.DeletionTimestamp.IsZero() {
 		return nil
+	}
+	if annotation := svc.Annotations[sdnv1alpha1.AnnotationVPC]; annotation != "" {
+		vpc := sdnv1alpha1.VPCRef{Namespace: ns, Name: annotation}
+		if owner, name, explicit := strings.Cut(annotation, "/"); explicit {
+			vpc.Namespace, vpc.Name = owner, name
+		}
+		if !s.bindingExists(ns, vpc) {
+			return nil
+		}
 	}
 	return svc
 }
 
-func (s *informerState) Endpoints(ns, svcName string, vpc sdnv1alpha1.VPCRef) []responder.Endpoint {
+func (s *informerState) Endpoints(ns, svcName string, vpc sdnv1alpha1.VPCRef) ([]responder.Endpoint, error) {
+	currentVPC := s.liveVPC(vpc)
+	if currentVPC == nil {
+		return nil, fmt.Errorf("current VPC identity is unavailable")
+	}
+	if s.svcs == nil {
+		return nil, fmt.Errorf("Service cache is unavailable")
+	}
+	object, found, err := s.svcs.GetByKey(ns + "/" + svcName)
+	if err != nil {
+		return nil, err
+	}
+	svc, valid := object.(*corev1.Service)
+	if !found || !valid || svc.UID == "" || !svc.DeletionTimestamp.IsZero() {
+		return nil, fmt.Errorf("current Service identity is unavailable")
+	}
 	objs, err := s.eps.ByIndex(svcIndex, ns+"/"+svcName)
 	if err != nil {
-		return nil
+		return nil, err
+	}
+	if len(objs) > responder.MaxEndpointWork {
+		return nil, fmt.Errorf("DNS endpoint scan exceeds work budget")
 	}
 	var out []responder.Endpoint
 	seen := map[string]bool{} // a pod may appear in more than one slice
+	work := 0
+	spend := func() bool { work++; return work <= responder.MaxEndpointWork }
 	for _, obj := range objs {
+		if !spend() {
+			return nil, fmt.Errorf("DNS endpoint scan exceeds work budget")
+		}
 		slice, ok := obj.(*discoveryv1.EndpointSlice)
-		if !ok {
+		if !ok || !serviceidentity.OwnsEndpointSlice(svc, slice) {
 			continue
 		}
 		for _, ep := range slice.Endpoints {
-			if ep.TargetRef == nil || ep.TargetRef.Kind != "Pod" {
+			if !spend() {
+				return nil, fmt.Errorf("DNS endpoint scan exceeds work budget")
+			}
+			if ep.TargetRef == nil || ep.TargetRef.Kind != "Pod" || ep.TargetRef.UID == "" {
 				continue
 			}
 			key := ep.TargetRef.Namespace + "/" + ep.TargetRef.Name
 			if seen[key] {
 				continue
 			}
-			seen[key] = true
 			ports, err := s.ports.ByIndex(podIndex, ep.TargetRef.Namespace+"/"+ep.TargetRef.Name)
 			if err != nil {
 				continue
 			}
 			for _, po := range ports {
+				if !spend() {
+					return nil, fmt.Errorf("DNS endpoint scan exceeds work budget")
+				}
 				port, ok := po.(*sdnv1alpha1.Port)
-				if !ok || port.Spec.VPCRef != vpc {
+				if !ok || !serviceidentity.MatchesPortVPC(port, currentVPC) ||
+					port.Labels[sdnv1alpha1.LabelPodUID] != string(ep.TargetRef.UID) {
 					continue // the structural authz: only same-VPC backends exist
 				}
 				ip := net.ParseIP(port.Spec.IP)
@@ -420,11 +636,15 @@ func (s *informerState) Endpoints(ns, svcName string, vpc sdnv1alpha1.VPCRef) []
 					hostname = *ep.Hostname
 				}
 				ready := ep.Conditions.Ready == nil || *ep.Conditions.Ready
+				if len(out) >= responder.MaxEndpoints {
+					return nil, fmt.Errorf("DNS endpoint view exceeds retention budget")
+				}
 				out = append(out, responder.Endpoint{Hostname: hostname, IP: ip, Ready: ready})
+				seen[key] = true
 			}
 		}
 	}
-	return out
+	return out, nil
 }
 
 func canonIP(s string) string {

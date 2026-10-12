@@ -19,9 +19,15 @@ package securitygroup
 import (
 	"context"
 	"errors"
+	"github.com/lllamnyp/cozyplane/pkg/netid"
+	"github.com/lllamnyp/cozyplane/pkg/registry/sdn/authz"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"net"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
+	"github.com/lllamnyp/cozyplane/internal/vpnlimits"
+	"k8s.io/apimachinery/pkg/api/equality"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -58,13 +64,13 @@ func SelectableFields(obj *sdn.SecurityGroup) fields.Set {
 type securityGroupStrategy struct {
 	runtime.ObjectTyper
 	names.NameGenerator
+	auth authorizer.Authorizer
 }
 
-// NewStrategy creates and returns a securityGroupStrategy instance. A group lives
-// in its VPC owner's namespace; owning the namespace is owning the VPC's policy,
-// so there is no virtual verb to check (contrast VPCPeering's `peer`).
-func NewStrategy(typer runtime.ObjectTyper) securityGroupStrategy {
-	return securityGroupStrategy{typer, names.SimpleNameGenerator}
+// NewStrategy preserves ordinary tenant policy permissions and separately
+// authorizes changes to operator-managed groups.
+func NewStrategy(typer runtime.ObjectTyper, auth authorizer.Authorizer) securityGroupStrategy {
+	return securityGroupStrategy{typer, names.SimpleNameGenerator, auth}
 }
 
 func (securityGroupStrategy) NamespaceScoped() bool {
@@ -83,64 +89,100 @@ func (securityGroupStrategy) PrepareForUpdate(ctx context.Context, obj, old runt
 	newSG.Status = oldSG.Status
 }
 
-func (securityGroupStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
+func (s securityGroupStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	sg := obj.(*sdn.SecurityGroup)
-	return validateSecurityGroup(sg)
+	errs := validateSecurityGroup(sg, false)
+	if err := authz.CheckManaged(ctx, s.auth, "securitygroups", obj, nil); err != nil {
+		errs = append(errs, err)
+	}
+	return errs
 }
 
-func validateSecurityGroup(sg *sdn.SecurityGroup) field.ErrorList {
-	var errs field.ErrorList
+func validateSecurityGroup(sg *sdn.SecurityGroup, unchanged bool) field.ErrorList {
 	specPath := field.NewPath("spec")
+	if !unchanged {
+		if errs := vpnlimits.ReferenceErrors(sg.Spec.VPCRef.Name, specPath.Child("vpcRef", "name"), true); len(errs) != 0 {
+			return errs
+		}
+	}
+	if _, err := metav1.LabelSelectorAsSelector(&sg.Spec.PodSelector); err != nil {
+		return field.ErrorList{field.Invalid(specPath.Child("podSelector"), nil, "must be a valid label selector")}
+	}
 	if sg.Spec.VPCRef.Name == "" {
-		errs = append(errs, field.Required(specPath.Child("vpcRef", "name"), "the local VPC name is required"))
+		return field.ErrorList{field.Required(specPath.Child("vpcRef", "name"), "the local VPC name is required")}
 	}
 	for i, r := range sg.Spec.Ingress {
-		p := specPath.Child("ingress").Index(i).Child("from")
-		hasGroup := r.From.Group != ""
-		hasCIDR := r.From.CIDR != ""
-		switch {
-		case hasGroup && hasCIDR:
-			errs = append(errs, field.Invalid(p, r.From, "set exactly one of group or cidr"))
-		case !hasGroup && !hasCIDR:
-			errs = append(errs, field.Required(p, "one of group or cidr is required"))
-		case hasCIDR:
-			// v2 north-south: the all-addresses CIDR (SG_WORLD) and specific
-			// ranges (sg_cidr LPM) are both enforced. Validate it parses.
-			if _, _, err := net.ParseCIDR(r.From.CIDR); err != nil {
-				errs = append(errs, field.Invalid(p.Child("cidr"), r.From.CIDR, "not a valid CIDR"))
-			}
+		rp := specPath.Child("ingress").Index(i)
+		if errs := validateRulePorts(r.Ports, rp.Child("ports")); len(errs) != 0 {
+			return errs
 		}
-		// A peer-VPC reference must name a group in that VPC.
-		if r.From.VPC != nil {
-			if r.From.VPC.Namespace == "" || r.From.VPC.Name == "" {
-				errs = append(errs, field.Invalid(p.Child("vpc"), r.From.VPC, "peer vpc ref needs both namespace and name"))
-			}
-			if !hasGroup {
-				errs = append(errs, field.Required(p.Child("group"), "a peer-VPC reference must name a group"))
-			}
+		if errs := validateRulePeer(r.From, rp.Child("from"), unchanged); len(errs) != 0 {
+			return errs
 		}
 	}
 	for i, r := range sg.Spec.Egress {
-		p := specPath.Child("egress").Index(i).Child("to")
-		hasGroup := r.To.Group != ""
-		hasCIDR := r.To.CIDR != ""
-		switch {
-		case hasGroup && hasCIDR:
-			errs = append(errs, field.Invalid(p, r.To, "set exactly one of group or cidr"))
-		case !hasGroup && !hasCIDR:
-			errs = append(errs, field.Required(p, "an egress rule must name a destination group or cidr"))
-		case hasCIDR:
-			if _, _, err := net.ParseCIDR(r.To.CIDR); err != nil {
-				errs = append(errs, field.Invalid(p.Child("cidr"), r.To.CIDR, "not a valid CIDR"))
+		rp := specPath.Child("egress").Index(i)
+		if errs := validateRulePorts(r.Ports, rp.Child("ports")); len(errs) != 0 {
+			return errs
+		}
+		if errs := validateRulePeer(r.To, rp.Child("to"), unchanged); len(errs) != 0 {
+			return errs
+		}
+	}
+	return nil
+}
+
+func validateRulePeer(peer sdn.SecurityGroupPeer, path *field.Path, unchanged bool) field.ErrorList {
+	hasGroup, hasCIDR := peer.Group != "", peer.CIDR != ""
+	if hasGroup && hasCIDR {
+		return field.ErrorList{field.Invalid(path, nil, "set exactly one of group or cidr")}
+	}
+	if !hasGroup && !hasCIDR {
+		return field.ErrorList{field.Required(path, "one of group or cidr is required")}
+	}
+	if hasGroup && !unchanged {
+		if errs := vpnlimits.ReferenceErrors(peer.Group, path.Child("group"), true); len(errs) != 0 {
+			return errs
+		}
+	}
+	if hasCIDR {
+		if len(peer.CIDR) > 64 {
+			return field.ErrorList{field.Invalid(path.Child("cidr"), nil, "must contain at most 64 bytes")}
+		}
+		if _, _, err := net.ParseCIDR(peer.CIDR); err != nil {
+			return field.ErrorList{field.Invalid(path.Child("cidr"), nil, "not a valid CIDR")}
+		}
+	}
+	if peer.VPC != nil {
+		if peer.VPC.Namespace == "" || peer.VPC.Name == "" {
+			return field.ErrorList{field.Invalid(path.Child("vpc"), nil, "peer vpc ref needs both namespace and name")}
+		}
+		if !hasGroup {
+			return field.ErrorList{field.Required(path.Child("group"), "a peer-VPC reference must name a group")}
+		}
+		if !unchanged {
+			if !vpnlimits.NamespaceName(peer.VPC.Namespace) {
+				return field.ErrorList{field.Invalid(path.Child("vpc", "namespace"), nil, "must be a DNS label namespace of at most 63 bytes")}
+			}
+			if errs := vpnlimits.ReferenceErrors(peer.VPC.Name, path.Child("vpc", "name"), true); len(errs) != 0 {
+				return errs
 			}
 		}
-		if r.To.VPC != nil {
-			if r.To.VPC.Namespace == "" || r.To.VPC.Name == "" {
-				errs = append(errs, field.Invalid(p.Child("vpc"), r.To.VPC, "peer vpc ref needs both namespace and name"))
-			}
-			if !hasGroup {
-				errs = append(errs, field.Required(p.Child("group"), "a peer-VPC egress reference must name a group"))
-			}
+	}
+	return nil
+}
+
+// Only an empty port list denotes all ports. Explicit zero and overflowing
+// ports must never reach the datapath's uint16 wildcard representation.
+func validatePorts(ports []sdn.SecurityGroupPort, path *field.Path) field.ErrorList {
+	var errs field.ErrorList
+	for i, port := range ports {
+		p := path.Index(i)
+		if port.Protocol != "TCP" && port.Protocol != "UDP" {
+			errs = append(errs, field.NotSupported(p.Child("protocol"), port.Protocol, []string{"TCP", "UDP"}))
+		}
+		if port.Port < 1 || port.Port > 65535 {
+			errs = append(errs, field.Invalid(p.Child("port"), port.Port, "must be between 1 and 65535"))
 		}
 	}
 	return errs
@@ -161,10 +203,13 @@ func (securityGroupStrategy) AllowUnconditionalUpdate() bool {
 func (securityGroupStrategy) Canonicalize(obj runtime.Object) {
 }
 
-func (securityGroupStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+func (s securityGroupStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	newSG := obj.(*sdn.SecurityGroup)
 	oldSG := old.(*sdn.SecurityGroup)
-	errs := validateSecurityGroup(newSG)
+	errs := validateSecurityGroup(newSG, equality.Semantic.DeepEqual(newSG.Spec, oldSG.Spec))
+	if err := authz.CheckManaged(ctx, s.auth, "securitygroups", obj, old); err != nil {
+		errs = append(errs, err)
+	}
 	// The VPC binding is the group's identity anchor; changing it would
 	// re-home the group and orphan its allocated id. Replace instead.
 	if newSG.Spec.VPCRef != oldSG.Spec.VPCRef {
@@ -192,12 +237,28 @@ func (securityGroupStatusStrategy) PrepareForUpdate(ctx context.Context, obj, ol
 	newSG := obj.(*sdn.SecurityGroup)
 	oldSG := old.(*sdn.SecurityGroup)
 	newSG.Spec = oldSG.Spec
+	authz.PreserveManager(obj, old)
 }
 
 func (securityGroupStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
-	return field.ErrorList{}
+	id := obj.(*sdn.SecurityGroup).Status.ID
+	if id != 0 && !netid.ValidGroup(id) {
+		return field.ErrorList{field.Invalid(field.NewPath("status", "id"), id, "must be zero (pending) or between 1 and 62")}
+	}
+	return nil
 }
 
 func (securityGroupStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
+}
+func validateRulePorts(ports []sdn.SecurityGroupPort, path *field.Path) field.ErrorList {
+	for i, port := range ports {
+		if port.Protocol != "TCP" && port.Protocol != "UDP" {
+			return field.ErrorList{field.Invalid(path.Index(i).Child("protocol"), nil, "must be TCP or UDP")}
+		}
+		if port.Port < 0 || port.Port > 65535 {
+			return field.ErrorList{field.Invalid(path.Index(i).Child("port"), port.Port, "must be 0-65535")}
+		}
+	}
 	return nil
 }

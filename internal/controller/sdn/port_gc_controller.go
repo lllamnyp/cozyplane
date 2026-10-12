@@ -26,13 +26,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
+	localv1alpha1 "github.com/lllamnyp/cozyplane/api/localsdn/v1alpha1"
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
 )
 
@@ -69,6 +69,19 @@ func (r *PortGCReconciler) reader() client.Reader {
 	return r.Client
 }
 
+const (
+	gcPortNodeIndex = "cozyplane.portgc.node"
+	gcPortPodIndex  = "cozyplane.portgc.pod"
+)
+
+func gcPortNodeKeys(obj client.Object) []string {
+	port := obj.(*sdnv1alpha1.Port)
+	if port.Spec.Node == "" {
+		return nil
+	}
+	return []string{port.Spec.Node}
+}
+
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=ports,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
@@ -93,6 +106,13 @@ func (r *PortGCReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 		if !apierrors.IsNotFound(err) {
 			return ctrl.Result{}, fmt.Errorf("get node %q: %w", port.Spec.Node, err)
+		}
+		err = r.reader().Get(ctx, types.NamespacedName{Name: port.Spec.Node}, &corev1.Node{})
+		if err == nil {
+			return ctrl.Result{}, nil // cache has not observed the live node yet
+		}
+		if !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("confirm node %q absent: %w", port.Spec.Node, err)
 		}
 	}
 
@@ -125,26 +145,30 @@ func (r *PortGCReconciler) reapIfAbandoned(ctx context.Context, port *sdnv1alpha
 	}
 	key := types.NamespacedName{Namespace: podNS, Name: podName}
 	pod := &corev1.Pod{}
+	claimantActive := func() bool {
+		return podUID == "" || string(pod.UID) == podUID &&
+			pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed
+	}
 	err := r.Get(ctx, key, pod)
-	if err == nil && (podUID == "" || string(pod.UID) == podUID) {
-		return ctrl.Result{}, nil // claimant alive
+	if err == nil && claimantActive() {
+		return r.reapObsoleteSandbox(ctx, port, pod)
 	}
 	if err != nil && !apierrors.IsNotFound(err) {
 		return ctrl.Result{}, fmt.Errorf("get claimant pod %s: %w", key, err)
 	}
-	// The cache says gone (or reused) — confirm live before deleting: a stale
+	// The cache says gone, reused or terminal — confirm live before deleting: a stale
 	// read on a just-created pod must not kill its newborn Port.
 	err = r.reader().Get(ctx, key, pod)
-	if err == nil && (podUID == "" || string(pod.UID) == podUID) {
+	if err == nil && claimantActive() {
 		return ctrl.Result{}, nil
 	}
 	if err != nil && !apierrors.IsNotFound(err) {
 		return ctrl.Result{}, fmt.Errorf("confirm claimant pod %s: %w", key, err)
 	}
-	if err := r.Delete(ctx, port); err != nil && !apierrors.IsNotFound(err) {
+	if err := r.Delete(ctx, port, client.Preconditions{UID: &port.UID, ResourceVersion: &port.ResourceVersion}); err != nil && !apierrors.IsNotFound(err) {
 		return ctrl.Result{}, fmt.Errorf("gc abandoned port %s: %w", port.Name, err)
 	}
-	log.FromContext(ctx).Info("GC'd abandoned port; claimant pod is gone",
+	log.FromContext(ctx).Info("GC'd abandoned port; claimant pod is gone or terminal",
 		"port", port.Name, "pod", podNS+"/"+podName, "gateway", port.Spec.Gateway)
 	return ctrl.Result{}, nil
 }
@@ -177,12 +201,18 @@ var deletionsOnly = predicate.Funcs{
 // claims (an abandoned Port gets no further Port event either). Both auxiliary
 // watches are delete-scoped — see deletionsOnly.
 func (r *PortGCReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	indexer := mgr.GetFieldIndexer()
+	if err := indexer.IndexField(context.Background(), &sdnv1alpha1.Port{}, gcPortNodeIndex, gcPortNodeKeys); err != nil {
+		return err
+	}
+	if err := indexer.IndexField(context.Background(), &sdnv1alpha1.Port{}, gcPortPodIndex, membershipPodKeys); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&sdnv1alpha1.Port{}).
-		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(r.mapNodeToPorts),
-			builder.WithPredicates(deletionsOnly)).
-		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.mapPodToPorts),
-			builder.WithPredicates(deletionsOnly)).
+		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(r.mapNodeToPorts)).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.mapPodToPorts)).
+		Watches(&localv1alpha1.FabricIP{}, handler.EnqueueRequestsFromMapFunc(r.mapFabricIPToPorts)).
 		Named("portgc").
 		Complete(r)
 }
@@ -190,11 +220,20 @@ func (r *PortGCReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // mapPodToPorts re-enqueues the Ports claimed by a pod (labels written at CNI
 // ADD), so a pod deletion revisits the Ports it may have abandoned.
 func (r *PortGCReconciler) mapPodToPorts(ctx context.Context, obj client.Object) []ctrl.Request {
+	return r.mapClaimantToPorts(ctx, obj.GetNamespace(), obj.GetName())
+}
+
+func (r *PortGCReconciler) mapFabricIPToPorts(ctx context.Context, obj client.Object) []ctrl.Request {
+	claim := obj.(*localv1alpha1.FabricIP)
+	return r.mapClaimantToPorts(ctx, claim.Spec.PodNamespace, claim.Spec.PodName)
+}
+
+func (r *PortGCReconciler) mapClaimantToPorts(ctx context.Context, namespace, name string) []ctrl.Request {
+	if namespace == "" || name == "" {
+		return nil
+	}
 	var ports sdnv1alpha1.PortList
-	if err := r.List(ctx, &ports, client.MatchingLabels{
-		sdnv1alpha1.LabelPodNamespace: obj.GetNamespace(),
-		sdnv1alpha1.LabelPodName:      obj.GetName(),
-	}); err != nil {
+	if err := r.List(ctx, &ports, client.MatchingFields{gcPortPodIndex: namespace + "/" + name}); err != nil {
 		return nil
 	}
 	var reqs []ctrl.Request
@@ -206,7 +245,7 @@ func (r *PortGCReconciler) mapPodToPorts(ctx context.Context, obj client.Object)
 
 func (r *PortGCReconciler) mapNodeToPorts(ctx context.Context, obj client.Object) []ctrl.Request {
 	var ports sdnv1alpha1.PortList
-	if err := r.List(ctx, &ports); err != nil {
+	if err := r.List(ctx, &ports, client.MatchingFields{gcPortNodeIndex: obj.GetName()}); err != nil {
 		return nil
 	}
 	var reqs []ctrl.Request

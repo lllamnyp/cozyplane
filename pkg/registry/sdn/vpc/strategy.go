@@ -19,14 +19,19 @@ package vpc
 import (
 	"context"
 	"errors"
+	"github.com/lllamnyp/cozyplane/pkg/netid"
 	"net"
+	"reflect"
 	"slices"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
+	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
+	"github.com/lllamnyp/cozyplane/pkg/registry/sdn/authz"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/names"
@@ -60,11 +65,16 @@ func SelectableFields(obj *sdn.VPC) fields.Set {
 type vpcStrategy struct {
 	runtime.ObjectTyper
 	names.NameGenerator
+	auth authorizer.Authorizer
 }
 
 // NewStrategy creates and returns a vpcStrategy instance.
-func NewStrategy(typer runtime.ObjectTyper) vpcStrategy {
-	return vpcStrategy{typer, names.SimpleNameGenerator}
+func NewStrategy(typer runtime.ObjectTyper, auth ...authorizer.Authorizer) vpcStrategy {
+	var a authorizer.Authorizer
+	if len(auth) > 0 {
+		a = auth[0]
+	}
+	return vpcStrategy{typer, names.SimpleNameGenerator, a}
 }
 
 func (vpcStrategy) NamespaceScoped() bool {
@@ -76,6 +86,7 @@ func (vpcStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 	// never sets it.
 	vpc := obj.(*sdn.VPC)
 	vpc.Status = sdn.VPCStatus{}
+	vpc.Generation = 1
 }
 
 func (vpcStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
@@ -83,10 +94,21 @@ func (vpcStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object
 	newVPC := obj.(*sdn.VPC)
 	oldVPC := old.(*sdn.VPC)
 	newVPC.Status = oldVPC.Status
+	newVPC.Generation = oldVPC.Generation
+	if !reflect.DeepEqual(newVPC.Spec, oldVPC.Spec) {
+		newVPC.Generation++
+	}
 }
 
-func (vpcStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
-	return validateVPCSpec(obj.(*sdn.VPC))
+func (s vpcStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
+	v := obj.(*sdn.VPC)
+	errs := validateVPCSpec(v)
+	if v.Spec.Boundary != nil {
+		if err := authz.CheckVPCVerb(ctx, s.auth, "manage-boundary", v.Namespace, v.Name, field.NewPath("spec", "boundary")); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errs
 }
 
 // validateVPCSpec rejects a VPC that cannot become a working network.
@@ -103,33 +125,26 @@ func validateVPCSpec(vpc *sdn.VPC) field.ErrorList {
 	var errs field.ErrorList
 	cidrsPath := field.NewPath("spec", "cidrs")
 
-	if len(vpc.Spec.CIDRs) == 0 {
-		errs = append(errs, field.Required(cidrsPath,
-			"a VPC needs at least one CIDR; pods cannot attach to a VPC with no address space"))
-	}
-	for i, c := range vpc.Spec.CIDRs {
-		p := cidrsPath.Index(i)
-		ip, ipnet, err := net.ParseCIDR(c)
-		if err != nil {
-			errs = append(errs, field.Invalid(p, c, "not a valid CIDR"))
-			continue
-		}
-		// Canonical (masked) form, like the Port and ServiceVIP name claims:
-		// "10.0.0.5/24" means 10.0.0.0/24 to every consumer of this field, and a
-		// tenant reading its own spec back should not have to know that.
-		if !ip.Equal(ipnet.IP) || ipnet.String() != c {
-			errs = append(errs, field.Invalid(p, c,
-				"must be in canonical form (the network address and prefix, e.g. "+ipnet.String()+")"))
-		}
+	if err := sdnv1alpha1.ValidateVPCCIDRs(vpc.Spec.CIDRs); err != nil {
+		return field.ErrorList{field.Invalid(cidrsPath, nil, err.Error())}
 	}
 
+	if len(vpc.Spec.CIDRs) == 0 {
+		return field.ErrorList{field.Required(cidrsPath, "at least one network CIDR is required")}
+	}
+	for i, cidr := range vpc.Spec.CIDRs {
+		ip, prefix, _ := net.ParseCIDR(cidr)
+		if !ip.Equal(prefix.IP) {
+			return field.ErrorList{field.Invalid(cidrsPath.Index(i), nil, "must be a network CIDR without host bits")}
+		}
+	}
 	// The MTU is handed to the CNI verbatim; a nonsensical one produces a pod
 	// interface nothing can talk through. Zero means "take the default".
 	if m := vpc.Spec.MTU; m != 0 && (m < 576 || m > 65535) {
 		errs = append(errs, field.Invalid(field.NewPath("spec", "mtu"), m,
 			"must be 0 (the controller default) or between 576 and 65535"))
 	}
-	return errs
+	return append(errs, validateBoundary(vpc)...)
 }
 
 // WarningsOnCreate returns warnings for the creation of the given object.
@@ -151,13 +166,26 @@ func (vpcStrategy) Canonicalize(obj runtime.Object) {
 // ValidateUpdate ratchets: the spec is re-validated only where it CHANGED, so a
 // VPC stored before this validation existed can still be edited (and repaired)
 // rather than being frozen by a rule it predates.
-func (vpcStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+func (s vpcStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	newVPC := obj.(*sdn.VPC)
 	oldVPC := old.(*sdn.VPC)
-	if slices.Equal(newVPC.Spec.CIDRs, oldVPC.Spec.CIDRs) && newVPC.Spec.MTU == oldVPC.Spec.MTU {
+	boundaryChanged := !reflect.DeepEqual(newVPC.Spec.Boundary, oldVPC.Spec.Boundary)
+	networkChanged := !slices.Equal(newVPC.Spec.CIDRs, oldVPC.Spec.CIDRs) || newVPC.Spec.MTU != oldVPC.Spec.MTU
+	var errs field.ErrorList
+	if boundaryChanged || (oldVPC.Spec.Boundary != nil && networkChanged) {
+		if err := authz.CheckVPCVerb(ctx, s.auth, "manage-boundary", oldVPC.Namespace, oldVPC.Name, field.NewPath("spec")); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if boundaryChanged {
+		if newVPC.Spec.Boundary != nil && oldVPC.Spec.Boundary != nil && newVPC.Spec.Boundary.Revision <= oldVPC.Spec.Boundary.Revision {
+			errs = append(errs, field.Invalid(field.NewPath("spec", "boundary", "revision"), newVPC.Spec.Boundary.Revision, "must increase when boundary changes"))
+		}
+	}
+	if !networkChanged && !boundaryChanged {
 		return field.ErrorList{}
 	}
-	return validateVPCSpec(newVPC)
+	return append(errs, validateVPCSpec(newVPC)...)
 }
 
 // WarningsOnUpdate returns warnings for the given update.
@@ -180,10 +208,15 @@ func (vpcStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.
 	newVPC := obj.(*sdn.VPC)
 	oldVPC := old.(*sdn.VPC)
 	newVPC.Spec = oldVPC.Spec
+	newVPC.Generation = oldVPC.Generation
 }
 
 func (vpcStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
-	return field.ErrorList{}
+	vni := obj.(*sdn.VPC).Status.VNI
+	if vni != 0 && !netid.ValidVNI(vni) {
+		return field.ErrorList{field.Invalid(field.NewPath("status", "vni"), vni, "must be zero (pending) or between 100 and 4194303")}
+	}
+	return nil
 }
 
 func (vpcStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {

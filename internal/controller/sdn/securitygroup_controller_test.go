@@ -18,21 +18,75 @@ package sdn
 
 import (
 	"context"
+	"fmt"
+	corev1 "k8s.io/api/core/v1"
 	"testing"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
 )
 
 func sg(ns, name, vpc string, created time.Time) *sdnv1alpha1.SecurityGroup {
 	return &sdnv1alpha1.SecurityGroup{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, CreationTimestamp: metav1.NewTime(created)},
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, UID: types.UID("group-" + ns + "-" + name), CreationTimestamp: metav1.NewTime(created)},
 		Spec:       sdnv1alpha1.SecurityGroupSpec{VPCRef: sdnv1alpha1.LocalVPCRef{Name: vpc}},
+	}
+}
+
+func TestPendingGroupCapacityDoesNotLeaveSelectedPortUngrouped(t *testing.T) {
+	c := membershipClientBuilder(t).
+		WithStatusSubresource(&sdnv1alpha1.SecurityGroup{}, &sdnv1alpha1.Port{}).Build()
+	for id := int32(1); id < sdnv1alpha1.MaxSecurityGroupsPerVPC; id++ {
+		group := sg("tenant", fmt.Sprintf("allocated-%d", id), "vpc", time.Now())
+		group.Status.ID = id
+		group.Spec.PodSelector = metav1.LabelSelector{MatchLabels: map[string]string{"role": "other"}}
+		if err := c.Create(t.Context(), group); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending := sg("tenant", "pending", "vpc", time.Now())
+	pending.Spec.PodSelector = metav1.LabelSelector{MatchLabels: map[string]string{"role": "protected"}}
+	port := &sdnv1alpha1.Port{ObjectMeta: metav1.ObjectMeta{Name: "v101.10-70-0-42", Annotations: map[string]string{sdnv1alpha1.AnnotationPodLabels: `{"role":"protected"}`}}, Spec: sdnv1alpha1.PortSpec{IP: "10.70.0.42", VPCRef: sdnv1alpha1.VPCRef{Namespace: "tenant", Name: "vpc"}}}
+	for _, object := range []client.Object{pending, port} {
+		if err := c.Create(t.Context(), object); err != nil {
+			t.Fatal(err)
+		}
+	}
+	allocator := &SecurityGroupReconciler{Client: c}
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: pending.Namespace, Name: pending.Name}}
+	result, err := allocator.Reconcile(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	membership := &PortMembershipReconciler{Client: c}
+	if _, err := membership.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: port.Name}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(t.Context(), types.NamespacedName{Name: port.Name}, port); err != nil {
+		t.Fatal(err)
+	}
+	if len(port.Status.Groups) != 1 || port.Status.Groups[0] != 0 {
+		t.Fatalf("selected pending group became ungrouped: %v", port.Status.Groups)
+	}
+	if result.RequeueAfter <= 0 {
+		t.Fatal("full group allocator will never retry")
+	}
+	if err := c.Delete(t.Context(), &sdnv1alpha1.SecurityGroup{ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "allocated-1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := allocator.Reconcile(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := membership.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: port.Name}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(t.Context(), types.NamespacedName{Name: port.Name}, port); err != nil || len(port.Status.Groups) != 1 || port.Status.Groups[0] != 1 {
+		t.Fatal("freed group identity did not replace pending marker", port.Status.Groups, err)
 	}
 }
 
@@ -58,7 +112,7 @@ func TestSecurityGroupIDAllocationPerVPC(t *testing.T) {
 	// distinct object names within the namespace
 	other.Name = "web-b"
 	other.Spec.VPCRef.Name = "vpc-b"
-	c := fake.NewClientBuilder().WithScheme(svcScheme(t)).
+	c := membershipClientBuilder(t).
 		WithObjects(a, b, other).
 		WithStatusSubresource(&sdnv1alpha1.SecurityGroup{}).
 		Build()
@@ -90,7 +144,7 @@ func TestSecurityGroupDuplicateIDRepair(t *testing.T) {
 	older.Status.ID = 1
 	younger := sg("team-a", "db", "vpc-a", t0.Add(time.Second))
 	younger.Status.ID = 1 // duplicate
-	c := fake.NewClientBuilder().WithScheme(svcScheme(t)).
+	c := membershipClientBuilder(t).
 		WithObjects(older, younger).
 		WithStatusSubresource(&sdnv1alpha1.SecurityGroup{}).
 		Build()
@@ -134,7 +188,7 @@ func TestPortMembershipResolution(t *testing.T) {
 		},
 		Spec: sdnv1alpha1.PortSpec{VPCRef: sdnv1alpha1.VPCRef{Namespace: "team-a", Name: "vpc-a"}, IP: "10.70.0.5"},
 	}
-	c := fake.NewClientBuilder().WithScheme(svcScheme(t)).
+	c := membershipClientBuilder(t).
 		WithObjects(web, member, nonMember).
 		WithStatusSubresource(&sdnv1alpha1.Port{}).
 		Build()
@@ -155,5 +209,40 @@ func TestPortMembershipResolution(t *testing.T) {
 	_ = r.Get(context.Background(), types.NamespacedName{Name: nonMember.Name}, got)
 	if len(got.Status.Groups) != 0 {
 		t.Errorf("non-member groups = %v, want empty", got.Status.Groups)
+	}
+}
+func TestMembershipLiveLabelsRequireSamePodUID(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		claimUID string
+		podUID   types.UID
+		want     int32
+	}{
+		{"current pod follows labels", "current", "current", 2},
+		{"replacement retains own snapshot", "old", "current", 1},
+		{"legacy cannot adopt by name", "", "current", 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			oldGroup := sg("tenant", "client", "vpc", time.Now())
+			oldGroup.Spec.PodSelector.MatchLabels = map[string]string{"role": "client"}
+			oldGroup.Status.ID = 1
+			newGroup := sg("tenant", "privileged", "vpc", time.Now())
+			newGroup.Spec.PodSelector.MatchLabels = map[string]string{"role": "privileged"}
+			newGroup.Status.ID = 2
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "workload", UID: test.podUID, Labels: map[string]string{"role": "privileged"}}}
+			port := &sdnv1alpha1.Port{ObjectMeta: metav1.ObjectMeta{Name: "v101.10-70-0-2", Labels: map[string]string{sdnv1alpha1.LabelPodNamespace: pod.Namespace, sdnv1alpha1.LabelPodName: pod.Name, sdnv1alpha1.LabelPodUID: test.claimUID}, Annotations: map[string]string{sdnv1alpha1.AnnotationPodLabels: `{"role":"client"}`}}, Spec: sdnv1alpha1.PortSpec{VPCRef: sdnv1alpha1.VPCRef{Namespace: "tenant", Name: "vpc"}, PodNamespace: pod.Namespace, PodName: pod.Name}}
+			c := membershipClientBuilder(t).WithObjects(oldGroup, newGroup, pod, port).WithStatusSubresource(&sdnv1alpha1.Port{}).Build()
+			r := &PortMembershipReconciler{Client: c}
+			if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: port.Name}}); err != nil {
+				t.Fatal(err)
+			}
+			got := &sdnv1alpha1.Port{}
+			if err := c.Get(t.Context(), types.NamespacedName{Name: port.Name}, got); err != nil {
+				t.Fatal(err)
+			}
+			if len(got.Status.Groups) != 1 || got.Status.Groups[0] != test.want {
+				t.Fatal("wrong endpoint group identity", got.Status.Groups, test.want)
+			}
+		})
 	}
 }

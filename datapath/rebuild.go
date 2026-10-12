@@ -19,7 +19,9 @@ package datapath
 import (
 	"errors"
 	"fmt"
+	"github.com/lllamnyp/cozyplane/pkg/netid"
 	"net"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -37,7 +39,14 @@ import (
 //
 // Format (versioned, order fixed):
 //
-//	cozyplane:1;net=<net-id>;gw=<0|1>;mac=<pod-iface MAC>;ips=<ip>[,<ip>]
+//	cozyplane:1;net=<net-id>;gw=<0|1>;fwd=<0|1>;mac=<pod-iface MAC>;ips=<ip>[,<ip>]
+//
+// `fwd` was added with multi-attach and is OPTIONAL on read: an alias written by
+// an earlier release has no such key and parses as fwd=0, which is what it was.
+// Without it a granted forwarding leg would silently lose PORT_F_FORWARD on the
+// first agent restart and start dropping its own transit traffic on the RPF
+// check — the failure would look like a datapath bug, hours after the change
+// that caused it.
 const vethAliasPrefix = "cozyplane:1;"
 
 // Host-side veth name prefixes (must match hostVethNameFor/gwHostVethNameFor in
@@ -51,6 +60,9 @@ const (
 // the ports-map value: the network id, with PortGatewayFlag set for a gateway
 // VPC leg.
 func FormatVethAlias(rawNet uint32, ips []net.IP, mac net.HardwareAddr) string {
+	if rawNet == QuarantineNet {
+		return vethAliasPrefix + "revoked=1"
+	}
 	gw := 0
 	if rawNet&PortGatewayFlag != 0 {
 		gw = 1
@@ -59,13 +71,24 @@ func FormatVethAlias(rawNet uint32, ips []net.IP, mac net.HardwareAddr) string {
 	for _, ip := range ips {
 		ss = append(ss, ip.String())
 	}
-	return fmt.Sprintf("%snet=%d;gw=%d;mac=%s;ips=%s",
-		vethAliasPrefix, PortNet(rawNet), gw, mac, strings.Join(ss, ","))
+	fwd := 0
+	if rawNet&PortForwardFlag != 0 {
+		fwd = 1
+	}
+	scoped := 0
+	if rawNet&PortForwardScopedFlag != 0 {
+		scoped = 1
+	}
+	return fmt.Sprintf("%snet=%d;gw=%d;fwd=%d;scoped=%d;mac=%s;ips=%s",
+		vethAliasPrefix, PortNet(rawNet), gw, fwd, scoped, mac, strings.Join(ss, ","))
 }
 
 // parseVethAlias inverts FormatVethAlias. ok is false for an empty, foreign, or
 // malformed alias (a veth created by a pre-alias CNI release).
 func parseVethAlias(alias string) (rawNet uint32, ips []net.IP, mac net.HardwareAddr, ok bool) {
+	if alias == vethAliasPrefix+"revoked=1" || strings.HasPrefix(alias, vethAliasPrefix+"revoked=1;") {
+		return QuarantineNet, nil, nil, true
+	}
 	body, found := strings.CutPrefix(alias, vethAliasPrefix)
 	if !found {
 		return 0, nil, nil, false
@@ -76,10 +99,18 @@ func parseVethAlias(alias string) (rawNet uint32, ips []net.IP, mac net.Hardware
 		if !found {
 			return 0, nil, nil, false
 		}
+		if _, exists := fields[k]; exists {
+			return 0, nil, nil, false
+		}
+		switch k {
+		case "net", "gw", "fwd", "scoped", "mac", "ips", "container", "ifname", "port", "portuid", "s", "staged":
+		default:
+			return 0, nil, nil, false
+		}
 		fields[k] = v
 	}
 	netID, err := strconv.ParseUint(fields["net"], 10, 32)
-	if err != nil {
+	if err != nil || (netID != 0 && (netID < uint64(netid.FirstVNI) || netID > uint64(netid.LastVNI))) {
 		return 0, nil, nil, false
 	}
 	rawNet = uint32(netID)
@@ -88,6 +119,32 @@ func parseVethAlias(alias string) (rawNet uint32, ips []net.IP, mac net.Hardware
 	case "1":
 		rawNet |= PortGatewayFlag
 	default:
+		return 0, nil, nil, false
+	}
+	switch fields["fwd"] {
+	case "", "0": // absent: written before multi-attach existed
+	case "1":
+		rawNet |= PortForwardFlag
+	default:
+		return 0, nil, nil, false
+	}
+	switch fields["scoped"] {
+	case "0":
+	case "1":
+		if rawNet&PortForwardFlag == 0 {
+			return 0, nil, nil, false
+		}
+		rawNet |= PortForwardScopedFlag
+	case "":
+		// Legacy fwd=1 aliases cannot distinguish scoped from blanket grants.
+		// Preserve the CIDR check rather than silently grant arbitrary sources.
+		if rawNet&PortForwardFlag != 0 {
+			rawNet |= PortForwardScopedFlag
+		}
+	default:
+		return 0, nil, nil, false
+	}
+	if netID == 0 && rawNet != 0 {
 		return 0, nil, nil, false
 	}
 	mac, err = net.ParseMAC(fields["mac"])
@@ -109,11 +166,290 @@ func parseVethAlias(alias string) (rawNet uint32, ips []net.IP, mac net.Hardware
 
 // SetVethAlias records the rebuild record on a host veth (CNI ADD).
 func SetVethAlias(link netlink.Link, rawNet uint32, ips []net.IP, mac net.HardwareAddr) error {
-	if err := netlink.LinkSetAlias(link, FormatVethAlias(rawNet, ips, mac)); err != nil {
+	return withBridgeLock(func() error { return setVethAlias(link, rawNet, ips, mac) })
+}
+
+func setVethAlias(link netlink.Link, rawNet uint32, ips []net.IP, mac net.HardwareAddr) error {
+	current, err := netlink.LinkByIndex(link.Attrs().Index)
+	if err != nil {
+		return err
+	}
+	if old, _, _, valid := parseVethAlias(current.Attrs().Alias); valid && old == QuarantineNet && rawNet != QuarantineNet {
+		return fmt.Errorf("revoked veth requires a new sandbox")
+	}
+	alias := FormatVethAlias(rawNet, ips, mac)
+	container, iface := VethSandbox(current.Attrs().Alias)
+	alias = aliasWithSandbox(alias, container, iface)
+	id := VethPortIdentity(current.Attrs().Alias)
+	alias = aliasWithPortIdentity(alias, id)
+	if err := netlink.LinkSetAlias(link, alias); err != nil {
 		return fmt.Errorf("set veth alias: %w", err)
 	}
+	link.Attrs().Alias = alias
 	return nil
 }
+
+func aliasWithSandbox(alias, containerID, ifName string) string {
+	if containerID == "" || ifName == "" {
+		return alias
+	}
+	return alias + ";container=" + url.QueryEscape(containerID) + ";ifname=" + url.QueryEscape(ifName)
+}
+
+func VethSandbox(alias string) (containerID, ifName string) {
+	if _, _, _, valid := parseVethAlias(alias); !valid {
+		return "", ""
+	}
+	for _, field := range strings.Split(alias, ";") {
+		key, encoded, found := strings.Cut(field, "=")
+		if !found {
+			continue
+		}
+		value, err := url.QueryUnescape(encoded)
+		if err != nil {
+			return "", ""
+		}
+		switch key {
+		case "container":
+			containerID = value
+		case "ifname":
+			ifName = value
+		}
+	}
+	return
+}
+
+func SetVethSandbox(link netlink.Link, containerID, ifName string) error {
+	return withBridgeLock(func() error {
+		current, err := netlink.LinkByIndex(link.Attrs().Index)
+		if err != nil {
+			return err
+		}
+		rawNet, ips, mac, valid := parseVethAlias(current.Attrs().Alias)
+		if !valid {
+			return fmt.Errorf("cannot record sandbox on invalid veth alias")
+		}
+		alias := aliasWithPortIdentity(aliasWithSandbox(FormatVethAlias(rawNet, ips, mac), containerID, ifName), VethPortIdentity(current.Attrs().Alias))
+		if len(alias) > 255 {
+			return fmt.Errorf("endpoint alias exceeds Linux limit")
+		}
+		if err := netlink.LinkSetAlias(current, alias); err != nil {
+			return err
+		}
+		link.Attrs().Alias = alias
+		return nil
+	})
+}
+
+// AdoptVethPortIdentity upgrades a legacy record only while its ownership
+// evidence still matches the caller's snapshot. It never activates delivery.
+func AdoptVethPortIdentity(ifindex int, expectedAlias string, id PortVethIdentity) (string, error) {
+	var updated string
+	err := withBridgeLock(func() error {
+		link, err := netlink.LinkByIndex(ifindex)
+		if err != nil {
+			return err
+		}
+		if link.Type() != "veth" || link.Attrs().Alias != expectedAlias {
+			return fmt.Errorf("endpoint changed before ownership adoption")
+		}
+		raw, ips, mac, valid := parseVethAlias(expectedAlias)
+		if !valid || raw == QuarantineNet || id.UID == "" {
+			return fmt.Errorf("invalid endpoint ownership adoption")
+		}
+		if previous := VethPortIdentity(expectedAlias); previous.UID != "" && previous.UID != id.UID {
+			return fmt.Errorf("endpoint belongs to another Port generation")
+		}
+		cid, iface := VethSandbox(expectedAlias)
+		updated = aliasWithPortIdentity(aliasWithSandbox(FormatVethAlias(raw, ips, mac), cid, iface), id)
+		if len(updated) > 255 {
+			return fmt.Errorf("endpoint alias exceeds Linux limit")
+		}
+		if err := netlink.LinkSetAlias(link, updated); err != nil {
+			return err
+		}
+		if !id.Staged && PortNet(raw) != 0 {
+			for _, ip := range ips {
+				idx, _, found, err := GetLocal(PortNet(raw), ip)
+				if err != nil {
+					return err
+				}
+				if found && idx == ifindex {
+					if err := setLocal(PortNet(raw), ip, ifindex, mac); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		return nil
+	})
+	return updated, err
+}
+
+// PodVethName is the host-side name the CNI gives a sandbox's primary veth.
+// The CNI and the agent's legacy-sandbox recovery must agree on it exactly.
+func PodVethName(containerID string) string {
+	if len(containerID) > 11 {
+		containerID = containerID[:11]
+	}
+	return podVethPrefix + containerID
+}
+
+// RecordLegacyVethSandbox fills the absent sandbox witness of an endpoint wired
+// by a CNI release that predates it. It only touches an unchanged record that
+// has no witness yet, and never activates delivery.
+func RecordLegacyVethSandbox(ifindex int, expectedAlias, containerID, ifName string) error {
+	if containerID == "" || ifName == "" {
+		return fmt.Errorf("incomplete sandbox witness")
+	}
+	return withBridgeLock(func() error {
+		link, err := netlink.LinkByIndex(ifindex)
+		if err != nil {
+			return err
+		}
+		if link.Type() != "veth" || link.Attrs().Alias != expectedAlias {
+			return fmt.Errorf("endpoint changed before sandbox recovery")
+		}
+		raw, ips, mac, valid := parseVethAlias(expectedAlias)
+		if !valid || raw == QuarantineNet {
+			return fmt.Errorf("invalid endpoint for sandbox recovery")
+		}
+		if cid, iface := VethSandbox(expectedAlias); cid != "" || iface != "" {
+			return fmt.Errorf("endpoint already records a sandbox")
+		}
+		alias := aliasWithPortIdentity(aliasWithSandbox(FormatVethAlias(raw, ips, mac), containerID, ifName), VethPortIdentity(expectedAlias))
+		if len(alias) > 255 {
+			return fmt.Errorf("endpoint alias exceeds Linux limit")
+		}
+		return netlink.LinkSetAlias(link, alias)
+	})
+}
+
+type PortVethIdentity struct {
+	UID    string
+	Staged bool
+}
+
+func VethPortIdentity(alias string) (id PortVethIdentity) {
+	for _, field := range strings.Split(alias, ";") {
+		key, value, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "portuid", "port":
+			id.UID, _ = url.QueryUnescape(value)
+		case "staged", "s":
+			id.Staged = value != "0" // malformed state must not activate locals
+		}
+	}
+	return
+}
+
+func aliasWithPortIdentity(alias string, id PortVethIdentity) string {
+	if id.UID != "" {
+		alias += ";port=" + url.QueryEscape(id.UID)
+	}
+	if id.Staged {
+		alias += ";s=1"
+	}
+	return alias
+}
+
+// SetEndpointVethAlias publishes sandbox, Port generation and staging together.
+func SetEndpointVethAlias(link netlink.Link, rawNet uint32, ips []net.IP, mac net.HardwareAddr, containerID, ifName string, id PortVethIdentity) error {
+	return withBridgeLock(func() error { return setEndpointVethAlias(link, rawNet, ips, mac, containerID, ifName, id) })
+}
+
+func setEndpointVethAlias(link netlink.Link, rawNet uint32, ips []net.IP, mac net.HardwareAddr, containerID, ifName string, id PortVethIdentity) error {
+	current, err := endpointVeth(link, containerID, ifName, id)
+	if err != nil {
+		return err
+	}
+	previous := VethPortIdentity(current.Attrs().Alias)
+	if previous.Staged {
+		id.Staged = true
+	} // only verified agent cutover activates
+	alias := aliasWithPortIdentity(aliasWithSandbox(FormatVethAlias(rawNet, ips, mac), containerID, ifName), id)
+	if len(alias) > 255 {
+		return fmt.Errorf("endpoint alias exceeds Linux limit")
+	}
+	if err := netlink.LinkSetAlias(current, alias); err != nil {
+		return err
+	}
+	link.Attrs().Alias = alias
+	return nil
+}
+
+func endpointVeth(link netlink.Link, containerID, ifName string, id PortVethIdentity) (netlink.Link, error) {
+	current, err := netlink.LinkByIndex(link.Attrs().Index)
+	if err != nil {
+		return nil, err
+	}
+	if current.Type() != "veth" || current.Attrs().Name != link.Attrs().Name {
+		return nil, fmt.Errorf("endpoint link changed")
+	}
+	if old, _, _, valid := parseVethAlias(current.Attrs().Alias); valid && old == QuarantineNet {
+		return nil, fmt.Errorf("revoked veth requires a new sandbox")
+	}
+	if previous := VethPortIdentity(current.Attrs().Alias); previous.UID != "" && previous.UID != id.UID {
+		return nil, fmt.Errorf("endpoint belongs to another Port generation")
+	}
+	if cid, iface := VethSandbox(current.Attrs().Alias); cid != "" && (cid != containerID || iface != ifName) {
+		return nil, fmt.Errorf("endpoint belongs to another sandbox")
+	}
+	return current, nil
+}
+
+// SetLocalStaging updates only endpoints of this Port generation and retains
+// their sandbox witness. Staging removes only each matched veth's locals entry.
+func SetLocalStaging(net_ uint32, ip net.IP, uid string, staged bool) error {
+	return withBridgeLock(func() error {
+		links, err := netlink.LinkList()
+		if err != nil {
+			return err
+		}
+		for _, link := range links {
+			id := VethPortIdentity(link.Attrs().Alias)
+			if uid == "" || id.UID != uid || link.Type() != "veth" {
+				continue
+			}
+			raw, ips, mac, ok := parseVethAlias(link.Attrs().Alias)
+			if !ok || raw == QuarantineNet || PortNet(raw) != net_ {
+				continue
+			}
+			matches := false
+			for _, a := range ips {
+				matches = matches || a.Equal(ip)
+			}
+			if !matches {
+				continue
+			}
+			id.Staged = staged
+			cid, iface := VethSandbox(link.Attrs().Alias)
+			alias := aliasWithPortIdentity(aliasWithSandbox(FormatVethAlias(raw, ips, mac), cid, iface), id)
+			if err := netlink.LinkSetAlias(link, alias); err != nil {
+				return err
+			}
+			if staged {
+				idx, _, found, err := GetLocal(net_, ip)
+				if err != nil {
+					return err
+				}
+				if found && idx == link.Attrs().Index {
+					if err := delLocal(net_, ip); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		return nil
+	})
+}
+
+// LocalFabricIP is a successfully rebuilt underlay endpoint, derived from an
+// alias (net0) or the primary VPC leg's fabric route. It is never a claim by itself.
+type LocalFabricIP struct{ Address, ContainerID, IfName string }
 
 // EnsureLocalFromVeth programs the locals entry for (net, ip) from the local
 // veth whose alias record covers it — the cutover half of staged locals: a
@@ -121,18 +457,55 @@ func SetVethAlias(link netlink.Link, rawNet uint32, ips []net.IP, mac net.Hardwa
 // elsewhere), and the agent calls this when the persistent Port's node
 // becomes this node. Returns false when no such veth exists (the ADD hasn't
 // happened here yet — it will program locals itself, seeing spec.node==self).
-func EnsureLocalFromVeth(net_ uint32, ip net.IP) (bool, error) {
-	ifindex, mac, ok, err := vethForAddr(net_, ip)
+func EnsureLocalFromVeth(net_ uint32, ip net.IP, containerID, ifName string, portUID ...string) (bool, error) {
+	ifindex, _, ok, err := vethForAddr(net_, ip, containerID, ifName)
 	if err != nil || !ok {
 		return false, err
 	}
-	return true, SetLocal(net_, ip, ifindex, mac)
+	err = withBridgeLock(func() error {
+		link, err := netlink.LinkByIndex(ifindex)
+		if err != nil {
+			return err
+		}
+		id := VethPortIdentity(link.Attrs().Alias)
+		if len(portUID) > 0 {
+			if id.UID != "" && id.UID != portUID[0] {
+				return fmt.Errorf("veth belongs to another Port generation")
+			}
+			id.UID = portUID[0]
+		}
+		id.Staged = false
+		raw, ips, aliasMAC, valid := parseVethAlias(link.Attrs().Alias)
+		if !valid || raw == QuarantineNet || PortNet(raw) != net_ || link.Type() != "veth" {
+			return fmt.Errorf("veth is not active")
+		}
+		cid, iface := VethSandbox(link.Attrs().Alias)
+		if containerID != "" && (cid != containerID || iface != ifName) {
+			return fmt.Errorf("sandbox changed before cutover")
+		}
+		matches := false
+		for _, a := range ips {
+			matches = matches || a.Equal(ip)
+		}
+		if !matches {
+			return fmt.Errorf("endpoint address changed before cutover")
+		}
+		if len(portUID) > 0 && VethPortIdentity(link.Attrs().Alias).UID == "" && containerID == "" {
+			return fmt.Errorf("legacy cutover requires a sandbox witness")
+		}
+		alias := aliasWithPortIdentity(aliasWithSandbox(FormatVethAlias(raw, ips, aliasMAC), cid, iface), id)
+		if err := netlink.LinkSetAlias(link, alias); err != nil {
+			return err
+		}
+		return setLocal(net_, ip, ifindex, aliasMAC)
+	})
+	return err == nil, err
 }
 
 // vethForAddr finds the local host veth whose rebuild alias covers (net, ip),
 // returning its ifindex and the pinned MAC. ok is false when no such veth
 // exists on this node (e.g. the CNI ADD hasn't landed here).
-func vethForAddr(net_ uint32, ip net.IP) (ifindex int, mac net.HardwareAddr, ok bool, err error) {
+func vethForAddr(net_ uint32, ip net.IP, containerID, ifName string) (ifindex int, mac net.HardwareAddr, ok bool, err error) {
 	links, err := netlink.LinkList()
 	if err != nil {
 		return 0, nil, false, fmt.Errorf("list links: %w", err)
@@ -142,21 +515,35 @@ func vethForAddr(net_ uint32, ip net.IP) (ifindex int, mac net.HardwareAddr, ok 
 		if !strings.HasPrefix(name, podVethPrefix) && !strings.HasPrefix(name, gwVethPrefix) {
 			continue
 		}
+		if l.Type() != "veth" {
+			continue
+		}
+		if containerID != "" {
+			id, iface := VethSandbox(l.Attrs().Alias)
+			if id != containerID || iface != ifName {
+				continue
+			}
+		}
 		rawNet, ips, amac, aok := parseVethAlias(l.Attrs().Alias)
 		if !aok || PortNet(rawNet) != net_ {
 			continue
 		}
 		for _, aip := range ips {
 			if aip.Equal(ip) {
-				return l.Attrs().Index, amac, true, nil
+				if ok {
+					return 0, nil, false, fmt.Errorf("multiple local veths for network %d address %s sandbox %s", net_, ip, containerID)
+				}
+				ifindex, mac, ok = l.Attrs().Index, amac, true
+				break
 			}
 		}
 	}
-	return 0, nil, false, nil
+	return ifindex, mac, ok, nil
 }
 
 // RebuildStats reports what a local-state rebuild did.
 type RebuildStats struct {
+	FabricIPs  []LocalFabricIP
 	Rebuilt    int      // veths whose ports/locals/bridges entries were re-put
 	Reattached int      // veths whose tcx links were swapped to the fresh programs
 	Pruned     int      // stale map entries removed (veth died without a CNI DEL)
@@ -234,6 +621,26 @@ func (m *Manager) RebuildLocalState() (RebuildStats, error) {
 			errs = append(errs, fmt.Errorf("rebuild %s: %w", name, err))
 		} else {
 			stats.Rebuilt++
+			if rawNet != QuarantineNet {
+				containerID, ifName := VethSandbox(l.Attrs().Alias)
+				if PortNet(rawNet) == 0 {
+					for _, ip := range ips {
+						owned, err := fabricRouteOwned(idx, ip)
+						if err != nil {
+							errs = append(errs, err)
+							continue
+						}
+						if !owned {
+							continue
+						}
+						stats.FabricIPs = append(stats.FabricIPs, LocalFabricIP{Address: ip.String(), ContainerID: containerID, IfName: ifName})
+					}
+				} else if fabric, err := fabricRouteIP(l); err != nil {
+					errs = append(errs, err)
+				} else if fabric != "" {
+					stats.FabricIPs = append(stats.FabricIPs, LocalFabricIP{Address: fabric, ContainerID: containerID, IfName: ifName})
+				}
+			}
 		}
 
 		if healed, err := healLinkLocalGW(l); err != nil {
@@ -273,6 +680,16 @@ func (m *Manager) RebuildLocalState() (RebuildStats, error) {
 // before any map entry, hence an entry's veth+alias witness always exists by
 // the time the entry does.
 func pruneStaleLocalState() (int, error) {
+	var pruned int
+	err := withBridgeLock(func() error {
+		var err error
+		pruned, err = pruneStaleLocalStateLocked()
+		return err
+	})
+	return pruned, err
+}
+
+func pruneStaleLocalStateLocked() (int, error) {
 	pruned := 0
 
 	// locals: live iff the endpoint's ifindex is a cozyplane veth whose alias
@@ -287,7 +704,8 @@ func pruneStaleLocalState() (int, error) {
 	var staleLocals []overlayLocalKey
 	it := lm.Iterate()
 	for it.Next(&lk, &lv) {
-		if !aliasVouches(int(lv.Ifindex), lk.Net, lk.Ip) {
+		link := cozyVethByIndex(int(lv.Ifindex))
+		if link == nil || VethPortIdentity(link.Attrs().Alias).Staged || !aliasVouches(int(lv.Ifindex), lk.Net, lk.Ip) {
 			staleLocals = append(staleLocals, lk)
 		}
 	}
@@ -348,6 +766,29 @@ func pruneStaleLocalState() (int, error) {
 			pruned++
 		}
 	}
+	owners, err := ebpf.LoadPinnedMap(filepath.Join(PinRoot, "bridge_owners"), nil)
+	if err != nil {
+		return pruned, err
+	}
+	defer owners.Close()
+	var owner overlayBridgeOwner
+	var staleOwners []overlayAddr128
+	ownerIt := owners.Iterate()
+	for ownerIt.Next(&bk, &owner) {
+		if err := bm.Lookup(&bk, &bv); isNotExist(err) {
+			staleOwners = append(staleOwners, bk)
+		} else if err != nil {
+			return pruned, err
+		}
+	}
+	if err := ownerIt.Err(); err != nil {
+		return pruned, err
+	}
+	for _, key := range staleOwners {
+		if err := owners.Delete(&key); err != nil && !isNotExist(err) {
+			return pruned, err
+		}
+	}
 
 	// fabric_of: the inverse of bridges — live iff its bridges counterpart
 	// (just pruned above) still maps the fabric IP back to this (net, VPC IP).
@@ -388,6 +829,9 @@ func cozyVethByIndex(ifindex int) netlink.Link {
 	if !strings.HasPrefix(name, podVethPrefix) && !strings.HasPrefix(name, gwVethPrefix) {
 		return nil
 	}
+	if l.Type() != "veth" {
+		return nil
+	}
 	return l
 }
 
@@ -401,6 +845,12 @@ func aliasVouches(ifindex int, net_ uint32, addr overlayAddr128) bool {
 	l := cozyVethByIndex(ifindex)
 	if l == nil {
 		return false // veth gone: the entry is stale
+	}
+	if net_ == 0 {
+		owned, err := fabricRouteOwned(ifindex, addr128ToIP(addr))
+		if err != nil || !owned {
+			return false
+		}
 	}
 	rawNet, ips, _, ok := parseVethAlias(l.Attrs().Alias)
 	if !ok {
@@ -429,28 +879,49 @@ func bridgeVouched(fabric overlayAddr128, ep overlayBridgeEp) bool {
 
 // rebuildVeth re-puts one veth's ports/locals entries and, for a VPC pod, its
 // bridges entry (fabric IP -> {net, VPC IP}), re-derived from the veth's
-// scope-link fabric route — the one host route whose destination is not a pod
-// address.
+// unique owned main-table fabric host route. Its address may equal the VPC IP.
 func rebuildVeth(l netlink.Link, idx int, rawNet uint32, ips []net.IP, mac net.HardwareAddr) error {
 	if err := SetPortNet(idx, rawNet); err != nil {
 		return err
 	}
+	if rawNet == QuarantineNet {
+		return nil // persist revocation; never restore endpoints from this link
+	}
 	for _, ip := range ips {
+		if PortNet(rawNet) == 0 {
+			if err := rebuildFabricLocal(idx, ip, mac); err != nil {
+				return err
+			}
+			continue
+		}
+		if VethPortIdentity(l.Attrs().Alias).Staged {
+			continue
+		}
 		if err := SetLocal(PortNet(rawNet), ip, idx, mac); err != nil {
 			return err
 		}
 	}
-	// Only a plain VPC pod has a fabric bridge (default pods are their fabric
-	// identity; a gateway VPC leg has none), and it has exactly one VPC IP.
-	if PortNet(rawNet) == 0 || rawNet&PortGatewayFlag != 0 || len(ips) != 1 {
+	// Only a VPC pod has a fabric bridge (a default pod IS its fabric identity),
+	// and a bridged leg carries exactly one VPC IP.
+	if PortNet(rawNet) == 0 || len(ips) != 1 {
 		return nil
 	}
-	fabric, err := fabricRouteIP(l, ips)
+	fabric, err := fabricRouteIP(l)
 	if err != nil {
 		return err
 	}
 	if fabric == "" {
-		return fmt.Errorf("no fabric route on VPC pod veth")
+		// No fabric route: this is not the pod's PRIMARY leg, so it has no
+		// bridge to rebuild. A gateway's VPC leg never had one, and with
+		// multi-attach neither does a secondary attachment — there is one
+		// fabric handle per pod and entry 0 owns it (docs/multi-attach.md).
+		//
+		// The route's presence is the signal, deliberately, and the gateway
+		// FLAG is not: a forwarding attachment carries that flag and may
+		// perfectly well be the primary leg, so testing the flag here would
+		// silently skip rebuilding a bridge that exists — the pod would come
+		// back from an agent restart unreachable on its own status.podIP.
+		return nil
 	}
 	// Heal the fabric IP's permanent neighbour (pods ADDed by a pre-neighbour
 	// CNI release lack it, and node-originated traffic — kubelet probes, DNS
@@ -458,21 +929,23 @@ func rebuildVeth(l netlink.Link, idx int, rawNet uint32, ips []net.IP, mac net.H
 	if err := addFabricNeigh(fabric, l.Attrs().Name, mac); err != nil {
 		return err
 	}
-	return setBridge(fabric, ips[0].String(), PortNet(rawNet))
+	return withBridgeLock(func() error { return setBridge(fabric, ips[0].String(), l.Attrs().Name, PortNet(rawNet)) })
 }
 
 // fabricRouteIP finds the fabric IP of a VPC pod's veth: the destination of the
-// gatewayless host route (/32 or /128) that is not one of the pod's addresses.
+// gatewayless main-table host route (/32 or /128). VPC CNI installs no separate
+// main-table VPC-address route, so the fabric IP may equal the VPC address.
+// Require effective route ownership and refuse multiple distinct candidates.
 // No scope filter — a v6 device route reports scope global, not link (only v4
 // host routes carry SCOPE_LINK).
-func fabricRouteIP(l netlink.Link, podIPs []net.IP) (string, error) {
+func fabricRouteIP(l netlink.Link) (string, error) {
 	routes, err := netlink.RouteList(l, netlink.FAMILY_ALL)
 	if err != nil {
 		return "", fmt.Errorf("list routes: %w", err)
 	}
-next:
+	fabric := ""
 	for _, r := range routes {
-		if r.Dst == nil || r.Gw != nil {
+		if r.Dst == nil || r.Gw != nil || r.Table != unix.RT_TABLE_MAIN || r.Type != unix.RTN_UNICAST || r.LinkIndex != l.Attrs().Index || len(r.MultiPath) != 0 {
 			continue
 		}
 		if ones, bits := r.Dst.Mask.Size(); ones != bits {
@@ -481,12 +954,18 @@ next:
 		if r.Dst.IP.IsLinkLocalUnicast() || r.Dst.IP.IsMulticast() {
 			continue
 		}
-		for _, ip := range podIPs {
-			if r.Dst.IP.Equal(ip) {
-				continue next
-			}
+		owned, err := fabricRouteOwned(l.Attrs().Index, r.Dst.IP)
+		if err != nil {
+			return "", fmt.Errorf("check fabric route ownership: %w", err)
 		}
-		return r.Dst.IP.String(), nil
+		if !owned {
+			continue
+		}
+		address := r.Dst.IP.String()
+		if fabric != "" && fabric != address {
+			return "", fmt.Errorf("ambiguous fabric host routes on %s", l.Attrs().Name)
+		}
+		fabric = address
 	}
-	return "", nil
+	return fabric, nil
 }

@@ -30,15 +30,18 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	localv1alpha1 "github.com/lllamnyp/cozyplane/api/localsdn/v1alpha1"
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
+	"github.com/lllamnyp/cozyplane/internal/vmidentity"
 )
 
 func launcher(name, node, vm, fabricIP string, uid types.UID) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "tenant",
-			Name:      name,
-			UID:       uid,
+			Namespace:       "tenant",
+			Name:            name,
+			UID:             uid,
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(vmi(vm, ""), vmiGVK)},
 			Labels: map[string]string{
 				sdnv1alpha1.KubeVirtLabelVMName:   vm,
 				sdnv1alpha1.KubeVirtLabelNodeName: node, // present only on the active pod
@@ -53,7 +56,7 @@ func persistentPort(vm, ip, node string) *sdnv1alpha1.Port {
 	return &sdnv1alpha1.Port{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   "v100." + ip,
-			Labels: map[string]string{sdnv1alpha1.LabelVMName: vm},
+			Labels: map[string]string{sdnv1alpha1.LabelVMName: vm, vmidentity.InstanceUIDLabel: "vmi-" + vm},
 		},
 		Spec: sdnv1alpha1.PortSpec{
 			VPCRef:       sdnv1alpha1.VPCRef{Namespace: "tenant", Name: "vpc"},
@@ -69,6 +72,7 @@ func vmi(vm, nodeName string) *unstructured.Unstructured {
 	u := newVMI()
 	u.SetNamespace("tenant")
 	u.SetName(vm)
+	u.SetUID(types.UID("vmi-" + vm))
 	_ = unstructured.SetNestedField(u.Object, nodeName, "status", "nodeName")
 	return u
 }
@@ -86,8 +90,10 @@ func ppScheme(t *testing.T) *runtime.Scheme {
 	s := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(s)
 	_ = sdnv1alpha1.AddToScheme(s)
+	_ = localv1alpha1.AddToScheme(s)
 	// Register the VMI GVK so the fake client can serve the unstructured object.
 	s.AddKnownTypeWithName(vmiGVK, &unstructured.Unstructured{})
+	s.AddKnownTypeWithName(vmGVK, &unstructured.Unstructured{})
 	return s
 }
 
@@ -183,7 +189,7 @@ func TestCutoverFallsBackToPodLabel(t *testing.T) {
 	}
 }
 
-// No virt-launcher pods ⇒ the VM is gone ⇒ the persistent Port is GC'd.
+// No launcher pods and no owning VM means the persistent Port is GC'd.
 func TestPersistentPortGCWhenNoPods(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(ppScheme(t)).
 		WithObjects(persistentPort("vm", "192.168.0.2", "node-a")).
@@ -195,5 +201,42 @@ func TestPersistentPortGCWhenNoPods(t *testing.T) {
 	err := r.Get(context.Background(), types.NamespacedName{Name: "v100.192.168.0.2"}, &sdnv1alpha1.Port{})
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("port should have been GC'd (NotFound), got err=%v", err)
+	}
+}
+func TestCutoverSandboxIdentityFollowsActiveClaim(t *testing.T) {
+	src := launcher("source", "node-a", "vm", "10.244.0.5", "source-uid")
+	dst := launcher("target", "node-b", "vm", "10.244.1.9", "target-uid")
+	port := persistentPort("vm", "192.168.0.2", "node-a")
+	port.Labels[sdnv1alpha1.LabelPodUID] = string(src.UID)
+	port.Annotations = map[string]string{sdnv1alpha1.AnnotationContainerID: "source-sandbox", sdnv1alpha1.AnnotationCNIIfName: "eth0", sdnv1alpha1.AnnotationCNIPrimary: "true"}
+	claim := &localv1alpha1.FabricIP{ObjectMeta: metav1.ObjectMeta{Name: localv1alpha1.FabricIPName(dst.Status.PodIP)}, Spec: localv1alpha1.FabricIPSpec{Address: dst.Status.PodIP, PodUID: string(dst.UID), PodName: dst.Name, PodNamespace: dst.Namespace, Node: dst.Spec.NodeName, ContainerID: "target-sandbox", IfName: "eth0"}}
+	c := fake.NewClientBuilder().WithScheme(ppScheme(t)).WithObjects(port, src, dst, claim, node("node-a", "192.0.2.1"), node("node-b", "192.0.2.2"), vmi("vm", "node-b")).Build()
+	r := &PersistentPortReconciler{Client: c, watchVMI: true}
+	got := reconcilePP(t, r, port.Name)
+	if got.Labels[sdnv1alpha1.LabelPodUID] != string(dst.UID) || got.Annotations[sdnv1alpha1.AnnotationContainerID] != "target-sandbox" || got.Spec.IP != port.Spec.IP || got.Spec.MAC != port.Spec.MAC {
+		t.Fatal("cutover failed to move sandbox identity while preserving the pinned NIC", got)
+	}
+	claim.Spec.PodUID = "foreign-uid"
+	if err := c.Update(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: port.Name}})
+	if err != nil || result.RequeueAfter == 0 {
+		t.Fatal("conflicting claim must retry", result, err)
+	}
+	got = &sdnv1alpha1.Port{}
+	if err := c.Get(t.Context(), types.NamespacedName{Name: port.Name}, got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Annotations[sdnv1alpha1.AnnotationContainerID] != "" {
+		t.Fatal("foreign or stale sandbox retained", got.Annotations)
+	}
+	claim.Spec.PodUID = string(dst.UID)
+	if err := c.Update(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	got = reconcilePP(t, r, port.Name)
+	if got.Annotations[sdnv1alpha1.AnnotationContainerID] != "target-sandbox" {
+		t.Fatal("late claim did not repair sandbox identity")
 	}
 }

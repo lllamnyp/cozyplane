@@ -89,6 +89,8 @@ func peeringClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
 	return fake.NewClientBuilder().
 		WithScheme(testScheme(t)).
+		WithIndex(&sdnv1alpha1.VPCPeering{}, peeringPairIndex, peeringPairKeys).
+		WithIndex(&sdnv1alpha1.VPCPeering{}, peeringVPCIndex, peeringVPCKeys).
 		WithObjects(objs...).
 		WithStatusSubresource(&sdnv1alpha1.VPCPeering{}).
 		Build()

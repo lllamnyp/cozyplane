@@ -88,3 +88,55 @@ spec:
         releaseName: cozyplane-kpr
         dependsOn:
         - cozyplane
+  # Fresh cluster only; pair with cozyplane.apiserver variant crd.
+  - name: crd
+    dependsOn: []
+    components:
+    # The cilium.io/v2 policy CRDs, inert. Stock Cozystack charts embed
+    # CiliumNetworkPolicy / CiliumClusterwideNetworkPolicy objects and fail to
+    # install when the CRDs are absent; the cozyplane variant runs no Cilium, so
+    # nothing enforces them. Installed into cozy-system, matching the chart's
+    # home in the cozystack tree; cross-namespace install.dependsOn is resolved
+    # by the operator, so the ordering below still holds.
+    - name: cozyplane-cilium-crds
+      path: cozyplane-cilium-crds
+      install:
+        namespace: cozy-system
+        releaseName: cozyplane-cilium-crds
+    # The CNI itself. valuesFiles are applied in order: the first with strategy
+    # Overwrite, every later one with Merge — so values-talos.yaml only works as
+    # a distinct second file (it carries kubeApiServer -> KubePrism
+    # localhost:7445, which is wrong off Talos and must not become a default).
+    - name: cozyplane
+      path: cozyplane
+      valuesFiles:
+      - values.yaml
+      - values-talos.yaml
+      - values-crd.yaml
+      install:
+        # The agent DaemonSet is hostNetwork + eBPF + host mounts; privileged
+        # makes the operator label the namespace
+        # pod-security.kubernetes.io/enforce: privileged.
+        privileged: true
+        namespace: cozy-cozyplane
+        releaseName: cozyplane
+        # The chart ships fabricips.local.sdn.cozystack.io, a v1alpha1 CRD that
+        # is still evolving. Trade-off: CreateReplace overwrites CRDs and can
+        # lose data if a field is dropped while live objects exist.
+        upgradeCRDs: CreateReplace
+        dependsOn:
+        - cozyplane-cilium-crds
+    # The kube-proxy replacement: socket-LB service load balancing, importing
+    # Cilium's LB control plane without a Cilium agent. On a cluster with no
+    # kube-proxy, in-cluster Services have nothing serving them without it.
+    - name: cozyplane-kpr
+      path: cozyplane-kpr
+      valuesFiles:
+      - values.yaml
+      - values-talos.yaml
+      install:
+        privileged: true
+        namespace: cozy-cozyplane
+        releaseName: cozyplane-kpr
+        dependsOn:
+        - cozyplane

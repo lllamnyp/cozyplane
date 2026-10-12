@@ -39,15 +39,18 @@ type HostFirewallSpec struct {
 	// (kubelet↔apiserver, the agent's own API access, kubelet probes —
 	// docs/host-firewall.md).
 	// +optional
+	// +listType=atomic
 	PolicyTypes []HostFirewallPolicyType `json:"policyTypes,omitempty"`
 
 	// Ingress rules union across all HostFirewalls selecting a node.
 	// +optional
+	// +listType=atomic
 	Ingress []HostFirewallRule `json:"ingress,omitempty"`
 
 	// Egress rules union across all HostFirewalls selecting a node. `to`
 	// peers are CIDRs, like ingress `from`.
 	// +optional
+	// +listType=atomic
 	Egress []HostFirewallEgressRule `json:"egress,omitempty"`
 }
 
@@ -68,11 +71,13 @@ const (
 type HostFirewallEgressRule struct {
 	// To lists admitted destination ranges. Empty means any destination.
 	// +optional
+	// +listType=atomic
 	To []HostFirewallPeer `json:"to,omitempty"`
 
 	// Ports narrows the rule to specific destination ports. Empty means
 	// every port, TCP and UDP.
 	// +optional
+	// +listType=atomic
 	Ports []HostFirewallPort `json:"ports,omitempty"`
 }
 
@@ -81,11 +86,13 @@ type HostFirewallEgressRule struct {
 type HostFirewallRule struct {
 	// From lists admitted source ranges. Empty means any source.
 	// +optional
+	// +listType=atomic
 	From []HostFirewallPeer `json:"from,omitempty"`
 
 	// Ports narrows the rule to specific destination ports. Empty means every
 	// port, TCP and UDP.
 	// +optional
+	// +listType=atomic
 	Ports []HostFirewallPort `json:"ports,omitempty"`
 }
 
@@ -96,6 +103,7 @@ type HostFirewallPeer struct {
 
 	// Except carves sub-ranges out of CIDR.
 	// +optional
+	// +listType=atomic
 	Except []string `json:"except,omitempty"`
 }
 

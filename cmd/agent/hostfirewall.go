@@ -42,9 +42,8 @@ import (
 // state; a label change re-selects on the next Node event.
 
 // hfSyncErrors counts failed map syncs, exposed as
-// cozyplane_hf_sync_errors_total. Like np_allow, a failed hf_allow sync only
-// ever over-drops (isolation is the flag, the map holds admissions), so it
-// must be loud rather than dangerous.
+// cozyplane_hf_sync_errors_total. A failed rule sync retains the temporary
+// default-deny mode until a complete ruleset can be installed.
 var hfSyncErrors atomic.Uint64
 
 // hfProtoNum maps the API protocol string to the IP protocol number.
@@ -77,11 +76,11 @@ func hfCompilePorts(ports []sdnv1alpha1.HostFirewallPort) ([]hfPortRow, []string
 	for _, p := range ports {
 		proto, ok := hfProtoNum(p.Protocol)
 		if !ok {
-			warnings = append(warnings, fmt.Sprintf("protocol %q is not served (TCP/UDP only); rule port skipped (fail closed)", p.Protocol))
+			addCompileWarnings(&warnings, fmt.Sprintf("protocol %q is not served (TCP/UDP only); rule port skipped (fail closed)", p.Protocol))
 			continue
 		}
 		if p.Port < 0 || p.Port > 65535 {
-			warnings = append(warnings, fmt.Sprintf("port %d out of range; rule port skipped (fail closed)", p.Port))
+			addCompileWarnings(&warnings, fmt.Sprintf("port %d out of range; rule port skipped (fail closed)", p.Port))
 			continue
 		}
 		lo, hi := p.Port, p.Port
@@ -89,14 +88,15 @@ func hfCompilePorts(ports []sdnv1alpha1.HostFirewallPort) ([]hfPortRow, []string
 			hi = p.EndPort
 		}
 		if hi < lo || hi > 65535 || (lo == 0 && hi != 0) {
-			warnings = append(warnings, fmt.Sprintf("endPort %d invalid for port %d; rule port skipped (fail closed)", p.EndPort, p.Port))
+			addCompileWarnings(&warnings, fmt.Sprintf("endPort %d invalid for port %d; rule port skipped (fail closed)", p.EndPort, p.Port))
 			continue
 		}
 		if int(hi)-int(lo)+1 > 64 {
-			warnings = append(warnings, fmt.Sprintf("port range %d-%d expands beyond 64 ports; rule port skipped (fail closed)", lo, hi))
+			addCompileWarnings(&warnings, fmt.Sprintf("port range %d-%d expands beyond 64 ports; rule port skipped (fail closed)", lo, hi))
 			continue
 		}
 		for port := int(lo); port <= int(hi); port++ {
+			// #nosec G115 -- lo and hi are validated in 0..65535 immediately before this bounded loop.
 			out = append(out, hfPortRow{proto: proto, port: uint16(port)})
 		}
 	}
@@ -131,7 +131,7 @@ func hfCompileRule(name string, peers []sdnv1alpha1.HostFirewallPeer, ports []sd
 	entries *[]datapath.HFAllow, warnings *[]string) {
 	rows, w := hfCompilePorts(ports)
 	for _, warn := range w {
-		*warnings = append(*warnings, fmt.Sprintf("HostFirewall %s: %s", name, warn))
+		addCompileWarnings(warnings, fmt.Sprintf("HostFirewall %s: %s", name, warn))
 	}
 	if len(peers) == 0 {
 		peers = hfAnyPeers
@@ -140,7 +140,7 @@ peers:
 	for _, peer := range peers {
 		_, allowNet, err := net.ParseCIDR(peer.CIDR)
 		if err != nil {
-			*warnings = append(*warnings, fmt.Sprintf("HostFirewall %s: bad cidr %q: peer skipped (fail closed)", name, peer.CIDR))
+			addCompileWarnings(warnings, fmt.Sprintf("HostFirewall %s: bad cidr %q: peer skipped (fail closed)", name, peer.CIDR))
 			continue
 		}
 		var excepts []*net.IPNet
@@ -149,7 +149,7 @@ peers:
 			if err != nil {
 				// A broken except would fail OPEN if dropped alone; skip the
 				// whole peer instead.
-				*warnings = append(*warnings, fmt.Sprintf("HostFirewall %s: bad except %q: peer skipped (fail closed)", name, ex))
+				addCompileWarnings(warnings, fmt.Sprintf("HostFirewall %s: bad except %q: peer skipped (fail closed)", name, ex))
 				continue peers
 			}
 			excepts = append(excepts, exNet)
@@ -171,6 +171,7 @@ type hfCompiled struct {
 	in       []datapath.HFAllow
 	eg       []datapath.HFAllow
 	warnings []string
+	err      error
 }
 
 // compileHostFirewalls turns the HostFirewalls selecting a node with
@@ -178,10 +179,14 @@ type hfCompiled struct {
 // every selecting object.
 func compileHostFirewalls(hfs []*sdnv1alpha1.HostFirewall, nodeLabels labels.Set) hfCompiled {
 	var c hfCompiled
+	if err := validateHFCompilation(hfs, nodeLabels); err != nil {
+		c.err = err
+		return c
+	}
 	for _, hf := range hfs {
 		sel, err := metav1.LabelSelectorAsSelector(&hf.Spec.NodeSelector)
 		if err != nil {
-			c.warnings = append(c.warnings, fmt.Sprintf("HostFirewall %s: bad nodeSelector: %v (object ignored)", hf.Name, err))
+			addCompileWarnings(&c.warnings, fmt.Sprintf("HostFirewall %s: bad nodeSelector: %v (object ignored)", hf.Name, err))
 			continue
 		}
 		if !sel.Matches(nodeLabels) {
@@ -220,7 +225,7 @@ func watchHostFirewalls(ctx context.Context, factory sdninformers.SharedInformer
 	selfInformer := selfFactory.Core().V1().Nodes()
 
 	var mu sync.Mutex
-	warned := map[string]bool{}
+	var warned compileWarnings
 	resync := func() {
 		mu.Lock()
 		defer mu.Unlock()
@@ -236,46 +241,40 @@ func watchHostFirewalls(ctx context.Context, factory sdninformers.SharedInformer
 		}
 
 		c := compileHostFirewalls(all, self.Labels)
-		for _, w := range c.warnings {
-			if !warned[w] {
-				warned[w] = true
-				log.Warn("hostfirewall compile", "warning", w)
+		if c.err != nil {
+			log.Error("reject HostFirewall compilation; arming deny guards", "err", c.err)
+			if err := mgr.BlockHostFirewall(); err != nil {
+				log.Error("arm HostFirewall deny guards", "err", err)
 			}
+			hfSyncErrors.Add(1)
+			return
+		}
+		warnings, truncated := warned.update(c.warnings)
+		for _, w := range warnings {
+			log.Warn("hostfirewall compile", "warning", w)
+		}
+		if truncated {
+			log.Warn("hostfirewall compile warnings truncated", "limit", maxCompileWarnings)
 		}
 
-		// Ordering keeps every transition fail-closed: rules land before a
-		// flag arms, and a flag drops before its rules are wiped. Each
-		// direction is armed independently (an egress-only object leaves
-		// ingress open, and vice versa).
+		// Each direction enters temporary default-deny before updating rules;
+		// failures retain it. An unselected direction is explicitly disabled.
 		arm := func(dir string, on bool, rules []datapath.HFAllow,
-			sync func([]datapath.HFAllow) error, set func(bool) error) {
+			apply func(bool, []datapath.HFAllow) error) {
+			if err := apply(on, rules); err != nil {
+				hfSyncErrors.Add(1)
+				log.Error("apply host firewall", "dir", dir, "isolated", on, "err", err)
+				return
+			}
 			if on {
-				if err := sync(rules); err != nil {
-					hfSyncErrors.Add(1)
-					log.Error("sync host firewall rules", "dir", dir, "err", err)
-					return // never arm on top of a failed sync
-				}
-				if err := set(true); err != nil {
-					hfSyncErrors.Add(1)
-					log.Error("arm host firewall", "dir", dir, "err", err)
-					return
-				}
 				log.Info("host firewall armed", "dir", dir, "rules", len(rules))
-				return
-			}
-			if err := set(false); err != nil {
-				hfSyncErrors.Add(1)
-				log.Error("disarm host firewall", "dir", dir, "err", err)
-				return
-			}
-			if err := sync(nil); err != nil {
-				hfSyncErrors.Add(1)
-				log.Error("clear host firewall rules", "dir", dir, "err", err)
 			}
 		}
-		arm("ingress", c.ingress, c.in, mgr.SyncHFAllows, mgr.SetHFEnabled)
-		arm("egress", c.egress, c.eg, mgr.SyncHFEgressAllows, mgr.SetHFEgressEnabled)
+		arm("ingress", c.ingress, c.in, mgr.ApplyHFIngress)
+		arm("egress", c.egress, c.eg, mgr.ApplyHFEgress)
 	}
+	resync = resyncAfterCacheSync(ctx, resync, hfs.Informer().HasSynced,
+		selfInformer.Informer().HasSynced)
 
 	if _, err := hfs.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(any) { resync() },

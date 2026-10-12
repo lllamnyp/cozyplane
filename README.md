@@ -94,6 +94,12 @@ outstanding.
 
 ## Documentation
 
+For managed VPNs in PodSecurity baseline tenant namespaces, enable hardened
+mode with a dedicated RuntimeClass exemption. The cluster operator must allow
+the forwarding sysctls and preserve existing admission defaults; the chart
+does not change tenant labels or Talos configuration. See the
+[VPN installation procedure](docs/vpn.md#runtimeclass-admission-in-baseline-tenant-namespaces).
+
 Start with [design.md](docs/design.md) (the vision and the **design tenets**), then
 [internals.md](docs/internals.md) (the as-built datapath).
 
@@ -171,3 +177,6 @@ Apache-2.0 (see [LICENSE](LICENSE)), with two carve-outs dictated by the kernel:
   [Cilium](https://github.com/cilium/cilium)'s `bpf/bpf_sock.c` (dual
   GPL-2.0/BSD-2-Clause; kernel license string "Dual BSD/GPL") — see
   `kpr/build-bpf.sh` for provenance and the pinned tag.
+
+Additional interface design: [several VPCs on one Pod](docs/multi-attach.md)
+and [additional KubeVirt NICs](docs/kubevirt-multi-nic.md).

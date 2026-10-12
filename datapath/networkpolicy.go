@@ -104,6 +104,7 @@ func npPortPrefixes(lo, hi uint16) []npPortPrefix {
 		for s := size; s > 1; s >>= 1 {
 			bits--
 		}
+		// #nosec G115 -- l <= h; h is widened from uint16, so l is at most 65535.
 		out = append(out, npPortPrefix{port: uint16(l), bits: bits})
 		l += size
 		if l == 0 {
@@ -113,7 +114,37 @@ func npPortPrefixes(lo, hi uint16) []npPortPrefix {
 	return out
 }
 
-// SyncNPIdents makes np_ident exactly `idents` (full-state diff). An address
+// BlockNetworkPolicy also guards rejected compiler snapshots before map sync.
+func (m *Manager) BlockNetworkPolicy() error {
+	m.npMu.Lock()
+	defer m.npMu.Unlock()
+	return m.objs.Params.Put(cfgNPUpdating, uint32(1))
+}
+
+// ApplyNetworkPolicy protects the whole snapshot against partial synchronization.
+// Failure retains the pinned deny guard until a later complete update succeeds.
+func (m *Manager) ApplyNetworkPolicy(idents []NPIdent, allows []NPAllow, cidrs []NPCidr) error {
+	m.npMu.Lock()
+	defer m.npMu.Unlock()
+	if err := m.objs.Params.Put(cfgNPUpdating, uint32(1)); err != nil {
+		return fmt.Errorf("arm NetworkPolicy update guard: %w", err)
+	}
+	if err := m.SyncNPIdents(idents); err != nil {
+		return err
+	}
+	if err := m.SyncNPAllows(allows); err != nil {
+		return err
+	}
+	if err := m.SyncNPCidrs(cidrs); err != nil {
+		return err
+	}
+	if err := m.objs.Params.Put(cfgNPInitialized, uint32(1)); err != nil {
+		return err
+	}
+	return m.objs.Params.Put(cfgNPUpdating, uint32(0))
+}
+
+// SyncNPIdents is a low-level map diff used within ApplyNetworkPolicy. An address
 // with no row is simply "no pod identity" — never isolated.
 func (m *Manager) SyncNPIdents(idents []NPIdent) error {
 	want := map[overlayAddr128]overlayNpIdentVal{}
@@ -122,7 +153,9 @@ func (m *Manager) SyncNPIdents(idents []NPIdent) error {
 		if err != nil {
 			return fmt.Errorf("np ident IP: %w", err)
 		}
-		want[a] = overlayNpIdentVal{Id: id.ID, Flags: id.Flags}
+		if err := putDesired(m.objs.NpIdent, want, a, overlayNpIdentVal{Id: id.ID, Flags: id.Flags}); err != nil {
+			return err
+		}
 	}
 	return syncMap(m.objs.NpIdent, want)
 }
@@ -141,14 +174,17 @@ func (m *Manager) SyncNPAllows(allows []NPAllow) error {
 			hi = 0 // any-port: a single /0
 		}
 		for _, pp := range npPortPrefixes(lo, hi) {
-			want[overlayNpAllowKey{
+			key := overlayNpAllowKey{
 				Prefixlen: 160 + pp.bits,
 				Dir:       r.Dir,
 				Proto:     r.Proto,
 				DstId:     r.DstID,
 				SrcId:     r.SrcID,
 				Port:      htons(pp.port),
-			}] = 1
+			}
+			if err := putDesired(m.objs.NpAllow, want, key, uint8(1)); err != nil {
+				return err
+			}
 		}
 	}
 	return syncMap(m.objs.NpAllow, want)
@@ -178,22 +214,13 @@ func (m *Manager) SyncNPCidrs(entries []NPCidr) error {
 		if e.CIDR == nil {
 			continue
 		}
-		ones, _ := e.CIDR.Mask.Size()
-		ip := e.CIDR.IP
-		var bits uint32
-		if v4 := ip.To4(); v4 != nil {
-			ip = v4
-			bits = 96 + uint32(ones)
-		} else {
-			bits = uint32(ones)
-		}
-		a, err := addr128(ip)
+		a, bits, family, err := cidrPolicyPrefix(e.CIDR)
 		if err != nil {
 			return fmt.Errorf("np_cidr range %q: %w", e.CIDR, err)
 		}
 		key := overlayNpCidrKey{
 			Prefixlen: 96 + bits,
-			Dir:       e.Dir,
+			Dir:       npCIDRDirection(e.Dir, family),
 			Proto:     e.Proto,
 			Port:      htons(e.Port),
 			Id:        e.ID,
@@ -206,7 +233,9 @@ func (m *Manager) SyncNPCidrs(entries []NPCidr) error {
 		if prev, ok := want[key]; ok && prev == 1 {
 			continue // an allow from any policy wins at an identical prefix
 		}
-		want[key] = v
+		if err := putDesired(m.objs.NpCidr, want, key, v); err != nil {
+			return err
+		}
 	}
 	return syncMap(m.objs.NpCidr, want)
 }

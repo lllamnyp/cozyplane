@@ -64,6 +64,14 @@ func (c *FakeSdnV1alpha1) VPCPeerings(namespace string) v1alpha1.VPCPeeringInter
 	return newFakeVPCPeerings(c, namespace)
 }
 
+func (c *FakeSdnV1alpha1) VPNConnections(namespace string) v1alpha1.VPNConnectionInterface {
+	return newFakeVPNConnections(c, namespace)
+}
+
+func (c *FakeSdnV1alpha1) VPNGateways(namespace string) v1alpha1.VPNGatewayInterface {
+	return newFakeVPNGateways(c, namespace)
+}
+
 // RESTClient returns a RESTClient that is used to communicate
 // with API server by this client implementation.
 func (c *FakeSdnV1alpha1) RESTClient() rest.Interface {

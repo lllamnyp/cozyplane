@@ -32,11 +32,16 @@ type FabricIPSpecApplyConfiguration struct {
 	// stranded address diagnosable.
 	Node *string `json:"node,omitempty"`
 	// PodNamespace, PodName and PodUID identify the claimant. The UID is the
-	// load-bearing one: GC keys on it, so a pod that reuses a name can never
-	// have its address reaped by the previous occupant's DEL.
+	// identity used by GC, so a pod that reuses a name cannot keep the previous
+	// occupant's claims alive. DEL uses the sandbox identity below.
 	PodNamespace *string `json:"podNamespace,omitempty"`
 	PodName      *string `json:"podName,omitempty"`
 	PodUID       *string `json:"podUID,omitempty"`
+	// ContainerID and IfName identify the CNI sandbox allocation. Pod UID alone
+	// is insufficient: a pod can replace its sandbox without changing its UID.
+	// Empty ContainerID denotes a legacy or repaired claim, never released by DEL.
+	ContainerID *string `json:"containerID,omitempty"`
+	IfName      *string `json:"ifName,omitempty"`
 }
 
 // FabricIPSpecApplyConfiguration constructs a declarative configuration of the FabricIPSpec type for use with
@@ -82,5 +87,21 @@ func (b *FabricIPSpecApplyConfiguration) WithPodName(value string) *FabricIPSpec
 // If called multiple times, the PodUID field is set to the value of the last call.
 func (b *FabricIPSpecApplyConfiguration) WithPodUID(value string) *FabricIPSpecApplyConfiguration {
 	b.PodUID = &value
+	return b
+}
+
+// WithContainerID sets the ContainerID field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the ContainerID field is set to the value of the last call.
+func (b *FabricIPSpecApplyConfiguration) WithContainerID(value string) *FabricIPSpecApplyConfiguration {
+	b.ContainerID = &value
+	return b
+}
+
+// WithIfName sets the IfName field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the IfName field is set to the value of the last call.
+func (b *FabricIPSpecApplyConfiguration) WithIfName(value string) *FabricIPSpecApplyConfiguration {
+	b.IfName = &value
 	return b
 }

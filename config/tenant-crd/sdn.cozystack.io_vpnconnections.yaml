@@ -1,0 +1,363 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.19.0
+  name: vpnconnections.sdn.cozystack.io
+spec:
+  group: sdn.cozystack.io
+  names:
+    kind: VPNConnection
+    listKind: VPNConnectionList
+    plural: vpnconnections
+    singular: vpnconnection
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.gatewayRef.name
+      name: Gateway
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          VPNConnection is one tunnel to a remote site, terminated by a VPNGateway
+          (issue #6). Its remote CIDRs become route-table entries toward the gateway
+          and the gateway's scoped forwarding allowlist (docs/vpn.md §3.2).
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: 'VPNConnectionSpec declares one tunnel to a remote site (issue
+              #6).'
+            properties:
+              gatewayRef:
+                description: |-
+                  GatewayRef is the VPNGateway that terminates this connection, in this
+                  namespace.
+                properties:
+                  name:
+                    description: Name is the VPNGateway name within the referring
+                      object's namespace.
+                    type: string
+                required:
+                - name
+                type: object
+              ipsec:
+                description: IPsec configures an IKEv2 peer. Exactly one of WireGuard
+                  or IPsec is set.
+                properties:
+                  addressPool:
+                    description: |-
+                      AddressPool selects a named pool on the gateway for a roadwarrior client.
+                      It is valid with certificate or EAP authentication and makes the connection
+                      responder-only.
+                    type: string
+                  auth:
+                    description: Auth is how the peer authenticates.
+                    properties:
+                      certificate:
+                        description: |-
+                          Certificate authenticates a remote peer with a certificate issued by the
+                          gateway's configured trusted CA.
+                        properties:
+                          remoteIdentity:
+                            description: RemoteIdentity is the exact IKE identity
+                              the client certificate must carry.
+                            type: string
+                        required:
+                        - remoteIdentity
+                        type: object
+                      eap:
+                        description: EAP authenticates one roadwarrior identity using
+                          a password Secret.
+                        properties:
+                          identity:
+                            description: Identity is the exact EAP identity accepted
+                              for this connection.
+                            type: string
+                          secretRef:
+                            description: |-
+                              SecretRef names a Secret containing the EAP password under "password" or
+                              "eap", or as its sole data entry.
+                            type: string
+                        required:
+                        - identity
+                        - secretRef
+                        type: object
+                      pskSecretRef:
+                        description: |-
+                          PSKSecretRef names a Secret in this namespace holding the pre-shared key
+                          (conventional data key "psk", or the Secret's sole entry).
+                        type: string
+                    type: object
+                  dpdDelay:
+                    description: DPDDelay is the dead-peer-detection interval in seconds;
+                      zero disables it.
+                    format: int32
+                    type: integer
+                  peerAddress:
+                    description: |-
+                      PeerAddress is the remote IKE endpoint (host or IP). Required for the
+                      initiator side; a responder-only peer may leave it empty.
+                    type: string
+                  proposals:
+                    description: |-
+                      Proposals overrides the gateway's default IKE/ESP proposals for this peer
+                      (strongSwan syntax). Empty inherits the gateway default.
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  remoteIdentity:
+                    description: |-
+                      RemoteIdentity binds a PSK to this exact IKE identity. When omitted, an
+                      IP-valued PeerAddress supplies the identity. Required for PSK responders
+                      without a fixed IP endpoint and for endpoints named by DNS.
+                    type: string
+                  startAction:
+                    description: |-
+                      StartAction selects whether this side actively initiates IKE. When unset,
+                      the compatibility default is Start if peerAddress is set and None for a
+                      responder without a peerAddress.
+                    type: string
+                required:
+                - auth
+                type: object
+              remoteCIDRs:
+                description: |-
+                  RemoteCIDRs are the remote networks reachable over this tunnel — routed
+                  into the VPC toward the gateway and admitted as the gateway's scoped
+                  forwarding sources.
+                items:
+                  type: string
+                type: array
+                x-kubernetes-list-type: atomic
+              wireguard:
+                description: |-
+                  WireGuard configures the peer. Exactly one tunnel backend is set, and it
+                  must match the gateway's backend.
+                properties:
+                  client:
+                    description: |-
+                      Client selects managed workstation access instead of site-to-site routes.
+                      The workstation creates and retains its private key.
+                    properties:
+                      addressPools:
+                        description: |-
+                          AddressPools select at most one pool per IP family from the gateway.
+                          Immutable after creation.
+                        items:
+                          type: string
+                        maxItems: 2
+                        minItems: 1
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      vpcRefs:
+                        description: VPCRefs identify the permitted VPCs among those
+                          served by the gateway.
+                        items:
+                          description: LocalVPCRef references a VPC in the same namespace
+                            as the referring object.
+                          properties:
+                            name:
+                              description: Name is the VPC name within the referring
+                                object's namespace.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        maxItems: 10
+                        minItems: 1
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                    required:
+                    - addressPools
+                    - vpcRefs
+                    type: object
+                  peerEndpoint:
+                    description: |-
+                      PeerEndpoint is the remote peer's host:port. Optional — a roaming peer may
+                      initiate, and WireGuard learns the endpoint from its handshake.
+                    type: string
+                  peerEndpoints:
+                    description: |-
+                      PeerEndpoints are the two remote host:port endpoints paired with
+                      PeerPublicKeys. Omit them for responder-only roaming peers.
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  peerPublicKey:
+                    description: |-
+                      PeerPublicKey is the remote peer's WireGuard public key for a single
+                      tunnel. It is mutually exclusive with PeerPublicKeys.
+                    type: string
+                  peerPublicKeys:
+                    description: |-
+                      PeerPublicKeys are the two remote identities used by an active-active
+                      gateway, ordered by appliance ordinal.
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  persistentKeepalive:
+                    description: PersistentKeepalive is the keepalive interval in
+                      seconds; zero disables it.
+                    format: int32
+                    type: integer
+                  presharedKeySecretRef:
+                    description: |-
+                      PresharedKeySecretRef names a Secret in this namespace holding an optional
+                      WireGuard preshared key.
+                    type: string
+                type: object
+            required:
+            - gatewayRef
+            type: object
+          status:
+            description: VPNConnectionStatus is the observed state of a VPNConnection.
+            properties:
+              assignedAddresses:
+                description: AssignedAddresses are the virtual IPs currently leased
+                  to this identity.
+                items:
+                  type: string
+                type: array
+                x-kubernetes-list-type: atomic
+              clientConfig:
+                description: ClientConfig is published only after the current configuration
+                  is applied.
+                properties:
+                  allowedIPs:
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  dns:
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  endpoint:
+                    type: string
+                  mtu:
+                    format: int32
+                    type: integer
+                  persistentKeepalive:
+                    format: int32
+                    type: integer
+                  serverPublicKey:
+                    type: string
+                required:
+                - allowedIPs
+                - endpoint
+                - mtu
+                - persistentKeepalive
+                - serverPublicKey
+                type: object
+              conditions:
+                description: Conditions is the detailed state.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              lastHandshake:
+                description: |-
+                  LastHandshake is when the tunnel last completed a handshake, read back
+                  from the appliance's kernel state.
+                format: date-time
+                type: string
+              observedAt:
+                description: |-
+                  ObservedAt is when the controller last obtained live tunnel state from the
+                  selected appliance. It stays empty while no appliance is reachable.
+                format: date-time
+                type: string
+              phase:
+                description: Phase is the lifecycle phase.
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

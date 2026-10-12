@@ -69,6 +69,7 @@ type VIPBackend struct {
 	// IP is the backend's VPC IP (never the fabric IP).
 	IP string `json:"ip"`
 	// Ports are the resolved per-port targets on this backend.
+	// +listType=atomic
 	Ports []VIPBackendPort `json:"ports,omitempty"`
 }
 
@@ -95,6 +96,7 @@ type ServiceVIPSpec struct {
 
 	// Ports are the service ports the VIP serves.
 	// +optional
+	// +listType=atomic
 	Ports []VIPPort `json:"ports,omitempty"`
 
 	// SessionAffinity mirrors the Service's: "ClientIP" pins every connection
@@ -109,6 +111,7 @@ type ServiceVIPStatus struct {
 	// Backends are the ready endpoints resolved to same-VPC Port addresses;
 	// the agents program the datapath from this list.
 	// +optional
+	// +listType=atomic
 	Backends []VIPBackend `json:"backends,omitempty"`
 
 	// Phase is the current lifecycle phase.

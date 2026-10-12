@@ -1,0 +1,27 @@
+{{- $mode := .Values.api.mode -}}
+{{- if not (has $mode (list "aggregated" "crd")) -}}
+{{- fail "api.mode must be aggregated or crd" -}}
+{{- end -}}
+{{- $previous := lookup "v1" "ConfigMap" .Release.Namespace "cozyplane-api-mode" -}}
+{{- if and $previous (ne (index $previous.data "mode") $mode) -}}
+{{- fail "tenant API mode cannot change in-place; use a fresh regional cluster" -}}
+{{- end -}}
+{{- $service := lookup "apiregistration.k8s.io/v1" "APIService" "" "v1alpha1.sdn.cozystack.io" -}}
+{{- if and (eq $mode "crd") $service $service.spec.service -}}
+{{- fail "CRD mode conflicts with the existing aggregated tenant APIService" -}}
+{{- end -}}
+{{- if eq $mode "aggregated" -}}
+{{- range $path, $_ := .Files.Glob "files/tenant-crd/*.yaml" -}}
+{{- $definition := $.Files.Get $path | fromYaml -}}
+{{- if lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" $definition.metadata.name -}}
+{{- fail "aggregated mode conflicts with an existing tenant CRD" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cozyplane-api-mode
+  namespace: {{ .Release.Namespace }}
+data:
+  mode: {{ $mode | quote }}

@@ -17,7 +17,10 @@ limitations under the License.
 package datapath
 
 import (
+	"fmt"
+	"math/rand"
 	"net"
+	"slices"
 	"testing"
 )
 
@@ -27,6 +30,43 @@ func cidr(s string) *net.IPNet {
 		panic(err)
 	}
 	return n
+}
+
+func BenchmarkUnionContainingScale(b *testing.B) {
+	items := make([]cidrGroup, 10000)
+	for i := range items {
+		items[i] = cidrGroup{scope: uint32(i%7 + 1), proto: 6, port: 443, cidr: cidr(fmt.Sprintf("10.%d.%d.0/24", i/256, i%256)), groups: 1 << uint(i%62+1)}
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		unionContaining(items)
+	}
+}
+
+func TestUnionContainingMatchesContainmentDefinition(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	items := make([]cidrGroup, 500)
+	for i := range items {
+		bits := rng.Intn(33)
+		prefix := fmt.Sprintf("10.%d.%d.0/%d", rng.Intn(8), rng.Intn(8), bits)
+		if i%3 == 0 {
+			prefix = fmt.Sprintf("2001:db8:%x::/%d", rng.Intn(8), rng.Intn(129))
+		}
+		items[i] = cidrGroup{scope: uint32(rng.Intn(3)), proto: uint8(6 + rng.Intn(2)), port: uint16(rng.Intn(3)), cidr: cidr(prefix), groups: 1 << uint(rng.Intn(62)+1)}
+	}
+	want := make([]uint64, len(items))
+	for i, e := range items {
+		ones, _ := e.cidr.Mask.Size()
+		for _, f := range items {
+			fones, _ := f.cidr.Mask.Size()
+			if f.scope == e.scope && f.proto == e.proto && f.port == e.port && fones <= ones && f.cidr.Contains(e.cidr.IP) {
+				want[i] |= f.groups
+			}
+		}
+	}
+	if got := unionContaining(items); !slices.Equal(got, want) {
+		t.Fatal("prefix union differs from scoped containment semantics")
+	}
 }
 
 // TestUnionContaining is the #11 regression: the sg_cidr LPM returns only the

@@ -48,8 +48,13 @@ most likely to set:
 - `image` — the cozyplane container image (digest-pinned by the release
   pipeline).
 - `mtu` — pod MTU (underlay MTU minus ~50 bytes of Geneve overhead).
+- `writeCNIConf` — defaults to true for standalone installations. Set false
+  when the platform owns a Multus/Cilium chain; no conflist is created or changed.
 - `cniConfName` — the CNI conflist filename; use a low prefix such as
   `00-cozyplane.conflist` to sort ahead of a co-installed CNI (e.g. Cilium).
+- `cniConfEnabled` controls whether the agent writes that standalone conflist
+  (default `true`). Set it to `false` when the platform supplies a chained
+  conflist, so exactly one component owns CNI configuration.
 - `genevePort` — override only to avoid a clash with another overlay on 6081.
 - `exportPolicy.enabled` — the VPCBinding export admission gate (needs k8s 1.30+).
 - `crds.enabled` — the `local.sdn.cozystack.io` CRDs (default true; disable
@@ -106,3 +111,25 @@ and both halves can take an existing scrape away silently.**
   `agent.metricsBindAddress=":9411"` to listen on every address as before —
   `test/policy-e2e.sh` needs that to exercise its v6 pod→node gate rather than
   skip it.
+
+Managed VPN appliances use privileged compatibility mode by default. On nodes
+whose kubelet admits the forwarding sysctls, set `vpn.hardenedAppliance=true` to
+drop privileged mode and retain only `NET_ADMIN`, `NET_RAW`, and
+`NET_BIND_SERVICE` (plus `BPF` for IPsec and workstation gateways). Baseline tenant
+namespaces also require a dedicated PodSecurity RuntimeClass exemption. Set
+`vpn.runtimeClassName=cozyplane-vpn` together with hardened mode;
+`vpn.runtimeClass.create=true` installs the `runc` RuntimeClass and its
+single-container appliance admission guard (Kubernetes >= 1.30). Defaults remain
+empty/false. For a preexisting class, leave create false and manage an equivalent
+guard externally. The chart never configures Talos admission/kubelet settings or
+changes tenant PodSecurity labels.
+
+Follow [the complete operator procedure](../../docs/vpn.md#runtimeclass-admission-in-baseline-tenant-namespaces)
+before enabling the exemption. Preserve the full PodSecurity entry and other
+machine configuration documents when applying the edited full Talos configuration;
+do not strategically merge the example lists, which can duplicate exemptions and
+prevent API-server startup. Allow the two forwarding sysctls on gateway nodes
+and verify `runc` exists. The guard supports ordinary, warm-standby and
+workstation appliances; active-active has a routing sidecar and is rejected
+by this single-container policy. RuntimeClass changes roll managed appliances
+across namespaces, so inventory existing gateways before a deployment.

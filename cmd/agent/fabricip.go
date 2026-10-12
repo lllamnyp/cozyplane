@@ -21,13 +21,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/cache"
 
 	localv1alpha1 "github.com/lllamnyp/cozyplane/api/localsdn/v1alpha1"
-	"github.com/lllamnyp/cozyplane/datapath"
 	localinformers "github.com/lllamnyp/cozyplane/pkg/generated/localsdn/informers/externalversions"
 )
 
@@ -48,55 +48,16 @@ import (
 // address. It blocks until the cache is synced: the datapath must know how to
 // reach existing pods before this agent starts forwarding for new ones.
 func watchFabricIPs(ctx context.Context, factory localinformers.SharedInformerFactory,
-	mgr *datapath.Manager, nodeIPOf func(string) net.IP, selfName string, log *slog.Logger) error {
+	routes *fabricRemoteReconciler, log *slog.Logger) error {
 	inf := factory.Local().V1alpha1().FabricIPs().Informer()
-
-	apply := func(obj any) {
-		fip, ok := obj.(*localv1alpha1.FabricIP)
-		if !ok {
-			return
-		}
-		ip := net.ParseIP(fip.Spec.Address)
-		if ip == nil || fip.Spec.Node == "" {
-			return
-		}
-		// A local pod is delivered by the `locals` map (the CNI wrote it at ADD);
-		// a remotes entry for it would send our own pods' traffic out the overlay
-		// and back. Only remote pods belong here.
-		if fip.Spec.Node == selfName {
-			if err := mgr.DelRemote(0, hostCIDR(fip.Spec.Address)); err != nil {
-				log.Debug("del remote (now local)", "addr", fip.Spec.Address, "err", err)
-			}
-			return
-		}
-		node := nodeIPOf(fip.Spec.Node)
-		if node == nil {
-			// The Node object has not arrived yet. The node watch re-applies on
-			// every node event, so this resolves itself.
-			return
-		}
-		if err := mgr.SetRemote(0, hostCIDR(fip.Spec.Address), node); err != nil {
-			log.Error("set remote", "addr", fip.Spec.Address, "node", fip.Spec.Node, "err", err)
-		}
+	if err := inf.AddIndexers(fabricClaimIndexers()); err != nil {
+		return fmt.Errorf("index FabricIP ownership: %w", err)
 	}
 
 	_, err := inf.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    apply,
-		UpdateFunc: func(_, newObj any) { apply(newObj) },
-		DeleteFunc: func(obj any) {
-			fip, ok := obj.(*localv1alpha1.FabricIP)
-			if !ok {
-				if tomb, ok2 := obj.(cache.DeletedFinalStateUnknown); ok2 {
-					fip, ok = tomb.Obj.(*localv1alpha1.FabricIP)
-				}
-				if !ok {
-					return
-				}
-			}
-			if err := mgr.DelRemote(0, hostCIDR(fip.Spec.Address)); err != nil {
-				log.Error("del remote", "addr", fip.Spec.Address, "err", err)
-			}
-		},
+		AddFunc:    routes.apply,
+		UpdateFunc: func(oldObj, newObj any) { routes.apply(oldObj); routes.apply(newObj) },
+		DeleteFunc: routes.apply,
 	})
 	if err != nil {
 		return fmt.Errorf("add fabricip handler: %w", err)
@@ -105,6 +66,9 @@ func watchFabricIPs(ctx context.Context, factory localinformers.SharedInformerFa
 	factory.Start(ctx.Done())
 	if !cache.WaitForCacheSync(ctx.Done(), inf.HasSynced) {
 		return fmt.Errorf("fabricip cache failed to sync")
+	}
+	if err := routes.syncInitial(); err != nil {
+		return err
 	}
 	log.Info("fabric IP watch synced (flat pool: remotes keyed per pod)")
 	return nil
@@ -117,60 +81,132 @@ func watchFabricIPs(ctx context.Context, factory localinformers.SharedInformerFa
 // (underlay claim) both point at the pod, and the pod UID is the key. A churned
 // address — a VM migrates, a pod is re-created — updates one object, and the
 // next resync programs the truth. There is no copy to go stale.
-func fabricByPodUID(factory localinformers.SharedInformerFactory, podUID string) string {
+func fabricByPodUID(factory localinformers.SharedInformerFactory, podUID, containerID, ifName string) string {
+	return fabricClaimAddress(factory.Local().V1alpha1().FabricIPs().Informer().GetIndexer(), podUID, containerID, ifName)
+}
+
+const (
+	fabricPodUIDIndex      = "fabric-by-pod-uid"
+	fabricSandboxIndex     = "fabric-by-sandbox"
+	fabricNodeSandboxIndex = "fabric-by-node-sandbox"
+)
+
+func fabricTupleKey(first, second, third string) string {
+	// Length prefixes keep the tuple unambiguous even for unexpected legacy
+	// values containing delimiters. Identity fields are still checked on read.
+	return strconv.Itoa(len(first)) + ":" + first + strconv.Itoa(len(second)) + ":" + second + third
+}
+
+func fabricClaimIndexers() cache.Indexers {
+	return cache.Indexers{
+		fabricPodUIDIndex: func(obj any) ([]string, error) {
+			claim, ok := obj.(*localv1alpha1.FabricIP)
+			if !ok || claim == nil || claim.Spec.PodUID == "" {
+				return nil, nil
+			}
+			return []string{claim.Spec.PodUID}, nil
+		},
+		fabricSandboxIndex: func(obj any) ([]string, error) {
+			claim, ok := obj.(*localv1alpha1.FabricIP)
+			if !ok || claim == nil || claim.Spec.PodUID == "" || claim.Spec.ContainerID == "" {
+				return nil, nil
+			}
+			return []string{fabricTupleKey(claim.Spec.PodUID, claim.Spec.ContainerID, claim.Spec.IfName)}, nil
+		},
+		fabricNodeSandboxIndex: func(obj any) ([]string, error) {
+			claim, ok := obj.(*localv1alpha1.FabricIP)
+			if !ok || claim == nil || claim.Spec.Node == "" || claim.Spec.PodNamespace == "" || claim.Spec.ContainerID == "" {
+				return nil, nil
+			}
+			return []string{fabricTupleKey(claim.Spec.Node, claim.Spec.PodNamespace, claim.Spec.ContainerID)}, nil
+		},
+	}
+}
+
+func fabricClaimAddress(store cache.Indexer, podUID, containerID, ifName string) string {
 	if podUID == "" {
 		return ""
 	}
-	for _, obj := range factory.Local().V1alpha1().FabricIPs().Informer().GetStore().List() {
+	index, key := fabricPodUIDIndex, podUID
+	if containerID != "" {
+		index, key = fabricSandboxIndex, fabricTupleKey(podUID, containerID, ifName)
+	}
+	claims, err := store.ByIndex(index, key)
+	if err != nil {
+		return ""
+	}
+	fallback := ""
+	for _, obj := range claims {
 		fip, ok := obj.(*localv1alpha1.FabricIP)
-		if !ok || fip.Spec.PodUID != podUID {
+		if !ok || fip == nil || fip.Spec.PodUID != podUID || (containerID != "" && (fip.Spec.ContainerID != containerID || fip.Spec.IfName != ifName)) {
 			continue
 		}
 		// A dual-stack pod holds one claim per family; the bridge keys on the
 		// v4 fabric handle (the bridges map is v4 today), so prefer it.
-		if ip := net.ParseIP(fip.Spec.Address); ip != nil && ip.To4() != nil {
-			return fip.Spec.Address
+		if ip := net.ParseIP(fip.Spec.Address); ip != nil {
+			if ip.To4() != nil {
+				return fip.Spec.Address
+			}
+			if fallback == "" {
+				fallback = fip.Spec.Address
+			}
 		}
 	}
 	// No v4 claim: fall back to whatever family the pod does hold.
-	for _, obj := range factory.Local().V1alpha1().FabricIPs().Informer().GetStore().List() {
-		if fip, ok := obj.(*localv1alpha1.FabricIP); ok && fip.Spec.PodUID == podUID {
-			return fip.Spec.Address
-		}
-	}
-	return ""
+	return fallback
 }
 
 // nodeIPIndex tracks node name -> underlay (Geneve) address, so a FabricIP can
 // be resolved to a tunnel endpoint without a second API read.
-//
-// It is written by the Node informer and read from three other goroutines —
-// the FabricIP informer (watchFabricIPs' nodeIPOf), the sdn informers
-// (watchVPCGateways' shard table) and run() itself — each backed by a
-// different SharedInformerFactory, so nothing serializes them. An unguarded
-// map here is not a stale read: concurrent read+write is a runtime FATAL
-// error, which takes the node's whole datapath manager down with it. Hence the
-// mutex, matching nodePoolIndex.
 type nodeIPIndex struct {
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	byName map[string]net.IP
+	subs   []func()
 }
 
 func newNodeIPIndex() *nodeIPIndex { return &nodeIPIndex{byName: map[string]net.IP{}} }
 
-func (n *nodeIPIndex) set(node *corev1.Node) {
-	ip := internalIP(node)
-	if ip == "" {
-		return
-	}
-	addr := net.ParseIP(ip)
+func (n *nodeIPIndex) onChange(f func()) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.byName[node.Name] = addr
+	n.subs = append(n.subs, f)
+}
+
+func (n *nodeIPIndex) set(node *corev1.Node) {
+	ip := net.ParseIP(internalIP(node))
+	n.mu.Lock()
+	changed := !n.byName[node.Name].Equal(ip)
+	if ip == nil {
+		delete(n.byName, node.Name)
+	} else {
+		n.byName[node.Name] = ip
+	}
+	var subs []func()
+	if changed {
+		subs = append(subs, n.subs...)
+	}
+	n.mu.Unlock()
+	for _, f := range subs {
+		f()
+	}
 }
 
 func (n *nodeIPIndex) get(name string) net.IP {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return append(net.IP(nil), n.byName[name]...)
+}
+
+func (n *nodeIPIndex) del(name string) {
 	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.byName[name]
+	_, existed := n.byName[name]
+	delete(n.byName, name)
+	var subs []func()
+	if existed {
+		subs = append(subs, n.subs...)
+	}
+	n.mu.Unlock()
+	for _, f := range subs {
+		f()
+	}
 }

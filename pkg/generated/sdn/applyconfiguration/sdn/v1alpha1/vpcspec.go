@@ -29,6 +29,9 @@ type VPCSpecApplyConfiguration struct {
 	// MTU is the MTU advertised to ports in this VPC. Zero selects the
 	// controller default.
 	MTU *int32 `json:"mtu,omitempty"`
+	// Boundary is an operator-managed ceiling, independent of tenant groups.
+	// Setting, changing or removing it requires manage-boundary on this VPC.
+	Boundary *VPCBoundaryApplyConfiguration `json:"boundary,omitempty"`
 }
 
 // VPCSpecApplyConfiguration constructs a declarative configuration of the VPCSpec type for use with
@@ -52,5 +55,13 @@ func (b *VPCSpecApplyConfiguration) WithCIDRs(values ...string) *VPCSpecApplyCon
 // If called multiple times, the MTU field is set to the value of the last call.
 func (b *VPCSpecApplyConfiguration) WithMTU(value int32) *VPCSpecApplyConfiguration {
 	b.MTU = &value
+	return b
+}
+
+// WithBoundary sets the Boundary field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Boundary field is set to the value of the last call.
+func (b *VPCSpecApplyConfiguration) WithBoundary(value *VPCBoundaryApplyConfiguration) *VPCSpecApplyConfiguration {
+	b.Boundary = value
 	return b
 }

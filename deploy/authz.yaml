@@ -34,26 +34,31 @@ spec:
   variables:
     - name: ref
       expression: object.spec.vpcRef
-    # vpcRef unchanged on UPDATE? Then this is a metadata/finalizer write (e.g.
-    # the controller's reap finalizer) and needs no export permission. Only a
-    # CREATE, or an UPDATE that retargets vpcRef, must satisfy the export check.
-    - name: refUnchanged
+    # Only unrelated metadata writes skip authorization. Forwarding changes and
+    # removing the reap finalizer can widen or retain access to another VPC.
+    - name: grantUnchanged
       expression: >-
         oldObject != null &&
-        oldObject.spec.vpcRef.namespace == object.spec.vpcRef.namespace &&
-        oldObject.spec.vpcRef.name == object.spec.vpcRef.name
+        oldObject.spec == object.spec &&
+        (!has(oldObject.metadata.finalizers) ||
+         !oldObject.metadata.finalizers.exists(f, f == 'sdn.cozystack.io/reap-ports') ||
+         (has(object.metadata.finalizers) &&
+          object.metadata.finalizers.exists(f, f == 'sdn.cozystack.io/reap-ports')))
   validations:
+    - expression: oldObject == null || object.spec.vpcRef == oldObject.spec.vpcRef
+      reason: Invalid
+      message: "spec.vpcRef is immutable; delete and recreate the binding"
     # The request's user must be allowed to `export` the referenced VPC, in the
     # VPC's own (owner) namespace. RBAC verbs `["*"]` match the custom `export`
     # verb, so cluster-admins and full namespace-admins pass automatically.
     - expression: >-
-        variables.refUnchanged ||
+        variables.grantUnchanged ||
         authorizer.group('sdn.cozystack.io').resource('vpcs')
           .namespace(variables.ref.namespace).name(variables.ref.name)
           .check('export').allowed()
       reason: Forbidden
       messageExpression: >-
-        "creating a VPCBinding to VPC " + variables.ref.namespace + "/" +
+        "creating or changing a VPCBinding grant to VPC " + variables.ref.namespace + "/" +
         variables.ref.name + " requires the 'export' verb on that VPC " +
         "(sdn.cozystack.io vpcs)"
 ---

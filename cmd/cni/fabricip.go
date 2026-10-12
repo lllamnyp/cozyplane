@@ -18,7 +18,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"github.com/lllamnyp/cozyplane/internal/ipam"
 	"hash/fnv"
 	"net"
 
@@ -41,9 +43,7 @@ import (
 // leaks its address across the reboot, invisibly and forever. A FabricIP is an
 // object: the controller reaps it when its pod is gone.
 
-// Labels for the reverse lookups: release-by-pod (DEL) and GC-by-pod
-// (controller). The UID is the load-bearing one — a reused pod name must never
-// let a stale DEL reap the new pod's address.
+// Pod UID labels narrow lookups; only the sandbox identity authorizes DEL.
 const (
 	labelFabricPodUID = localv1alpha1.LabelFabricPodUID
 	labelFabricPodNS  = localv1alpha1.LabelFabricPodNamespace
@@ -96,31 +96,67 @@ func poolOfFamily(pools []string, wantV6 bool) []string {
 // It walks candidates and lets Create decide: AlreadyExists means someone else
 // holds it, so try the next. Nothing is reserved that is not created, so a
 // crashed plugin leaks nothing.
-func claimFabricIPs(ctx context.Context, client localclientset.Interface, cidrs []string, node, podNS, podName, podUID string) ([]net.IP, error) {
-	var claimed []net.IP
+type fabricAllocation struct {
+	Addresses []net.IP
+	Created   []localv1alpha1.FabricIP
+}
+
+func claimFabricIPs(ctx context.Context, client localclientset.Interface, cidrs []string, node, podNS, podName, podUID, containerID, ifName string) (*fabricAllocation, error) {
+	if podUID == "" || containerID == "" || ifName == "" {
+		return nil, fmt.Errorf("fabric allocation requires pod UID, container ID and interface")
+	}
+	claimed := &fabricAllocation{}
 	for _, cidr := range cidrs {
-		ip, err := claimOne(ctx, client, cidr, node, podNS, podName, podUID)
+		ip, created, err := claimOne(ctx, client, cidr, node, podNS, podName, podUID, containerID, ifName)
 		if err != nil {
 			// Roll back whatever we already took for this pod: a half-addressed
 			// pod is worse than a failed ADD, and the addresses would leak
 			// until the controller's GC noticed.
 			cctx, ccancel := cleanupContext(ctx)
-			_ = releaseFabricIPs(cctx, client, podUID)
+			cleanupErr := releaseFabricClaims(cctx, client, claimed.Created, nil)
 			ccancel()
-			return nil, err
+			return nil, errors.Join(err, cleanupErr)
 		}
-		claimed = append(claimed, ip)
+		claimed.Addresses = append(claimed.Addresses, ip)
+		if created != nil {
+			claimed.Created = append(claimed.Created, *created)
+		}
 	}
-	if len(claimed) == 0 {
+	if len(claimed.Addresses) == 0 {
 		return nil, fmt.Errorf("no pod CIDR to allocate from")
 	}
 	return claimed, nil
 }
 
-func claimOne(ctx context.Context, client localclientset.Interface, cidr, node, podNS, podName, podUID string) (net.IP, error) {
+func claimOne(ctx context.Context, client localclientset.Interface, cidr, node, podNS, podName, podUID, containerID, ifName string) (net.IP, *localv1alpha1.FabricIP, error) {
 	_, ipnet, err := net.ParseCIDR(cidr)
 	if err != nil {
-		return nil, fmt.Errorf("parse pod CIDR %q: %w", cidr, err)
+		return nil, nil, fmt.Errorf("parse pod CIDR %q: %w", cidr, err)
+	}
+	claims, err := sandboxFabricClaims(ctx, client, labelFabricPodUID+"="+podUID, podUID, containerID, ifName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list sandbox fabric claims: %w", err)
+	}
+	var existing net.IP
+	for i := range claims {
+		claim := &claims[i]
+		ip := net.ParseIP(claim.Spec.Address)
+		if ip == nil || !ipnet.Contains(ip) {
+			continue
+		}
+		if isReserved(ipnet, ip) {
+			return nil, nil, fmt.Errorf("sandbox fabric claim uses reserved address %s", ip)
+		}
+		if !claim.DeletionTimestamp.IsZero() || claim.Spec.Node != node || claim.Spec.PodNamespace != podNS || claim.Spec.PodName != podName || claim.Name != localv1alpha1.FabricIPName(ip.String()) {
+			return nil, nil, fmt.Errorf("sandbox fabric claim has inconsistent ownership")
+		}
+		if existing != nil && !existing.Equal(ip) {
+			return nil, nil, fmt.Errorf("sandbox holds multiple addresses in pool %s", cidr)
+		}
+		existing = ip
+	}
+	if existing != nil {
+		return existing, nil, nil
 	}
 
 	// Where to start walking. A flat pool is large (a /16 is 65k addresses) and
@@ -154,8 +190,12 @@ func claimOne(ctx context.Context, client localclientset.Interface, cidr, node, 
 
 	candidate := addOffset(ipnet.IP, start)
 	for tried := uint64(0); tried < maxTries; tried++ {
-		if !ipnet.Contains(candidate) || isReserved(ipnet, candidate) {
+		if !ipnet.Contains(candidate) {
 			candidate = addOffset(ipnet.IP, 2) // wrapped past the end: restart low
+			continue
+		}
+		if isReserved(ipnet, candidate) {
+			candidate = nextIP(candidate)
 			continue
 		}
 		fip := &localv1alpha1.FabricIP{
@@ -173,28 +213,35 @@ func claimOne(ctx context.Context, client localclientset.Interface, cidr, node, 
 				PodNamespace: podNS,
 				PodName:      podName,
 				PodUID:       podUID,
+				ContainerID:  containerID,
+				IfName:       ifName,
 			},
 		}
-		_, err := client.LocalV1alpha1().FabricIPs().Create(ctx, fip, metav1.CreateOptions{})
+		created, err := client.LocalV1alpha1().FabricIPs().Create(ctx, fip, metav1.CreateOptions{})
 		if err == nil {
-			return candidate, nil
+			return candidate, created, nil
 		}
 		if !apierrors.IsAlreadyExists(err) {
-			return nil, fmt.Errorf("claim fabric IP %s: %w", candidate, err)
+			return nil, nil, fmt.Errorf("claim fabric IP %s: %w", candidate, err)
+		}
+		// Another concurrent retry may have created this sandbox's claim since
+		// the initial List. Reuse it instead of advancing to a second address.
+		held, err := client.LocalV1alpha1().FabricIPs().Get(ctx, fip.Name, metav1.GetOptions{})
+		if err != nil && !apierrors.IsNotFound(err) {
+			return nil, nil, err
+		}
+		if err == nil && held.DeletionTimestamp.IsZero() && ownsFabricSandbox(held, podUID, containerID, ifName) && held.Spec.Node == node && held.Spec.PodNamespace == podNS && held.Spec.PodName == podName && held.Spec.Address == candidate.String() {
+			return candidate, nil, nil
 		}
 		candidate = nextIP(candidate)
 	}
-	return nil, fmt.Errorf("pod pool %s: no free address found in %d attempts (pool full, or claims are leaking)", cidr, maxTries)
+	return nil, nil, fmt.Errorf("pod pool %s: no free address found in %d attempts (pool full, or claims are leaking)", cidr, maxTries)
 }
 
 // isReserved keeps the network address and the .1 gateway convention out of the
 // pool.
 func isReserved(ipnet *net.IPNet, ip net.IP) bool {
-	base := ipnet.IP.Mask(ipnet.Mask)
-	if ip.Equal(base) {
-		return true
-	}
-	return ip.Equal(addOffset(base, 1))
+	return ipam.IsPoolReserved(ipnet, ip)
 }
 
 // addOffset returns base + n (big-endian, both families).
@@ -203,33 +250,80 @@ func addOffset(base net.IP, n uint64) net.IP {
 	copy(out, base)
 	for i := len(out) - 1; i >= 0 && n > 0; i-- {
 		sum := uint64(out[i]) + n&0xff
-		out[i] = byte(sum)
+		out[i] = byte(sum & 0xff)
 		n >>= 8
 		n += sum >> 8
 	}
 	return out
 }
 
-// releaseFabricIPs drops every address held by this pod UID.
-//
-// One DeleteCollection, not a list-then-delete walk: this runs on the rollback
-// path of a failed ADD, under the plugin's shortest timeout budget and usually
-// while the API server is the unhealthy thing, so it should cost one round trip.
-// The SA is granted `deletecollection` for it (chart/cozyplane/templates/agent.yaml),
-// a verb that reaches nothing the `list` and `delete` it already holds could not.
-//
-// Best-effort in that it may never run at all (the node dies mid-ADD) — the
-// controller's GC reaps the claim once the pod is gone. But a claim leaked while
-// its pod still LIVES is invisible to that GC forever, so the error is returned
-// rather than dropped; see bringup-field-notes.md §9 for how that bit.
-func releaseFabricIPs(ctx context.Context, client localclientset.Interface, podUID string) error {
-	if podUID == "" {
+func ownsFabricSandbox(claim *localv1alpha1.FabricIP, podUID, containerID, ifName string) bool {
+	return containerID != "" && ifName != "" && (podUID == "" || claim.Spec.PodUID == podUID) && claim.Spec.ContainerID == containerID && claim.Spec.IfName == ifName
+}
+
+// DEL never touches an unidentified legacy claim or another sandbox of this Pod.
+func releaseFabricIPs(ctx context.Context, client localclientset.Interface, podUID, containerID, ifName string, delBridge func(string) error) error {
+	if containerID == "" || ifName == "" {
 		return nil
 	}
-	if err := client.LocalV1alpha1().FabricIPs().DeleteCollection(ctx,
-		metav1.DeleteOptions{},
-		metav1.ListOptions{LabelSelector: labelFabricPodUID + "=" + podUID}); err != nil {
-		return fmt.Errorf("release fabric IP claims: %w", err)
+	selector := ""
+	if podUID != "" {
+		selector = labelFabricPodUID + "=" + podUID
 	}
-	return nil
+	owned, err := sandboxFabricClaims(ctx, client, selector, podUID, containerID, ifName)
+	if err != nil {
+		return err
+	}
+	return releaseFabricClaims(ctx, client, owned, delBridge)
+}
+
+// Retain only owned claims, and never publish ownership from a partial list.
+// A UID-less DEL still needs to scan the cluster, but one response cannot copy
+// every unrelated FabricIP into the short-lived CNI process.
+func sandboxFabricClaims(ctx context.Context, client localclientset.Interface, selector, podUID, containerID, ifName string) ([]localv1alpha1.FabricIP, error) {
+	var owned []localv1alpha1.FabricIP
+	err := ipam.WalkClaims(ctx, func(limit int64, token string) ([]localv1alpha1.FabricIP, string, error) {
+		list, err := client.LocalV1alpha1().FabricIPs().List(ctx, metav1.ListOptions{LabelSelector: selector, Limit: limit, Continue: token})
+		if err != nil {
+			return nil, "", err
+		}
+		return list.Items, list.Continue, nil
+	}, func(claim *localv1alpha1.FabricIP) {
+		if ownsFabricSandbox(claim, podUID, containerID, ifName) {
+			owned = append(owned, *claim)
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	return owned, nil
+}
+
+func releaseFabricClaims(ctx context.Context, client localclientset.Interface, claims []localv1alpha1.FabricIP, delBridge func(string) error) error {
+	var errs []error
+	for i := range claims {
+		claim := &claims[i]
+		current, err := client.LocalV1alpha1().FabricIPs().Get(ctx, claim.Name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if current.UID != claim.UID || current.ResourceVersion != claim.ResourceVersion || current.Spec != claim.Spec {
+			continue
+		}
+		if delBridge != nil {
+			if err := delBridge(claim.Spec.Address); err != nil {
+				errs = append(errs, err)
+				continue
+			}
+		}
+		err = client.LocalV1alpha1().FabricIPs().Delete(ctx, claim.Name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &claim.UID, ResourceVersion: &claim.ResourceVersion}})
+		if err != nil && !apierrors.IsNotFound(err) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }

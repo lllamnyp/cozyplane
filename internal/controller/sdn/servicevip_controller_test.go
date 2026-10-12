@@ -18,6 +18,7 @@ package sdn
 
 import (
 	"context"
+	"net"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -31,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"github.com/lllamnyp/cozyplane/api/sdn"
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
 )
 
@@ -49,9 +51,41 @@ func svcScheme(t *testing.T) *runtime.Scheme {
 	return s
 }
 
+func TestVIPAllocatorSkipsReservedCandidate(t *testing.T) {
+	vpc := readyVPC("tenant", "net", "169.254.40.0/22", 100)
+	objects := []client.Object{vpc}
+	for address := net.ParseIP("169.254.43.254"); !address.Equal(net.ParseIP("169.254.42.1")); address = prevIP(address) {
+		objects = append(objects, &sdnv1alpha1.Port{ObjectMeta: metav1.ObjectMeta{Name: sdn.PortName(100, address.String())}, Spec: sdnv1alpha1.PortSpec{IP: address.String(), VPCRef: sdnv1alpha1.VPCRef{Namespace: "tenant", Name: "net"}}})
+	}
+	c := svcClient(t, objects...)
+	r := &ServiceVIPReconciler{Client: c, Reader: c}
+	address, err := r.allocateVIP(t.Context(), vpc)
+	if err != nil || address != "169.254.42.0" {
+		t.Fatal("reserved address assigned instead of adjacent usable VIP", address, err)
+	}
+}
+
+func TestVIPAllocatorIncludesFinalUsableCandidate(t *testing.T) {
+	for _, test := range []struct{ cidr, held, want string }{{"10.0.0.0/30", "", "10.0.0.2"}, {"fd00::/126", "fd00::3", "fd00::2"}} {
+		t.Run(test.cidr, func(t *testing.T) {
+			vpc := readyVPC("tenant", "net", test.cidr, 100)
+			objects := []client.Object{vpc}
+			if test.held != "" {
+				objects = append(objects, &sdnv1alpha1.Port{ObjectMeta: metav1.ObjectMeta{Name: sdn.PortName(100, test.held)}, Spec: sdnv1alpha1.PortSpec{VPCRef: sdnv1alpha1.VPCRef{Namespace: "tenant", Name: "net"}, IP: test.held}})
+			}
+			c := svcClient(t, objects...)
+			r := &ServiceVIPReconciler{Client: c, Reader: c}
+			address, err := r.allocateVIP(t.Context(), vpc)
+			if err != nil || address != test.want {
+				t.Fatal("last free pool address skipped", address, err)
+			}
+		})
+	}
+}
+
 func readyVPC(ns, name, cidr string, vni int32) *sdnv1alpha1.VPC {
 	return &sdnv1alpha1.VPC{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, UID: types.UID("vpc-" + ns + "-" + name)},
 		Spec:       sdnv1alpha1.VPCSpec{CIDRs: []string{cidr}},
 		Status:     sdnv1alpha1.VPCStatus{VNI: vni, Phase: sdnv1alpha1.VPCPhaseReady},
 	}
@@ -69,6 +103,7 @@ func clusterIPService(ns, name, vpcAnno string) *corev1.Service {
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:   ns,
 			Name:        name,
+			UID:         types.UID("service-" + ns + "-" + name),
 			Annotations: map[string]string{sdnv1alpha1.AnnotationVPC: vpcAnno},
 		},
 		Spec: corev1.ServiceSpec{
@@ -80,11 +115,12 @@ func clusterIPService(ns, name, vpcAnno string) *corev1.Service {
 
 func svcClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
-	return fake.NewClientBuilder().
+	return pagedServiceVIPClient{fake.NewClientBuilder().
 		WithScheme(svcScheme(t)).
 		WithObjects(objs...).
+		WithIndex(&sdnv1alpha1.Port{}, serviceVIPPodIndex, vpnAppliancePodKeys).
 		WithStatusSubresource(&sdnv1alpha1.ServiceVIP{}).
-		Build()
+		Build()}
 }
 
 func reconcileSVC(t *testing.T, c client.Client, ns, name string) {
@@ -148,6 +184,32 @@ func TestServiceVIPNeedsBinding(t *testing.T) {
 	}
 }
 
+func TestServiceVIPRevocation(t *testing.T) {
+	b := binding("consumer", "owner", "vpc")
+	b.Finalizers = []string{"sdn.cozystack.io/reap-ports"}
+	svc := clusterIPService("consumer", "service", "owner/vpc")
+	c := svcClient(t, readyVPC("owner", "vpc", "10.0.0.0/24", 101), b, svc,
+		clusterIPService("other", "service", "owner/vpc"))
+	reconcileSVC(t, c, "consumer", "service")
+	if len(vipsInVPC(t, c, "owner", "vpc")) != 1 {
+		t.Fatal("live binding did not grant VIP")
+	}
+	if err := c.Delete(t.Context(), b); err != nil {
+		t.Fatal(err)
+	}
+	r := &ServiceVIPReconciler{Client: c}
+	requests := r.servicesForBinding(t.Context(), b)
+	if len(requests) != 1 || requests[0].Namespace != "consumer" || requests[0].Name != "service" {
+		t.Fatalf("binding revocation requests = %v", requests)
+	}
+	if _, err := r.Reconcile(t.Context(), requests[0]); err != nil {
+		t.Fatal(err)
+	}
+	if len(vipsInVPC(t, c, "owner", "vpc")) != 0 {
+		t.Fatal("terminating binding retained a VIP")
+	}
+}
+
 // The Port-always-wins repair: if a Port comes to hold a VIP's address, the
 // VIP yields (is deleted) on its next reconcile and re-allocates a fresh one —
 // a Port's IP is pinned workload identity, the VIP is the movable kind.
@@ -167,7 +229,7 @@ func TestServiceVIPYieldsToPort(t *testing.T) {
 	// A Port now claims that exact address (the collision the repair guards).
 	port := &sdnv1alpha1.Port{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "v101." + "conflict",
+			Name: sdn.PortName(101, vip),
 			Labels: map[string]string{
 				sdnv1alpha1.LabelVPC:          "vpc-a",
 				sdnv1alpha1.LabelVPCNamespace: "team-a",

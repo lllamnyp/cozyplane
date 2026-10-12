@@ -19,6 +19,7 @@ package sdn
 import (
 	"context"
 	"fmt"
+	"github.com/lllamnyp/cozyplane/pkg/netid"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -33,7 +34,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
+	"github.com/lllamnyp/cozyplane/internal/vpnlimits"
 )
+
+const gatewayVPCUIDAnnotation = "sdn.cozystack.io/gateway-vpc-uid"
 
 // GatewayConfig parameterizes the gateway pods the controller spawns.
 type GatewayConfig struct {
@@ -74,9 +78,12 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	vpc := &sdnv1alpha1.VPC{}
 	if err := r.Get(ctx, req.NamespacedName, vpc); err != nil {
 		if apierrors.IsNotFound(err) {
-			return ctrl.Result{}, r.deleteGateways(ctx, req.Namespace, req.Name)
+			return ctrl.Result{}, r.deleteGateways(ctx, req.Namespace, req.Name, "")
 		}
 		return ctrl.Result{}, fmt.Errorf("fetch VPC: %w", err)
+	}
+	if !vpc.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, r.deleteGateways(ctx, vpc.Namespace, vpc.Name, vpc.UID)
 	}
 
 	// The door is a VPCGateway now, not a field on the VPC: the boundary is a
@@ -84,12 +91,20 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// internet by flipping a bool on an object it owns (docs/north-south.md).
 	// The VPC's boundary is its OLDEST gateway; a second one realizes nothing.
 	var gws sdnv1alpha1.VPCGatewayList
-	if err := r.List(ctx, &gws, client.InNamespace(vpc.Namespace)); err != nil {
+	if err := r.List(ctx, &gws, client.InNamespace(vpc.Namespace), client.MatchingFields{gatewayVPCIndex: vpc.Name}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("list VPCGateways: %w", err)
 	}
 	gw := sdnv1alpha1.EffectiveGateway(gws.Items, vpc.Name)
 	if gw == nil || !gw.Spec.NAT.Enabled {
-		return ctrl.Result{}, r.deleteGateways(ctx, vpc.Namespace, vpc.Name)
+		return ctrl.Result{}, r.deleteGateways(ctx, vpc.Namespace, vpc.Name, vpc.UID)
+	}
+	// The tenant declared its own appliance as the VPC's door
+	// (docs/multi-attach.md). There is exactly one door, and gateways[vni] holds
+	// exactly one entry, so cozyplane must not also run a pod for it: two
+	// claimants would race for the same map entry and the winner would be
+	// whichever agent resynced last.
+	if gw.Spec.Appliance != nil {
+		return ctrl.Result{}, r.deleteGateways(ctx, vpc.Namespace, vpc.Name, vpc.UID)
 	}
 	// A gateway realizes each family's egress in eBPF (vpc_nat_snat / vpc_nat_snat6)
 	// when the pool could give that family an address — SNAT at the pod's own veth,
@@ -105,10 +120,13 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	v6Covered := !cidrsHaveV6(vpc.Spec.CIDRs) || gw.Status.NATAddress6 != ""
 	haveIdentity := gw.Status.NATAddress != "" || gw.Status.NATAddress6 != ""
 	if v4Covered && v6Covered && haveIdentity {
-		return ctrl.Result{}, r.deleteGateways(ctx, vpc.Namespace, vpc.Name)
+		return ctrl.Result{}, r.deleteGateways(ctx, vpc.Namespace, vpc.Name, vpc.UID)
 	}
-	if vpc.Status.VNI == 0 {
+	if !netid.ValidVNI(vpc.Status.VNI) {
 		return ctrl.Result{}, nil // requeued by the VPC status update
+	}
+	if vpc.UID == "" {
+		return ctrl.Result{}, fmt.Errorf("gateway VPC has no UID")
 	}
 
 	desired := r.deployment(vpc)
@@ -123,7 +141,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	case err != nil:
 		return ctrl.Result{}, fmt.Errorf("get gateway deployment: %w", err)
 	default:
-		if !equality.Semantic.DeepDerivative(desired.Spec.Template.Spec.Containers, existing.Spec.Template.Spec.Containers) ||
+		if existing.Annotations[gatewayVPCUIDAnnotation] != string(vpc.UID) {
+			return ctrl.Result{}, fmt.Errorf("gateway deployment %q is not owned by current VPC", existing.Name)
+		}
+		if !equality.Semantic.DeepDerivative(desired.Spec.Template.Spec, existing.Spec.Template.Spec) ||
 			!equality.Semantic.DeepDerivative(desired.Spec.Template.Annotations, existing.Spec.Template.Annotations) {
 			existing.Spec = desired.Spec
 			if err := r.Update(ctx, existing); err != nil {
@@ -146,33 +167,71 @@ func (r *GatewayReconciler) healSeveredGateway(ctx context.Context, vpc *sdnv1al
 		sdnv1alpha1.LabelVPCNamespace: vpc.Namespace,
 	}
 
-	var ports sdnv1alpha1.PortList
-	if err := r.List(ctx, &ports, sel); err != nil {
-		return fmt.Errorf("list gateway ports: %w", err)
-	}
-	havePort := map[string]bool{} // pod name -> claimed a gateway Port
-	for i := range ports.Items {
-		if ports.Items[i].Spec.Gateway {
-			havePort[ports.Items[i].Spec.PodName] = true
-		}
-	}
-
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods, client.InNamespace(r.Config.Namespace), sel); err != nil {
 		return fmt.Errorf("list gateway pods: %w", err)
 	}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if !pod.DeletionTimestamp.IsZero() || !podReady(pod) || havePort[pod.Name] {
+		if !pod.DeletionTimestamp.IsZero() || !podReady(pod) {
 			continue
 		}
-		if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+		owned, err := r.gatewayPodOwned(ctx, pod, vpc)
+		if err != nil {
+			return err
+		}
+		if !owned {
+			continue
+		}
+		var ports sdnv1alpha1.PortList
+		if err := r.List(ctx, &ports, sel, client.MatchingFields{vpnAppliancePodIndex: pod.Namespace + "/" + pod.Name}); err != nil {
+			return fmt.Errorf("list gateway pod ports: %w", err)
+		}
+		havePort := false
+		for i := range ports.Items {
+			port := &ports.Items[i]
+			if port.Spec.Gateway && port.DeletionTimestamp.IsZero() &&
+				port.Spec.PodNamespace == pod.Namespace && port.Spec.PodName == pod.Name &&
+				port.Spec.VPCRef == (sdnv1alpha1.VPCRef{Namespace: vpc.Namespace, Name: vpc.Name}) &&
+				port.Labels[sdnv1alpha1.LabelPodUID] == string(pod.UID) {
+				havePort = true
+				break
+			}
+		}
+		if havePort {
+			continue
+		}
+		if err := r.Delete(ctx, pod, client.Preconditions{UID: &pod.UID, ResourceVersion: &pod.ResourceVersion}); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("delete severed gateway pod %q: %w", pod.Name, err)
 		}
 		log.FromContext(ctx).Info("recreating severed gateway pod (Ready but its gateway Port is gone)",
 			"pod", pod.Name, "vpc", vpc.Namespace+"/"+vpc.Name)
 	}
 	return nil
+}
+
+// Only the actual Deployment/ReplicaSet chain authorizes destructive healing.
+func (r *GatewayReconciler) gatewayPodOwned(ctx context.Context, pod *corev1.Pod, vpc *sdnv1alpha1.VPC) (bool, error) {
+	ref := metav1.GetControllerOf(pod)
+	if ref == nil || ref.APIVersion != "apps/v1" || ref.Kind != "ReplicaSet" || ref.UID == "" {
+		return false, nil
+	}
+	rs := &appsv1.ReplicaSet{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: ref.Name}, rs); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	if rs.UID != ref.UID || !rs.DeletionTimestamp.IsZero() {
+		return false, nil
+	}
+	ref = metav1.GetControllerOf(rs)
+	if ref == nil || ref.APIVersion != "apps/v1" || ref.Kind != "Deployment" || ref.UID == "" || ref.Name != r.deployment(vpc).Name {
+		return false, nil
+	}
+	dep := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: ref.Name}, dep); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	return vpc.UID != "" && dep.UID == ref.UID && dep.DeletionTimestamp.IsZero() && dep.Annotations[gatewayVPCUIDAnnotation] == string(vpc.UID), nil
 }
 
 func podReady(pod *corev1.Pod) bool {
@@ -187,7 +246,7 @@ func podReady(pod *corev1.Pod) bool {
 // deleteGateways removes any gateway Deployment labeled for the VPC (looked up
 // by labels, not name — the VNI-derived name is unknowable once the VPC is
 // gone, and a cross-namespace ownerRef is not an option).
-func (r *GatewayReconciler) deleteGateways(ctx context.Context, vpcNS, vpcName string) error {
+func (r *GatewayReconciler) deleteGateways(ctx context.Context, vpcNS, vpcName string, vpcUID types.UID) error {
 	var list appsv1.DeploymentList
 	if err := r.List(ctx, &list, client.InNamespace(r.Config.Namespace), client.MatchingLabels{
 		"app":                         "cozyplane-gateway",
@@ -197,7 +256,12 @@ func (r *GatewayReconciler) deleteGateways(ctx context.Context, vpcNS, vpcName s
 		return fmt.Errorf("list gateway deployments: %w", err)
 	}
 	for i := range list.Items {
-		if err := r.Delete(ctx, &list.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+		dep := &list.Items[i]
+		uid := dep.Annotations[gatewayVPCUIDAnnotation]
+		if uid == "" || (vpcUID != "" && uid != string(vpcUID)) {
+			continue
+		}
+		if err := r.Delete(ctx, dep, client.Preconditions{UID: &dep.UID, ResourceVersion: &dep.ResourceVersion}); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("delete gateway deployment %q: %w", list.Items[i].Name, err)
 		}
 		log.FromContext(ctx).Info("gateway deployment deleted", "deployment", list.Items[i].Name)
@@ -223,9 +287,10 @@ func (r *GatewayReconciler) deployment(vpc *sdnv1alpha1.VPC) *appsv1.Deployment 
 	}
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("cozyplane-gateway-%d", vpc.Status.VNI),
-			Namespace: r.Config.Namespace,
-			Labels:    labels,
+			Name:        fmt.Sprintf("cozyplane-gateway-%d", vpc.Status.VNI),
+			Namespace:   r.Config.Namespace,
+			Labels:      labels,
+			Annotations: map[string]string{gatewayVPCUIDAnnotation: string(vpc.UID)},
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: new(int32(1)),
@@ -239,13 +304,17 @@ func (r *GatewayReconciler) deployment(vpc *sdnv1alpha1.VPC) *appsv1.Deployment 
 					},
 				},
 				Spec: corev1.PodSpec{
+					AutomountServiceAccountToken: new(false),
 					Containers: []corev1.Container{{
 						Name:    "gateway",
 						Image:   r.Config.Image,
 						Command: []string{"/usr/local/bin/cozyplane-gateway"},
 						Args:    args,
-						// Privileged: iptables + sysctls in its own netns only.
-						SecurityContext: &corev1.SecurityContext{Privileged: new(true)},
+						SecurityContext: &corev1.SecurityContext{
+							Privileged: new(false), AllowPrivilegeEscalation: new(false),
+							Capabilities:   &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}, Add: []corev1.Capability{"NET_ADMIN", "NET_BIND_SERVICE"}},
+							SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+						},
 					}},
 				},
 			},
@@ -257,6 +326,7 @@ func (r *GatewayReconciler) deployment(vpc *sdnv1alpha1.VPC) *appsv1.Deployment 
 // Deployment events map back to their VPC so a deleted or drifted Deployment
 // self-heals.
 func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// VPCGatewayReconciler registers the shared VPCGateway index first in main.
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&sdnv1alpha1.VPC{}).
 		Watches(&appsv1.Deployment{}, handler.EnqueueRequestsFromMapFunc(r.mapDeploymentToVPC)).
@@ -294,7 +364,7 @@ func (r *GatewayReconciler) mapDeploymentToVPC(ctx context.Context, obj client.O
 // mapVPCGatewayToVPC re-drives the VPC whose boundary changed.
 func (r *GatewayReconciler) mapVPCGatewayToVPC(ctx context.Context, obj client.Object) []ctrl.Request {
 	gw, ok := obj.(*sdnv1alpha1.VPCGateway)
-	if !ok || gw.Spec.VPCRef.Name == "" {
+	if !ok || !vpnlimits.ObjectName(gw.Spec.VPCRef.Name) {
 		return nil
 	}
 	return []ctrl.Request{{NamespacedName: types.NamespacedName{

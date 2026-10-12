@@ -45,6 +45,7 @@ func gwClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
 	return fake.NewClientBuilder().
 		WithScheme(gatewayScheme(t)). // registers client-go (Services/EndpointSlices) + sdn
+		WithIndex(&sdnv1alpha1.VPCGateway{}, gatewayVPCIndex, gatewayVPCKeys).
 		WithObjects(objs...).
 		WithStatusSubresource(&sdnv1alpha1.VPCGateway{}, &corev1.Service{}).
 		Build()

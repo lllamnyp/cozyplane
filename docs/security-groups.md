@@ -1,5 +1,27 @@
 # Security groups — intra-VPC policy
 
+### Admission diagnostics
+
+VPC and group references must be representable Kubernetes object names before
+indexing or lookup: DNS subdomains up to 253 bytes, and explicit peer namespaces
+up to 63 bytes. Create and spec-changing update reject the first invalid
+reference without echoing its value. Metadata-only updates of unchanged legacy
+specs remain possible for cleanup; the immutable local VPC anchor stays pinned.
+Controllers exclude invalid legacy VPC keys and publish Pending/ID zero without
+an allocation scan. Agent name and membership indexes ignore invalid local
+references; invalid peer references grant no rule and trigger no VPC lookup.
+No malformed reference may cause a global compilation failure for other VPCs.
+
+The aggregated API rejects malformed policy at its first invalid field. Error
+Status construction retains that field's index but does not repeat raw policy,
+selector, peer or protocol values. CIDR text is checked against a 64-byte budget
+before parsing. Valid ingress/egress, IPv4/IPv6, peer references, TCP/UDP ports
+and immutable VPC anchors keep their existing semantics. This bounds invalid
+request diagnostics; it does not replace the agent's compilation budgets or
+Kubernetes object quotas.
+
+Rule and membership updates are applied as one guarded operation. Before mutating maps, the agent sets params slot 13 to block new SG-gated flows on this node, including endpoints whose membership is missing. Only completion of all five map syncs clears that guard. An error retains it across restart; a later complete sync restores normal policy. This can temporarily deny new flows to ungrouped VPC endpoints too: missing membership cannot safely prove that an endpoint is ungrouped during a failed update. Existing protocol/plumbing exemptions remain. Operators must reduce a ruleset that exceeds map capacity.
+
 > One of three policy layers; which layer owns which flow (and why a
 > SecurityGroup can never break kubelet probes) is recorded in
 > [policy-layers.md](policy-layers.md).
@@ -104,8 +126,13 @@ a reconcile; no pod restart.
   *input* to membership changed. A pod losing its group loses admission on its
   next new flow (established TCP is not torn down — the SYN-gate has no
   conntrack to revoke; the same is true of NetworkPolicy).
-- The **numeric group id** is allocated by the controller per VPC. id 0 = "no
-  groups, legacy allow"; ids **1..62** are real groups; id **63 is reserved**
+- The **numeric group id** is allocated by the controller per VPC. An empty
+  membership list means legacy allow. Membership id **0** is an unresolved
+  selected group: its reserved bit keeps the endpoint grouped without granting
+  any rule until allocation succeeds. This also fails closed when the VPC's
+  group capacity is exhausted. The controller retries pending allocation;
+  rules from other resolved groups retain their normal union semantics.
+  IDs **1..62** are real groups; id **63 is reserved**
   as the north-south "world" pseudo-group (v2). Membership is a `u64` bitmap in
   the datapath. Allocation lives in `SecurityGroup.status.id`, assigned like
   VNIs (live-read allocator with deterministic duplicate repair — the
@@ -130,7 +157,9 @@ internet/DNS replies) is left alone (north-south, stateful-reply territory). For
 a gated packet, `sg_l4` decides whether to enforce (TCP new-connection only; UDP
 always) and reads the destination port, then `sg_admit`:
 
-1. `dstmap = sg_members[{net, dst}]`; zero ⇒ legacy allow (no groups) — done.
+1. `dstmap = sg_members[{net, dst}]`; explicit zero means resolved unselected
+   membership and legacy allow. A missing registered local VPC endpoint uses
+   bit zero (pending default-deny).
 2. `srcmap = sg_members[{net, src}]` — the intra-VPC source's groups; a peered
    source misses (disjoint CIDR) and gets `srcmap = 0` ⇒ the AWS-shaped drop.
 3. For each set bit in `dstmap` (unrolled 1..62): union `sg_rules[{group, proto,
@@ -361,7 +390,10 @@ allocation (so a denied packet leaks no connection state):
    `from: {cidr: 0.0.0.0/0}` rule compiles to the `SG_WORLD` bit (the agent
    already does this), so `allowed & srcmap` admits it. An ungrouped pod
    short-circuits to allow. No rule ⇒ drop (+ `sg_drops`). Stateless in the
-   client IP, so every packet of a flow decides the same way — no SYN-gate.
+   client IP, so every packet of a flow decides the same way. The floating path
+   gates TCP on a new connection only (SYN, no ACK), like every other SG gate: a
+   floating pod's own outbound flows (admitted by its `to: {cidr}` rules) must get
+   their replies back through the public IP. UDP stays gated per packet.
 
 The east-west `to_pod` check is unchanged (it runs only for non-bridge,
 non-floating traffic — those paths return earlier).
@@ -590,3 +622,129 @@ host firewall — solve once, not three times); peer-existence validation for pe
 refs; net-0 RPF for NetworkPolicy identity (same shape as above).
 See also: floating-pod egress gating (below), [#11](../../issues/11)
 (overlapping north-south cidr union, below).
+Live pod-label membership verifies the Port's recorded Pod UID before consuming
+labels. A replacement pod with the same namespace/name cannot assign its groups
+to the predecessor's endpoint. Missing/mismatched UID uses the Port's own label
+snapshot, as for a persistent Port between launcher pods.
+The aggregated API validates label selectors and TCP/UDP port numbers (0 through
+65535) on both create and update. Invalid ports cannot wrap into a wildcard:
+the agent also discards malformed stored port rules before narrowing to uint16.
+Port zero remains the explicit any-port value for the selected protocol.
+### CIDR compilation cost
+
+Specific north-south CIDR keys include the actual packet family: the low byte
+of the 16-bit protocol field is the L4 protocol and the high byte is 4 or 6.
+IPv4-mapped CIDR input normalizes to IPv4; native IPv6 prefixes do not grant
+IPv4 access through the shared RFC 6052 representation. Ingress and egress
+lookups use the same encoding, so legacy untagged rows cannot authorize either
+family before replay. The explicit SG_WORLD all-addresses shortcut retains its
+existing semantics. Ingress query/key scratch is a fixed unpinned per-CPU slot,
+fully overwritten before use; lookup failure denies and no flow history grows.
+
+CIDR group union uses a prefix index keyed by VNI, protocol, port and address
+family. Each prefix inherits only its at most 129 ancestors, rather than scanning
+every other rule. Desired map construction stops at the actual BPF map capacity;
+an oversized snapshot retains the SG update deny guard until recovery.
+The compiler also preflights the whole input: at most 65536 objects of each kind,
+65536 expanded rows per direction and 1048576 input operations. Duplicate and
+invalid raw entries count towards these conservative budgets. Rejection arms
+the SG deny guard before building row arrays; a later bounded snapshot recovers.
+
+
+### Membership identity across group recreation
+
+Port status records resolved numeric groups together with each selected,
+allocated SecurityGroup UID/ID and the Pod UID used for that resolution. The
+agent proves each numeric membership against current live groups in that VPC.
+A missing/stale witness, changed Pod UID, changed group ID or duplicate current
+ID projects only the unresolved default-deny bit for that membership. Deleting
+and recreating a group cannot transfer predecessor Ports into the replacement
+merely because its numeric ID was reused. Valid other memberships still union
+their permissions. Terminating groups cannot grant membership or rules. Legacy
+nonempty group status remains guarded until the controller refreshes its proof.
+Empty membership retains the existing asynchronous label/selector evaluation
+contract; this does not promise instant first-policy installation.
+
+The UID index is built once per bounded agent snapshot, not once per Port.
+Membership proof consumes at most 63 numeric groups and 62 resolved references
+per Port; oversized legacy status is guarded without expanding a new bitmap
+list or group/Port Cartesian product. Persistent IP/MAC identity is unchanged.
+
+
+### Initial local membership
+
+A registered local VPC endpoint whose membership entry is missing is unresolved,
+not an unselected endpoint. SG ingress/egress uses the default-deny bit until
+Port membership status proves the current Pod UID. The agent publishes explicit
+zero entries for resolved unselected Ports; net-0 and non-endpoint routed source
+addresses retain their existing semantics. The membership map therefore retains
+one entry per current VPC Port within its existing 65,536-entry budget. NDP,
+DHCP and authorized kubelet probe paths keep their existing exceptions. This
+closes first-publication misses.
+
+### Local address reuse and sandbox ownership
+
+Local endpoint and membership values both carry a SHA-256 witness of the Port
+UID, CNI container ID and CNI interface name. A local VPC bitmap is usable only
+when its nonempty witness matches the endpoint currently owning that address.
+An old informer snapshot therefore cannot reopen rights after address reuse,
+including a persistent Port rebound to another sandbox. Remote identities keep
+the existing source-side RPF and authoritative Geneve membership contract.
+
+The CNI keeps the interface quarantined while publishing the alias and local
+values, then activates its ports entry last. ADD retries for the same owner
+preserve resolved membership; policy may also arrive before the local endpoint,
+without requiring another API event. Staged migration targets do not replace
+the active locals entry; cutover/rebuild derives the same witness from the
+verified alias. Existing witness-less local entries remain guarded until
+rebuilt or verified ownership adoption refreshes an already-active local entry;
+adoption never creates a missing delivery entry. The two existing 65,536-entry maps gain 32 witness bytes per value each
+(4.25 MiB including local-value alignment at capacity); no per-packet hashing, selector scan,
+netlink inventory or new background worker is introduced.
+
+Userspace hashes the sandbox witness in a fixed 255-byte stack buffer, bounded
+by the Linux veth alias capacity. Empty or over-budget witnesses stay zero and
+cannot authorize a local endpoint. Repeated membership snapshots therefore do
+not allocate a concatenated witness string for every Port; the digest and its
+full four-word comparison remain unchanged for representable aliases.
+
+The receive hook also verifies delivery against the current local ifindex,
+including on the default network. A projection for another VNI cannot bypass
+that receiver's NetworkPolicy through a stale bridge.
+An old veth cannot receive the replacement endpoint's permissions just because
+its ports entry still names the same VNI. Fabric/floating translations resolve
+the tenant destination before that check; direct tenant destinations retain
+VNI scope. Missing local state on staged targets retains the existing plumbing
+contract; this check refuses a known different local owner and does not create
+delivery entries or reactivate staged endpoints.
+
+### Membership controller work
+
+Unsupported SCTP traffic also enters the shared L4 policy gate. A grouped VPC
+endpoint cannot bypass default-deny by using SCTP east-west; no SCTP allow rules
+are compiled. Ungrouped endpoints retain default-open within authorized VPCs.
+This does not add SCTP fabric translation or service handling.
+
+Membership cache lookups are indexed by the exact VPC reference, both for
+groups selected by a Port and for Ports notified by a group change. Pod label
+changes use an indexed namespace/name witness as well. An event does not copy
+unrelated VPCs' objects into the controller's working list.
+
+Before selector conversion, one VPC resolution preflights at most 65,536 group
+objects and 65,536 selector work units (groups, match labels, expressions and
+raw values, including duplicates). It checks cancellation during traversal.
+Oversized or invalid legacy selectors publish only pending group zero, with no
+UID grants; they cannot become resolved empty/allow membership. Reducing the
+input allows the next notification to recover normally. Numeric membership is
+built with a fixed 63-bit set rather than retaining one zero per pending group.
+These bounds cover per-resolution work, not total informer cache size or a
+global Kubernetes object quota.
+
+Numeric ID allocation and duplicate repair use complete live scans, not these
+cache indexes. They request 128-object pages within the owner namespace, consume
+continuation tokens and refuse incomplete/oversized/cancelled scans before
+publishing a new ID. The existing claim-walk limit is 65,536 objects and 512
+pages per namespace; the temporary occupied-ID set retains only IDs 1 through
+62. Other VPCs' claims in that namespace do not reserve this VPC's IDs. A claim
+on a later page participates in both allocation and deterministic older-wins
+duplicate repair.

@@ -17,6 +17,7 @@ limitations under the License.
 package responder
 
 import (
+	"fmt"
 	"net"
 	"testing"
 
@@ -43,11 +44,14 @@ type fakeState struct {
 
 func (f *fakeState) PortByFabricIP(ip string) *sdnv1alpha1.Port { return f.ports[ip] }
 func (f *fakeState) Service(ns, name string) *corev1.Service    { return f.svcs[ns+"/"+name] }
-func (f *fakeState) Endpoints(ns, name string, vpc sdnv1alpha1.VPCRef) []Endpoint {
+func (f *fakeState) Endpoints(ns, name string, vpc sdnv1alpha1.VPCRef) ([]Endpoint, error) {
 	if f.vpcOf[ns+"/"+name] != vpc {
-		return nil // backends belong to another net: structurally invisible
+		return nil, nil // backends belong to another net: structurally invisible
 	}
-	return append([]Endpoint(nil), f.eps[ns+"/"+name]...)
+	if len(f.eps[ns+"/"+name]) > MaxEndpoints {
+		return nil, fmt.Errorf("too many endpoints")
+	}
+	return append([]Endpoint(nil), f.eps[ns+"/"+name]...), nil
 }
 func (f *fakeState) Peers(vpc sdnv1alpha1.VPCRef) []sdnv1alpha1.VPCRef { return f.peers[vpc] }
 func (f *fakeState) ServiceVIPFor(ns, name string, vpc sdnv1alpha1.VPCRef) net.IP {

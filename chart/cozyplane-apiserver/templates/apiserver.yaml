@@ -1,3 +1,4 @@
+{{- if eq .Values.api.mode "aggregated" }}
 {{- $ns := .Release.Namespace -}}
 # The sdn.cozystack.io group served by a real aggregated API server (backed by a
 # dedicated etcd) instead of CRDs — enabling custom validation and subresources
@@ -303,6 +304,14 @@ spec:
         - name: apiserver
           image: {{ .Values.image }}
           imagePullPolicy: {{ .Values.imagePullPolicy }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           command: ["/usr/local/bin/cozyplane-apiserver"]
           args:
             - --serve-sdn
@@ -374,3 +383,5 @@ spec:
     - port: 443
       targetPort: 6443
       name: https
+
+{{- end }}

@@ -69,7 +69,11 @@ func CheckResourceVerb(ctx context.Context, auth authorizer.Authorizer, verb, re
 		ResourceRequest: true,
 	})
 	who := name
-	if namespace != "" {
+	if len(name) > 253 || len(namespace) > 63 {
+		// Legacy grants must remain revocable with their original authority.
+		// Keep the authorization attributes exact, but do not echo their payload.
+		who = "(oversized reference)"
+	} else if namespace != "" {
 		who = namespace + "/" + name
 	}
 	if err != nil {

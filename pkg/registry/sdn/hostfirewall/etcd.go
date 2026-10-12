@@ -46,6 +46,7 @@ func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter) (*reg
 		TableConvertor: rest.NewDefaultTableConvertor(sdn.Resource("hostfirewalls")),
 	}
 
+	registry.InstallMetadataValidation(store)
 	options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: GetAttrs}
 	if err := store.CompleteWithOptions(options); err != nil {
 		return nil, nil, err

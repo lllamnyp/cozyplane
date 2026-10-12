@@ -1,0 +1,54 @@
+# Replace every REPLACE_ME value before applying. The cloud-init Secret is
+# deliberately external: it contains the VPN configuration and must not be in Git.
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: vpn-appliance
+  namespace: vpn-example
+spec:
+  runStrategy: Always
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vpn-appliance
+      annotations:
+        # The VPC and its VPCBinding must exist in this namespace.
+        sdn.cozystack.io/vpc: REPLACE_ME_VPC
+        # KubeVirt requires bridge binding and this annotation for migration.
+        kubevirt.io/allow-pod-bridge-network-live-migration: ""
+    spec:
+      evictionStrategy: LiveMigrate
+      domain:
+        cpu:
+          cores: 2
+        resources:
+          requests:
+            memory: 1Gi
+        devices:
+          disks:
+            - name: rootdisk
+              disk:
+                bus: virtio
+            - name: state
+              disk:
+                bus: virtio
+            - name: cloudinit
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              bridge: {}
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        - name: rootdisk
+          containerDisk:
+            image: registry.example.invalid/cozyplane/vpn-appliance:REPLACE_ME
+        - name: state
+          persistentVolumeClaim:
+            claimName: vpn-appliance-state
+        - name: cloudinit
+          cloudInitNoCloud:
+            secretRef:
+              name: vpn-appliance-cloud-init

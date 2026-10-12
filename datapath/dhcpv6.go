@@ -24,6 +24,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vishvananda/netlink"
 	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"
 )
@@ -85,6 +86,13 @@ func serveDHCPv6(ctx context.Context, veth string, ifindex int, mac net.Hardware
 	}
 	conn := pc.(*net.UDPConn)
 	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	link, err := netlink.LinkByIndex(ifindex)
+	if err != nil || link.Attrs().Name != veth || !raEligible(link).Equal(podIP) {
+		return
+	}
+	identity := raIdentity(link)
 	p := ipv6.NewPacketConn(conn)
 	group := &net.UDPAddr{IP: net.ParseIP("ff02::1:2")}
 	if err := p.JoinGroup(&net.Interface{Index: ifindex, Name: veth}, group); err != nil {
@@ -93,14 +101,32 @@ func serveDHCPv6(ctx context.Context, veth string, ifindex int, mac net.Hardware
 	}
 
 	buf := make([]byte, 1500)
+	tick := time.NewTicker(ipv6SolicitationInterval)
+	defer tick.Stop()
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
 		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		n, src, err := conn.ReadFromUDP(buf)
 		if ctx.Err() != nil {
 			return
 		}
-		if err != nil || n < 4 {
+		if err != nil {
+			if e, ok := err.(net.Error); ok && e.Timeout() {
+				continue
+			}
+			log.Warn("DHCPv6: receive ended", "veth", veth, "err", err)
+			return
+		}
+		if n < 4 {
 			continue
+		}
+		current, err := netlink.LinkByIndex(ifindex)
+		if err != nil || raIdentity(current) != identity {
+			return
 		}
 		reply := buildDHCP6Reply(buf[:n], mac, podIP, rdnss)
 		if reply == nil {
@@ -191,8 +217,12 @@ func buildDHCP6Reply(msg []byte, mac net.HardwareAddr, podIP net.IP, rdnss net.I
 }
 
 func appendOpt(b []byte, code uint16, body []byte) []byte {
+	if len(body) > 65535 {
+		return b
+	}
 	var hdr [4]byte
 	binary.BigEndian.PutUint16(hdr[0:2], code)
+	// #nosec G115 -- payloads longer than the uint16 wire length are rejected above.
 	binary.BigEndian.PutUint16(hdr[2:4], uint16(len(body)))
 	b = append(b, hdr[:]...)
 	return append(b, body...)

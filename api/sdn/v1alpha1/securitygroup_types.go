@@ -21,8 +21,8 @@ import (
 )
 
 // MaxSecurityGroupsPerVPC is the number of distinct security-group identities a
-// VPC can have. The datapath carries membership as a bitmap; id 0 is reserved
-// for "no groups" (legacy allow), so ids run 1..63.
+// VPC can have. Real ids run 1..62; 63 is the north-south pseudo-group. A
+// selected unresolved group uses membership bit 0 to fail closed.
 const MaxSecurityGroupsPerVPC = 63
 
 // SecurityGroupPhase is the lifecycle phase of a SecurityGroup.
@@ -31,7 +31,8 @@ type SecurityGroupPhase string
 
 const (
 	// SecurityGroupPhasePending means the group exists but has no allocated id
-	// yet (or its VPC is not Ready) — it does not yet affect the datapath.
+	// yet (or its VPC is not Ready). Selected ports remain default-deny until
+	// allocation succeeds; pending groups cannot grant permissions.
 	SecurityGroupPhasePending SecurityGroupPhase = "Pending"
 	// SecurityGroupPhaseReady means the group has an id and its rules are
 	// programmed by the agents.

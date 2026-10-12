@@ -1,0 +1,3 @@
+# Admission phase after the CNI and cert-manager; no tenant apiserver/etcd.
+api:
+  mode: crd
