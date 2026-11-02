@@ -5,10 +5,17 @@
 # Operator-managed VPC boundaries
 
 This extension adds an optional boundary to VPCs without changing legacy VPC
-behavior. The boundary is independent of the union of tenant SecurityGroups.
-For cross-VPC traffic between two managed VPCs, these rules are authoritative:
-tenant SecurityGroups cannot widen or narrow an imposed common path. Intra-VPC
-traffic and legacy VPC pairs retain their SecurityGroup checks.
+behavior. For cross-VPC traffic between two managed VPCs the boundary is the
+CEILING: SecurityGroups cannot widen an imposed common path, but they still
+apply on top of it and NARROW it, exactly as between any other pair — a flow is
+delivered only if the boundary admits it AND the destination's ingress and the
+source's egress groups admit it. Intra-VPC traffic and legacy VPC pairs keep
+their SecurityGroup checks unchanged. Since every pod of a managed VPC is
+usually selected by some group, the operator that writes boundaries also writes
+the matching groups (`to/from: {group, vpc}` across the peering) before agents
+enforcing this rule are rolled out; a pair with a boundary rule and no matching
+group rule is closed as soon as one endpoint is grouped. Two UNGROUPED endpoints
+keep the default-open group semantics: the boundary alone decides for them.
 Only a principal granted the virtual `manage-boundary` verb on the VPC may set,
 change or remove it. A managed VPC may not be deleted or have its CIDRs or MTU
 changed without that grant. Metadata-only VPC updates remain permitted.
@@ -38,7 +45,15 @@ Compilation rejects negative VNI values and malformed address masks before any
 map publication. ICMP type/code packing preserves the validated eight-bit values.
 
 Every cross-VPC packet is checked at source and destination, independently of
-placement. TCP ACK without tracked admission is denied. UDP and ICMP replies
+placement. Same node: the boundary gate (source `from_pod`, destination
+`to_pod`), then the SecurityGroup check in the `to_pod` continuation. Cross
+node: the source-side boundary gate in `from_pod`, then the SecurityGroup check
+in `from_overlay` (source identity from the Geneve option of a trusted node),
+then the destination-side boundary gate in `to_pod`. Both layers must admit;
+the order only decides which one records flow state first. TCP: the group check sees only the SYN; the return packets
+ride the boundary's flow state. UDP: the group check runs on EVERY packet, so a
+UDP rule A→B also needs a reply rule B→A (`{UDP, port 0}` keeps it within the
+ceiling). ICMP is not gated by groups: the boundary alone decides. TCP ACK without tracked admission is denied. UDP and ICMP replies
 require a tracked forward flow. Flow state includes endpoint VNI and the current
 boundary revisions, so replacing a policy invalidates established flows. State
 at one hook cannot bypass admission at the other hook.

@@ -5612,8 +5612,9 @@ static __always_inline int dns_return(struct __sk_buff *skb, struct pkt *p)
 	return TC_ACT_OK;
 }
 
-// Managed VPC boundaries have their own maps and state. They are deliberately
-// separate from additive tenant SGs and run before any NAT/Service return path.
+// Managed VPC boundaries have their own maps and state and run before any
+// NAT/Service return path. Between two bounded VPCs the boundary is the CEILING;
+// security groups still apply on top of it and narrow it (both must admit).
 struct boundary_policy { __u64 revision; __u64 identity; __u32 internet; __u32 pad; };
 struct boundary_rule { __u64 revision; __u32 net; __u32 peer; __u16 port; __u8 proto; __u8 direction; __u32 pad; };
 struct boundary_flow {
@@ -6656,6 +6657,10 @@ int cozyplane_to_pod_continue(struct __sk_buff *skb)
 	// authoritatively from the source's Geneve TLV (stage B) — skip the
 	// (spoofable) inference here rather than re-check it.
 	//
+	// Between two bounded VPCs the boundary (boundary_gate, run before this
+	// continuation) is the ceiling and the groups narrow it: a flow must pass
+	// both. The SG check is therefore NOT skipped for a managed pair.
+	//
 	// A VPC pod acting as its net's gateway transits off-VPC egress: the packet
 	// arrives on the gateway's veth (dstnet is the gateway's net) but its
 	// destination is *not* a VPC address (the internet/cluster). That is
@@ -6664,9 +6669,7 @@ int cozyplane_to_pod_continue(struct __sk_buff *skb)
 	// every grouped source (the off-VPC dst is ungrouped) and break all TCP/UDP
 	// north-south egress. A normal east-west delivery always has an in-VPC dst.
 	int ns_transit = net_of(&networks, dstnet, p.dst) == 0;
-	int managed_cross = srcnet && srcnet != dstnet &&
-		bpf_map_lookup_elem(&boundary_policy,&srcnet) && bpf_map_lookup_elem(&boundary_policy,&dstnet);
-	if (dstnet && !ns_transit && !managed_cross && !(mark & (GW_MARK | SG_OK | FWD_MARK))) {
+	if (dstnet && !ns_transit && !(mark & (GW_MARK | SG_OK | FWD_MARK))) {
 		__u16 dport;
 		__u32 l4off = p.is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
 		if (sg_l4(skb, p.proto, l4off, &dport)) {
@@ -6853,15 +6856,14 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 			// here — the only place the tunnel metadata is readable — and mark
 			// it done so to_pod won't re-check via (spoofable) inference. An
 			// ungrouped source carries no option and falls through to to_pod's
-			// same-node/inference path.
+			// same-node/inference path. A bounded VPC pair is enforced too:
+			// the boundary is the ceiling, the groups narrow it.
 			struct sg_geneve_opt opt;
 			if (bpf_skb_get_tunnel_opt(skb, (void *)&opt, sizeof(opt)) >= (int)sizeof(opt) &&
 			    opt.opt_class == bpf_htons(SG_OPT_CLASS) && opt.type == SG_OPT_TYPE) {
 				__u16 dport;
 				__u32 l4off = p.is_v6 ? (ETH_HLEN + 40) : (ETH_HLEN + 20);
-				int managed = opt.src_net != vni && bpf_map_lookup_elem(&boundary_policy,&vni) &&
-					bpf_map_lookup_elem(&boundary_policy,&opt.src_net);
-				if (!managed && sg_l4(skb, p.proto, l4off, &dport)) {
+				if (sg_l4(skb, p.proto, l4off, &dport)) {
 					struct local_key dk = { .net = vni, .ip = p.dst };
 					__u64 dstmap = sg_membership(&dk);
 					// Ingress: dst's groups admit the (TLV-authoritative) source.

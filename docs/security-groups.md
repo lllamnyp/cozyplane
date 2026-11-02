@@ -85,6 +85,9 @@ Semantics, deliberately AWS-shaped:
   needs symmetric rules; most UDP (cluster DNS) takes the resolver/gateway path
   and never reaches this check. Non-TCP/UDP (ICMP) is not gated in v1, so PMTU
   and ping keep working to a grouped pod (a deliberate v1 gap).
+  The same holds across a peering: a UDP rule between two VPCs needs its reply
+  rule too, including between two VPCs that carry an operator boundary (the
+  boundary is the ceiling, groups narrow it — `vpc-boundary.md`).
 - `from.group` references a group in the **same VPC**. Peered-VPC references are
   v2 (identity has to cross a trust boundary — the Geneve TLV). A peered source
   is in a disjoint CIDR (peering requires it), so it matches no group in the
@@ -456,6 +459,10 @@ name) — grouped and ungrouped pods become mutually isolated, which is the stri
 reading of default-deny-both-ways. `to: {cidr}` egress (reaching ungrouped /
 external destinations) is a later increment; it needs source-side / gateway
 enforcement, unlike the group case.
+
+Between two VPCs that both carry an operator boundary these checks run TOO,
+after the boundary gate: the boundary is the ceiling, the groups narrow it
+(`vpc-boundary.md`). Earlier revisions skipped the group check for such a pair.
 
 ### Datapath
 
