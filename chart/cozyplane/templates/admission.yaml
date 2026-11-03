@@ -1,0 +1,57 @@
+{{- if eq .Values.api.mode "crd" }}
+{{- $ns := .Release.Namespace }}
+{{- $secret := default "cozyplane-admission-serving" .Values.admission.tls.existingSecret }}
+{{- if and .Values.admission.tls.existingSecret (not .Values.admission.tls.caBundle) }}
+{{- fail "admission.tls.existingSecret requires a trusted admission.tls.caBundle" }}
+{{- end }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: cozyplane-tenant-validation
+  {{- if not .Values.admission.tls.existingSecret }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ $ns }}/cozyplane-admission-serving
+  {{- end }}
+webhooks:
+  - name: tenant.sdn.cozystack.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+    matchPolicy: Equivalent
+    timeoutSeconds: 10
+    clientConfig:
+      {{- with .Values.admission.tls.caBundle }}
+      caBundle: {{ . | quote }}
+      {{- end }}
+      service:
+        namespace: {{ $ns }}
+        name: cozyplane-admission
+        path: /validate
+        port: 443
+    rules:
+      - apiGroups: ["sdn.cozystack.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources:
+          - vpcs
+          - vpcbindings
+          - vpcpeerings
+          - vpcgateways
+          - securitygroups
+          - floatingips
+          - ports
+          - servicevips
+          - hostfirewalls
+          - vpngateways
+          - vpnconnections
+          - vpcs/status
+          - vpcpeerings/status
+          - vpcgateways/status
+          - securitygroups/status
+          - floatingips/status
+          - ports/status
+          - servicevips/status
+          - hostfirewalls/status
+          - vpngateways/status
+          - vpnconnections/status
+{{- end }}

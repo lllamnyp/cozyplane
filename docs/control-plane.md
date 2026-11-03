@@ -4,6 +4,29 @@ How the operator comes alive. Companion to `design.md` (architecture). Group:
 `sdn.cozystack.io`, version `v1alpha1`, served by the **cozyplane aggregated API
 server** — with a CRD serving of the same group as the **bootstrap surface**.
 
+## Metadata validation resource budget
+
+The aggregated API must reject malformed metadata collections before the generic
+Kubernetes store assembles its complete error list. Repeated invalid labels,
+annotations, finalizers, owner references or managed-field entries can otherwise
+amplify a small rejected request into substantial temporary allocations and CPU
+work. Validate entries with Kubernetes' own rules, stop at the first invalid
+entry, and return one bounded `Invalid` cause without echoing the input. Check
+Kubernetes' existing byte limits before splitting or matching long keys, label
+values, finalizers or field-manager names. Keep
+collection-wide constraints (annotation bytes, a single controlling owner, and
+conflicting deletion finalizers), existing storage hooks and valid metadata.
+The same guard must cover create, update and the shared `/status` stores.
+This bounds diagnostics; it does not make request decoding use constant memory.
+
+Request-option validation needs the same protection before the generic resource
+handlers. For create, update and patch, check the decoded `fieldManager` against
+Kubernetes' 128-byte and printable-character rules before calling the SDK's
+validator, which otherwise emits one error per invalid character. Return one
+bounded `Invalid` cause without reading the request body or echoing the value.
+Place this filter inside the existing generic handler chain so authentication,
+authorization, request accounting and auditing retain their normal order.
+
 ## 0. Two groups, two owners — and no takeover
 
 **Rewritten 2026-07-12** ([api-groups.md](api-groups.md) is the design). The old
@@ -331,6 +354,16 @@ prove it on the target runtime first.
 
 ## 4. Distribution: agents watch, controller compiles
 
+Boundary informer callbacks only enqueue a coalesced notification (capacity
+one). A single worker reads current informer state, programs the maps, then
+reports acknowledgements with a bounded request context. An API stall must
+not retain an unbounded queue of object notifications. The five-second repair
+tick remains, so real map drift and agent replacement are still detected.
+Stable VPC status is not sent again; changed agent acknowledgements remain
+observable and must not be filtered by a generation-only predicate.
+Stable boundary map entries are compared with their current values before
+writing. These BPF writes are kernel memory operations, not etcd disk writes.
+
 - **Agents** (per-node DaemonSet) watch `Port`/`SecurityGroup`/`VPC`/`Subnet`
   filtered to their node, and translate the slice into eBPF map state. They are
   the only writers of `Port/{bind,status}`.
@@ -490,10 +523,13 @@ Deleting a Port drives the sever:
   existing isolation check; it removes the `locals` entry and tears down the
   fabric↔vpc bridge. The pod keeps running, disconnected (NetworkPolicy-like).
 
-The agent distinguishes revocation from ordinary pod deletion (where CNI `DEL`
-already cleaned up) by checking the owning pod still exists, isn't terminating,
-and matches the Port's recorded pod UID — so a stale delete for a name-reused pod
-can't cut off an unrelated one.
+Revocation drains every still-present veth proven to belong to the reaped Port,
+including lingering sandboxes of terminated or already deleted Pods. The exact
+Port UID in the live alias fences replacement owners; the alias is rechecked
+under the shared writer lock. This proven-owner path does not depend on an
+unused live Pod read. Legacy endpoints require sandbox or protected launcher
+ownership proof before adoption. A Pod name or shared VPC address alone cannot
+authorize revocation.
 
 Revocation is **replayable across agent outages** via a sever finalizer
 (`sdn.cozystack.io/sever`, set by the CNI at claim time): a reaped Port stays
@@ -502,6 +538,37 @@ to sever) and releases the finalizer. An agent that was down finds the
 still-terminating Port in its informer's initial sync and acts then. A Port
 whose node no longer exists is released by the controller's Port GC — the
 workload died with its node.
+
+Before releasing that barrier on a cache-missing Node, Port GC confirms the
+Node's absence with the live API reader. An initial or delayed informer view
+cannot acknowledge severing on behalf of an existing node agent. Abandoned-Port
+GC and binding revocation delete each observed Port with both UID and resource
+version preconditions. Replacement or in-place rebinding between the read and
+delete returns a conflict and retries from a new snapshot; a binding keeps its
+reap finalizer while any deletion remains unresolved. Persistent VM Ports retain
+their existing lifecycle exemption from abandoned-pod GC.
+
+The binding reaper lists remaining grants and matching Ports through the live
+API reader, not the informer snapshot. A newly granted binding must preserve
+authorized endpoints even if its event has not arrived; a revoked grant or a
+new Port missing from the cache must not escape the durable reap barrier. Both
+lists consume all continuations before deletion, using 128-object pages and a
+65,536-object/512-page limit. Failed or incomplete scans keep the finalizer and
+delete nothing. Only name, UID and resource version of the candidate Ports are
+retained after each page, keeping large spec/annotation payloads out of the
+deletion work list. Conditional deletion still catches replacement/rebinding
+after that snapshot; these live reads are not a distributed transaction with
+concurrent grant creation.
+
+A binding's `spec.vpcRef` is immutable. Retargeting a live grant would otherwise
+lose the original VPC's durable Port-reaping target and let a consumer owning
+the new VPC authorize removal of the old grant's finalizer. Running agents also
+reconcile missing grants, but that is not a substitute for replayable revocation
+while an agent is unavailable. To change VPC targets, delete the old binding,
+let its reap barrier finish, then create the new grant. The aggregated strategy
+and CRD admission policy reject retargeting even for an actor authorized on both
+VPCs. Owner-authorized forwarding/CIDR changes and ordinary metadata updates
+retain their existing behavior.
 
 One known limitation of this iteration: **re-granting** (recreating the binding)
 does not restore a severed pod — it must be recreated.
@@ -573,3 +640,112 @@ Smallest slice that is observably alive, in order:
 
 Everything after (identity/SG, persistent Ports + migration, multi-attach,
 gateways) layers on this spine.
+### Controller allocation serialization
+
+VNI allocation additionally reserves a durable monotonically increasing counter
+in `kube-system/cozyplane-vni-allocator` (Lease). Unlike the leader-election
+Lease, this counter records historical allocations and must survive workload
+deletion, restarts and backups. No VNI is recycled; the valid tenant range is
+100 through `2^22-1`, below the Geneve forwarding/gateway flag bits.
+
+The controller manager requires leader election, including a single-replica
+Deployment: a rolling update also overlaps processes. All instances use the
+same coordination Lease, `kube-system/sdn-controller.cozystack.io`. Disabling
+election is rejected at startup. Live reads and serial reconciles allocate VNI
+and group IDs only inside this leader; they are not distributed allocation locks
+on their own. The controller ServiceAccount has a namespaced Lease role.
+APIService reconciliation explicitly writes insecureSkipTLSVerify=false when
+TLS verification is enabled. Moving from a self-signed development registration
+to the production CA-injection configuration must revoke the old TLS bypass;
+omitting the field from a merge patch would preserve it.
+
+Peering CIDR overlap checks parse each candidate once. They sort and collapse
+one list into disjoint prefixes, then search that list for each prefix in the
+other VPC. There is no pairwise reparsing of both lists: transient memory is
+linear and lookup work grows with sorting and binary searches. IPv4, IPv6,
+host bits, mapped IPv4 spellings and ignored unparsable entries retain the
+existing overlap definition; this changes no two-sided peering authorization.
+
+The peering status controller uses cache indexes for the complete directed
+VPC pair and for both current VPC references. Reciprocal resolution/events
+copy only candidates for the reverse pair; a VPC event copies only halves
+referencing that namespace/name. Indexes track reference updates and removal,
+without accumulating historical keys. The Matches predicate still checks both
+references and deletion timestamps; an index hit alone is not consent.
+
+VNI live-scan safeguard (SEC198): bootstrap high-water scans and duplicate
+ownership checks use 128-object pages, at most 65,536 objects per collection.
+Bootstrap shares a 30-second deadline across VPC, Port and ServiceVIP scans;
+the complete Lease reservation/retry operation has the same bounded lifetime.
+Duplicate checks also have a 30-second budget. Counter reservation must
+independently observe a successful Lease write before returning a VNI (SEC199).
+A retry helper returning nil after an interrupted attempt is not success; both
+parent cancellation and per-request deadline errors must propagate. Earlier parent cancellation or
+deadlines always win. The high-water includes orphaned Port/ServiceVIP claims
+and all VPCs, including terminating objects; failed, oversized or incomplete
+scans publish no partial allocation or duplicate verdict. Pagination bounds
+transient client payloads, not total stored objects or a universal memory quota.
+
+VPC status reconciliation still checks live duplicate VNI ownership, but sends
+a status update only when it changes VNI or phase. Repeated metadata/status
+notifications on an already Ready VPC do not send identical writes. Allocation
+and duplicate repair still publish their new VNI before returning.
+
+VPC CIDR admission bounds spec.cidrs to 1,024 prefixes and 64 bytes per prefix, validates IP CIDR syntax on create or CIDR changes, and returns bounded index-only diagnostics. CIDRs remain optional and tenant ranges may overlap. Unchanged legacy CIDRs permit metadata/finalizer and unrelated updates so invalid objects can still be repaired or deleted. Runtime CNI and agent checks protect against legacy objects already stored. This ceiling does not guarantee aggregate datapath capacity or replace ResourceQuota.
+
+### Persistent NIC creation transaction
+
+Within a VNI, persistent Port creation checks the current namespace/VM/VPC/NIC identity in a paged etcd snapshot before writing. The transaction compares the modification revision of every Port key in that VNI with the snapshot revision, alongside the existing Port/ServiceVIP address guards. A concurrent creation or identity-affecting update invalidates the snapshot; eight retries and a 65,536-claim/128-per-page scan ceiling bound the work. The allocation client caps each gRPC response at 16 MiB, and each scan stops before decoding more than 64 MiB of stored data; exceeding either limit fails ADD without a partial allocation. This includes legacy claims without adding an index, lease or historical reservation. Empty-collection compares admit the first claim. A matching claim returns AlreadyExists with the actual holding Port name, so ADD can fetch it, verify the instance UID and pinned IP/MAC, and bind or stage it. NIC identity fields are immutable through normal and status updates; pinned VM MAC changes are refused. Unrelated status changes within a busy VNI may cause a bounded retry or an ADD failure for kubelet to retry; they cannot permit a second identity.
+
+VPCGateway reference safeguard (SEC200): the local VPC reference must be a
+nonempty DNS subdomain name of at most 253 bytes, on both create and update.
+Legacy invalid references are omitted from VPC indexes and notification queues
+before hashing or retention. Status reconciliation treats them as unresolved
+without looking up the invalid target or allocating a boundary for it; the
+existing unresolved-VPC cleanup and status contract applies. A valid retarget
+still notifies both old and new VPCs. Diagnostics do not echo invalid values.
+This bounds reference bytes per request, not valid update frequency or all
+controller-cache memory. Namespace-selector indexes require separate review.
+
+VPCGateway selector-reference safeguard (SEC201): appliance and route namespaces
+are optional (empty means the gateway namespace); nonempty values must be DNS
+labels of at most 63 bytes. Admission create/update stops on the first invalid
+reference with a bounded diagnostic, and rejects more than 4096 route declarations
+or prefix candidates, matching the existing route-resolution ceiling. The
+namespace index does not retain invalid keys or expand oversized legacy route
+arrays. Legacy invalid next-hop namespaces do not reach Pod lookups: valid
+route prefixes remain published with no next hop (blackholes); an invalid
+appliance namespace resolves no appliance. Correct references recover normally.
+No new workers or historical state are introduced.
+
+Gateway healing lookup safeguard (SEC202): list the system gateway Pods first,
+then confirm a live Ready Pod belongs to the current VPC gateway Deployment
+through its ReplicaSet UID before consulting Ports. Use the existing spec pod
+namespace/name index plus VPC labels, then retain the existing gateway flag,
+Pod UID and VPC identity checks. No Ready owned Pod means no Port list. A missing
+index or failed lookup is an error, never a broad scan or a reason to delete a
+Pod. Destructive healing still requires UID/resourceVersion preconditions.
+Register the shared Port pod index in VPCGateway setup before Gateway and VPN
+setup; no duplicate indexes, historical state or new workers.
+
+Actual-cache test transports must honor request cancellation and return API
+list metadata, never reuse the cache reader s continue-not-supported marker as
+an upstream continuation. Restart fixtures clear that marker and supply the
+current snapshot/resourceVersion. This prevents a simulated pager from retaining
+repeated pages after a test is cancelled; it is not a tenant exploit finding.
+
+Peering reference safeguard (SEC219): both VPC names must be nonempty DNS subdomain names of at most 253 bytes, and the remote namespace a nonempty DNS label of at most 63 bytes. Reject unusable references before delegated authorization, without echoing their contents. Controller and DNS indexes omit malformed legacy halves before joining or retaining keys; reconciliation and agent replay resolve no target or grant for these halves. Unchanged legacy specs still permit metadata cleanup and deletion. Valid references retain exact spelling, namespace separation and reciprocal consent. This bounds added reference work and index keys; informer objects and aggregate object counts still require operator resource limits.
+
+Binding reference safeguard (SEC220): creation validates the VPC name and optional namespace against the same Kubernetes name bounds before export authorization. Immutable-target rejection never echoes a submitted reference. Legacy invalid targets do not reach NAD name/config construction or local grant-map hashing. The empty namespace remains the same-namespace default; unchanged legacy metadata cleanup and owner-authorized withdrawal/finalizer release keep their existing paths. These guards do not grant attachment, change pinned NIC identity or remove revocation barriers.
+
+Authorization diagnostics also omit oversized legacy reference text without altering the attributes sent to the authorizer. This preserves owner-authorized cleanup while keeping a denied withdrawal response bounded; malformed legacy reference bytes must not be repeated in the APIStatus message and cause.
+
+### Multiple workload interfaces
+
+`NetworkAttachment` was never built and is deliberately dropped. Pod attachments
+are a JSON-list annotation; the VPC owner authorizes forwarding through
+`VPCBinding`, with its existing `export` check. See [multi-attach.md](multi-attach.md).
+KubeVirt additional guest NICs use the Multus adapter and a generated
+NetworkAttachmentDefinition per binding. This does not add an attachment grant;
+the delegate CNI verifies current binding consent. See
+[kubevirt-multi-nic.md](kubevirt-multi-nic.md).

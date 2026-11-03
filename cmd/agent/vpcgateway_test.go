@@ -96,3 +96,23 @@ func TestDesiredVPCIngressOldestWins(t *testing.T) {
 		t.Error("a newer gateway must not close the real boundary's door either")
 	}
 }
+
+func TestTerminatingVPCWithdrawsIngressAndNAT(t *testing.T) {
+	vpc := vpcObj("tenant-a", "net", 101)
+	gw := gwObj(vpc.Namespace, "door", vpc.Name, true, 0)
+	gw.Spec.NAT.Enabled = true
+	gw.Status.NATAddress = "203.0.113.10"
+	gws := []*sdnv1alpha1.VPCGateway{gw}
+	vpcs := []*sdnv1alpha1.VPC{vpc}
+	if !desiredVPCIngress(gws, vpcs)[101] || len(desiredVPCNAT(gws, vpcs)) != 1 {
+		t.Fatal("live VPC grants missing")
+	}
+	now := metav1.Now()
+	vpc.DeletionTimestamp = &now
+	if got := desiredVPCIngress(gws, vpcs); len(got) != 0 {
+		t.Errorf("deleting VPC still admits LB ingress: %+v", got)
+	}
+	if got := desiredVPCNAT(gws, vpcs); len(got) != 0 {
+		t.Errorf("deleting VPC retains NAT identity: %+v", got)
+	}
+}

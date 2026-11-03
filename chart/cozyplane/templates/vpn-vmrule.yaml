@@ -1,0 +1,125 @@
+{{- if and .Values.vpn.observability.rules.enabled (.Capabilities.APIVersions.Has "operator.victoriametrics.com/v1beta1/VMRule") }}
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMRule
+metadata:
+  name: cozyplane-vpn
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cozyplane.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vpn
+    {{- with .Values.vpn.observability.rules.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: cozyplane.vpn
+      rules:
+        - alert: CozyplaneVPNConnectionDown
+          expr: max by (cluster, namespace, gateway, connection, backend) (cozyplane_vpn_connection_up{job="cozyplane-vpn-gateways"}) == 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: VPN connection {{ "{{" }} $labels.connection {{ "}}" }} is down
+            description: VPN connection {{ "{{" }} $labels.connection {{ "}}" }} on gateway {{ "{{" }} $labels.gateway {{ "}}" }} in namespace {{ "{{" }} $labels.namespace {{ "}}" }} has been down for at least two minutes.
+        - alert: CozyplaneVPNConnectionNeverHandshake
+          expr: max by (cluster, namespace, gateway, connection, backend) (cozyplane_vpn_connection_last_handshake_timestamp_seconds{job="cozyplane-vpn-gateways"}) == 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: VPN connection {{ "{{" }} $labels.connection {{ "}}" }} never completed a handshake
+            description: VPN connection {{ "{{" }} $labels.connection {{ "}}" }} on gateway {{ "{{" }} $labels.gateway {{ "}}" }} has not completed its first handshake within ten minutes.
+        - alert: CozyplaneVPNConnectionHandshakeStale
+          expr: (max by (cluster, namespace, gateway, connection, backend) (cozyplane_vpn_connection_last_handshake_timestamp_seconds{job="cozyplane-vpn-gateways",backend="wireguard"}) > 0) and (time() - max by (cluster, namespace, gateway, connection, backend) (cozyplane_vpn_connection_last_handshake_timestamp_seconds{job="cozyplane-vpn-gateways",backend="wireguard"}) > 300)
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: VPN connection {{ "{{" }} $labels.connection {{ "}}" }} handshake is stale
+            description: VPN connection {{ "{{" }} $labels.connection {{ "}}" }} on gateway {{ "{{" }} $labels.gateway {{ "}}" }} has not handshaken for over five minutes.
+        {{- if .Values.vpn.observability.rules.noTraffic.enabled }}
+        - alert: CozyplaneVPNConnectionNoTraffic
+          expr: sum by (cluster, namespace, gateway, connection, backend) (increase(cozyplane_vpn_connection_rx_bytes_total{job="cozyplane-vpn-gateways"}[{{ .Values.vpn.observability.rules.noTraffic.window }}]) + increase(cozyplane_vpn_connection_tx_bytes_total{job="cozyplane-vpn-gateways"}[{{ .Values.vpn.observability.rules.noTraffic.window }}])) == 0
+          labels:
+            severity: warning
+          annotations:
+            summary: VPN connection {{ "{{" }} $labels.connection {{ "}}" }} has no traffic
+            description: VPN connection {{ "{{" }} $labels.connection {{ "}}" }} on gateway {{ "{{" }} $labels.gateway {{ "}}" }} has transferred no traffic for {{ .Values.vpn.observability.rules.noTraffic.window }}.
+        {{- end }}
+        - alert: CozyplaneVPNScrapeFailed
+          expr: min by (cluster, namespace, gateway, pod) (up{job="cozyplane-vpn-gateways"}) == 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: VPN appliance metrics unavailable
+            description: Scraping VPN appliance {{ "{{" }} $labels.pod {{ "}}" }} in namespace {{ "{{" }} $labels.namespace {{ "}}" }} has failed for two minutes.
+        - alert: CozyplaneVPNTargetMissing
+          expr: (max by (cluster, namespace, pod) (kube_pod_container_info{container="vpn-gateway"}) unless on (cluster, namespace, pod) max by (cluster, namespace, pod) (up{job="cozyplane-vpn-gateways"})) unless on (cluster, namespace, pod) kube_pod_deletion_timestamp
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: VPN appliance missing from scrape discovery
+            description: Kubernetes reports VPN appliance {{ "{{" }} $labels.pod {{ "}}" }} in namespace {{ "{{" }} $labels.namespace {{ "}}" }}, but VictoriaMetrics has no scrape target. Check VMAgent selection and kube-state-metrics inventory.
+        - alert: CozyplaneVPNMetricsMissing
+          expr: (max by (cluster, namespace, gateway, pod) (up{job="cozyplane-vpn-gateways"}) == 1) unless on (cluster, namespace, gateway, pod) cozyplane_vpn_gateway_connections{job="cozyplane-vpn-gateways"}
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: VPN scrape has no gateway inventory metric
+            description: Appliance {{ "{{" }} $labels.pod {{ "}}" }} answers scrapes but its required VPN metrics are missing.
+        - alert: CozyplaneVPNIPsecXfrmTelemetryUnavailable
+          expr: >-
+            (min by (cluster, namespace, gateway, pod) (cozyplane_vpn_ipsec_xfrm_collection_success{job="cozyplane-vpn-gateways"}) == 0)
+            or (max by (cluster, namespace, gateway, pod) (cozyplane_vpn_gateway_connections{job="cozyplane-vpn-gateways",backend="ipsec"})
+                unless on (cluster, namespace, gateway, pod) cozyplane_vpn_ipsec_xfrm_collection_success{job="cozyplane-vpn-gateways"})
+            or ((min by (cluster, namespace, gateway, pod) (cozyplane_vpn_ipsec_xfrm_collection_success{job="cozyplane-vpn-gateways"}) == 1)
+                unless on (cluster, namespace, gateway, pod) cozyplane_vpn_ipsec_xfrm_errors_total{job="cozyplane-vpn-gateways",reason="XfrmInStateSeqError"})
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: IPsec kernel error telemetry unavailable
+            description: Appliance {{ "{{" }} $labels.pod {{ "}}" }} cannot read its namespace-local XFRM statistics or required telemetry is missing.
+        - alert: CozyplaneVPNInventoryUnavailable
+          expr: (max by (cluster, namespace, gateway, pod) (up{job="cozyplane-vpn-gateways"}) == 1) unless on (cluster, namespace, pod) (kube_pod_container_info{container="vpn-gateway"} and on (cluster, namespace, pod) kube_pod_container_status_restarts_total{container="vpn-gateway"})
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: VPN Kubernetes monitoring inventory unavailable
+            description: Appliance {{ "{{" }} $labels.pod {{ "}}" }} is scraped but lacks kube-state-metrics inventory. Missing targets and restart monitoring may be blind.
+        - alert: CozyplaneVPNResourceMetricsUnavailable
+          expr: (max by (cluster, namespace, gateway, pod) (up{job="cozyplane-vpn-gateways"}) == 1) unless on (cluster, namespace, pod) (container_cpu_usage_seconds_total{container="vpn-gateway"} and on (cluster, namespace, pod) container_memory_working_set_bytes{container="vpn-gateway"})
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: VPN resource monitoring unavailable
+            description: CPU or memory metrics for appliance {{ "{{" }} $labels.pod {{ "}}" }} are missing. Check kubelet/cAdvisor scraping.
+        - alert: CozyplaneVPNConnectionMetricsIncomplete
+          expr: >-
+            ((4 * max by (cluster, namespace, gateway, pod, backend) (cozyplane_vpn_gateway_connections{job="cozyplane-vpn-gateways",backend="wireguard"})) or
+             (6 * max by (cluster, namespace, gateway, pod, backend) (cozyplane_vpn_gateway_connections{job="cozyplane-vpn-gateways",backend="ipsec"})))
+            != on (cluster, namespace, gateway, pod, backend)
+            (count by (cluster, namespace, gateway, pod, backend) (max by (cluster, namespace, gateway, pod, backend, connection, __name__)
+              ({job="cozyplane-vpn-gateways",__name__=~"cozyplane_vpn_connection_(rx_bytes_total|tx_bytes_total|rx_packets_total|tx_packets_total|up|last_handshake_timestamp_seconds)"}))
+             or on (cluster, namespace, gateway, pod, backend) (0 * max by (cluster, namespace, gateway, pod, backend) (cozyplane_vpn_gateway_connections{job="cozyplane-vpn-gateways"})))
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: VPN connection metric families are incomplete
+            description: Appliance {{ "{{" }} $labels.pod {{ "}}" }} does not expose all required per-connection metric series for its configured connections.
+        - alert: CozyplaneVPNIPsecXfrmErrors
+          expr: sum by (cluster, namespace, gateway, reason) (rate(cozyplane_vpn_ipsec_xfrm_errors_total{job="cozyplane-vpn-gateways"}[5m])) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Sustained IPsec kernel errors
+            description: Gateway {{ "{{" }} $labels.gateway {{ "}}" }} has sustained XFRM errors of type {{ "{{" }} $labels.reason {{ "}}" }}. Replay errors can indicate reordering, not only an attack.
+{{- end }}

@@ -75,11 +75,22 @@ func TestDNSIsRedirectedNotForwarded(t *testing.T) {
 // everything else to the gateway is dropped.
 func TestInputRestrictedToDNS(t *testing.T) {
 	assertRules(t, inputRules("eth1", false), []string{
+		"! -i eth1 -p udp --dport 53 -j DROP",
+		"! -i eth1 -p tcp --dport 53 -j DROP",
 		"-i eth1 -p udp --dport 53 -j ACCEPT",
 		"-i eth1 -p tcp --dport 53 -j ACCEPT",
 		"-i eth1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
 		"-i eth1 -j DROP",
 	})
+}
+
+func TestDNSRejectsNonVPCBeforeEveryAccept(t *testing.T) {
+	for _, v6 := range []bool{false, true} {
+		rules := joined(inputRules("eth1", v6))
+		if len(rules) < 2 || rules[0] != "! -i eth1 -p udp --dport 53 -j DROP" || rules[1] != "! -i eth1 -p tcp --dport 53 -j DROP" {
+			t.Fatalf("v6=%v: fabric/loopback DNS bypasses filter: %v", v6, rules)
+		}
+	}
 }
 
 func TestNATMasqueradesFabricLegOnly(t *testing.T) {

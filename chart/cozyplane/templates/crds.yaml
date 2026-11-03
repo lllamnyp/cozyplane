@@ -3,19 +3,15 @@
        must work before cert-manager, before etcd, and before cozyplane's own
        aggregated apiserver (all of which are default-network pods).
 
-       The TENANT kinds (VPC, Port, SecurityGroup, HostFirewall, ...) are NOT
-       here and never will be: they are served only by the aggregated apiserver
-       (chart/cozyplane-apiserver). One group served by two mechanisms makes the
-       kube-apiserver's OpenAPI merge collide on duplicated paths, and the
-       group's schema then never serves — which breaks `kubectl apply` for every
-       object in it while core types keep working. See docs/api-groups.md. */ -}}
+       Tenant kinds are selected separately by api.mode in tenant-crds.yaml.
+       FabricIP is always a local-group CRD and has no webhook dependency. */ -}}
 {{- if .Values.crds.enabled }}
 ---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.19.0
+    controller-gen.kubebuilder.io/version: v0.20.1
   name: fabricips.local.sdn.cozystack.io
 spec:
   group: local.sdn.cozystack.io
@@ -81,6 +77,14 @@ spec:
                   escaped form). This is the underlay identity of a pod: `status.podIP` for
                   a default-network pod, and the fabric handle of a VPC pod.
                 type: string
+              containerID:
+                description: |-
+                  ContainerID and IfName identify the CNI sandbox allocation. Pod UID alone
+                  is insufficient: a pod can replace its sandbox without changing its UID.
+                  Empty ContainerID denotes a legacy or repaired claim, never released by DEL.
+                type: string
+              ifName:
+                type: string
               node:
                 description: |-
                   Node is the node the claiming pod runs on. Informational for a flat pool
@@ -92,8 +96,8 @@ spec:
               podNamespace:
                 description: |-
                   PodNamespace, PodName and PodUID identify the claimant. The UID is the
-                  load-bearing one: GC keys on it, so a pod that reuses a name can never
-                  have its address reaped by the previous occupant's DEL.
+                  identity used by GC, so a pod that reuses a name cannot keep the previous
+                  occupant's claims alive. DEL uses the sandbox identity below.
                 type: string
               podUID:
                 type: string

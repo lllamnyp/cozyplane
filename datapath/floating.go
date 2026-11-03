@@ -243,6 +243,41 @@ func (m *Manager) EnsureFloatingUplink(publicIP string) error {
 	return m.bindFloatUplink(link, ip, r.Gw)
 }
 
+// SetFloatingNextHopIPv4 configures connected external pools before the
+// manager starts. Routed external addresses keep their FIB next hop.
+func (m *Manager) SetFloatingNextHopIPv4(raw string) error {
+	if raw == "" {
+		m.floatingNextHopIPv4 = nil
+		return nil
+	}
+	ip := net.ParseIP(raw)
+	if ip == nil || ip.To4() == nil || !ip.IsGlobalUnicast() || ip.IsLoopback() {
+		return fmt.Errorf("floating next hop must be an IPv4 unicast router address")
+	}
+	m.floatingNextHopIPv4 = ip.To4()
+	return nil
+}
+
+func floatingNextHop(subnet *net.IPNet, firstHost, routeGateway, configured net.IP) (net.IP, error) {
+	if routeGateway != nil {
+		return routeGateway, nil
+	}
+	if configured == nil {
+		return firstHost, nil
+	}
+	if !subnet.Contains(configured) || configured.Equal(subnet.IP) {
+		return nil, fmt.Errorf("configured floating next hop is outside the external interface's host range")
+	}
+	broadcast := append(net.IP(nil), subnet.IP.To4()...)
+	for i := range broadcast {
+		broadcast[i] |= ^subnet.Mask[i]
+	}
+	if configured.Equal(broadcast) {
+		return nil, fmt.Errorf("configured floating next hop is a broadcast address")
+	}
+	return configured, nil
+}
+
 // bindFloatUplink attaches from_uplink at link's ingress and programs the egress
 // ifindex, the covering subnet and the off-subnet next-hop. gw is the FIB's next
 // hop for a routed address: the VIP is then off this link's subnet, so the
@@ -267,9 +302,9 @@ func (m *Manager) bindFloatUplink(link netlink.Link, ip, gw net.IP) error {
 		// break every floating and LB reply on the node.
 		return fmt.Errorf("floating uplink %s carries no subnet covering %s", link.Attrs().Name, anchor)
 	}
-	nh := firstHost
-	if gw != nil {
-		nh = gw
+	nh, err := floatingNextHop(subnet, firstHost, gw, m.floatingNextHopIPv4)
+	if err != nil {
+		return err
 	}
 
 	// Serialized: several watchers call this on the same event cascade, and a
@@ -328,7 +363,11 @@ func (m *Manager) bindFloatUplink(link netlink.Link, ip, gw net.IP) error {
 	// ifindex first: on a FIRST bind it leaves the window at (new link, nh 0),
 	// which falls back to a plain FIB lookup, rather than (default link, new
 	// nh), whose next-hop is not reachable there.
-	if err := m.objs.Params.Put(cfgFloatIfindex, uint32(idx)); err != nil {
+	index, err := Ifindex(idx)
+	if err != nil {
+		return err
+	}
+	if err := m.objs.Params.Put(cfgFloatIfindex, index); err != nil {
 		return fmt.Errorf("set floating uplink ifindex: %w", err)
 	}
 	if err := m.objs.Params.Put(cfgFloatNH, want.nh); err != nil {
@@ -376,11 +415,81 @@ func (m *Manager) SetFloating(publicIP, vpcIP string, net_ uint32) error {
 	if err != nil {
 		return fmt.Errorf("vpc IP: %w", err)
 	}
+	var previous overlayBridgeEp
+	lookupErr := m.objs.Floating.Lookup(&pub, &previous)
+	if lookupErr != nil && !isNotExist(lookupErr) {
+		return fmt.Errorf("read previous floating %s: %w", publicIP, lookupErr)
+	}
+	// Withdraw the predecessor before publishing the replacement, also freeing
+	// its reverse slot so a same-address retarget succeeds at map capacity.
+	if lookupErr == nil && (previous.Net != net_ || previous.VpcIp != vpc) {
+		if err := m.delFloatingEgressOwned(overlayLocalKey{Net: previous.Net, Ip: previous.VpcIp}, pub); err != nil {
+			return err
+		}
+	}
 	if err := m.objs.Floating.Put(&pub, &overlayBridgeEp{Net: net_, VpcIp: vpc}); err != nil {
 		return fmt.Errorf("set floating %s: %w", publicIP, err)
 	}
 	if err := m.objs.FloatingEgress.Put(&overlayLocalKey{Net: net_, Ip: vpc}, &pub); err != nil {
 		return fmt.Errorf("set floating egress %s: %w", publicIP, err)
+	}
+	return nil
+}
+
+func (m *Manager) delFloatingEgressOwned(key overlayLocalKey, pub overlayAddr128) error {
+	var current overlayAddr128
+	if err := m.objs.FloatingEgress.Lookup(key, &current); err != nil {
+		if isNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if current == pub {
+		if err := m.objs.FloatingEgress.Delete(key); err != nil && !isNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+// FloatingTarget identifies a tenant leg in a complete floating projection.
+type FloatingTarget struct {
+	VNI   uint32
+	VPCIP string
+}
+
+// SyncFloating preflights and reconciles both map directions, pruning orphan
+// SNAT entries that can no longer be discovered from the forward map alone.
+func (m *Manager) SyncFloating(targets map[string]FloatingTarget) error {
+	forward := map[overlayAddr128]overlayBridgeEp{}
+	reverse := map[overlayLocalKey]overlayAddr128{}
+	for public, target := range targets {
+		pubIP, vpcIP := net.ParseIP(public), net.ParseIP(target.VPCIP)
+		if pubIP == nil || vpcIP == nil || (pubIP.To4() != nil) != (vpcIP.To4() != nil) || target.VNI == 0 {
+			return fmt.Errorf("invalid floating identity %q -> VNI %d address %q", public, target.VNI, target.VPCIP)
+		}
+		pub, _ := addr128(pubIP)
+		vpc, _ := addr128(vpcIP)
+		ep := overlayBridgeEp{Net: target.VNI, VpcIp: vpc}
+		key := overlayLocalKey{Net: target.VNI, Ip: vpc}
+		if old, ok := forward[pub]; ok && old != ep {
+			return fmt.Errorf("floating address %s has multiple targets", public)
+		}
+		if old, ok := reverse[key]; ok && old != pub {
+			return fmt.Errorf("floating target has multiple public addresses")
+		}
+		if err := putDesired(m.objs.Floating, forward, pub, ep); err != nil {
+			return err
+		}
+		if err := putDesired(m.objs.FloatingEgress, reverse, key, pub); err != nil {
+			return err
+		}
+	}
+	if err := syncMap(m.objs.FloatingEgress, reverse); err != nil {
+		return fmt.Errorf("sync floating egress: %w", err)
+	}
+	if err := syncMap(m.objs.Floating, forward); err != nil {
+		return fmt.Errorf("sync floating ingress: %w", err)
 	}
 	return nil
 }
@@ -402,9 +511,8 @@ func (m *Manager) DelFloating(publicIP string) error {
 	var ep overlayBridgeEp
 	if err := m.objs.Floating.Lookup(&pub, &ep); err == nil {
 		key := overlayLocalKey{Net: ep.Net, Ip: ep.VpcIp}
-		var cur overlayAddr128
-		if err := m.objs.FloatingEgress.Lookup(&key, &cur); err == nil && cur == pub {
-			_ = m.objs.FloatingEgress.Delete(&key)
+		if err := m.delFloatingEgressOwned(key, pub); err != nil {
+			return err
 		}
 	}
 	if err := m.objs.Floating.Delete(&pub); err != nil && !isNotExist(err) {
@@ -586,13 +694,20 @@ func extLinksToPrune(have map[overlayLpmKey]overlayExtEgress, idx int, keep []ov
 // extEgressVal builds the map value: the link, its router, and its subnet for
 // the on/off-subnet test the datapath makes against a destination.
 func extEgressVal(idx int, subnet *net.IPNet, nh net.IP) (overlayExtEgress, error) {
+	index, err := Ifindex(idx)
+	if err != nil {
+		return overlayExtEgress{}, err
+	}
+	if _, _, err := cidrAddressPrefix(subnet); err != nil {
+		return overlayExtEgress{}, err
+	}
 	base := subnet.IP.Mask(subnet.Mask).To4()
 	mask := net.IP(subnet.Mask).To4()
 	if base == nil || mask == nil {
 		return overlayExtEgress{}, fmt.Errorf("ext link %s is not v4", subnet)
 	}
 	v := overlayExtEgress{
-		Ifindex: uint32(idx),
+		Ifindex: index,
 		Base:    binary.NativeEndian.Uint32(base),
 		Mask:    binary.NativeEndian.Uint32(mask),
 	}

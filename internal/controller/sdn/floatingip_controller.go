@@ -29,12 +29,15 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/lllamnyp/cozyplane/api/sdn"
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
+	"github.com/lllamnyp/cozyplane/internal/floatingvalidation"
 )
 
 // FloatingIPReconciler gives a FloatingIP an externally-routable address by owning
@@ -58,6 +61,7 @@ type FloatingIPReconciler struct {
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=floatingips,verbs=get;list;watch
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=floatingips/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=ports,verbs=get;list;watch
+// +kubebuilder:rbac:groups=sdn.cozystack.io,resources=vpcs,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;create;update;patch;delete
 
@@ -70,6 +74,24 @@ func (r *FloatingIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	fip := &sdnv1alpha1.FloatingIP{}
 	if err := r.Get(ctx, req.NamespacedName, fip); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if errs := floatingvalidation.Validate(fip.Spec.VPCRef.Name, fip.Spec.Target, fip.Spec.LoadBalancerClass, fip.Spec.AddressClaimName); len(errs) != 0 {
+		if err := r.deleteOwnedService(ctx, fip); err != nil {
+			return ctrl.Result{}, err
+		}
+		status := sdnv1alpha1.FloatingIPStatus{Phase: sdnv1alpha1.FloatingIPPhasePending}
+		setFIPCondition(&status, sdnv1alpha1.FloatingIPConditionTargetExclusive, false, "InvalidSpec", "FloatingIP spec must contain usable references and an IP target")
+		if !fipStatusEqual(fip.Status, status) {
+			status.Conditions[0].ObservedGeneration = fip.Generation
+			fip.Status = status
+			if err := r.Status().Update(ctx, fip); err != nil {
+				if apierrors.IsConflict(err) {
+					return ctrl.Result{Requeue: true}, nil
+				}
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
 	}
 
 	// The address is delivered to the node hosting the target's Port. A live Port
@@ -86,7 +108,7 @@ func (r *FloatingIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// First writer wins (oldest, then by name); the loser gets no Service and stays
 	// Pending.
 	conflict := r.conflictingFIP(ctx, fip)
-	exclusive := conflict == ""
+	exclusive := conflict == "" && fip.DeletionTimestamp == nil
 
 	// The address comes from a Service this FloatingIP owns: a type: LoadBalancer
 	// carrying service-proxy-name, so every proxy skips its datapath while the
@@ -274,7 +296,7 @@ func (r *FloatingIPReconciler) deleteOwnedService(ctx context.Context, fip *sdnv
 	if err != nil || svc == nil {
 		return err
 	}
-	if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
+	if err := r.Delete(ctx, svc, client.Preconditions{UID: &svc.UID, ResourceVersion: &svc.ResourceVersion}); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete floating service: %w", err)
 	}
 	return nil
@@ -317,9 +339,7 @@ func (r *FloatingIPReconciler) ensureEndpointSlice(ctx context.Context, svc *cor
 	}}
 
 	key := client.ObjectKey{Namespace: svc.Namespace, Name: svc.Name}
-	existing := &discoveryv1.EndpointSlice{}
-	switch err := r.Get(ctx, key, existing); {
-	case apierrors.IsNotFound(err):
+	create := func() error {
 		slice := &discoveryv1.EndpointSlice{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      svc.Name,
@@ -341,16 +361,24 @@ func (r *FloatingIPReconciler) ensureEndpointSlice(ctx context.Context, svc *cor
 			return fmt.Errorf("create endpointslice: %w", err)
 		}
 		return nil
+	}
+	existing := &discoveryv1.EndpointSlice{}
+	switch err := r.Get(ctx, key, existing); {
+	case apierrors.IsNotFound(err):
+		return create()
 	case err != nil:
 		return fmt.Errorf("get endpointslice: %w", err)
 	}
 
 	// AddressType is immutable; a family change (target edited) needs a recreate.
+	if !metav1.IsControlledBy(existing, svc) {
+		return fmt.Errorf("endpointslice %s/%s is not controlled by service UID %s", existing.Namespace, existing.Name, svc.UID)
+	}
 	if existing.AddressType != addrType {
-		if err := r.Delete(ctx, existing); err != nil && !apierrors.IsNotFound(err) {
+		if err := r.Delete(ctx, existing, client.Preconditions{UID: &existing.UID, ResourceVersion: &existing.ResourceVersion}); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("delete endpointslice for family change: %w", err)
 		}
-		return r.ensureEndpointSlice(ctx, svc, fip, node)
+		return create()
 	}
 	existing.Endpoints = []discoveryv1.Endpoint{ep}
 	existing.Ports = desiredPorts
@@ -380,18 +408,17 @@ func ingressAddress(svc *corev1.Service) string {
 // VPCRef namespace is the VPC owner's, which for a FloatingIP's local vpcRef is
 // the FloatingIP's own namespace.
 func (r *FloatingIPReconciler) targetLiveNode(ctx context.Context, fip *sdnv1alpha1.FloatingIP) string {
-	var list sdnv1alpha1.PortList
-	if err := r.List(ctx, &list); err != nil {
+	vpc := &sdnv1alpha1.VPC{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: fip.Namespace, Name: fip.Spec.VPCRef.Name}, vpc); err != nil || vpc.DeletionTimestamp != nil || vpc.Status.VNI <= 0 {
 		return ""
 	}
-	for i := range list.Items {
-		p := &list.Items[i]
-		if p.Spec.VPCRef.Namespace == fip.Namespace &&
-			p.Spec.VPCRef.Name == fip.Spec.VPCRef.Name &&
-			p.Spec.IP == fip.Spec.Target &&
-			p.Spec.Node != "" {
-			return p.Spec.Node
-		}
+	ip, err := netip.ParseAddr(fip.Spec.Target)
+	if err != nil {
+		return ""
+	}
+	p := &sdnv1alpha1.Port{}
+	if err := r.Get(ctx, client.ObjectKey{Name: sdn.PortName(vpc.Status.VNI, ip.Unmap().String())}, p); err == nil && currentVPCPortClaim(p, vpc) && p.Spec.Node != "" {
+		return p.Spec.Node
 	}
 	return ""
 }
@@ -405,24 +432,18 @@ func (r *FloatingIPReconciler) targetLiveNode(ctx context.Context, fip *sdnv1alp
 // target's {net, VPC IP}, so the last writer simply wins and the loser's clients
 // break silently (see FloatingIPConditionTargetExclusive).
 func (r *FloatingIPReconciler) conflictingFIP(ctx context.Context, fip *sdnv1alpha1.FloatingIP) string {
+	key := floatingTargetKey(fip)
+	if key == "" {
+		return "invalid target"
+	}
 	var list sdnv1alpha1.FloatingIPList
-	if err := r.List(ctx, &list, client.InNamespace(fip.Namespace)); err != nil {
+	if err := r.List(ctx, &list, client.InNamespace(fip.Namespace), client.MatchingFields{floatingTargetIndex: key}); err != nil {
 		// Fail closed: an unverifiable target is not provably ours, and programming
 		// it could break a binding that already works.
 		return "unknown (FloatingIP list failed)"
 	}
-	for i := range list.Items {
-		other := &list.Items[i]
-		if other.Name == fip.Name ||
-			other.Spec.VPCRef.Name != fip.Spec.VPCRef.Name ||
-			other.Spec.Target != fip.Spec.Target ||
-			!other.DeletionTimestamp.IsZero() {
-			continue
-		}
-		if other.CreationTimestamp.Time.Before(fip.CreationTimestamp.Time) ||
-			(other.CreationTimestamp.Equal(&fip.CreationTimestamp) && other.Name < fip.Name) {
-			return other.Name
-		}
+	if winner := sdnv1alpha1.EffectiveFloatingIP(list.Items, fip.Spec.VPCRef.Name, fip.Spec.Target); winner != nil && winner.Name != fip.Name {
+		return winner.Name
 	}
 	return ""
 }
@@ -480,17 +501,36 @@ func fipStatusEqual(a, b sdnv1alpha1.FloatingIPStatus) bool {
 // drives the endpoint's Ready condition), and when another FloatingIP changes (a
 // target may have freed up).
 func (r *FloatingIPReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &sdnv1alpha1.FloatingIP{}, floatingTargetIndex, floatingTargetIndexKeys); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&sdnv1alpha1.FloatingIP{}).
 		Owns(&corev1.Service{}). // re-reconcile when the owned Service's LB ingress is filled
+		Watches(&sdnv1alpha1.VPC{}, handler.EnqueueRequestsFromMapFunc(r.mapVPCToFloatingIPs)).
 		Watches(&sdnv1alpha1.Port{}, handler.EnqueueRequestsFromMapFunc(r.mapPortToFloatingIPs)).
-		Watches(&sdnv1alpha1.FloatingIP{}, handler.EnqueueRequestsFromMapFunc(r.mapToPendingFloatingIPs)).
+		Watches(&sdnv1alpha1.FloatingIP{}, handler.EnqueueRequestsFromMapFunc(r.mapTargetToFloatingIPs), builder.WithPredicates(floatingContenderEvents())).
 		Named("floatingip").
 		Complete(r)
 }
 
 // mapPortToFloatingIPs enqueues FloatingIPs whose target IP matches the changed
 // Port's VPC and IP — their liveness gate turns on/off with the Port.
+func (r *FloatingIPReconciler) mapVPCToFloatingIPs(ctx context.Context, obj client.Object) []ctrl.Request {
+	var list sdnv1alpha1.FloatingIPList
+	if err := r.List(ctx, &list, client.InNamespace(obj.GetNamespace())); err != nil {
+		return nil
+	}
+	var out []ctrl.Request
+	for i := range list.Items {
+		f := &list.Items[i]
+		if f.Spec.VPCRef.Name == obj.GetName() {
+			out = append(out, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(f)})
+		}
+	}
+	return out
+}
+
 func (r *FloatingIPReconciler) mapPortToFloatingIPs(ctx context.Context, obj client.Object) []ctrl.Request {
 	port, ok := obj.(*sdnv1alpha1.Port)
 	if !ok {
@@ -499,33 +539,40 @@ func (r *FloatingIPReconciler) mapPortToFloatingIPs(ctx context.Context, obj cli
 	// A local vpcRef resolves in the VPC owner's namespace, which is the Port's
 	// VPCRef namespace.
 	var list sdnv1alpha1.FloatingIPList
-	if err := r.List(ctx, &list, client.InNamespace(port.Spec.VPCRef.Namespace)); err != nil {
+	key := floatingTargetKey(&sdnv1alpha1.FloatingIP{Spec: sdnv1alpha1.FloatingIPSpec{VPCRef: sdnv1alpha1.LocalVPCRef{Name: port.Spec.VPCRef.Name}, Target: port.Spec.IP}})
+	if key == "" {
+		return nil
+	}
+	if err := r.List(ctx, &list, client.InNamespace(port.Spec.VPCRef.Namespace), client.MatchingFields{floatingTargetIndex: key}); err != nil {
 		return nil
 	}
 	var reqs []ctrl.Request
 	for i := range list.Items {
 		f := &list.Items[i]
-		if f.Spec.VPCRef.Name == port.Spec.VPCRef.Name && f.Spec.Target == port.Spec.IP {
-			reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: f.Namespace, Name: f.Name}})
-		}
+		reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: f.Namespace, Name: f.Name}})
 	}
 	return reqs
 }
 
-// mapToPendingFloatingIPs enqueues every not-yet-Ready FloatingIP when any
-// FloatingIP changes: a delete (or an address change) may have freed an address
-// a Pending binding is waiting for.
-func (r *FloatingIPReconciler) mapToPendingFloatingIPs(ctx context.Context, obj client.Object) []ctrl.Request {
+// mapTargetToFloatingIPs revisits the changed binding's target contenders,
+// including Ready ones that can lose ownership when an older binding retargets.
+func (r *FloatingIPReconciler) mapTargetToFloatingIPs(ctx context.Context, obj client.Object) []ctrl.Request {
+	fip, ok := obj.(*sdnv1alpha1.FloatingIP)
+	if !ok {
+		return nil
+	}
+	key := floatingTargetKey(fip)
+	if key == "" {
+		return nil
+	}
 	var list sdnv1alpha1.FloatingIPList
-	if err := r.List(ctx, &list); err != nil {
+	if err := r.List(ctx, &list, client.InNamespace(fip.Namespace), client.MatchingFields{floatingTargetIndex: key}); err != nil {
 		return nil
 	}
 	var reqs []ctrl.Request
 	for i := range list.Items {
 		f := &list.Items[i]
-		if f.Status.Phase != sdnv1alpha1.FloatingIPPhaseReady {
-			reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: f.Namespace, Name: f.Name}})
-		}
+		reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: f.Namespace, Name: f.Name}})
 	}
 	return reqs
 }

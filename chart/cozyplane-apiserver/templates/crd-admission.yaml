@@ -1,0 +1,161 @@
+{{- if eq .Values.api.mode "crd" }}
+{{- $ns := .Release.Namespace }}
+{{- $secret := default "cozyplane-admission-serving" .Values.admission.tls.existingSecret }}
+{{- if and .Values.admission.tls.existingSecret (not .Values.admission.tls.caBundle) }}
+{{- fail "admission.tls.existingSecret requires a trusted admission.tls.caBundle" }}
+{{- end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cozyplane-admission
+  namespace: {{ $ns }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cozyplane-admission
+rules:
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+  - apiGroups: ["sdn.cozystack.io"]
+    resources: ["ports", "servicevips"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cozyplane-admission
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cozyplane-admission
+subjects:
+  - kind: ServiceAccount
+    name: cozyplane-admission
+    namespace: {{ $ns }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cozyplane-admission
+  namespace: {{ $ns }}
+spec:
+  type: ClusterIP
+  selector:
+    app: cozyplane-admission
+  ports:
+    - name: https
+      port: 443
+      targetPort: 9443
+---
+{{- if not .Values.admission.tls.existingSecret }}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: cozyplane-admission-selfsign
+  namespace: {{ $ns }}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: cozyplane-admission-ca
+  namespace: {{ $ns }}
+spec:
+  isCA: true
+  commonName: cozyplane-admission-ca
+  secretName: cozyplane-admission-ca
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: cozyplane-admission-selfsign
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: cozyplane-admission-ca
+  namespace: {{ $ns }}
+spec:
+  ca:
+    secretName: cozyplane-admission-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: cozyplane-admission-serving
+  namespace: {{ $ns }}
+spec:
+  secretName: cozyplane-admission-serving
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: cozyplane-admission-ca
+    kind: Issuer
+  dnsNames:
+    - cozyplane-admission.{{ $ns }}.svc
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cozyplane-admission
+  namespace: {{ $ns }}
+spec:
+  replicas: {{ .Values.admission.replicas }}
+  selector:
+    matchLabels:
+      app: cozyplane-admission
+  template:
+    metadata:
+      labels:
+        app: cozyplane-admission
+    spec:
+      serviceAccountName: cozyplane-admission
+      {{- include "cozyplane-apiserver.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: admission
+          image: {{ .Values.image }}
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          command: ["/usr/local/bin/cozyplane-admission"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: https
+              containerPort: 9443
+          resources:
+            {{- toYaml .Values.admission.resources | nindent 12 }}
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ $secret }}
+            defaultMode: 0440
+{{- end }}

@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+: "${VPN_BACKEND:=wireguard}"
+: "${VPN_CONFIG:=/etc/cozyplane-vpn/config.json}"
+export VPN_CONFIG
+
+case "$VPN_BACKEND" in
+wireguard)
+    exec /usr/local/bin/cozyplane-vpn-gateway
+    ;;
+ipsec)
+    exec /usr/local/bin/cozyplane-vpn-gateway-ipsec
+    ;;
+*)
+    echo "unsupported VPN_BACKEND: $VPN_BACKEND" >&2
+    exit 64
+    ;;
+esac

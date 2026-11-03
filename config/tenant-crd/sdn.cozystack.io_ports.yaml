@@ -1,0 +1,180 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.19.0
+  name: ports.sdn.cozystack.io
+spec:
+  group: sdn.cozystack.io
+  names:
+    kind: Port
+    listKind: PortList
+    plural: ports
+    singular: port
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.vpcRef.name
+      name: VPC
+      type: string
+    - jsonPath: .spec.vpcRef.namespace
+      name: VPCNamespace
+      type: string
+    - jsonPath: .spec.ip
+      name: IP
+      type: string
+    - jsonPath: .spec.node
+      name: Node
+      type: string
+    - jsonPath: .spec.podName
+      name: Pod
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Port is a pod's realized interface on a VPC.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              PortSpec is the realized network interface of a pod on a VPC.
+
+              A Port is cluster-scoped and its name encodes the VPC's VNI and the IP
+              (v<vni>.<ip-with-dashes>), so creating it is an atomic claim on that IP within
+              the VPC — etcd name uniqueness serializes concurrent allocators. The VNI is
+              globally unique, so the name stays unique even though VPCs are namespaced.
+            properties:
+              forwarding:
+                description: |-
+                  Forwarding marks a port allowed to emit packets sourced from an address
+                  that is not its own — a tenant router or firewall bridging two VPCs
+                  (docs/multi-attach.md). The CNI sets it from the VPCBinding's
+                  spec.allowForwarding; the datapath honours it as PORT_F_FORWARD, which
+                  lifts from_pod's source RPF check and marks the packet FWD_MARK so the
+                  destination's isolation check admits an off-VPC source — but, unlike a
+                  gateway, that source is then re-judged by the destination's
+                  SecurityGroups as a north-south source (a from:{cidr} rule). Deliberately
+                  NOT PORT_F_GATEWAY, which would skip east-west policy entirely.
+
+                  DISTINCT from Gateway, and it must stay that way. Gateway means "this is
+                  the VPC's .1 egress leg" and is what desiredGateways reads to program
+                  gateways[vni]; a forwarding port is not the VPC's door and must never be
+                  programmed as one. They happen to share a datapath flag, not a meaning.
+                type: boolean
+              gateway:
+                description: |-
+                  Gateway marks the VPC's gateway port (the .1 leg of the egress gateway
+                  pod); agents route off-VPC traffic to it.
+                type: boolean
+              ip:
+                description: |-
+                  IP is the address allocated to the pod within the VPC CIDR (the tenant
+                  address configured inside the pod).
+                type: string
+              mac:
+                description: MAC is the pod interface MAC address.
+                type: string
+              node:
+                description: Node is the name of the node hosting the pod.
+                type: string
+              nodeIP:
+                description: NodeIP is the host IP of that node (the Geneve tunnel
+                  endpoint).
+                type: string
+              podName:
+                type: string
+              podNamespace:
+                description: PodNamespace and PodName identify the owning pod.
+                type: string
+              primary:
+                description: |-
+                  Primary is set by the CNI only for the default network attachment.
+                  A managed boundary denies Internet initiations on secondary legs.
+                type: boolean
+              vpcRef:
+                description: VPCRef identifies the VPC this port belongs to (owner
+                  namespace + name).
+                properties:
+                  name:
+                    description: Name is the VPC name within that namespace.
+                    type: string
+                  namespace:
+                    description: |-
+                      Namespace is the namespace that owns the VPC.
+                      Omitted namespace resolves locally for namespaced binding consumers.
+                    type: string
+                required:
+                - name
+                type: object
+            required:
+            - ip
+            - node
+            - nodeIP
+            - vpcRef
+            type: object
+          status:
+            description: PortStatus is the controller-observed state of a Port.
+            properties:
+              groupPodUID:
+                description: GroupPodUID identifies the pod whose labels resolved
+                  this membership.
+                type: string
+              groupRefs:
+                description: GroupRefs proves the current SecurityGroup UID behind
+                  each allocated ID.
+                items:
+                  description: |-
+                    SecurityGroupMembership prevents a recycled numeric ID from granting the
+                    permissions of a replacement group to predecessor Ports.
+                  properties:
+                    id:
+                      format: int32
+                      type: integer
+                    uid:
+                      description: |-
+                        UID is a type that holds unique ID values, including UUIDs.  Because we
+                        don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                        intent and helps make sure that UIDs and names do not get conflated.
+                      type: string
+                  required:
+                  - id
+                  - uid
+                  type: object
+                type: array
+                x-kubernetes-list-type: atomic
+              groups:
+                description: |-
+                  Groups is the set of SecurityGroup numeric ids (1..62, within the Port's
+                  VPC) this Port is a member of, resolved by the controller from the pod's
+                  labels. The agent folds it into the datapath membership bitmap. Empty
+                  means "no groups" — legacy allow-all intra-VPC ingress.
+                  Zero denotes a selected group awaiting allocation: default-deny without
+                  granting rules. Resolved groups still union their permissions normally.
+                items:
+                  format: int32
+                  type: integer
+                type: array
+                x-kubernetes-list-type: atomic
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -71,6 +71,10 @@ func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Sdn().V1alpha1().VPCGateways().Informer()}, nil
 	case v1alpha1.SchemeGroupVersion.WithResource("vpcpeerings"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Sdn().V1alpha1().VPCPeerings().Informer()}, nil
+	case v1alpha1.SchemeGroupVersion.WithResource("vpnconnections"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Sdn().V1alpha1().VPNConnections().Informer()}, nil
+	case v1alpha1.SchemeGroupVersion.WithResource("vpngateways"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Sdn().V1alpha1().VPNGateways().Informer()}, nil
 
 	}
 

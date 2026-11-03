@@ -19,8 +19,12 @@ package vpcgateway
 import (
 	"context"
 	"errors"
+	"github.com/lllamnyp/cozyplane/pkg/registry/sdn/authz"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
+	"reflect"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
+	"github.com/lllamnyp/cozyplane/internal/vpnlimits"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -59,13 +63,13 @@ func SelectableFields(obj *sdn.VPCGateway) fields.Set {
 type vpcGatewayStrategy struct {
 	runtime.ObjectTyper
 	names.NameGenerator
+	auth authorizer.Authorizer
 }
 
-// NewStrategy creates and returns a vpcGatewayStrategy instance. The gateway
-// needs no escalation gate anymore: who may mint the public address it draws is
-// Service RBAC + the allocator's scoping (docs/external-addresses.md §8).
-func NewStrategy(typer runtime.ObjectTyper) vpcGatewayStrategy {
-	return vpcGatewayStrategy{typer, names.SimpleNameGenerator}
+// NewStrategy separately authorizes changes to operator-managed gateways.
+// Ordinary gateway address allocation remains governed by Service RBAC.
+func NewStrategy(typer runtime.ObjectTyper, auth authorizer.Authorizer) vpcGatewayStrategy {
+	return vpcGatewayStrategy{typer, names.SimpleNameGenerator, auth}
 }
 
 func (vpcGatewayStrategy) NamespaceScoped() bool {
@@ -87,13 +91,38 @@ func (vpcGatewayStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime
 }
 
 func (s vpcGatewayStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
-	gw := obj.(*sdn.VPCGateway)
-	var errs field.ErrorList
-	specPath := field.NewPath("spec")
-	if gw.Spec.VPCRef.Name == "" {
-		errs = append(errs, field.Required(specPath.Child("vpcRef", "name"), "the VPC name is required"))
+	if err := authz.CheckManaged(ctx, s.auth, "vpcgateways", obj, nil); err != nil {
+		return field.ErrorList{err}
 	}
-	return errs
+	return validateGatewaySpec(obj.(*sdn.VPCGateway))
+}
+
+func validateGatewaySpec(gw *sdn.VPCGateway) field.ErrorList {
+	path := field.NewPath("spec")
+	if errs := vpnlimits.ReferenceErrors(gw.Spec.VPCRef.Name, path.Child("vpcRef", "name"), true); len(errs) != 0 {
+		return errs
+	}
+	if len(gw.Spec.Routes) > vpnlimits.RoutePrefixes {
+		return field.ErrorList{field.TooMany(path.Child("routes"), len(gw.Spec.Routes), vpnlimits.RoutePrefixes)}
+	}
+	if gw.Spec.Appliance != nil {
+		if errs := vpnlimits.NamespaceReferenceErrors(gw.Spec.Appliance.Namespace, path.Child("appliance", "namespace")); len(errs) != 0 {
+			return errs
+		}
+	}
+	prefixes := 0
+	for i := range gw.Spec.Routes {
+		route := &gw.Spec.Routes[i]
+		routePath := path.Child("routes").Index(i)
+		if errs := vpnlimits.NamespaceReferenceErrors(route.Via.Namespace, routePath.Child("via", "namespace")); len(errs) != 0 {
+			return errs
+		}
+		if len(route.CIDRs) > vpnlimits.RoutePrefixes-prefixes {
+			return field.ErrorList{field.TooMany(routePath.Child("cidrs"), len(route.CIDRs), vpnlimits.RoutePrefixes-prefixes)}
+		}
+		prefixes += len(route.CIDRs)
+	}
+	return nil
 }
 
 // WarningsOnCreate returns warnings for the creation of the given object.
@@ -113,7 +142,13 @@ func (vpcGatewayStrategy) Canonicalize(obj runtime.Object) {
 }
 
 func (s vpcGatewayStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
-	return field.ErrorList{}
+	if err := authz.CheckManaged(ctx, s.auth, "vpcgateways", obj, old); err != nil {
+		return field.ErrorList{err}
+	}
+	if reflect.DeepEqual(obj.(*sdn.VPCGateway).Spec, old.(*sdn.VPCGateway).Spec) {
+		return nil
+	}
+	return validateGatewaySpec(obj.(*sdn.VPCGateway))
 }
 
 // WarningsOnUpdate returns warnings for the given update.
@@ -136,6 +171,7 @@ func (vpcGatewayStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old r
 	newPeering := obj.(*sdn.VPCGateway)
 	oldPeering := old.(*sdn.VPCGateway)
 	newPeering.Spec = oldPeering.Spec
+	authz.PreserveManager(obj, old)
 }
 
 func (vpcGatewayStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {

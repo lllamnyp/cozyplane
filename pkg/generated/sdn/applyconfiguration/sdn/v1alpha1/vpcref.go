@@ -25,6 +25,7 @@ package v1alpha1
 // owner's namespace, not necessarily the referrer's.
 type VPCRefApplyConfiguration struct {
 	// Namespace is the namespace that owns the VPC.
+	// Omitted namespace resolves locally for namespaced binding consumers.
 	Namespace *string `json:"namespace,omitempty"`
 	// Name is the VPC name within that namespace.
 	Name *string `json:"name,omitempty"`

@@ -20,8 +20,10 @@ import (
 	"time"
 
 	"context"
+	"sync"
 	"testing"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -38,7 +40,44 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	if err := sdnv1alpha1.AddToScheme(s); err != nil {
 		t.Fatalf("add to scheme: %v", err)
 	}
+	if err := coordinationv1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
 	return s
+}
+
+func TestVNIReservationSurvivesDeletionAndRestart(t *testing.T) {
+	scheme := testScheme(t)
+	vpc := &sdnv1alpha1.VPC{ObjectMeta: metav1.ObjectMeta{Name: "old", Namespace: "tenant"}, Spec: sdnv1alpha1.VPCSpec{CIDRs: []string{"10.0.0.0/24"}}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(vpc).WithStatusSubresource(vpc).Build()
+	r := &VPCReconciler{Client: c, Reader: c}
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(vpc)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(t.Context(), client.ObjectKeyFromObject(vpc), vpc); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(t.Context(), vpc); err != nil {
+		t.Fatal(err)
+	}
+	r = &VPCReconciler{Client: c, Reader: c}
+	allocated, err := r.allocateVNI(t.Context())
+	if err != nil || allocated <= vpc.Status.VNI {
+		t.Fatalf("deleted VPC identity reused after restart: old=%d new=%d err=%v", vpc.Status.VNI, allocated, err)
+	}
+}
+
+func TestVNIReservationSeedsAboveOrphanClaims(t *testing.T) {
+	scheme := testScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&sdnv1alpha1.Port{ObjectMeta: metav1.ObjectMeta{Name: "v100.10-0-0-2"}},
+		&sdnv1alpha1.ServiceVIP{ObjectMeta: metav1.ObjectMeta{Name: "sv105.10-0-0-254"}},
+	).Build()
+	r := &VPCReconciler{Client: c, Reader: c}
+	allocated, err := r.allocateVNI(t.Context())
+	if err != nil || allocated != 106 {
+		t.Fatalf("orphan claim identity reused: new=%d err=%v", allocated, err)
+	}
 }
 
 func vpcWithVNI(name string, vni int32) *sdnv1alpha1.VPC {
@@ -92,7 +131,7 @@ func TestAllocateVNI(t *testing.T) {
 	}{
 		{"none allocated starts at firstVNI", nil, firstVNI},
 		{"lowest free above the run", []int32{100, 101}, 102},
-		{"fills a gap", []int32{100, 102}, 101},
+		{"does not recycle a gap", []int32{100, 102}, 103},
 		// VNIs are unique cluster-wide even across namespaces.
 		{"ignores zero (unallocated)", []int32{0, 100}, 101},
 	}
@@ -111,6 +150,47 @@ func TestAllocateVNI(t *testing.T) {
 				t.Fatalf("allocateVNI = %d, want %d", got, c.want)
 			}
 		})
+	}
+}
+
+func TestVNIReservationsConcurrentAndBounded(t *testing.T) {
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+	var workers sync.WaitGroup
+	results := make(chan int32, 4)
+	errors := make(chan error, 4)
+	for range 4 {
+		workers.Go(func() {
+			r := &VPCReconciler{Client: c, Reader: c}
+			vni, err := r.allocateVNI(t.Context())
+			results <- vni
+			errors <- err
+		})
+	}
+	workers.Wait()
+	seen := map[int32]bool{}
+	for range 4 {
+		if err := <-errors; err != nil {
+			t.Fatal(err)
+		}
+		vni := <-results
+		if seen[vni] || vni < firstVNI || vni > lastVNI {
+			t.Fatal("unsafe concurrent reservation", vni)
+		}
+		seen[vni] = true
+	}
+	counter := &coordinationv1.Lease{}
+	if err := c.Get(t.Context(), client.ObjectKey{Namespace: vniCounterNamespace, Name: vniCounterName}, counter); err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"", "invalid", "-1", "4194304", "4194303"} {
+		counter.Annotations[vniCounterAnnotation] = value
+		if err := c.Update(t.Context(), counter); err != nil {
+			t.Fatal(err)
+		}
+		r := &VPCReconciler{Client: c, Reader: c}
+		if vni, err := r.allocateVNI(t.Context()); err == nil || vni != 0 {
+			t.Fatalf("unsafe counter %q accepted: vni=%d err=%v", value, vni, err)
+		}
 	}
 }
 

@@ -123,5 +123,6 @@ func (p *VPCPeering) LocalRef() VPCRef {
 // VPC is p's peer and vice versa. Both the controller (status) and the agent
 // (datapath programming) key the peering's liveness on this predicate.
 func (p *VPCPeering) Matches(other *VPCPeering) bool {
-	return other.LocalRef() == p.Spec.PeerRef && p.LocalRef() == other.Spec.PeerRef
+	return p != nil && other != nil && p.DeletionTimestamp.IsZero() && other.DeletionTimestamp.IsZero() &&
+		other.LocalRef() == p.Spec.PeerRef && p.LocalRef() == other.Spec.PeerRef
 }

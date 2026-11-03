@@ -1,5 +1,5 @@
 ---
-# The aggregated API server for sdn.cozystack.io, split out of
+# The tenant control-plane phase for sdn.cozystack.io, split out of
 # networking.yaml on purpose: the CNI installs before everything, while this
 # needs cert-manager Certificates, an EtcdCluster from the etcd-operator, and a
 # StorageClass — so it must come after the storage layer. One PackageSource
@@ -36,5 +36,19 @@ spec:
       path: cozyplane-apiserver
       install:
         privileged: true
+        namespace: cozy-cozyplane
+        releaseName: cozyplane-apiserver
+  # CRD admission follows the CNI and cert-manager, without a dedicated etcd.
+  # Pair with cozyplane.networking variant crd in a fresh regional cluster.
+  - name: crd
+    dependsOn:
+    - cozystack.cert-manager
+    components:
+    - name: cozyplane-apiserver
+      path: cozyplane-apiserver
+      valuesFiles:
+      - values.yaml
+      - values-crd.yaml
+      install:
         namespace: cozy-cozyplane
         releaseName: cozyplane-apiserver

@@ -19,6 +19,7 @@ package datapath
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/lllamnyp/cozyplane/internal/atomicfile"
 	"os"
 	"path/filepath"
 )
@@ -47,6 +48,11 @@ type AgentState struct {
 	// do with which node it landed on, so a node cannot exhaust while the
 	// cluster has room, and an address can follow a pod across a node move.
 	ClusterPodCIDRs []string `json:"clusterPodCIDRs,omitempty"`
+	// ExcludedPodCIDRs are blocks of ClusterPodCIDRs no new pod address is
+	// drawn from — a platform reservation, such as the block Cozystack gives
+	// Cilium's router addresses. A sandbox already holding an address there
+	// keeps it until the pod is recreated.
+	ExcludedPodCIDRs []string `json:"excludedPodCIDRs,omitempty"`
 	// MTU is the pod MTU (underlay MTU minus Geneve overhead).
 	MTU int `json:"mtu"`
 	// Namespace is the agent's own (system) namespace. Gateway-attach
@@ -56,18 +62,14 @@ type AgentState struct {
 
 // Save atomically writes the agent state to AgentStateFile.
 func (s *AgentState) Save() error {
-	if err := os.MkdirAll(filepath.Dir(AgentStateFile), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(AgentStateFile), 0o750); err != nil {
 		return err
 	}
 	b, err := json.Marshal(s)
 	if err != nil {
 		return err
 	}
-	tmp := AgentStateFile + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, AgentStateFile)
+	return atomicfile.Write(AgentStateFile, b)
 }
 
 // LoadAgentState reads the agent state published for the CNI plugin.

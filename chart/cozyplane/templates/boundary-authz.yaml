@@ -1,0 +1,126 @@
+# CRD-mode twins of the aggregated API's managed-boundary authorization.
+# Keep this file identical to chart/cozyplane/templates/boundary-authz.yaml.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: cozyplane-managed-vpc-boundary
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["sdn.cozystack.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["vpcs", "vpcs/status"]
+  variables:
+    - name: oldManaged
+      expression: oldObject != null && has(oldObject.spec.boundary) && oldObject.spec.boundary != null
+    - name: newManaged
+      expression: object != null && has(object.spec.boundary) && object.spec.boundary != null
+  validations:
+    - expression: >-
+        (!variables.oldManaged && !variables.newManaged) ||
+        (request.operation == 'UPDATE' && object.spec == oldObject.spec) ||
+        authorizer.group('sdn.cozystack.io').resource('vpcs')
+          .namespace(request.namespace).name(request.name).check('manage-boundary').allowed()
+      reason: Forbidden
+      message: Managed VPC policy, address space and deletion require manage-boundary.
+    - expression: >-
+        request.operation != 'UPDATE' || !variables.oldManaged || !variables.newManaged ||
+        object.spec.boundary == oldObject.spec.boundary ||
+        object.spec.boundary.revision > oldObject.spec.boundary.revision
+      reason: Invalid
+      message: Boundary changes must increase the policy revision.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: cozyplane-managed-vpc-boundary
+spec:
+  policyName: cozyplane-managed-vpc-boundary
+  validationActions: ["Deny"]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: cozyplane-managed-vpc-peering
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["sdn.cozystack.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["vpcpeerings", "vpcpeerings/status"]
+  variables:
+    - name: oldManaged
+      expression: >-
+        oldObject != null && has(oldObject.metadata.labels) &&
+        'app.kubernetes.io/managed-by' in oldObject.metadata.labels &&
+        oldObject.metadata.labels['app.kubernetes.io/managed-by'] == 'neosequentia-portal'
+    - name: newManaged
+      expression: >-
+        object != null && has(object.metadata.labels) &&
+        'app.kubernetes.io/managed-by' in object.metadata.labels &&
+        object.metadata.labels['app.kubernetes.io/managed-by'] == 'neosequentia-portal'
+  validations:
+    - expression: >-
+        (!variables.oldManaged && !variables.newManaged) ||
+        (request.operation == 'UPDATE' && request.subResource == 'status' &&
+          variables.oldManaged == variables.newManaged && object.spec == oldObject.spec) ||
+        authorizer.group('sdn.cozystack.io').resource('vpcpeerings')
+          .namespace(request.namespace).name(request.name).check('manage-boundary').allowed()
+      reason: Forbidden
+      message: Managed peering changes and deletion require manage-boundary.
+    - expression: request.operation != 'UPDATE' || object.spec == oldObject.spec
+      reason: Invalid
+      message: Peering references are immutable.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: cozyplane-managed-vpc-peering
+spec:
+  policyName: cozyplane-managed-vpc-peering
+  validationActions: ["Deny"]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: cozyplane-managed-network-objects
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["sdn.cozystack.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["securitygroups", "securitygroups/status", "vpcgateways", "vpcgateways/status"]
+  variables:
+    - name: oldManaged
+      expression: >-
+        oldObject != null && has(oldObject.metadata.labels) &&
+        'app.kubernetes.io/managed-by' in oldObject.metadata.labels &&
+        oldObject.metadata.labels['app.kubernetes.io/managed-by'] == 'neosequentia-portal'
+    - name: newManaged
+      expression: >-
+        object != null && has(object.metadata.labels) &&
+        'app.kubernetes.io/managed-by' in object.metadata.labels &&
+        object.metadata.labels['app.kubernetes.io/managed-by'] == 'neosequentia-portal'
+  validations:
+    - expression: >-
+        (!variables.oldManaged && !variables.newManaged) ||
+        (request.operation == 'UPDATE' && request.subResource == 'status' &&
+          variables.oldManaged == variables.newManaged && object.spec == oldObject.spec) ||
+        authorizer.group('sdn.cozystack.io').resource(request.resource.resource)
+          .namespace(request.namespace).name(request.name).check('manage-boundary').allowed()
+      reason: Forbidden
+      message: Managed gateways and security groups require manage-boundary.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: cozyplane-managed-network-objects
+spec:
+  policyName: cozyplane-managed-network-objects
+  validationActions: ["Deny"]

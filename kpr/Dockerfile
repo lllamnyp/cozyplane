@@ -18,7 +18,7 @@
 # Bases are digest-pinned for digest-reproducible releases (#4): a floating tag
 # resolving to a new base silently changes every layer above it. Bump the pins
 # deliberately, and keep the golang pin in lockstep with the root Dockerfile.
-FROM --platform=$BUILDPLATFORM golang:1.26@sha256:f96cc555eb8db430159a3aa6797cd5bae561945b7b0fe7d0e284c63a3b291609 AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.10-bookworm@sha256:23ce71337b726608afb1bc00986e630a05034a87a87ea1fc2cd1ae5cf33387eb AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

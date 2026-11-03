@@ -18,6 +18,7 @@ package datapath
 
 import (
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -32,6 +33,8 @@ func TestVethAliasRoundtrip(t *testing.T) {
 		{"vpc v4", 102, []net.IP{net.ParseIP("10.70.0.2")}},
 		{"vpc v6", 100, []net.IP{net.ParseIP("fd00:70::3")}},
 		{"gateway leg", 102 | PortGatewayFlag, []net.IP{net.ParseIP("10.70.0.1")}},
+		{"tenant forwarding leg", 102 | PortForwardFlag, []net.IP{net.ParseIP("10.70.0.9")}},
+		{"scoped forwarding leg", 102 | PortForwardFlag | PortForwardScopedFlag, []net.IP{net.ParseIP("10.70.0.9")}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -58,6 +61,26 @@ func TestVethAliasRoundtrip(t *testing.T) {
 	}
 }
 
+func TestEndpointIdentityFitsAliasAndSurvivesQuarantine(t *testing.T) {
+	mac, _ := net.ParseMAC("02:00:00:00:00:01")
+	id := PortVethIdentity{UID: "11111111-1111-1111-1111-111111111111", Staged: true}
+	cid, iface := strings.Repeat("a", 64), strings.Repeat("n", 15)
+	alias := aliasWithPortIdentity(aliasWithSandbox(FormatVethAlias(16777215, []net.IP{net.ParseIP("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")}, mac), cid, iface), id)
+	if len(alias) > 255 {
+		t.Fatalf("full identity too long: %d", len(alias))
+	}
+	if got := VethPortIdentity(alias); got != id {
+		t.Fatal(got)
+	}
+	alias = aliasWithPortIdentity(aliasWithSandbox(FormatVethAlias(QuarantineNet, nil, nil), cid, iface), id)
+	if raw, _, _, valid := parseVethAlias(alias); !valid || raw != QuarantineNet {
+		t.Fatal("quarantine not recognized")
+	}
+	if c, i := VethSandbox(alias); c != cid || i != iface {
+		t.Fatal("quarantine lost sandbox witness")
+	}
+}
+
 func TestParseVethAliasRejects(t *testing.T) {
 	mac, _ := net.ParseMAC("02:a1:b2:c3:d4:e5")
 	for _, alias := range []string{
@@ -75,7 +98,57 @@ func TestParseVethAliasRejects(t *testing.T) {
 		}
 	}
 	// Sanity: the canonical form is accepted.
-	if _, _, _, ok := parseVethAlias(FormatVethAlias(7, []net.IP{net.ParseIP("10.0.0.1")}, mac)); !ok {
+	if _, _, _, ok := parseVethAlias(FormatVethAlias(107, []net.IP{net.ParseIP("10.0.0.1")}, mac)); !ok {
 		t.Fatal("canonical alias rejected")
+	}
+}
+
+// An alias written before multi-attach existed carries no fwd key. It must still
+// parse, as fwd=0 — which is what it was. Getting this wrong would not fail
+// loudly: the veth would come back from an agent restart without
+// PORT_F_FORWARD, and a granted router would start dropping its own transit
+// traffic on the RPF check hours after the change that caused it.
+func TestVethAliasWithoutForwardKeyParsesAsNotForwarding(t *testing.T) {
+	legacy := vethAliasPrefix + "net=102;gw=0;mac=02:a1:b2:c3:d4:e5;ips=10.70.0.2"
+	rawNet, ips, _, ok := parseVethAlias(legacy)
+	if !ok {
+		t.Fatal("a pre-multi-attach alias must still parse")
+	}
+	if rawNet&PortForwardFlag != 0 {
+		t.Error("a legacy alias must not come back as a forwarding leg")
+	}
+	if PortNet(rawNet) != 102 || len(ips) != 1 {
+		t.Errorf("rawNet=%d ips=%v", rawNet, ips)
+	}
+}
+
+func TestLegacyForwardingAliasRetainsSourceRestriction(t *testing.T) {
+	legacy := vethAliasPrefix + "net=102;gw=0;fwd=1;mac=02:a1:b2:c3:d4:e5;ips=10.70.0.2"
+	rawNet, _, _, ok := parseVethAlias(legacy)
+	if !ok || rawNet&PortForwardScopedFlag == 0 {
+		t.Fatal("ambiguous legacy forwarding must not become an unrestricted grant")
+	}
+}
+
+func TestRevocationSurvivesAliasReconstruction(t *testing.T) {
+	alias := FormatVethAlias(QuarantineNet, []net.IP{net.ParseIP("10.70.0.2")}, nil)
+	rawNet, ips, _, ok := parseVethAlias(alias)
+	if !ok || rawNet != QuarantineNet || len(ips) != 0 {
+		t.Fatalf("revocation rebuilt as a live endpoint: net=%#x ips=%v ok=%v", rawNet, ips, ok)
+	}
+}
+
+func TestSandboxAliasRebuildRoundTrip(t *testing.T) {
+	id := strings.Repeat("a", 64)
+	mac, _ := net.ParseMAC("02:00:00:00:00:01")
+	ips := []net.IP{net.ParseIP("10.244.0.2"), net.ParseIP("fd00::2")}
+	alias := aliasWithSandbox(FormatVethAlias(0, ips, mac), id, "eth0")
+	containerID, ifName := VethSandbox(alias)
+	netID, got, _, ok := parseVethAlias(alias)
+	if containerID != id || ifName != "eth0" || !ok || netID != 0 || len(got) != 2 || !got[0].Equal(ips[0]) || !got[1].Equal(ips[1]) {
+		t.Fatal("sandbox alias did not preserve endpoint and identity")
+	}
+	if len(alias) > 255 {
+		t.Fatal("alias exceeds Linux limit")
 	}
 }

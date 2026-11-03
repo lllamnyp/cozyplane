@@ -1,0 +1,157 @@
+{{- $class := .Values.vpn.runtimeClassName -}}
+{{- if $class -}}
+{{- if or (gt (len $class) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $class)) -}}
+{{- fail "vpn.runtimeClassName must be a DNS subdomain of at most 253 characters" -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.vpn.runtimeClass.create -}}
+{{- $class = required "vpn.runtimeClass.create requires vpn.runtimeClassName" $class -}}
+{{- if not .Values.vpn.hardenedAppliance -}}
+{{- fail "vpn.runtimeClass.create requires vpn.hardenedAppliance=true" -}}
+{{- end -}}
+{{- if not (semverCompare ">=1.30-0" .Capabilities.KubeVersion.Version) -}}
+{{- fail "vpn.runtimeClass.create requires Kubernetes >= 1.30 for ValidatingAdmissionPolicy" -}}
+{{- end -}}
+{{- $guard := printf "cozyplane-vpn-%s" ($class | sha256sum | trunc 16) -}}
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: {{ $class | quote }}
+  labels:
+    {{- include "cozyplane.labels" . | nindent 4 }}
+handler: runc
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $guard }}
+  # Existing pods retain the old RuntimeClass during a rollout/uninstall.
+  # Never remove their guard while a cluster PSA exemption may still exist.
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "cozyplane.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    matchPolicy: Equivalent
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods", "pods/ephemeralcontainers"]
+        scope: Namespaced
+  matchConditions:
+    - name: vpn-runtime-class
+      expression: >-
+        has(object.spec.runtimeClassName) && object.spec.runtimeClassName == {{ $class | toJson }}
+  validations:
+    - expression: >-
+        object.spec.containers.size() == 1 && object.spec.containers.all(c,
+          c.name == 'vpn-gateway' && c.image == {{ .Values.image | toJson }} &&
+          has(c.command) && c.command.size() == 1 &&
+          c.command[0] in ['/usr/local/bin/cozyplane-vpn-gateway', '/usr/local/bin/cozyplane-vpn-gateway-ipsec'] &&
+          (!has(c.args) || c.args.size() == 0))
+      message: The VPN RuntimeClass requires the configured single-container Cozyplane appliance and entrypoint.
+    - expression: >-
+        object.spec.containers.all(c, has(c.securityContext) &&
+          (!has(c.securityContext.privileged) || !c.securityContext.privileged) &&
+          has(c.securityContext.allowPrivilegeEscalation) && !c.securityContext.allowPrivilegeEscalation &&
+          has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) &&
+          c.securityContext.capabilities.drop.size() == 1 && c.securityContext.capabilities.drop[0] == 'ALL' &&
+          (!has(c.securityContext.capabilities.add) || (c.securityContext.capabilities.add.size() <= 4 &&
+            c.securityContext.capabilities.add.all(cap, cap in ['NET_ADMIN', 'NET_RAW', 'NET_BIND_SERVICE', 'BPF']))) &&
+          (!has(c.securityContext.procMount) || c.securityContext.procMount == 'Default') &&
+          (!has(c.securityContext.seccompProfile) || c.securityContext.seccompProfile.type != 'Unconfined') &&
+          (!has(c.securityContext.windowsOptions) || !has(c.securityContext.windowsOptions.hostProcess) ||
+            !c.securityContext.windowsOptions.hostProcess))
+      message: The VPN appliance must drop ALL capabilities, prohibit privilege escalation and add only VPN networking and BPF capabilities.
+    - expression: >-
+        (!has(object.spec.hostNetwork) || !object.spec.hostNetwork) &&
+        (!has(object.spec.hostPID) || !object.spec.hostPID) &&
+        (!has(object.spec.hostIPC) || !object.spec.hostIPC) &&
+        (!has(object.spec.os) || object.spec.os.name == 'linux') &&
+        (!has(object.spec.containers[0].ports) || object.spec.containers[0].ports.all(p, !has(p.hostPort) || p.hostPort == 0))
+      message: The VPN appliance cannot use host namespaces, host ports or a non-Linux OS.
+    - expression: >-
+        (!has(object.spec.initContainers) || object.spec.initContainers.size() == 0) &&
+        (!has(object.spec.ephemeralContainers) || object.spec.ephemeralContainers.size() == 0)
+      message: The VPN RuntimeClass does not allow init or ephemeral containers.
+    - expression: >-
+        has(object.spec.automountServiceAccountToken) && !object.spec.automountServiceAccountToken &&
+        (!has(object.spec.volumes) || object.spec.volumes.all(v,
+          !has(v.hostPath) && ((v.name == 'config' && has(v.secret)) ||
+            (v.name == 'frr-run' && has(v.emptyDir))))) &&
+        object.spec.containers.all(c,
+          (!has(c.volumeDevices) || c.volumeDevices.size() == 0) &&
+          (!has(c.volumeMounts) || c.volumeMounts.all(m,
+            m.name == 'config' && m.mountPath == '/etc/cozyplane-vpn' && has(m.readOnly) && m.readOnly &&
+            (!has(m.subPath) || m.subPath == '') && (!has(m.subPathExpr) || m.subPathExpr == '') &&
+            (!has(m.mountPropagation) || m.mountPropagation == 'None'))))
+      message: The VPN appliance mounts only read-only configuration and cannot mount host paths or API credentials.
+    - expression: >-
+        object.spec.containers.all(c,
+          (!has(c.envFrom) || c.envFrom.size() == 0) &&
+          (!has(c.env) || (c.env.size() <= 2 && c.env.all(e,
+            (e.name == 'POD_NAME' && (!has(e.value) || e.value == '') &&
+              has(e.valueFrom) && has(e.valueFrom.fieldRef) && e.valueFrom.fieldRef.fieldPath == 'metadata.name') ||
+            (e.name == 'VPN_CONFIG_CHECKSUM' && !has(e.valueFrom))))) &&
+          !has(c.lifecycle) &&
+          (!has(c.readinessProbe) || !has(c.readinessProbe.exec)) &&
+          (!has(c.livenessProbe) || !has(c.livenessProbe.exec)) &&
+          (!has(c.startupProbe) || !has(c.startupProbe.exec)))
+      message: The VPN appliance cannot override its environment or execute alternate lifecycle/probe commands.
+    - expression: >-
+        object.spec.containers.all(c,
+          (!has(c.readinessProbe) ||
+            ((!has(c.readinessProbe.httpGet) || !has(c.readinessProbe.httpGet.host) || c.readinessProbe.httpGet.host == '') &&
+             (!has(c.readinessProbe.tcpSocket) || !has(c.readinessProbe.tcpSocket.host) || c.readinessProbe.tcpSocket.host == ''))) &&
+          (!has(c.livenessProbe) ||
+            ((!has(c.livenessProbe.httpGet) || !has(c.livenessProbe.httpGet.host) || c.livenessProbe.httpGet.host == '') &&
+             (!has(c.livenessProbe.tcpSocket) || !has(c.livenessProbe.tcpSocket.host) || c.livenessProbe.tcpSocket.host == ''))) &&
+          (!has(c.startupProbe) ||
+            ((!has(c.startupProbe.httpGet) || !has(c.startupProbe.httpGet.host) || c.startupProbe.httpGet.host == '') &&
+             (!has(c.startupProbe.tcpSocket) || !has(c.startupProbe.tcpSocket.host) || c.startupProbe.tcpSocket.host == ''))))
+      message: VPN probes cannot override their destination host.
+    - expression: >-
+        !has(object.spec.securityContext) ||
+          ((!has(object.spec.securityContext.sysctls) || object.spec.securityContext.sysctls.all(s,
+            s.name in ['net.ipv4.ip_forward', 'net.ipv6.conf.all.forwarding'] && s.value == '1')) &&
+           (!has(object.spec.securityContext.seccompProfile) || object.spec.securityContext.seccompProfile.type != 'Unconfined') &&
+           (!has(object.spec.securityContext.windowsOptions) || !has(object.spec.securityContext.windowsOptions.hostProcess) ||
+             !object.spec.securityContext.windowsOptions.hostProcess))
+      message: Only the two VPN forwarding sysctls are allowed and pod security profiles cannot disable confinement.
+    - expression: >-
+        (!has(object.spec.securityContext) ||
+          ((!has(object.spec.securityContext.appArmorProfile) || object.spec.securityContext.appArmorProfile.type in ['RuntimeDefault', 'Localhost']) &&
+           (!has(object.spec.securityContext.seLinuxOptions) ||
+             ((!has(object.spec.securityContext.seLinuxOptions.user) || object.spec.securityContext.seLinuxOptions.user == '') &&
+              (!has(object.spec.securityContext.seLinuxOptions.role) || object.spec.securityContext.seLinuxOptions.role == '') &&
+              (!has(object.spec.securityContext.seLinuxOptions.type) ||
+                object.spec.securityContext.seLinuxOptions.type in ['', 'container_t', 'container_init_t', 'container_kvm_t']))))) &&
+        object.spec.containers.all(c, !has(c.securityContext) ||
+          ((!has(c.securityContext.appArmorProfile) || c.securityContext.appArmorProfile.type in ['RuntimeDefault', 'Localhost']) &&
+           (!has(c.securityContext.seLinuxOptions) ||
+             ((!has(c.securityContext.seLinuxOptions.user) || c.securityContext.seLinuxOptions.user == '') &&
+              (!has(c.securityContext.seLinuxOptions.role) || c.securityContext.seLinuxOptions.role == '') &&
+              (!has(c.securityContext.seLinuxOptions.type) ||
+                c.securityContext.seLinuxOptions.type in ['', 'container_t', 'container_init_t', 'container_kvm_t']))))) &&
+        (!has(object.metadata.annotations) || object.metadata.annotations.all(k,
+          (!k.startsWith('container.apparmor.security.beta.kubernetes.io/') ||
+            object.metadata.annotations[k] == 'runtime/default' || object.metadata.annotations[k].startsWith('localhost/')) &&
+          (!(k == 'seccomp.security.alpha.kubernetes.io/pod' || k.startsWith('container.seccomp.security.alpha.kubernetes.io/')) ||
+            object.metadata.annotations[k] in ['runtime/default', 'docker/default'] || object.metadata.annotations[k].startsWith('localhost/'))))
+      message: The VPN exemption cannot weaken baseline AppArmor, SELinux or legacy confinement settings.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $guard }}
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "cozyplane.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $guard }}
+  validationActions: [Deny]
+{{- end }}

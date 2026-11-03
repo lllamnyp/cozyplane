@@ -1,0 +1,33 @@
+{{- if eq .Values.api.mode "crd" }}
+# Persistent guard: an old aggregated server must not repoint tenant CRD traffic.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: cozyplane-crd-distribution
+  labels:
+    {{- include "cozyplane.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["apiregistration.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["apiservices"]
+  validations:
+    - expression: >-
+        object.metadata.name != 'v1alpha1.sdn.cozystack.io' ||
+        !has(object.spec.service)
+      reason: Forbidden
+      message: "CRD distribution cannot coexist with a remote tenant APIService"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: cozyplane-crd-distribution
+  labels:
+    {{- include "cozyplane.labels" . | nindent 4 }}
+spec:
+  policyName: cozyplane-crd-distribution
+  validationActions: ["Deny"]
+{{- end }}

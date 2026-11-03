@@ -48,7 +48,7 @@ const (
 // stale bootstrap CRD is still cleaned up rather than resurrecting the kind.
 var sdnPlurals = []string{
 	"vpcs", "vpcbindings", "vpcpeerings", "vpcgateways", "ports", "externalpools",
-	"floatingips", "servicevips", "securitygroups", "hostfirewalls",
+	"floatingips", "servicevips", "securitygroups", "hostfirewalls", "vpngateways", "vpnconnections",
 }
 
 var apiServiceGVR = schema.GroupVersionResource{
@@ -76,11 +76,8 @@ func apiServiceDesired(svcNamespace, svcName, caInjection string, insecureSkipTL
 			"port":      int64(443),
 		},
 	}
-	if insecureSkipTLS {
-		// The server self-signed its serving cert (dev/CI: no cert-manager), so
-		// the aggregator has no CA to pin. Production installs inject one.
-		spec["insecureSkipTLSVerify"] = true
-	}
+	// Explicit false revokes a stored development bypass during verified registration.
+	spec["insecureSkipTLSVerify"] = insecureSkipTLS
 	annotations = map[string]any{}
 	if caInjection != "" {
 		annotations["cert-manager.io/inject-ca-from"] = caInjection

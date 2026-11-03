@@ -19,6 +19,10 @@ package sdn
 import (
 	"context"
 	"fmt"
+	"time"
+
+	"github.com/lllamnyp/cozyplane/internal/ipam"
+	"k8s.io/apimachinery/pkg/api/meta"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -79,11 +83,9 @@ var quotableResources = []string{
 // ResourceQuota admission plugin: one object-count evaluator per tenant-created
 // kind.
 //
-// Usage is counted by LISTing the namespace through the server's own loopback
-// client — the same storage the create is about to write to. kube-apiserver's quota
-// reads from shared informers instead, which is cheaper but stale, and staleness in
-// a quota means over-admission. Creates here are rare (a tenant makes a VPC, not a
-// VPC per request), so we buy exactness at a price nobody pays.
+// The stock admission plugin charges each create against ResourceQuota status;
+// it does not invoke UsageStats on each request. The registered listers support
+// explicit usage calculation with bounded live pages and retained identities.
 func NewQuotaConfiguration(loopback *rest.Config) (quota.Configuration, error) {
 	client, err := sdnclientset.NewForConfig(loopback)
 	if err != nil {
@@ -100,45 +102,68 @@ func NewQuotaConfiguration(loopback *rest.Config) (quota.Configuration, error) {
 
 // listerFor returns the namespace lister the object-count evaluator uses to
 // compute current usage.
+const quotaScanTimeout = 30 * time.Second
+
 func listerFor(client sdnclientset.Interface, resource string) generic.ListFuncByNamespace {
 	return func(namespace string) ([]runtime.Object, error) {
-		ctx := context.TODO()
-		opts := metav1.ListOptions{}
-		v1 := client.SdnV1alpha1()
-
-		switch resource {
-		case "vpcs":
-			l, err := v1.VPCs(namespace).List(ctx, opts)
-			return items(l.Items, err, func(i int) runtime.Object { return &l.Items[i] }, len(l.Items))
-		case "vpcgateways":
-			l, err := v1.VPCGateways(namespace).List(ctx, opts)
-			return items(l.Items, err, func(i int) runtime.Object { return &l.Items[i] }, len(l.Items))
-		case "floatingips":
-			l, err := v1.FloatingIPs(namespace).List(ctx, opts)
-			return items(l.Items, err, func(i int) runtime.Object { return &l.Items[i] }, len(l.Items))
-		case "securitygroups":
-			l, err := v1.SecurityGroups(namespace).List(ctx, opts)
-			return items(l.Items, err, func(i int) runtime.Object { return &l.Items[i] }, len(l.Items))
-		case "vpcpeerings":
-			l, err := v1.VPCPeerings(namespace).List(ctx, opts)
-			return items(l.Items, err, func(i int) runtime.Object { return &l.Items[i] }, len(l.Items))
-		case "vpcbindings":
-			l, err := v1.VPCBindings(namespace).List(ctx, opts)
-			return items(l.Items, err, func(i int) runtime.Object { return &l.Items[i] }, len(l.Items))
-		}
-		return nil, fmt.Errorf("no quota lister for %q", resource)
+		ctx, cancel := context.WithTimeout(context.Background(), quotaScanTimeout)
+		defer cancel()
+		return listQuotaUsage(ctx, client, resource, namespace)
 	}
 }
 
-// items adapts a typed list to the []runtime.Object the evaluator wants. It is
-// generic over nothing useful, so it takes an indexer instead.
-func items[T any](_ []T, err error, at func(int) runtime.Object, n int) ([]runtime.Object, error) {
+// Generic object-count evaluation needs identity only: discard tenant payloads
+// before requesting the next page, and never return an incomplete count.
+func listQuotaUsage(ctx context.Context, client sdnclientset.Interface, resource, namespace string) ([]runtime.Object, error) {
+	var objects []runtime.Object
+	err := ipam.WalkClaims(ctx, func(limit int64, token string) ([]runtime.Object, string, error) {
+		list, err := quotaPage(ctx, client, resource, namespace, metav1.ListOptions{Limit: limit, Continue: token})
+		if err != nil {
+			return nil, "", err
+		}
+		if meta.LenList(list) > int(limit) {
+			return nil, "", fmt.Errorf("quota list exceeds requested page size")
+		}
+		listMeta, err := meta.ListAccessor(list)
+		if err != nil {
+			return nil, "", err
+		}
+		page, err := meta.ExtractList(list)
+		if err != nil {
+			return nil, "", err
+		}
+		for i := range page {
+			identity, err := meta.Accessor(page[i])
+			if err != nil {
+				return nil, "", err
+			}
+			page[i] = &metav1.PartialObjectMetadata{ObjectMeta: metav1.ObjectMeta{
+				Name: identity.GetName(), Namespace: identity.GetNamespace(), UID: identity.GetUID(),
+			}}
+		}
+		return page, listMeta.GetContinue(), nil
+	}, func(object *runtime.Object) { objects = append(objects, *object) })
 	if err != nil {
 		return nil, err
 	}
-	out := make([]runtime.Object, 0, n)
-	for i := range n {
-		out = append(out, at(i))
+	return objects, nil
+}
+
+func quotaPage(ctx context.Context, client sdnclientset.Interface, resource, namespace string, opts metav1.ListOptions) (runtime.Object, error) {
+	v1 := client.SdnV1alpha1()
+	switch resource {
+	case "vpcs":
+		return v1.VPCs(namespace).List(ctx, opts)
+	case "vpcgateways":
+		return v1.VPCGateways(namespace).List(ctx, opts)
+	case "floatingips":
+		return v1.FloatingIPs(namespace).List(ctx, opts)
+	case "securitygroups":
+		return v1.SecurityGroups(namespace).List(ctx, opts)
+	case "vpcpeerings":
+		return v1.VPCPeerings(namespace).List(ctx, opts)
+	case "vpcbindings":
+		return v1.VPCBindings(namespace).List(ctx, opts)
 	}
-	return out, nil
+	return nil, fmt.Errorf("no quota lister for %q", resource)
 }

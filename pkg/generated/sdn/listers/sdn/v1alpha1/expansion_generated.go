@@ -77,3 +77,19 @@ type VPCPeeringListerExpansion interface{}
 // VPCPeeringNamespaceListerExpansion allows custom methods to be added to
 // VPCPeeringNamespaceLister.
 type VPCPeeringNamespaceListerExpansion interface{}
+
+// VPNConnectionListerExpansion allows custom methods to be added to
+// VPNConnectionLister.
+type VPNConnectionListerExpansion interface{}
+
+// VPNConnectionNamespaceListerExpansion allows custom methods to be added to
+// VPNConnectionNamespaceLister.
+type VPNConnectionNamespaceListerExpansion interface{}
+
+// VPNGatewayListerExpansion allows custom methods to be added to
+// VPNGatewayLister.
+type VPNGatewayListerExpansion interface{}
+
+// VPNGatewayNamespaceListerExpansion allows custom methods to be added to
+// VPNGatewayNamespaceLister.
+type VPNGatewayNamespaceListerExpansion interface{}

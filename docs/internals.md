@@ -84,19 +84,22 @@ maps and one program.
 | `remotes` | LPM trie | {scope net, dst IP/CIDR} → remote node IP | agent (Nodes + Ports) |
 | `networks` | LPM trie | {scope net, CIDR} → dst net id | agent (VPCs + VPCPeerings) |
 | `ports` | hash | veth ifindex → network id (bit 31 = gateway leg) | plugin (per pod) |
-| `locals` | hash | {net id, pod IP} → {veth ifindex, pod MAC} | plugin (per pod) |
+| `locals` | hash | {net id, pod IP} → {veth ifindex, pod MAC, SHA-256 Port/sandbox witness} | plugin (per pod) |
 | `peers` | hash | {src net id, dst net id} → 1 | agent (VPCPeerings) |
 | `gateways` | hash | net id → {gateway .1 IP, node IP (0=local)} | agent (gateway Ports) |
 | `bridges` | hash | fabric IP → {net id, VPC IP} | plugin (per VPC pod) |
 | `ct_fwd` / `ct_rev` | LRU hash | the bridge's L4 NAT connection table | datapath (in-band) |
 | `svc_vips` | hash | {net, VIP, proto, port} → backend set + flags | agent (ServiceVIPs) |
 | `vpc_counters` | PERCPU hash | net id → {tx,rx bytes/packets} | datapath (in-band) |
-| `sg_members` | hash | {net, VPC IP} → `u64` group bitmap | agent (Ports' `status.groups`) |
+| `sg_members` | hash | {net, VPC IP} → group bitmap + SHA-256 Port/sandbox witness; explicit zero for resolved unselected Ports | agent (Ports' UID-proven membership status) |
 | `sg_rules` | hash | {dst net, src net, dst group, proto, port} → `u64` allowed-source bitmap | agent (SecurityGroups) |
 | `sg_egress` | hash | {src net, dst net, src group, proto, port} → allowed-dst-group bitmap | agent (SecurityGroups) |
 | `sg_cidr` | LPM trie | {net, proto, port, client CIDR} → allowed-group bitmap | agent (SecurityGroups) |
 | `sg_drops` | PERCPU hash | net id → policy-drop count | datapath (in-band) |
 | `params` | array | `[0]`=Geneve ifindex, `[1]`=default VNI | agent |
+| `vpc_routes` | LPM trie | `{VNI, prefix}` → up to two appliance next hops; zero hops is a blackhole | agent |
+| `route_guard` | one-cell array | blocks off-VPC workload egress during incomplete route compilation/publication | agent |
+| `hf_modes` | array | ingress/egress isolation mode + initialization witness, preserved independently of `params` | agent |
 
 Per-VPC metering (#2): `count_dir` bumps `vpc_counters` — **both directions
 from `to_pod`** (rx for the destination net, tx for the source net), the one
@@ -116,6 +119,9 @@ Security groups (#7, intra-VPC policy — see [security-groups.md](security-grou
 `to_pod`, right after the isolation check, gates admitted east-west traffic
 destination-side. `sg_admit` (another stack-lean `noinline` subprogram, single
 `sg_query` pointer arg) looks up the destination's group bitmap in `sg_members`;
+missing registered local VPC membership remains pending under bit zero, while
+an explicit zero entry proves resolved unselected membership. Before Port status
+proves the current Pod UID, the agent keeps the same pending bit.
 if it is grouped, it unions the `sg_rules` allowed-source bitmaps for the
 destination's groups and admits only if that intersects the source's bitmap,
 else drops and bumps `sg_drops`. TCP is gated on new connections only (SYN,
@@ -373,6 +379,15 @@ resolver's replies die in FAILED ARP/NDP before ever reaching `to_pod`'s DNAT
 Like the route, the entry lives and dies with the veth.
 
 ### VPC DNS steering (split-horizon resolver)
+
+VPC CIDRs may overlap the fabric pool. Native VPC delivery carries a private
+VPC_MARK derived by trusted origin/overlay hooks and cleared at untrusted
+boundaries. The receiving hook resolves the scoped local owner, consumes the
+marker, and enforces SecurityGroups without reinterpreting an equal address as
+a global fabric, DNS or floating alias. Unmarked host probes and legitimate
+resolver replies retain their plumbing path. Real classifier tests cover local
+and Geneve IPv4/IPv6 TCP/UDP delivery, default-deny, explicit group rules,
+overlapping VNIs, recycled owners and repeated descriptor lifetime.
 
 A VPC pod's `resolv.conf` points at the cluster DNS ClusterIP, which the
 isolation rule makes unreachable — so `from_pod` **steers** those queries to a
@@ -826,6 +841,33 @@ kube-proxy does.**
 
 ### Map-ABI upgrades — pinned-map reconcile & local-state rebuild
 
+DNS discovery, node-address advertisement and missing-FabricIP repair each
+use a five-second child operation deadline. The repair budget covers the Pod
+list and all claim reads/creations together. A shorter parent remains effective;
+every return cancels the child without cancelling the agent. Failed repair
+preserves foreign claims and reports through the existing startup warning.
+Informer synchronization remains a separate readiness condition. Real stalled
+HTTP tests cover all five request stages, shared repair budget, shorter parents
+and 125 cancellations with stable descriptors/goroutines. The repair skips Pod reads when no unambiguous rebuilt address is usable.
+It requests only local Running Pods, in pages of 128 with a 65,536-object/512-page
+budget under the same total operation deadline. The temporary selection retains
+only matching addresses and Pod identities, not historical Pod specifications
+or annotations. A failed, expired, cancelled or malformed page publishes no
+repair authority, and conflicting live Pod identities for an address are omitted.
+Claim operations start only after the complete bounded snapshot succeeds; repair
+never deletes or adopts a foreign claim. Real HTTP tests exercise continuation,
+filtering, ownership, incomplete snapshots and deadlines. A measured SDK fixture
+with 1,024 completed Pods and one Running Pod reduces transient allocations from
+about 34 MB to 30 KB per snapshot; this is not a permanent heap leak claim. The full Linux agent/IPAM suites pass with the race detector, including the
+existing 125 cancellation/resource-lifetime checks; no deployment is implied.
+
+A separate route-rebuild review remains open: a VPC address may equal its
+fabric allocation. The CNI installs main-table VPC host routes only for the
+default network; VPC bridge host routes therefore must not be rejected merely
+because their address also appears in the VPC alias. Verify this with real
+isolated IPv4/IPv6 host routes before changing reconstruction authority, and
+refuse ambiguous or non-owned candidates.
+
 Maps are pinned by name and reused across restarts, so a release that changes a
 map's shape (the 128-bit rekey was the first) cannot reuse the old pins: the load
 fails and, before this mechanism, the agent crash-looped until the node was
@@ -845,8 +887,8 @@ rebooted to clear bpffs ([#7](../../issues/7)). The agent now handles it:
   agent's watches (default-network pods have no `Port` object at all).
 - **Rebuild + re-attach at every agent start.** The agent walks the `cph*`/`cpg*`
   links: parses the alias and re-`Put`s the `ports` and `locals` entries;
-  re-derives a VPC pod's `bridges` entry from the veth's scope-link fabric route
-  (the one host route whose destination is not a pod address); then points both
+  re-derives a VPC pod's `bridges` entry from its unique owned, gatewayless main-table host route (/32 or /128);
+  ambiguous routes do not authorize reconstruction; then points both
   tcx links at the freshly pinned programs. The link is **adopted and its program
   swapped in place** (`Link.Update`), never replaced by a second link, so there is
   never an unfiltered window *and* never a second generation — see "one link per
@@ -877,6 +919,27 @@ rebooted to clear bpffs ([#7](../../issues/7)). The agent now handles it:
   absent. The CNI plugin opens them on every ADD, and a remove-then-pin gap is
   not theoretical: it failed ~250 sandbox creations during one agent rollout.
 
+- **Live TCX ordering fails closed.** Moving the same program in the TCX list
+  requires detaching its old link; the kernel rejects a second attachment of
+  that program. Before replacing an existing pin, install a separately pinned
+  two-instruction DROP guard at the head. Keep it on attach/pin failure and
+  remove it only after the replacement is pinned. Subsequent reconciliation
+  retries recovery; a completed replacement also clears a guard left by an
+  interrupted process. DEL removes both ordinary links and their guards.
+  This trades a brief packet drop during a move for continuous isolation and
+  bounds retained guard pins to one per interface and direction, plus a
+  temporary swap pin during publication. Serialize hook queries, guard removal
+  and swaps with the shared writer lock across agent/CNI processes; confirm
+  each scanned veth alias before changing its hooks. Explicit link detachment
+  avoids waiting for deferred kernel link destruction before a same-program
+  retry.
+- **Detached TCX pins are reaped.** Interface deletion detaches its TCX links
+  but does not remove their bpffs pins; a missed DEL otherwise retains the link
+  and program objects indefinitely. The periodic hook reconciliation streams
+  the owned links directory in small batches and removes only links whose
+  kernel TCX info reports ifindex zero. Inspect and unpin under the shared
+  writer lock, retaining active pod, uplink and overlay hooks even without a
+  rebuild alias. No historical interface-ID cache is retained.
 - **The one-release gap.** A veth without the alias (created by a pre-alias CNI)
   cannot be rebuilt; after an ABI break such pods need a restart, and the agent
   logs each one. On a compatible restart they are unaffected — state lives in the
@@ -901,16 +964,26 @@ no node reboots ([#7](../../issues/7) acceptance).
 
 ### Controller
 
-`VPCReconciler` lists VPCs cluster-wide, assigns the lowest free VNI ≥ 100 to any
-VPC without one, and sets `status.phase = Ready`. The allocation list goes to the
+`VPCReconciler` assigns a monotonically increasing VNI ≥ 100 to any
+VPC without one, and sets `status.phase = Ready`. Before publishing status it
+reserves the identifier by resourceVersion CAS in the durable Lease
+`kube-system/cozyplane-vni-allocator`, annotation `sdn.cozystack.io/last-vni`.
+Reservations survive VPC deletion, controller restart and failed status writes;
+identifiers are never recycled while delayed watches or pinned datapath state
+could still refer to a previous tenant. Bootstrap seeds the counter above all
+live VPC VNIs and Port/ServiceVIP claim names. The counter must be backed up and
+must never be deleted or rolled back independently of the cluster's SDN state.
+VNIs stay below `2^22` because the two high Geneve bits carry forwarding/gateway
+flags; exhaustion or malformed counter state fails allocation closed.
+The allocation list goes to the
 **API server directly (`APIReader`), never the informer cache**: the cache lags
 the reconciler's own status writes, so back-to-back reconciles of two fresh VPCs
 could both see a VNI as free and assign it twice — a **cross-tenant isolation
 break** (two VPCs sharing a network id are one delivery domain, and a peering
 whose CIDRs collide then overwrites the victim's own `networks` entry). Caught
 live in the e2e once the map-recreation phase re-tested a VPC late enough.
-Reconciles are serial (default MaxConcurrentReconciles=1), so live-list +
-assign-before-return is race-free. The reconciler also **repairs duplicates**
+Reconciles are serial (default MaxConcurrentReconciles=1), and the counter CAS
+also prevents concurrent reservations from colliding. The reconciler **repairs duplicates**
 (pre-fix clusters): if another VPC holds the same VNI, the deterministic loser —
 younger by creationTimestamp, then namespace/name — clears its VNI and
 reallocates; the winner keeps it. A conflicting status update just requeues.
@@ -936,9 +1009,9 @@ misses:
 - it releases the sever finalizer from *terminating* Ports whose node no longer
   exists — the agent that would acknowledge is never coming back, and the
   workload died with its node;
-- it **deletes live Ports whose claimant pod is gone** (the pod recorded in the
+- it **deletes live Ports whose claimant pod is gone or terminal** (the pod recorded in the
   Port's pod labels no longer exists, or its UID differs — the name was reused
-  by a new pod). A pod that dies uncleanly (node reboot, forced eviction) never
+  by a new pod, or its phase is Succeeded/Failed). A pod that dies uncleanly (node reboot, forced eviction) never
   runs CNI DEL, so its Port leaks; for an ordinary pod that leaks an address,
   but for a **gateway pod it wedges the replacement forever** — the fixed `.1`
   claim fails `AlreadyExists` and the pod stays ContainerCreating. GC frees the
@@ -947,7 +1020,7 @@ misses:
   lifecycle, and a launcher pod's absence there must *not* release the pinned
   IP+MAC. Deletion still passes through the sever finalizer, so the owning node
   drains first (or PortGC's node-gone path releases it). Before deleting, the
-  claimant's absence is confirmed against the API server directly — the
+  claimant's absence or terminal phase is confirmed against the API server directly — the
   informer cache could lag a *just-created* pod and GC would otherwise kill a
   newborn Port.
 
@@ -1101,6 +1174,11 @@ do not have to infer it. If the agent is being OOM-killed, look there first.
 
 ## 7. Known limitations / divergence from the design
 
+TCP SYNs crossing a VPN route or a Geneve north-south path have an oversized
+MSS option reduced by eBPF with an incremental TCP checksum update. This is a
+bounded option parser and is a no-op for malformed packets, absent/smaller MSS,
+SYN+ACK, UDP and ICMP; PMTU remains responsible for all other traffic.
+
 Most of the design has since been built (all three policy layers, the north-south
 boundary, Services, live migration, multi-tenancy). What remains divergent or
 rough, as built:
@@ -1149,3 +1227,346 @@ rough, as built:
   *node's*, making the tenant indistinguishable from the platform on the wire —
   the one thing the eBPF VPC NAT exists to prevent. Requiring `poolRef` would
   delete `cmd/gateway` outright; open (docs/north-south.md).
+
+### Security audit follow-up (2026-10-07)
+
+Live, non-terminating VPCBindings are the authorization source for existing Ports, forwarding grants, DNS queries and annotated Services. An API/configuration error fails closed. Endpoint selection requires the actual Port VPC and matching Pod UID when the EndpointSlice provides one. VM Ports bind to a protected VMI controller reference and its UID; VM labels alone are insufficient. Legacy Ports without an authenticated VMI UID require explicit repair or recreation. Kubernetes OwnerReferencesPermissionEnforcement must be enabled.
+
+Fallback gateway workloads live in the trusted system namespace. Cross-namespace ownership is recorded using the VPC UID; labels and generated names alone do not authorize adoption, modification or deletion. Legacy unmarked gateway Deployments require operator repair/recreation. The fallback container uses only NET_ADMIN and NET_BIND_SERVICE, disables privilege escalation and service-account-token mounting, and uses the runtime default seccomp profile. The CNI enables forwarding before container start; the gateway checks its value before attempting a write.
+
+Port and ServiceVIP creation now checks both etcd keys in the same transaction as the write. They must use the same etcd backend; split resource overrides are rejected at startup. Ordinary codec/encryption, object versioning, watches and CRUD remain those of the registry. This replaces the non-atomic cross-kind lookup as the allocation authority. Existing conflicting claims still require reconciliation before rollout.
+
+### FabricIP sandbox ownership (2026-10-07)
+
+GC event lookup uses a cache index on the recorded Pod namespace/name, rather
+than copying every FabricIP on each Pod status update. Both current and previous
+Pod UIDs sharing that name are enqueued; the reconciler still checks the live
+Pod UID and grace period before a conditional deletion. Port GC likewise indexes
+the recorded Node and Pod namespace/name. These indexes change lookup work, not
+the persistent-VM exemption or the sever acknowledgement contract.
+
+The allocation owner is (containerID, ifName), with Pod UID retained for indexing and GC. ADD reuses an existing claim of that sandbox, including retries; rollback releases only claims created by that attempt. DEL removes bridges and claims only for its sandbox, with UID/resourceVersion preconditions. Legacy claims without sandbox identity are retained by DEL and left to GC.
+
+Bridge next hops `169.254.1.1` / `fe80::1` and service hairpin identities
+`169.254.42.1` / `fe80::2a:1` are reserved platform addresses. FabricIP, Port
+and ServiceVIP allocators skip them; explicit CNI requests and new API claims
+reject them. Their RFC6052 representations are reserved as well because they
+share datapath keys with the IPv4 addresses. CIDRs containing these addresses
+remain usable and may still overlap between VNIs. Existing pinned workload
+identities are never silently replaced; an unusable reserved claim reports an
+error. A gateway leg whose network+1 collides with a platform address fails ADD
+before creating a Port.
+
+GC also reaps claims not listed in a matching Running Pod status.podIPs after a five-minute grace period, and requeues younger claims. The agent repairs missing claims only for current local Pod status addresses actually present in successfully rebuilt local endpoint state. Existing conflicting claims are reported and preserved. New veth aliases retain sandbox metadata through forwarding updates; legacy rebuilt links can be repaired without inventing a container ID.
+- Sandbox ownership also applies to ordinary tenant Ports and gateway Ports.
+  Their annotations store the full container ID and CNI invocation interface;
+  the interface label distinguishes attachments within that invocation. Retried
+  ADD reuses owned Ports and an existing veth only after verifying its peer and
+  host alias. Rollback releases only newly created objects with UID and resourceVersion preconditions. A same-UID Port rebound after ADD is observed survives rollback. The rollback record follows successful sandbox annotation patches made by that ADD, so an unchanged claim can still be released after a later failure.
+
+DNS identifies a sandbox's primary attachment, never an arbitrary Port of its
+Pod UID. Multiple legacy attachment candidates without this witness are refused.
+Upstream DNS work is limited to 256 requests globally and 16 per querying VPC;
+excess queries receive SERVFAIL. Gateway UDP/TCP relay work shares a 128-operation
+limit and drops/closes excess work before spawning handlers. HTTP metrics bound
+header/write/idle time; flow NDJSON bounds writes individually to preserve streams.
+
+Release builds verify the downloaded CNI plugin archive against the published
+v1.9.1 SHA256 pinned in the Dockerfile for amd64/arm64 before extraction. Other
+version/architecture combinations fail until their trusted digest is added.
+
+Local operator material (`.codex-*`, kubeconfigs and dotenv files) is excluded
+from Git additions and Docker build contexts; it is never input to COPY . .
+or a release artifact. Exclusion does not revoke credentials already disclosed.
+
+Revocation resolves the fabric bridge from the veth actually found in locals,
+so a migration target already recorded on the persistent Port cannot cause
+cleanup to delete that target's bridge while draining the source.
+
+Bridge writers and cleanup share a host file lock, and a new pinned
+bridge_owners map records the veth ifindex and a SHA256 of sandbox identity.
+Late cleanup after GC/address reuse removes a bridge only if this owner witness
+still matches. Rebuild derives witnesses from veth aliases. A missing witness
+fails closed for deletion; the original FabricIP label is never ownership proof.
+During VM migration, target ADD preserves the active Port's pod and sandbox
+identity while spec.node still points at the source. At cutover the controller
+updates the pod identity and sandbox container ID together, deriving the latter
+from the active launcher's status.podIP FabricIP claim. Missing claims cause a
+short retry; an old sandbox identity is never silently reused for the new pod.
+Persistent Port local delivery at cutover selects the host veth by its recorded
+sandbox container ID and CNI interface, in addition to VNI and VPC address.
+Legacy records with no sandbox metadata are usable only when exactly one local
+veth matches. Multiple matches are an error, never an arbitrary first endpoint.
+The shared bridge writer lock also serializes local endpoint map updates and
+conditional deletion. CNI DEL and Port sever remove a local entry only while its
+ifindex still belongs to their captured endpoint; a cutover/reallocation cannot
+replace it between the ownership check and Delete.
+Sever acknowledgement also checks the current Port's node against the event's
+node, and its binding against the one actually drained. A lagging source agent
+cannot acknowledge a terminating Port whose active sandbox moved elsewhere.
+IPv6 link-local ingress is a control-protocol exception, not an identity:
+only NDP with code zero and hop limit 255, and DHCPv6 server replies, may
+bypass isolation. TCP/UDP application traffic from a link-local or multicast
+source is rejected before policy; fabric bridge translation remains a separate
+sanctioned path.
+
+FabricIP repair refuses an address witnessed by multiple rebuilt sandboxes.
+Pod status identifies the address but cannot identify the owning sandbox;
+an old veth must not supply the container ID for the current pod's claim.
+
+Default-network rebuild also checks the effective host route before restoring
+an address to locals or offering it to FabricIP repair. A lingering sandbox's
+alias cannot replace the current sandbox's source-authentication endpoint.
+Pruning applies the same route witness, including to pre-alias net-0 entries.
+An authorized default-network ADD replaces a stale host route to its claimed
+fabric address; EEXIST must not silently retain another sandbox's route.
+
+The bridge gateway (169.254.1.1) and ServiceVIP hairpin source (169.254.42.1)
+are host-generated IPv4 identities. A workload cannot emit either source at
+its origin veth, even with a forwarding grant or a misleading local endpoint
+record. NAT may assign these sources only after the origin check.
+
+### Policy compiler startup
+
+NetworkPolicy, SecurityGroup and HostFirewall compilers wait until every input informer has completed its initial list before applying a snapshot. Early notifications leave pinned policy intact. Each compiler performs a full resync once its caches are ready, even if its last initial event arrived before the ready flag. If initial synchronization fails, no partial policy replaces the pinned state.
+
+### Fabric route reconciliation
+
+FabricIP notifications and Node-driven resyncs share a serialized reconciler. Events only identify a cache key: the reconciler rereads the current claim while holding its writer lock, so a stale DEL cannot remove a replacement claim and an old node snapshot cannot restore a deleted claim. A missing node endpoint removes its claims from remotes. After the initial FabricIP list, prune pinned net-0 remotes absent from the current claims; leave VPC-scoped remotes intact.
+
+Grant reconciliation reads the full ports-map value, including gateway and quarantine flags. The network-only accessor is reserved for address-scoped cleanup. Platform gateway legs are never treated as tenant forwarding legs or severed for lacking a tenant VPCBinding.
+# IPv6 responder lifecycle
+
+Each RA/DHCPv6 responder belongs to the complete veth rebuild identity, not
+only its ifindex. Changes to that identity cancel the previous listener before
+starting a replacement. RA workers cancel and join their DHCPv6 and periodic
+send goroutines before closing the raw socket. Fatal receive errors end the
+worker rather than spinning. Closed netlink update channels are disabled, so a
+failed subscription does not cause a busy rescan loop. Cancellation drains all
+workers; only eligible real veths may start a responder.
+Each responder reads at most ten solicitations per second. A guest flooding
+RS or DHCPv6 cannot make the agent parse and answer every packet at line rate;
+normal provisioning retries continue within the bounded socket queue.
+
+Host veth configuration publishes alias, forwarding allowlist, port flags and
+local endpoints under the same writer lock as grant reconciliation. Forwarding
+stays disabled while its CIDRs are replaced; no partially populated grant may
+inherit a reused ifindex's old prefixes. CNI arms quarantine before attaching
+hooks. Bridge publication rechecks the active alias so a concurrent revocation
+cannot recreate a revoked endpoint's bridge. ADD retries retain staging until
+the agent performs a verified cutover.
+
+Policy informer handlers queue one pending reconciliation instead of compiling
+a full node snapshot per notification. A worker waits for complete caches,
+applies their latest contents and coalesces bursts with a fixed 100ms interval
+between passes. Continuous updates cannot postpone reconciliation indefinitely.
+A notification during compilation schedules another pass; cancellation drops
+pending work. This bounds handler backlog under object churn.
+Binding reconciliation uses the same bounded notification worker and indexes a
+single local-veth inventory by Port UID/address, so remote-only Ports do not
+trigger per-Port kernel scans or pod API reads.
+Gateway, route, FloatingIP and LoadBalancer-uplink reconciliation also use this
+worker. Their informer callbacks perform no full-list scans, netlink discovery
+or map writes. Each waits for all of its declared informer inputs before the
+initial replay, retaining pinned forwarding state while an input list is
+unavailable. This also prevents a startup view missing the oldest VPCGateway
+from choosing a different boundary. Node-set callbacks queue the same VPC
+boundary worker. One pending notification is retained during a running pass;
+the next pass rereads the latest caches, rather than retaining every event.
+Route rows are retained during startup, but their separate `route_guard` is
+armed on every loader start and before compilation/publication. Off-VPC workload
+traffic stops until a complete snapshot succeeds; incomplete or saturated
+snapshots must not turn VPN traffic into an ordinary NAT miss. The route worker
+also retries every 15 seconds through the same coalesced queue, without depending
+on new events. Unresolved prefixes use zero next hops as explicit blackholes.
+The guard is one kernel cell, with no per-event timer, goroutine or prefix state;
+native VPC/peer delivery and fabric/node plumbing retain their own paths.
+An explicit overlay delivery also requires the Geneve ifindex to be configured.
+If transport configuration is absent, `encap_sg` drops instead of handing the
+unencapsulated packet to ordinary kernel routing (hardening 192). This covers
+VPN/default-appliance routes, native remote VPC delivery and migration forwarding;
+ordinary host-stack plumbing that never selected overlay delivery is unchanged.
+Forwarding reconciliation applies a UID-proven endpoint batch before legacy ownership API work, then a separate batch for individually verified legacy endpoints. Each batch snapshots the scoped CIDR map once for its local
+legs, diffs each owned scope and leaves unchanged grants untouched. Changing
+scopes still disable forwarding before mutation and retain that disabled state
+on errors. RA discovery coalesces link-event bursts into one fixed-window
+rescan, so grant changes cannot trigger a complete interface scan per event.
+
+Fresh or recreated policy maps begin under the NetworkPolicy/SecurityGroup
+deny guards before programs are published. Successful complete snapshots mark
+each layer initialized in params slots 14/15; only then may its guard clear.
+An interrupted initial startup cannot make empty, already-pinned maps appear
+initialized on the next restart. Compatible initialized snapshots remain
+available while caches load; missing inputs re-arm the relevant guard.
+The four-slot LB/HostFirewall tail-call map is also pinned. Its targets must
+survive closure of the agent's userspace descriptors while attached classifiers
+continue to run. Loader initialization restores modes and all tail-call slots
+before publishing the from_pod/to_pod pins used by CNI. Compatible loads replace
+targets in that same bounded map.
+### Peering reconciliation work
+
+The agent indexes live peering halves by their directed pair of VPC references
+to find reciprocal consent in linear time. Terminating halves never enter the
+index, and an object cannot consent to itself. Reconciliation runs only after
+both caches synchronize and coalesces notification bursts in a bounded queue.
+### Auxiliary HTTP request lifetime
+
+Agent, responder and VPN metrics/status/flow servers bound reading the whole
+HTTP request to five seconds, including bodies attached to GET requests. Header
+and idle deadlines alone do not bound the automatic body draining performed by
+Go's HTTP server. Write deadlines remain ten seconds; flow streams refresh
+their existing per-message deadlines and can outlive the request read budget.
+Auxiliary request headers are limited to 32KiB before handler/authentication
+work (Go allows an extra 4KiB parser slop). Oversized headers are rejected with
+431 and connection closure; a client still writing may see a TCP reset. Request
+body/write/idle and stream lifetime limits remain unchanged. This bounds header
+work per connection without claiming an overall constant heap or request rate.
+
+### Pool-reserved workload addresses
+
+The network address and network+1 gateway address are reserved within each
+allocation pool, independently of global bridge/hairpin reservations. Explicit
+ordinary Port requests, sandbox retries and persistent VM binds obey the same
+rule as automatic allocation; otherwise a tenant can preempt the platform
+gateway claim. The authorized gateway attachment remains the sole network+1
+claim path. Existing incompatible pinned identities are preserved and refused,
+not silently reallocated. This per-pool check does not ban overlapping CIDRs.
+ServiceVIP selection includes network+2 as its final usable candidate, so a
+free /30 IPv4 pool can provide that address; only its network/gateway addresses
+and the allocator existing broadcast exclusion remain reserved.
+
+Terminal Pod claim cleanup also covers FabricIP: a matching UID in Succeeded
+or Failed no longer holds a fabric address, even if the Pod object is retained
+for Job history or finalizers. Pending, Running and Unknown are preserved by
+this terminal check, as are claims without a recorded UID. FabricIP uses its
+live Pod reader; Port GC confirms the terminal phase live before deletion and
+retains the sever barrier. Persistent VM IP/MAC claims remain exempt.
+
+Ordinary Ports from a primary CNI invocation can also outlive their sandbox
+while the Pod UID stays unchanged. After a five-minute creation grace, Port GC
+may reap a primary-invocation Port only when the Running Pod's current one or
+two status addresses all have live, nonterminating FabricIP claims proving the
+same different container ID and the primary CNI interface. Pod UID, namespace,
+name, node and canonical address must match; the Pod and claims are confirmed
+with the live reader before conditional deletion. Unknown/legacy witnesses,
+mixed sandbox claims and delegate interface mismatches preserve the Port.
+Persistent VM Ports remain exempt. FabricIP events revisit only this Pod's
+indexed Ports, so late claim publication triggers cleanup without periodic
+cluster scans or an additional worker. The normal sever finalizer still gates
+address reuse until the node acknowledges withdrawal.
+
+### Forwarding grant work budgets
+
+A live unrestricted VPCBinding forwarding grant wins without constructing any scoped CIDR union, regardless of input order. Otherwise, the complete union may contain at most 4,096 input prefixes (duplicates count against work). Above that budget, attachment authorization remains present but forwarding resolves false with no partial CIDRs; CNI reports the budget error before endpoint publication and the agent revokes the forwarding flags on existing legs. API create/spec updates reject any single binding above 4,096 prefixes. Active scoped forwarding prefixes must be valid IP CIDRs of at most 64 bytes, enforced at admission and legacy resolution; errors report only the offending index, never the complete untrusted text. Unrestricted grants still bypass construction/validation of irrelevant legacy scoped unions. Legacy oversized or malformed scoped snapshots are handled fail-closed at resolution. Unchanged legacy specs remain eligible for authorized finalizer removal, and an authorized owner can disable forwarding while retaining the old prefixes; input validation must not prevent revoking a malformed legacy grant. This is a work bound, not a promise of available global fwd_cidrs map slots.
+
+### IPv4-mapped CIDR input
+
+An IPv4-mapped IPv6 CIDR with a mask of at least /96 represents the same IPv4 range as its unmapped form: `::ffff:192.0.2.0/120` equals `192.0.2.0/24`. Normalize the mask before adding the RFC 6052 /96 address prefix. All route, forwarding and policy LPM keys share this conversion; adding /96 twice exceeds the kernel key width and can leave policy update guards armed. SecurityGroup containment must normalize these inputs too, so a narrower mapped prefix inherits the same scoped group union as ordinary IPv4. Shorter IPv6 prefixes remain native IPv6 ranges after masking. Invalid internal IP/mask combinations are rejected before map mutation. No map layout or packet address encoding changes.
+
+CNI attachment authorization reads VPCBindings in pages of 128, with the existing 65,536-object/512-page live scan budget and operation context. Its temporary accumulator stores at most 4,096 matching forwarding prefixes; it retains no unrelated binding specs or list backing arrays. An unrestricted matching grant on a later page overrides a rejected legacy scoped union, so union errors are resolved only after the complete scan. List failure, cancellation and non-progressing continuation return no authorization from partial state. The cached resolver keeps its inexpensive first unrestricted-grant pass; the streaming resolver may allocate a bounded scoped union before a later unrestricted grant arrives.
+
+For each agent reconciliation, index bindings only for consumer namespace / full VPC reference keys that have local Port endpoints. Resolve each such key once and share its read-only scoped union among those endpoints; unrelated grants are never parsed or copied into a union. The index belongs to the current pass and retains no historical grants. Complete namespace and VPC identity remain part of the key, including the binding reference's default namespace. DNS checks only live attachment consent and do not construct a forwarding union. Forwarding still resolves fail-closed on invalid scoped input, without removing valid attachment consent.
+
+Port retry/persistent-NIC lookup, sandbox Port teardown and gateway consent use the same bounded live CNI scan budget. Retry and persistent-NIC lookup retain at most one matching Port; multiple matches are an error, preserving every existing pinned identity rather than choosing an arbitrary NIC claim. Teardown retains only exact sandbox-owned Ports and starts cleanup after all pages succeed. Gateway consent retains only the oldest live boundary for the requested VPC, including its deterministic name tie-break, and consumes all pages before authorizing. Partial or failed scans cannot cause reuse, VM identity rebinding, endpoint cleanup or new gateway publication.
+
+The pod's cozyplane networks annotation is decoded with a 16 KiB byte budget and a maximum of ten entries, enforced before decoding an eleventh entry. Both the annotation and Multus delegate paths use this same decoder. VPC references, IPs, MACs and interface names have bounded text lengths; oversized-field and JSON errors do not repeat the annotation payload. Duplicate explicit interface names are rejected before a delegate can choose a conflicting IP/MAC pin from the first match. This preserves the existing ten-entry annotation contract and does not change the separate supported delegate-name ordinal range or pinned VM identities. The single-VPC annotation also has the VPC-reference text bound.
+
+### CIDR policy family identity
+
+The shared RFC 6052 address encoding must not widen an IPv6 policy prefix into an IPv4 permission. For NetworkPolicy ipBlock and HostFirewall, an IPv6 CIDR authorizes IPv6 packets only, even when its range covers the internal `64:ff9b::/96` representation of IPv4. An IPv4 CIDR likewise must not authorize native IPv6 packets addressed in that range. Policy lookup needs the actual packet family as well as the encoded address; mapped IPv4 input normalizes to IPv4. Empty peer lists may still explicitly compile both families. Any key-encoding transition must leave legacy keys unable to authorize new family-scoped queries before complete reconciliation. This concerns policy authorization, not future SIIT translation or the shared routing address layout.
+
+Specific SecurityGroup north-south CIDR rules follow the same packet-family constraint. Their 16-bit protocol field carries the L4 protocol in its low byte and family `4`/`6` in its high byte. Containment unions remain within one logical family and scope. The documented SG_WORLD shortcut for explicit all-addresses rules keeps its existing contract; specific IPv6 ranges such as `64:ff9b::/96` must not authorize IPv4 sources or destinations merely because IPv4 is encoded there. Legacy untagged CIDR rows cannot match either family's tagged query.
+
+The north-south ingress query and CIDR lookup key use one unpinned per-CPU scratch entry (72 bytes per possible CPU). They are fully overwritten before use, with compiler barriers before lookups, and reused only within one non-sleepable TC execution. This keeps the combined eBPF call stack below the verifier limit without allocating per-flow state or retaining a packet history. Scratch lookup failure denies the packet.
+
+Scoped forwarding grants bind the full host-veth ifindex, actual source packet family (4/6), and source prefix. A native IPv6 prefix cannot grant permission to emit foreign IPv4 sources through their RFC 6052 encoding; mapped IPv4 input grants only IPv4. `fwd_cidrs` uses a dedicated 28-byte key with 64 fixed scope/family bits followed by the 128-bit address, rather than the routing LPM key. Route addressing and overlapping VNI scopes remain unchanged. The existing incompatible-pin reconciliation recreates legacy 24-byte forwarding maps, leaving scoped foreign traffic denied until a complete owned grant replay. Old attached programs retain their old map until hook replacement, following the existing upgrade contract. Capacity stays 4,096 entries (16 KiB additional key payload at capacity), with no per-packet allocation or new worker.
+
+Own VPC CIDRs are reconciled from a complete cache snapshot, covering every
+declared family/prefix rather than just CIDRs[0]. The coalesced worker waits
+for initial VPC cache synchronization and prunes obsolete own rows (scope equals
+value), including rows retained across a restart or deletion. Peering rows
+remain owned by their existing reconciler. Both writers serialize access to
+the shared 1,024-entry networks map and preflight total retained plus desired
+capacity before deletion. Desired input work and row memory are bounded to
+65,536 input units and the map's actual distinct-key capacity. A malformed
+legacy VPC contributes no partial own rows; other VPCs can still reconcile.
+An over-budget snapshot or total capacity overflow retains the last complete
+routing state. A successful peer replay queues a new own replay, so removal of
+stale peer rows can free startup capacity without waiting for another VPC event.
+Updating one VPC's CIDRs must not consume entries for every historical
+prefix. This preserves RFC 6052 routing representation and overlapping VNIs.
+
+Within this worker, successfully seeded counter IDs are remembered only while
+their networks remain in the current successful own snapshot. Unchanged passes
+therefore do not decode every CPU's counter values again. Failed seeds remain
+eligible for retry and disappearing scopes are removed from the small userspace
+set; restart begins with an empty set. This does not itself delete historical
+kernel counters.
+
+### VPC counter lifetime
+
+The complete VPC informer snapshot also reconciles the scopes of vpc_counters and sg_drops. Counters for current VNIs, including terminating and CIDR-less VPCs, retain their values; scopes whose VPC object disappeared are removed. Counter seeding and pruning share a mutex, and a stale policy pass cannot recreate a scope excluded by the last complete snapshot. Before the first complete snapshot, counters remain untouched. Key enumeration is bounded by each map capacity and reads no per-CPU values. Unchanged scope sets skip kernel enumeration; failed pruning remains eligible for the next event. Failed or incomplete scans perform no pruning. These maps are bounded already; reclamation prevents historical VNIs exhausting their slots and increasing metrics work, rather than claiming an unbounded heap leak.
+
+### VPC CIDR input admission
+
+VPC creation and changes to spec.cidrs admit at most 1,024 input prefixes, matching the entire networks map capacity, with at most 64 bytes per prefix and valid IP CIDR syntax. Empty CIDR lists remain valid; overlapping tenant ranges, host-bit notation, IPv4-mapped notation and native IPv6 remain accepted. This is an input-work ceiling, not a reservation or a per-tenant quota: aggregate routing capacity still applies. Unchanged malformed legacy CIDRs do not prevent metadata/finalizer or unrelated field updates. CNI validates the full list before any claim or identity rebind, with index-only rejection diagnostics. The agent excludes an oversized legacy VPC before charging the complete snapshot work budget, so one stored oversized list cannot block all healthy VPC network updates. Bounded malformed lists still count toward the raw parsing work budget and contribute no partial routes.
+
+Peering replay validates each referenced VPC CIDR list against the same bounds before overlap checks or peer-map publication. Invalid legacy VPCs contribute neither a peer grant nor delivery rows; healthy and revoked pairs can still reconcile. Validation is memoized by complete VPC reference for one snapshot, without historical retention. Peering controller readiness applies the same CIDR and VNI checks; invalid syntax must not be described as disjoint merely because an overlap parser ignored it.
+
+### Metrics collection work budget
+
+The agent metrics endpoint shares one immutable response snapshot across requests for one second. Rebuilds are serialized, including failures, so a burst cannot multiply full per-CPU map scans and formatting work by HTTP concurrency. The first request collects a snapshot; values and VPC labels refresh after expiration. HTTP writes take place outside the collection lock, retaining the existing connection/write-time budgets. There is no polling worker or snapshot history. A response larger than 128 MiB is refused, and failures use the same one-second retry budget. This changes metric freshness by at most one second after collection; it does not claim to eliminate all transient allocation or permanently authorize unbounded scrape rates.
+
+### Persistent NIC creation transaction
+
+Within a VNI, persistent Port creation checks the current namespace/VM/VPC/NIC identity in a paged etcd snapshot before writing. The transaction compares the modification revision of every Port key in that VNI with the snapshot revision, alongside the existing Port/ServiceVIP address guards. A concurrent creation or identity-affecting update invalidates the snapshot; eight retries and a 65,536-claim/128-per-page scan ceiling bound the work. The allocation client caps each gRPC response at 16 MiB, and each scan stops before decoding more than 64 MiB of stored data; exceeding either limit fails ADD without a partial allocation. This includes legacy claims without adding an index, lease or historical reservation. Empty-collection compares admit the first claim. A matching claim returns AlreadyExists with the actual holding Port name, so ADD can fetch it, verify the instance UID and pinned IP/MAC, and bind or stage it. NIC identity fields are immutable through normal and status updates; pinned VM MAC changes are refused. Unrelated status changes within a busy VNI may cause a bounded retry or an ADD failure for kubelet to retry; they cannot permit a second identity.
+
+### Same-sandbox CNI operation concurrency
+
+Address-name uniqueness does not by itself serialize concurrent ADD retries for one ordinary sandbox. Both calls can observe no owned Port and then choose different free addresses. The operation boundary covers rollback and DEL, since a failing ADD must not remove an allocation another same-sandbox ADD has already reused. Cross-node VM identity remains enforced by the allocation transaction.
+
+CNI ADD and DEL hold a host flock around the complete operation, including failed-ADD rollback. All interfaces of one container ID share a SHA-256-selected shard in /run/cozyplane/cni-locks; the set has at most 256 files, independent of pod history. Nonblocking lock attempts sleep for 20 ms and stop at cancellation or five seconds. The root-owned parent directory must not be group/world writable; directory-relative opens refuse symlinks, nonregular or multiply linked files and unsafe ownership/modes before running the operation. The root-owned directory uses 0700 and lock files use 0600; descriptors close on all returns and kernel locks disappear on process exit. Hash collisions conservatively serialize unrelated sandboxes; kubelet can retry a busy shard. Missing identity fails ADD and makes DEL a harmless no-op. VM identity across hosts is still enforced by etcd.
+
+### DEL namespace ownership
+
+The namespace path supplied with DEL is not a sandbox identity: a removed namespace path may resolve to another sandbox by the time an old DEL runs. Pod-side primary, secondary and gateway interface deletion must verify the live veth peer in the host namespace against the full container ID and CNI interface ownership. A matching interface name or truncated host-name prefix alone is insufficient. Real isolated namespace/veth tests cover stale DEL, shared host-name prefixes, namespace-local index collisions, and current-sandbox teardown.
+
+DEL validates both the host peer alias and the peer network-namespace ID against the opened pod namespace. Namespace-local interface indexes alone are not globally unique. Unknown ownership, non-veth interfaces, and missing namespace-ID proof are preserved for runtime teardown. Addresses are collected from the verified link object and that same object/index is deleted, without a second name lookup. This adds bounded local netlink calls, no retained state or background worker.
+
+### Pod-label snapshot budget
+
+Pod labels used for Port SecurityGroup fallback membership must be copied completely or rejected: truncation would change selector semantics. Kubernetes validates individual label keys and values but does not impose an aggregate label count limit. Writers check a 4096-label count and 128 KiB raw JSON-size estimate before serializing a snapshot, then enforce the same limit on the encoded result, leaving room within the 256 KiB Kubernetes annotation limit for other Port annotations. CNI must reject before allocation; migration writers must preserve the existing binding and pinned IP/MAC on rejection. This bounds additional serialization work and transient heap use; it does not remove the cost of obtaining the Pod itself. For valid Kubernetes label characters the estimate is exact; unexpected escaped input may expand during one bounded serialization and is checked afterwards. Default-network attachment needs no Port-label snapshot. Behavior tests reproduce repeated API rejection from a valid large Pod and require preflight rejection without any Port update.
+
+### FabricIP lookup work during revocation
+
+Severing a Port joins its Pod UID and sandbox/interface to the underlay claim. Bulk binding revocation must retrieve only claims of that sandbox (or that Pod UID for legacy Ports), rather than materializing the entire cluster FabricIP store once or twice per Port. Register both indexes before the FabricIP informer starts; updates and deletions remove old index memberships through client-go. Selection retains IPv4 preference and IPv6 fallback and does not use a claim of another sandbox. Index state contains only current cache objects, with no historical retention. A scoped lookup failure returns no invented fabric address. Behavior tests verify one retrieved sandbox row among 10003 claims, legacy Pod scope, 64-character container IDs, dual-stack preference, retarget/deletion and 1000-object churn without historical index keys. The measured lookup allocation falls from 327680 bytes to 40 bytes.
+
+### Route capacity isolation (SEC188 availability)
+
+The global route guard remains closed until all initial caches and a complete
+publication succeed. Capacity overflow must then fail closed only for the
+owner namespaces exceeding their fair route-candidate budgets. When total
+demand fits, preserve every namespace unchanged; otherwise distribute capacity
+with max-min shares, satisfying smaller demands first with deterministic ties.
+An over-budget namespace publishes no partial route set: every VPC scope with
+route intent from that namespace is explicitly blocked for off-VPC workloads.
+Native VPC delivery and other namespaces keep their existing behavior.
+
+A pinned scope bitmap covers all 22-bit tenant VNIs without a second scarce
+per-VPC hash capacity: 1024 array cells, each 128 uint32 words (512 bytes), total
+512 KiB of values. The source VNI chooses the array cell and bit; unknown/out-of-
+range map lookups fail closed. The global guard covers bitmap and route-table
+updates together. On restart initialize all 1024 cells before opening it; later
+updates retain only current nonzero cells (at most 1024, no update history) and
+record each successful mutation so retries recover partial writes correctly.
+Kernel write/scan failures or incomplete cache proofs keep the global guard
+closed. This addresses steady capacity overflow; atomic publication still has
+a short global gate, and aggregate cache/work ceilings still require operator
+resource quotas. No routing outside eBPF and no Port identity changes.
+
+Once an owner is known to exceed the entire route capacity or has malformed
+route input, stop parsing its remaining prefixes/rows, including later gateway
+objects. Still visit each active VPC reference and record its blocked scope.
+Only complete valid owner sets spend prefix-compilation work; global cache
+lookup/object enumeration ceilings remain fail-closed. This avoids allowing
+one already-rejected namespace to close the global gate via redundant parsing.

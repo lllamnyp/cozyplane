@@ -1,3 +1,4 @@
+{{- if eq .Values.api.mode "aggregated" }}
 {{- /* Operator-managed etcd for the aggregated apiserver (etcd-operator.cozystack.io
        v1alpha2). PVC-backed by default; `etcd.operator.persistent: false` gives a
        tmpfs member instead, for an install with no storage layer.
@@ -121,6 +122,10 @@ spec:
     medium: Memory
     {{- end }}
     size: {{ .Values.etcd.operator.size }}
+  {{- with .Values.etcd.operator.affinity }}
+  affinity:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   options:
     autoCompactionMode: periodic
     autoCompactionRetention: "5m"
@@ -133,4 +138,6 @@ spec:
     peer:
       certManager:
         issuerRef: { name: cozyplane-etcd-peer-issuer, kind: Issuer }
+{{- end }}
+
 {{- end }}

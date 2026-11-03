@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # Keep in lockstep with kpr/go.mod's cilium require.
-CILIUM_TAG="v1.19.5"
+CILIUM_TAG="v1.19.8"
 OUT="$(cd "$(dirname "$0")" && pwd)/bpf_sock.o"
 
 SRC="${1:-}"

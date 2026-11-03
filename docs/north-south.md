@@ -99,6 +99,32 @@ stack was never involved.
 
 ## 3. The model
 
+A VPC with a deletion timestamp no longer has an active boundary. Agents withdraw
+its LoadBalancer admission and NAT identity even if gateway status still carries
+an address. Controllers retire owned NAT Services and gateway Deployments rather
+than recreating them during finalization. Existing ownership checks still govern
+cleanup; this does not reallocate persistent workload Ports.
+
+The appliance/fallback gateway map also requires a current non-terminating Port
+claim in its referenced live VPC, with the canonical address/name for that VPC's
+VNI. A retained `spec.gateway` flag cannot keep a deleted or predecessor VPC's
+door active. The agent observes VPC lifecycle as well as gateway Port events and
+waits for the Port, VPC and VPCGateway initial caches before replacing pinned
+gateway state. The current oldest non-terminating VPCGateway must authorize the
+door: a declared appliance uses only its resolved status.appliancePort; otherwise
+NAT must be enabled and the Port must be the first CIDR network address plus one,
+the reserved fallback leg. Removing/retargeting the boundary or disabling fallback
+NAT withdraws the gateway map without waiting for a Port or Pod teardown event.
+An appliance door remains independent of whether NAT identity allocation is enabled.
+
+Controller cache lookups for fallback Deployment reconciliation, VPCGateway
+conflicts and VPC/Port notifications are
+indexed by the referenced VPC name within its namespace. An unrelated VPC's Port
+must not enqueue every appliance or route gateway in the namespace. The index
+tracks the current reference and is removed with the gateway; arbitration still
+uses the same oldest-first rule. The always-enabled VPCGateway controller
+registers this shared index before the optional fallback Gateway controller.
+
 **`VPCGateway`** (a namespaced kind — built) declares the VPC's
 north-south boundary: whether the VPC may reach the internet at all, the NAT
 identity its egress wears (drawn from owned delegated LoadBalancer Services —
@@ -219,6 +245,61 @@ pool that covers every family a VPC uses.
 > new datapath** are the coverage — all **dev4-validated**: a dual-stack VPC drew a v4
 > and a v6 identity and shed its gateway pod, on agents that loaded the new datapath
 > with no verifier error.
+
+## 6b. The door can be the tenant's own appliance
+
+A VPC's door is whatever holds `gateways[vni]`, and off-VPC traffic is delivered
+to it **with the original destination intact** — so the holder receives the VPC's
+egress by construction and may route it on rather than merely NAT it. That entry
+is built from Ports carrying `spec.gateway`.
+
+Until now only cozyplane's own gateway pod could carry it: `addGatewayLeg` claims
+it, restricted to the agent's namespace and to the VPC's reserved `.1`. A tenant
+running a firewall or router had no way to say "that is my door", so a capability
+the datapath already had was unreachable by the workload it was for.
+
+`VPCGateway.spec.appliance.podSelector` says it. The VPCGateway is already the
+VPC's one declared boundary, so what serves as that boundary belongs on it rather
+than on a new kind. The controller resolves the selector, finds the selected
+workload's Port **in this VPC** (a multi-attached appliance has one per VPC, and
+only the local leg can be its door), and moves `spec.gateway` onto it.
+`desiredGateways` is unchanged, and so is the datapath: the door was always a Port
+flag, and this only decides which Port carries it. While an appliance is declared
+cozyplane spawns no gateway pod of its own — one entry, one claimant.
+
+**Receiving is not sending.** Being the door means traffic arrives; emitting a
+source you do not own is the separate `VPCBinding.allowForwarding` grant, authored
+by whoever holds `export` on the VPC (docs/multi-attach.md). A firewall wants
+both, and they are deliberately granted by different people: the tenant may point
+its own VPC's door wherever it likes inside its own network, but the right to
+impersonate a member of that VPC stays with the VPC's owner.
+
+### Reconciliation of NAT identities and shard ownership
+
+After its complete initial gateway/VPC lists, the agent builds the whole reverse
+projection from the currently effective NAT identities and the current node
+shards. It validates addresses, duplicate ownership and map capacity before
+mutating either reverse map. Entries absent from that projection, including
+old addresses retained across earlier agent restarts, are pruned. Reverse
+ownership is programmed on every node, including nodes with no local SNAT
+shard. A failed projection prevents publication of new local SNAT identities.
+
+Rotating a VPC's address removes its previous reverse ownership; deleting an
+old VPC removes an address only if that address still points to the same VNI.
+An address already reassigned to another VPC must survive the old VPC's cleanup.
+Shard rows are reconciled as a whole, so old addresses, removed shards and nodes
+without a current underlay endpoint cannot retain routing rows indefinitely.
+This bounds retained kernel state under repeated address/node changes. The
+existing node-set reshuffle can still interrupt established NAT flows.
+Underlay endpoint changes and withdrawals trigger the same bounded boundary
+worker even when a node remains Ready; readiness alone is not an endpoint
+identity. The endpoint index publishes its new value before notifying readers.
+Gateway projection groups candidates by the full namespace/VPC reference
+before applying the existing oldest-gateway rule. It scans each VPC's candidates
+only, so unrelated gateways in a busy namespace cannot multiply every VPC's
+boundary scan. Terminating gateways, timestamp/name tie-breaking and namespace
+separation retain the same semantics. The temporary index is rebuilt per pass;
+it does not retain old gateway objects across notifications.
 
 ## 7. Open questions
 
