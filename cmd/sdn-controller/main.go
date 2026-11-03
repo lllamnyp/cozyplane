@@ -49,6 +49,7 @@ import (
 	"github.com/lllamnyp/cozyplane/internal/apigate"
 	localsdnctrl "github.com/lllamnyp/cozyplane/internal/controller/localsdn"
 	sdncontroller "github.com/lllamnyp/cozyplane/internal/controller/sdn"
+	"github.com/lllamnyp/cozyplane/internal/orggateway"
 )
 
 var (
@@ -379,6 +380,11 @@ func setupSDNControllers(mgr manager.Manager, cfg sdnControllerConfig) error {
 				Effect:   corev1.TaintEffectNoSchedule,
 			}}
 		}
+		// A malformed orgGateway config grants VPN clients nothing extra.
+		orgGateway, err := orggateway.FromEnv()
+		if err != nil {
+			setupLog.Error(err, "organisation gateway disabled")
+		}
 		if err := (&sdncontroller.VPNGatewayReconciler{
 			Client: mgr.GetClient(),
 			// Live reads for the tunnel quota — a stale cache would let a burst of
@@ -395,6 +401,8 @@ func setupSDNControllers(mgr manager.Manager, cfg sdnControllerConfig) error {
 				HardenedAppliance:        cfg.vpnHardened,
 				RuntimeClassName:         cfg.vpnRuntimeClass,
 				InternalCIDRs:            parseCIDRs(cfg.internalCIDRs),
+				OrgGateway:               orgGateway,
+				ClusterDNS:               cfg.clusterDNS,
 			},
 		}).SetupWithManager(mgr); err != nil {
 			return fmt.Errorf("unable to create controller %s: %w", "VPNGateway", err)

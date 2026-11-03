@@ -243,6 +243,7 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- include "cozyplane.orgGatewayEnv" . | nindent 12 }}
             {{- if .Values.kubeApiServer.host }}
             # Reach the kube-apiserver directly (not via the kubernetes.default
             # ClusterIP): with no kube-proxy, that VIP is unserved until
@@ -307,6 +308,7 @@ spec:
             # cluster DNS the pod-level dnsPolicy would hand us.
             - name: RESOLV_CONF
               value: /host/etc/resolv.conf
+            {{- include "cozyplane.orgGatewayEnv" . | nindent 12 }}
           volumeMounts:
             - name: host-resolv
               mountPath: /host/etc/resolv.conf

@@ -561,7 +561,7 @@ may egress there (v4 in NAT64 form, like `sg_cidr`); `0.0.0.0/0` is just a `/0`
 entry, so no pseudo-group is needed. No group-loop, so `from_pod`'s budget is
 safe.
 
-**Coverage — all THREE north-south egress paths.** Every way a VPC pod can leave
+**Coverage — all FOUR north-south egress paths.** Every way a VPC pod can leave
 calls `ns_egress_ok`, and each is an independent enforcement point:
 
 1. **The eBPF VPC NAT** (`vpc_nat_snat`) — the *primary* path since
@@ -572,6 +572,9 @@ calls `ns_egress_ok`, and each is an independent enforcement point:
 3. **The floating path** — `floating_egress_snat`/`_snat6` call `ns_egress_ok`
    right after confirming the pod is floating and the destination external, before
    the SNAT.
+4. **The organisation Gateway** — `gw_steer` calls it before re-sourcing a flow
+   to the internal Gateway address ([services-in-vpc.md](services-in-vpc.md)):
+   a `to: {cidr}` rule must cover that address on 80/443.
 
 A grouped floating pod is gated by its `to: {cidr}` rules exactly like a gateway'd
 one; ungrouped pods, replies (SYN-gated) and ICMP pass. And the source-spoofing gap —

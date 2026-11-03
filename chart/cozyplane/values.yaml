@@ -69,6 +69,35 @@ egress:
   # route-CIDR deny-set — include the node network here so it is covered.
   internalCIDRs: []
 
+# Internal organisation Gateways (docs/services-in-vpc.md § "Organisation
+# gateway"). A VPC reaches its organisation's INTERNAL Gateway — an Envoy
+# Gateway proxy in the Gateway namespace, behind a LoadBalancer address from a
+# private reserve — on TCP 80/443 only, and resolves its apex names; the VPN
+# clients and sites of that VPC too. Everything is derived from platform data
+# (namespace labels and ownership, the proxy Service and its LB status). Public
+# Gateways are not handled here. Off by default.
+orgGateway:
+  enabled: false
+  # Namespace label naming the Gateway-owning namespace (ancestor-or-self,
+  # verified against the namespace ownerReferences).
+  gatewayNamespaceLabel: namespace.cozystack.io/gateway
+  # Namespace label carrying the tenant host: the apex the resolver answers.
+  apexLabel: namespace.cozystack.io/host
+  # Labels of the Gateway's proxy Service, matched in the Gateway namespace
+  # only; "{namespace}" stands for that namespace.
+  serviceSelector:
+    gateway.envoyproxy.io/owning-gateway-name: cozystack
+    gateway.envoyproxy.io/owning-gateway-namespace: "{namespace}"
+  # The private gateway reserve (IPv4 CIDRs). Must equal the portal's gateway
+  # ranges and be listed in egress.internalCIDRs (the chart refuses otherwise),
+  # so no NAT, floating or route path can cover it.
+  addressCIDRs: []
+  # An apex must sit strictly under one of these DNS suffixes.
+  apexSuffixes: []
+  # VPN clients whose address pool pushes exactly egress.clusterDNS may reach
+  # it (TCP/UDP 53, masqueraded by the appliance) and resolve the apexes.
+  vpnDNS: false
+
 # Managed VPN (issue #6, docs/vpn.md). The controller runs tunnel appliances for
 # VPNGateway/VPNConnection; these bound their placement and per-tenant scale.
 # Every appliance exposes per-connection metrics on the named `vpn-metrics`

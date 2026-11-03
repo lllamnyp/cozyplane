@@ -59,6 +59,7 @@ import (
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
 	"github.com/lllamnyp/cozyplane/datapath"
 	"github.com/lllamnyp/cozyplane/internal/floatingvalidation"
+	"github.com/lllamnyp/cozyplane/internal/orggateway"
 	"github.com/lllamnyp/cozyplane/internal/vpnlimits"
 	localclientset "github.com/lllamnyp/cozyplane/pkg/generated/localsdn/clientset/versioned"
 	localinformers "github.com/lllamnyp/cozyplane/pkg/generated/localsdn/informers/externalversions"
@@ -500,6 +501,18 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, writeCNI bool
 	// programmed while the aggregated group is absent.
 	watchServiceUplinks(ctx, client, mgr, log)
 
+	// A malformed orgGateway config disables the feature (no VPC reaches any
+	// Gateway) rather than the node.
+	orgGateway, err := orggateway.FromEnv()
+	if err != nil {
+		log.Error("organisation gateway disabled", "err", err)
+	}
+	// The pinned grants outlive restarts: revoke them (and the flow records)
+	// before any cache syncs; watchOrgGateways re-grants from a synced view.
+	if err := mgr.SyncOrgGateways(nil, nil); err != nil {
+		log.Warn("clear organisation gateways", "err", err)
+	}
+
 	// VPC watching is best-effort: the default network must work even before the
 	// sdn.cozystack.io API exists, so we don't block readiness on it. One shared
 	// factory backs all sdn informers; it is started only after every handler is
@@ -555,6 +568,7 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, writeCNI bool
 			watchFloatingIPs(ctx, factory, mgr, log)
 			watchServiceUplinks(ctx, client, mgr, log)
 			watchServiceVIPs(ctx, factory, mgr, log)
+			watchOrgGateways(ctx, factory, client, mgr, orgGateway, log)
 			watchSecurityGroups(ctx, factory, mgr, log)
 			if err := watchHostFirewalls(ctx, factory, client, mgr, nodeName, log); err != nil {
 				log.Error("watch hostfirewalls", "err", err)

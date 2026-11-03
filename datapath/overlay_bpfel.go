@@ -82,6 +82,7 @@ type overlayBoundaryScratch struct {
 	Rule     overlayBoundaryRule
 	Cidr     overlayBoundaryCidr
 	Endpoint overlayLocalKey
+	Gw       overlayOrgGwCtKey
 }
 
 type overlayBridgeEp struct {
@@ -301,6 +302,22 @@ type overlayNpScratchVal struct {
 	Cd overlayNpCidrKey
 	Lk overlayLocalKey
 	_  [4]byte
+}
+
+type overlayOrgGwAddr struct {
+	_    structs.HostLayout
+	Addr overlayAddr128
+	Port uint16
+	Pad  uint16
+}
+
+type overlayOrgGwCtKey struct {
+	_      structs.HostLayout
+	Fabric overlayAddr128
+	Gw     overlayAddr128
+	Sport  uint16
+	Dport  uint16
+	Pad    uint32
 }
 
 type overlayPeerKey struct {
@@ -538,6 +555,9 @@ const (
 	overlayMapNpIdent                   = "np_ident"
 	overlayMapNpNodes                   = "np_nodes"
 	overlayMapNpScratch                 = "np_scratch"
+	overlayMapOrgGw                     = "org_gw"
+	overlayMapOrgGwBe                   = "org_gw_be"
+	overlayMapOrgGwCt                   = "org_gw_ct"
 	overlayMapOverlayNodes              = "overlay_nodes"
 	overlayMapParams                    = "params"
 	overlayMapPeers                     = "peers"
@@ -680,6 +700,9 @@ type overlayMapSpecs struct {
 	NpIdent         *ebpf.MapSpec `ebpf:"np_ident"`
 	NpNodes         *ebpf.MapSpec `ebpf:"np_nodes"`
 	NpScratch       *ebpf.MapSpec `ebpf:"np_scratch"`
+	OrgGw           *ebpf.MapSpec `ebpf:"org_gw"`
+	OrgGwBe         *ebpf.MapSpec `ebpf:"org_gw_be"`
+	OrgGwCt         *ebpf.MapSpec `ebpf:"org_gw_ct"`
 	OverlayNodes    *ebpf.MapSpec `ebpf:"overlay_nodes"`
 	Params          *ebpf.MapSpec `ebpf:"params"`
 	Peers           *ebpf.MapSpec `ebpf:"peers"`
@@ -780,6 +803,9 @@ type overlayMaps struct {
 	NpIdent         *ebpf.Map `ebpf:"np_ident"`
 	NpNodes         *ebpf.Map `ebpf:"np_nodes"`
 	NpScratch       *ebpf.Map `ebpf:"np_scratch"`
+	OrgGw           *ebpf.Map `ebpf:"org_gw"`
+	OrgGwBe         *ebpf.Map `ebpf:"org_gw_be"`
+	OrgGwCt         *ebpf.Map `ebpf:"org_gw_ct"`
 	OverlayNodes    *ebpf.Map `ebpf:"overlay_nodes"`
 	Params          *ebpf.Map `ebpf:"params"`
 	Peers           *ebpf.Map `ebpf:"peers"`
@@ -856,6 +882,9 @@ func (m *overlayMaps) Close() error {
 		m.NpIdent,
 		m.NpNodes,
 		m.NpScratch,
+		m.OrgGw,
+		m.OrgGwBe,
+		m.OrgGwCt,
 		m.OverlayNodes,
 		m.Params,
 		m.Peers,

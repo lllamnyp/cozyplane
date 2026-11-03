@@ -251,7 +251,7 @@ func TestUnionVPCCIDRsAndRoutingConfig(t *testing.T) {
 	gwHA.Spec.HA = &sdnv1alpha1.VPNGatewayHA{Mode: sdnv1alpha1.VPNGatewayHAModeActiveActive, ActiveActive: &sdnv1alpha1.VPNGatewayActiveActive{
 		LocalASN: 64520, PeerASN: 64521, PeerAddresses: []string{"10.250.0.1"}, BFD: true,
 	}}
-	cfg := routingConfigFor(gwHA, vpcs)
+	cfg := routingConfigFor(gwHA, vpcs, nil)
 	if cfg == nil {
 		t.Fatal("routingConfigFor = nil, want a config for active-active HA")
 	}
@@ -268,7 +268,7 @@ func TestUnionVPCCIDRsAndRoutingConfig(t *testing.T) {
 	gwPlain.Name, gwPlain.Namespace = "gateway", "tenant"
 	gwPlain.Spec.VPCRef.Name = "vpc-a"
 	gwPlain.Spec.WireGuard = &sdnv1alpha1.VPNGatewayWireGuard{}
-	if cfg := routingConfigFor(gwPlain, vpcs); cfg != nil {
+	if cfg := routingConfigFor(gwPlain, vpcs, nil); cfg != nil {
 		t.Fatalf("routingConfigFor = %+v, want nil without active-active HA", cfg)
 	}
 }

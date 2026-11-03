@@ -61,6 +61,11 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
+  # Namespaces: the VPN controller resolves a namespace's organisation Gateway
+  # from namespace labels and ownership (orgGateway values).
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
   # VPCGateways: a VPC's north-south boundary (docs/north-south.md). The
   # controller owns their status (VPC resolution, one-per-VPC, NAT identity from
   # owned Services) and reads them to decide whether to realize the gateway pod.
@@ -316,6 +321,7 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- include "cozyplane.orgGatewayEnv" . | nindent 12 }}
           resources:
             {{- toYaml .Values.controller.resources | nindent 12 }}
           livenessProbe:

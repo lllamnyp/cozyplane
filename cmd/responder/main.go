@@ -45,6 +45,7 @@ import (
 	localv1alpha1 "github.com/lllamnyp/cozyplane/api/localsdn/v1alpha1"
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
 	"github.com/lllamnyp/cozyplane/datapath"
+	"github.com/lllamnyp/cozyplane/internal/orggateway"
 	"github.com/lllamnyp/cozyplane/internal/responder"
 	"github.com/lllamnyp/cozyplane/internal/serviceidentity"
 	"github.com/lllamnyp/cozyplane/internal/vpnlimits"
@@ -59,6 +60,7 @@ const (
 	podUIDIndex      = "podUID"   // on Ports: the claiming pod
 	podIndex         = "pod"
 	svcIndex         = "service"
+	orgGatewayIndex  = "orgGateway" // on Services: those holding a gateway reserve address
 	localVPCIndex    = "localVPC"
 	peeringPairIndex = "peeringPair"
 	maxPeeringWork   = 65536
@@ -178,8 +180,29 @@ func run() error {
 		return err
 	}
 
+	// A malformed orgGateway config answers no apex rather than stopping DNS.
+	orgGateway, err := orggateway.FromEnv()
+	if err != nil {
+		log.Printf("organisation gateway disabled: %v", err)
+	}
+	orgGateway.ClusterDomain = domain
+
 	kubeFactory := informers.NewSharedInformerFactory(kube, 0)
 	svcInf := kubeFactory.Core().V1().Services().Informer()
+	if err := svcInf.AddIndexers(cache.Indexers{orgGatewayIndex: func(obj any) ([]string, error) {
+		if s, ok := obj.(*corev1.Service); ok && orgGateway.HoldsReserve(s) {
+			return []string{orgGatewayIndex}, nil
+		}
+		return nil, nil
+	}}); err != nil {
+		return err
+	}
+	synced := []cache.InformerSynced{svcInf.HasSynced}
+	var nsInf cache.SharedIndexInformer
+	if orgGateway.Enabled {
+		nsInf = kubeFactory.Core().V1().Namespaces().Informer()
+		synced = append(synced, nsInf.HasSynced)
+	}
 	epsInf := kubeFactory.Discovery().V1().EndpointSlices().Informer()
 	if err := epsInf.AddIndexers(cache.Indexers{
 		svcIndex: func(obj any) ([]string, error) {
@@ -217,11 +240,14 @@ func run() error {
 	sdnFactory.Start(stop)
 	localFactory.Start(stop)
 	kubeFactory.Start(stop)
-	if !cache.WaitForCacheSync(stop, vpcInf.HasSynced, portInf.HasSynced, bindingInf.HasSynced, svcInf.HasSynced, epsInf.HasSynced, peeringInf.HasSynced, svipInf.HasSynced, fipInf.HasSynced) {
+	if !cache.WaitForCacheSync(stop, append(synced, vpcInf.HasSynced, portInf.HasSynced, bindingInf.HasSynced, epsInf.HasSynced, peeringInf.HasSynced, svipInf.HasSynced, fipInf.HasSynced)...) {
 		return fmt.Errorf("informer caches did not sync")
 	}
 
-	state := &informerState{vpcs: vpcInf.GetIndexer(), bindings: bindingInf.GetIndexer(), ports: portInf.GetIndexer(), svcs: svcInf.GetIndexer(), eps: epsInf.GetIndexer(), peerings: peeringInf.GetIndexer(), svips: svipInf.GetIndexer(), fips: fipInf.GetIndexer()}
+	state := &informerState{vpcs: vpcInf.GetIndexer(), bindings: bindingInf.GetIndexer(), ports: portInf.GetIndexer(), svcs: svcInf.GetIndexer(), eps: epsInf.GetIndexer(), peerings: peeringInf.GetIndexer(), svips: svipInf.GetIndexer(), fips: fipInf.GetIndexer(), orgGateway: orgGateway}
+	if nsInf != nil {
+		state.namespaces = nsInf.GetIndexer()
+	}
 	res := &responder.Resolver{Domain: domain, Upstreams: upstreams, State: state}
 
 	// DNS observability (docs/observability.md §D): opt-in like the rest of
@@ -346,6 +372,35 @@ type informerState struct {
 	eps      cache.Indexer
 	peerings cache.Indexer
 	svips    cache.Indexer
+	// namespaces is set only while orgGateway is enabled.
+	namespaces cache.Indexer
+	orgGateway orggateway.Config
+}
+
+// OrgGateway resolves the organisation Gateway of a VPC namespace from the
+// cached Namespaces and every Service holding a reserve address.
+func (s *informerState) OrgGateway(namespace string) orggateway.Gateway {
+	if !s.orgGateway.Enabled || s.namespaces == nil {
+		return orggateway.Gateway{}
+	}
+	objs, err := s.svcs.ByIndex(orgGatewayIndex, orgGatewayIndex)
+	if err != nil {
+		return orggateway.Gateway{}
+	}
+	services := make([]*corev1.Service, 0, len(objs))
+	for _, obj := range objs {
+		if svc, ok := obj.(*corev1.Service); ok {
+			services = append(services, svc)
+		}
+	}
+	return s.orgGateway.Resolve(namespace, func(name string) *corev1.Namespace {
+		obj, found, err := s.namespaces.GetByKey(name)
+		if err != nil || !found {
+			return nil
+		}
+		ns, _ := obj.(*corev1.Namespace)
+		return ns
+	}, services)
 }
 
 // ServiceVIPFor returns the VIP materialized for the service in the given

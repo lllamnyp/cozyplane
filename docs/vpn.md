@@ -752,6 +752,31 @@ Appliance form factor follows from the tier: a **VM** unlocks tier 1
 (live migration) and is the accepted `tenant-site-connectivity` shape; a **pod**
 restarts faster on a crash but cannot live-migrate. Both do tiers 2 and 3.
 
+### 3.6 Organisation gateway
+
+When `orgGateway` is enabled ([services-in-vpc.md](services-in-vpc.md) §
+"Organisation gateway"), the clients and sites of a gateway reach the internal
+Gateway of the gateway namespace's organisation, on TCP 80/443 only. The
+controller resolves the Gateway's addresses and adds each as a /32:
+
+- to a WireGuard client's `AllowedIPs` and to the `wg0` destination filter
+  (`clientDestinationCIDRs`);
+- to every IPsec peer's `localCIDRs` (traffic selectors and decrypted-traffic
+  filter);
+- to the active-active `advertiseCIDRs`.
+
+The appliance config carries `gatewayDestinations`; the appliance masquerades
+TCP 80/443 to them on its primary leg (the default-route link) behind its own VPC
+address, the only source the datapath re-sources toward the Gateway
+(`vpnnet.MasqueradeOrgGateway`, a private `nat` chain rebuilt at start). With
+`orgGateway.vpnDNS`, a client pool whose `dns` is exactly `egress.clusterDNS`
+also gets that /32 and `dnsDestination` (UDP/TCP 53 masqueraded): the query
+reaches the split-horizon resolver as the appliance and gets the VPC's answers.
+A tenant-supplied pool DNS server never extends a filter or selector. Remote
+sites forward the apex zone to the resolver themselves; nothing is pushed to
+them. A Gateway Service or namespace change re-renders the gateways of the
+namespaces it serves (the appliance rolls). IPv4 only.
+
 ## 4. Non-goals
 
 - **Transit encryption.** Node-to-node encryption of the overlay (what Cilium

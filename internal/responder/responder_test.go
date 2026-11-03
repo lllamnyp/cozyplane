@@ -19,6 +19,7 @@ package responder
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"testing"
 
 	"github.com/miekg/dns"
@@ -26,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
+	"github.com/lllamnyp/cozyplane/internal/orggateway"
 )
 
 var (
@@ -40,6 +42,7 @@ type fakeState struct {
 	vpcOf map[string]sdnv1alpha1.VPCRef
 	peers map[sdnv1alpha1.VPCRef][]sdnv1alpha1.VPCRef
 	svips map[string]net.IP // ns/name -> VIP
+	gws   map[string]orggateway.Gateway
 }
 
 func (f *fakeState) PortByFabricIP(ip string) *sdnv1alpha1.Port { return f.ports[ip] }
@@ -57,6 +60,7 @@ func (f *fakeState) Peers(vpc sdnv1alpha1.VPCRef) []sdnv1alpha1.VPCRef { return 
 func (f *fakeState) ServiceVIPFor(ns, name string, vpc sdnv1alpha1.VPCRef) net.IP {
 	return f.svips[ns+"/"+name]
 }
+func (f *fakeState) OrgGateway(namespace string) orggateway.Gateway { return f.gws[namespace] }
 
 func headless(ns, name, vpcAnno string, ports ...corev1.ServicePort) *corev1.Service {
 	return &corev1.Service{
@@ -302,5 +306,41 @@ func TestPublishNotReady(t *testing.T) {
 	m := query(t, r, "10.244.1.5", "etcd.team-a.svc.cluster.local", dns.TypeA)
 	if got := answers(m); len(got) != 3 {
 		t.Fatalf("want 3 records with publishNotReadyAddresses, got %v", got)
+	}
+}
+
+// The organisation Gateway's apexes resolve for the querier's own VPC only:
+// A/AAAA are answered (NODATA for a missing family), other types and other
+// organisations' VPCs go upstream like any external name.
+func TestOrgGatewayApexes(t *testing.T) {
+	r := testResolver()
+	st := r.State.(*fakeState)
+	st.ports["10.244.1.6"] = &sdnv1alpha1.Port{Spec: sdnv1alpha1.PortSpec{VPCRef: vpcB, IP: "172.16.0.9"}}
+	st.gws = map[string]orggateway.Gateway{
+		"team-a": {Apexes: []string{"org-a.apps.example.test"}, IPs: []netip.Addr{netip.MustParseAddr("10.240.0.5")}},
+		"team-b": {Apexes: []string{"org-b.apps.example.test"}, IPs: []netip.Addr{netip.MustParseAddr("10.240.0.9")}},
+	}
+	for _, name := range []string{"org-a.apps.example.test", "App.Org-A.apps.example.test"} {
+		m := query(t, r, "10.244.1.5", name, dns.TypeA)
+		if got := answers(m); len(got) != 1 || got[0] != "10.240.0.5" || m.Answer[0].Header().Ttl != 5 || !m.Authoritative {
+			t.Fatalf("%s: want the Gateway address with TTL 5, got %v", name, m)
+		}
+	}
+	m := query(t, r, "10.244.1.5", "web.org-a.apps.example.test", dns.TypeAAAA)
+	if m.Rcode != dns.RcodeSuccess || len(m.Answer) != 0 || len(m.Ns) != 1 {
+		t.Fatalf("AAAA without a v6 address must be NODATA, got %v", m)
+	}
+	for _, tc := range []struct {
+		from, name string
+		qtype      uint16
+	}{
+		{"10.244.1.5", "org-a.apps.example.test", dns.TypeMX},
+		{"10.244.1.6", "org-a.apps.example.test", dns.TypeA}, // another organisation's VPC
+		{"10.244.1.5", "notorg-a.apps.example.test", dns.TypeA},
+	} {
+		// No upstreams: forwarding shows as SERVFAIL, never an authoritative answer.
+		if m := query(t, r, tc.from, tc.name, tc.qtype); m.Rcode != dns.RcodeServerFailure || m.Authoritative {
+			t.Fatalf("%s %s from %s must be forwarded, got %v", tc.name, dns.TypeToString[tc.qtype], tc.from, m)
+		}
 	}
 }

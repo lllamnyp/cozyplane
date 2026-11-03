@@ -1947,6 +1947,57 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } dns_ct SEC(".maps");
 
+// org_gw: (VPC net, organisation Gateway address) -> 1. A VPC pod may open TCP
+// 80/443 to its own organisation's internal Gateway (docs/services-in-vpc.md §
+// "Organisation gateway"); gw_steer re-sources the flow to the pod's fabric IP
+// and hands it to Cilium on the same veth. The agent derives every entry from
+// platform data (internal/orggateway); IPv4 only, like the fabric bridge.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct local_key);
+	__type(value, __u8);
+	__uint(max_entries, 16384);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} org_gw SEC(".maps");
+
+// org_gw_ct records each steered flow so gw_return admits only the Gateway's
+// replies to it, never an unsolicited packet from the Gateway address.
+struct org_gw_ct_key {
+	struct addr128 fabric; // the pod's rewritten source
+	struct addr128 gw;     // the Gateway address
+	__u16 sport;           // the pod's source port, network order
+	__u16 dport;           // 80 or 443, network order
+	__u32 pad;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__type(key, struct org_gw_ct_key);
+	__type(value, __u32); // the VPC net the flow left
+	__uint(max_entries, 65536);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} org_gw_ct SEC(".maps");
+
+// org_gw_be: Gateway proxy endpoint (address, target port) -> the Gateway
+// address and service port it serves. Cilium's KPR translates the Gateway
+// address to a proxy pod; when that pod runs on another node, its reply reaches
+// to_pod before Cilium (chained after us) reverse-NATs it, so gw_return undoes
+// the translation itself. It grants nothing alone: the translated reply must
+// still match an org_gw_ct record.
+struct org_gw_addr {
+	struct addr128 addr;
+	__u16 port; // network order
+	__u16 pad;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct org_gw_addr);
+	__type(value, struct org_gw_addr);
+	__uint(max_entries, 16384);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} org_gw_be SEC(".maps");
+
 // ---- ServiceVIP maps (docs/services-in-vpc.md increment 2) ----------------
 // A ServiceVIP is the ClusterIP-equivalent inside a VPC: an address from the
 // VPC's own space that from_pod DNATs to a backend VPC IP. Keys are net-scoped
@@ -5612,6 +5663,105 @@ static __always_inline int dns_return(struct __sk_buff *skb, struct pkt *p)
 	return TC_ACT_OK;
 }
 
+// ponytail: the Gateway listeners are fixed at HTTP/HTTPS; a per-entry port set
+// in org_gw if another listener ever appears.
+static __always_inline int org_gw_port(__u16 port)
+{
+	return port == bpf_htons(80) || port == bpf_htons(443);
+}
+
+// gw_steer: from_pod's half of the organisation Gateway path. Called only for a
+// non-gateway VPC pod's IPv4 TCP flow whose destination resolved off-VPC, so a
+// tenant CIDR covering the address shadows it, as with DNS. On an org_gw hit
+// the source becomes the pod's fabric IP — Cilium's endpoint identity on this
+// veth — and TC_ACT_NEXT lets Cilium's program, chained after ours, load-balance
+// the LB address to a Gateway proxy pod. No fabric handle (a secondary leg, a foreign
+// source) means no access: the reserve is cluster-internal, nothing else may
+// carry it. k and ck are per-CPU scratch (from_pod's stack is full).
+#define GW_MISS -2 // not -1: that is TC_ACT_NEXT, gw_steer's success verdict
+static __always_inline int gw_steer(struct __sk_buff *skb, struct pkt *p, __u32 srcnet, __u32 foreign,
+				    struct local_key *k, struct org_gw_ct_key *ck)
+{
+	struct iphdr *ip;
+	if (parse_ipv4(skb, &ip) < 0 || ip->ihl != 5)
+		return GW_MISS;
+	__u16 sport, dport;
+	if (l4_ports(skb, &sport, &dport) < 0 || !org_gw_port(dport))
+		return GW_MISS;
+	k->net = srcnet;
+	k->ip = p->dst;
+	if (!bpf_map_lookup_elem(&org_gw, k))
+		return GW_MISS;
+	// A forwarding leg relaying a source it does not own (possibly a co-VPC
+	// pod's address, with that pod's fabric handle) never speaks for it.
+	if (foreign)
+		return TC_ACT_SHOT;
+	// The pod's SecurityGroup egress applies like on every north-south path
+	// (a grouped pod needs a `to: {cidr}` rule covering the Gateway); only the
+	// VPC boundary's Internet switch is waived, the Gateway being internal.
+	if (!ns_egress_ok(skb, srcnet, 0, IPPROTO_TCP, p->src, p->dst))
+		return TC_ACT_SHOT;
+	k->ip = p->src;
+	struct addr128 *fabp = bpf_map_lookup_elem(&fabric_of, k);
+	if (!fabp)
+		return TC_ACT_SHOT;
+	ck->fabric = *fabp;
+	ck->gw = p->dst;
+	ck->sport = sport;
+	ck->dport = dport;
+	ck->pad = 0;
+	if (bpf_map_update_elem(&org_gw_ct, ck, &srcnet, BPF_ANY) < 0)
+		return TC_ACT_SHOT;
+	nat_addr(skb, IPPROTO_TCP, IP_SADDR_OFF, v4_of_128(&p->src), v4_of_128(&ck->fabric));
+	return TC_ACT_NEXT;
+}
+
+// gw_return: to_pod's half. The Gateway's reply, routed here by the fabric /32,
+// arrives either as gw:80/443 -> fabric:sport (Cilium already reverse-NATed it:
+// the proxy runs on this node) or as proxy:target -> fabric:sport (another
+// node: Cilium, chained after us, has not yet). The direct form is tried
+// first, then a programmed proxy endpoint is translated back to its Gateway
+// address and port. Either way the reply is delivered to the pod's VPC IP only
+// when gw_steer recorded that exact flow from this net. Returns 1 when it
+// rewrote the packet.
+static __always_inline int gw_return(struct __sk_buff *skb, struct pkt *p)
+{
+	if (p->is_v6 || p->proto != IPPROTO_TCP)
+		return 0;
+	struct iphdr *ip;
+	if (parse_ipv4(skb, &ip) < 0 || ip->ihl != 5)
+		return 0;
+	__u16 sport, dport;
+	if (l4_ports(skb, &sport, &dport) < 0)
+		return 0;
+	// The direct form first: no org_gw_be entry can redirect a reply that
+	// already carries the Gateway address of a recorded flow.
+	struct org_gw_ct_key ck = { .fabric = p->dst, .gw = p->src, .sport = dport, .dport = sport };
+	__u32 *net = org_gw_port(sport) ? bpf_map_lookup_elem(&org_gw_ct, &ck) : NULL;
+	struct org_gw_addr *proxied = NULL;
+	if (!net) {
+		struct org_gw_addr from = { .addr = p->src, .port = sport };
+		proxied = bpf_map_lookup_elem(&org_gw_be, &from);
+		if (!proxied)
+			return 0;
+		ck.gw = proxied->addr;
+		ck.dport = proxied->port;
+		net = bpf_map_lookup_elem(&org_gw_ct, &ck);
+		if (!net)
+			return 0;
+	}
+	struct bridge_ep *be = bridge_of(p->dst);
+	if (!be || be->net != *net)
+		return 0;
+	if (proxied) {
+		nat_addr(skb, IPPROTO_TCP, IP_SADDR_OFF, v4_of_128(&p->src), v4_of_128(&ck.gw));
+		if (sport != ck.dport)
+			nat_port(skb, IPPROTO_TCP, L4_SPORT_OFF, sport, ck.dport);
+	}
+	nat_addr(skb, IPPROTO_TCP, IP_DADDR_OFF, v4_of_128(&p->dst), v4_of_128(&be->vpc_ip));
+	return 1;
+}
+
 // Managed VPC boundaries have their own maps and state and run before any
 // NAT/Service return path. Between two bounded VPCs the boundary is the CEILING;
 // security groups still apply on top of it and narrow it (both must admit).
@@ -5649,6 +5799,7 @@ struct boundary_scratch {
 	struct boundary_flow key; struct boundary_flow reverse;
 	struct boundary_flow_value value; struct boundary_rule rule;
 	struct boundary_cidr cidr; struct local_key endpoint;
+	struct org_gw_ct_key gw; // gw_steer's flow key, from_pod continuation only
 };
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY); __type(key, __u32); __type(value, struct boundary_scratch);
@@ -5918,6 +6069,13 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 			if (!plumbing && !s->key.peer && cfg(CFG_RESOLVER_PORT) && dns_destination(&s->packet) &&
 			    (s->packet.proto == IPPROTO_TCP || s->packet.proto == IPPROTO_UDP) && boundary_l4(skb, s) &&
 			    s->key.dport == bpf_htons(53)) plumbing = 1;
+			// The organisation Gateway is plumbing too: gw_steer in the
+			// continuation either re-sources the flow or drops it.
+			if (!plumbing && !s->key.peer && !s->packet.is_v6 && s->packet.proto == IPPROTO_TCP &&
+			    boundary_l4(skb, s) && org_gw_port(s->key.dport)) {
+				s->endpoint.net = net; s->endpoint.ip = s->packet.dst;
+				plumbing = bpf_map_lookup_elem(&org_gw, &s->endpoint) != NULL;
+			}
 			if (!plumbing && !boundary_gate(skb, s)) return TC_ACT_SHOT;
 		}
 	}
@@ -6068,8 +6226,17 @@ static __always_inline int from_pod(struct __sk_buff *skb)
 	// Family-agnostic — the addresses are already 128-bit map keys.
 	__u32 dstnet = net_of(&networks, srcnet, p->dst);
 
-	// An explicit per-VPC route is the first off-VPC decision. VPN prefixes
-	// must win before specialised DNS, LB-return and FloatingIP processing.
+	// The organisation Gateway (gw_steer) precedes every off-VPC path, explicit
+	// routes included: the reserve is cluster-internal, no route, NAT, floating
+	// IP or gateway may carry it (the controllers refuse such routes anyway).
+	if (srcnet && !dstnet && !is_gw && !p->is_v6 && p->proto == IPPROTO_TCP) {
+		int gr = gw_steer(skb, p, srcnet, foreign_src, &packet_scratch->endpoint, &packet_scratch->gw);
+		if (gr != GW_MISS)
+			return gr;
+	}
+
+	// Otherwise an explicit per-VPC route is the first off-VPC decision. VPN
+	// prefixes must win before specialised DNS, LB-return and FloatingIP processing.
 	if (srcnet && !dstnet && !is_gw) {
 		if (routes_blocked(srcnet))
 			return TC_ACT_SHOT;
@@ -6493,6 +6660,9 @@ int cozyplane_to_pod_continue(struct __sk_buff *skb)
 		int dr = dns_return(skb, &p);
 		if (dr != DNS_MISS)
 			return dr;
+		// The organisation Gateway's reply, likewise before the bridge.
+		if (gw_return(skb, &p))
+			return TC_ACT_OK;
 	}
 
 	// The north-south bridge and floating IPs are v4-only today; a v6 packet

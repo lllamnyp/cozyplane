@@ -66,6 +66,13 @@ socket load balancer has translated its Service IP to an internal backend.
 Only off-VPC TCP/UDP destination port 53 is eligible; the continuation redirects
 it to the node-local split-horizon resolver. It never grants direct access to
 that backend, an unrelated management port, an external resolver, or a peer VPC.
+The organisation Gateway is the third plumbing exception: off-VPC IPv4 TCP to
+port 80 or 443 of an address the agent programmed for this VPC in `org_gw`
+(its own organisation's internal Gateway, [services-in-vpc.md](services-in-vpc.md))
+passes without the `internet` permission. The continuation, before any explicit
+route, re-sources it to the pod's fabric IP or drops it (no fabric handle, or a
+forwarded foreign source); it never reaches a route, NAT, a floating IP or a peer.
+SecurityGroup egress still applies to it.
 IPv6 guests also need link-local Router Solicitations and DHCPv6 requests before
 they own their pinned VPC address. Those frames must reach only the local veth
 responder, with exact control-message, source-scope and destination checks;

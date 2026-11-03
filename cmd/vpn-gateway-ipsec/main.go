@@ -71,6 +71,10 @@ type config struct {
 	Credentials *ikeCredentials `json:"credentials,omitempty"`
 	Pools       []addressPool   `json:"pools,omitempty"`
 	Peers       []peer          `json:"peers"`
+	// The organisation Gateway /32s (and cluster DNS) tunnel traffic may reach
+	// through this appliance's own VPC address (vpnnet.MasqueradeOrgGateway).
+	GatewayDestinations []string `json:"gatewayDestinations,omitempty"`
+	DNSDestination      string   `json:"dnsDestination,omitempty"`
 }
 
 type ikeCredentials struct {
@@ -180,6 +184,9 @@ func run(path string, log *slog.Logger) error {
 	}
 
 	if err := vpnnet.EnsureForwarding(); err != nil {
+		return err
+	}
+	if err := vpnnet.MasqueradeOrgGateway(cfg.GatewayDestinations, cfg.DNSDestination); err != nil {
 		return err
 	}
 

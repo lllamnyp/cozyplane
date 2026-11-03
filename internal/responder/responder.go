@@ -26,12 +26,15 @@ limitations under the License.
 //     backends' VPC IPs (A/AAAA, per-hostname records, SRV); every other
 //     cluster-domain name is NXDOMAIN. Not forwarding these prevents probing
 //     other tenants' existence and never hands out dead-end ClusterIPs.
+//   - The apexes of the querier's organisation Gateway (and every name under
+//     them) answer A/AAAA with that Gateway's private addresses.
 //   - Everything else defers to the node's upstream resolvers.
 package responder
 
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -41,6 +44,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
+	"github.com/lllamnyp/cozyplane/internal/orggateway"
 )
 
 // TTL for authoritative answers, matching CoreDNS's kubernetes-zone default.
@@ -96,6 +100,9 @@ type State interface {
 	// ServiceVIPFor returns the VIP materialized for an attached non-headless
 	// Service within the given VPC, or nil while none is allocated.
 	ServiceVIPFor(ns, name string, vpc sdnv1alpha1.VPCRef) net.IP
+	// OrgGateway returns the organisation Gateway of a VPC's namespace
+	// (internal/orggateway), empty when there is none.
+	OrgGateway(namespace string) orggateway.Gateway
 }
 
 // Resolver serves the per-net DNS view.
@@ -150,6 +157,18 @@ func (r *Resolver) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		r.reply(w, req, resp)
 		r.Metrics.Response(resp.Rcode, vpc)
 		return
+	}
+	// The querying VPC's organisation Gateway: its apexes (and every name under
+	// them) resolve to the Gateway's private addresses, for this VPC only.
+	// Other record types still go upstream.
+	if q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA {
+		gw := r.State.OrgGateway(vpc.Namespace)
+		if apex := apexOf(qname, gw.Apexes); apex != "" {
+			resp := orgGatewayAnswer(req, q, apex, gw.IPs)
+			r.reply(w, req, resp)
+			r.Metrics.Response(resp.Rcode, vpc)
+			return
+		}
 	}
 	resp := r.forward(w, req)
 	r.Metrics.Response(resp.Rcode, vpc)
@@ -488,10 +507,38 @@ func (r *Resolver) failed(req *dns.Msg) *dns.Msg {
 	return m
 }
 
+// apexOf returns the apex qname equals or sits under, or "".
+func apexOf(qname string, apexes []string) string {
+	for _, apex := range apexes {
+		if dns.IsSubDomain(dns.Fqdn(apex), qname) {
+			return apex
+		}
+	}
+	return ""
+}
+
+// orgGatewayAnswer answers an apex name with the Gateway's addresses of the
+// asked family, or NODATA under the apex's SOA when it has none.
+func orgGatewayAnswer(req *dns.Msg, q dns.Question, apex string, ips []netip.Addr) *dns.Msg {
+	m := new(dns.Msg)
+	m.SetReply(req)
+	m.Authoritative = true
+	for _, ip := range ips {
+		if rr := addrRecord(q.Name, q.Qtype, net.IP(ip.AsSlice())); rr != nil {
+			m.Answer = append(m.Answer, rr)
+		}
+	}
+	if len(m.Answer) == 0 {
+		m.Ns = []dns.RR{soaRecord(dns.Fqdn(apex))}
+	}
+	return m
+}
+
 // soa synthesizes the zone SOA for negative answers (NXDOMAIN/NODATA), so
 // stub resolvers cache them; the minimum field doubles as the negative TTL.
-func (r *Resolver) soa() dns.RR {
-	zone := dns.Fqdn(r.Domain)
+func (r *Resolver) soa() dns.RR { return soaRecord(dns.Fqdn(r.Domain)) }
+
+func soaRecord(zone string) dns.RR {
 	return &dns.SOA{
 		Hdr:     dns.RR_Header{Name: zone, Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: ttl},
 		Ns:      "ns.dns." + zone,

@@ -18,7 +18,8 @@ func TestKernelClientPacketAuthorization(t *testing.T) {
 	}
 	defer objects.Close()
 	r, err := compile([]Peer{
-		{Addresses: []string{"10.200.0.2/32", "fd00:200::2/128"}, Destinations: []string{"10.1.0.0/24", "fd00:1::/64"}},
+		// 10.240.0.5/32: an organisation Gateway address joins as a host prefix.
+		{Addresses: []string{"10.200.0.2/32", "fd00:200::2/128"}, Destinations: []string{"10.1.0.0/24", "fd00:1::/64", "10.240.0.5/32"}},
 		{Addresses: []string{"10.200.0.3/32"}, Destinations: []string{"10.2.0.0/24", "10.200.0.0/24"}},
 	}, []netip.Addr{netip.MustParseAddr("10.1.0.1"), netip.MustParseAddr("fd00:1::1")})
 	if err != nil {
@@ -46,6 +47,9 @@ func TestKernelClientPacketAuthorization(t *testing.T) {
 		{"authorized v4", "10.200.0.2", "10.1.0.5", true},
 		{"authorized v6", "fd00:200::2", "fd00:1::5", true},
 		{"other VPC", "10.200.0.2", "10.2.0.5", false},
+		{"gateway /32", "10.200.0.2", "10.240.0.5", true},
+		{"next to the gateway /32", "10.200.0.2", "10.240.0.6", false},
+		{"gateway /32 of another peer", "10.200.0.3", "10.240.0.5", false},
 		{"second peer VPC", "10.200.0.3", "10.2.0.5", true},
 		{"unknown source", "10.200.0.4", "10.1.0.5", false},
 		{"appliance v4", "10.200.0.2", "10.1.0.1", false},

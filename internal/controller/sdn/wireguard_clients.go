@@ -75,8 +75,10 @@ func connectionsForVPC(conns []sdn.VPNConnection, name string) []sdn.VPNConnecti
 	return out
 }
 
-func clientDestinationCIDRs(c *sdn.VPNConnection, vpcs []*sdn.VPC) []string {
-	var out []string
+// clientDestinationCIDRs is what a client may reach: its granted VPCs' CIDRs,
+// plus the platform-derived extra /32s (organisation Gateway, cluster DNS).
+func clientDestinationCIDRs(c *sdn.VPNConnection, vpcs []*sdn.VPC, extra []string) []string {
+	out := slices.Clone(extra)
 	for _, vpc := range vpcs {
 		if clientAllowsVPC(c, vpc.Name) {
 			out = append(out, vpc.Spec.CIDRs...)
@@ -770,6 +772,10 @@ func (r *VPNGatewayReconciler) finalizeWGClientGateway(ctx context.Context, gw *
 }
 
 func (r *VPNGatewayReconciler) reflectWGClientConfig(ctx context.Context, gw *sdn.VPNGateway, vpcs []*sdn.VPC, conns []sdn.VPNConnection, applied bool) error {
+	gateways, err := r.orgGatewayDestinations(ctx, gw.Namespace)
+	if err != nil {
+		return err
+	}
 	for i := range conns {
 		want := &conns[i]
 		current := &sdn.VPNConnection{}
@@ -784,13 +790,9 @@ func (r *VPNGatewayReconciler) reflectWGClientConfig(ctx context.Context, gw *sd
 		current.Status.ClientConfig = nil
 		ready := applied && gw.Status.Address != "" && gw.Status.PublicKey != ""
 		if ready {
-			var dns []string
-			for _, pool := range gw.Spec.WireGuard.AddressPools {
-				if slices.Contains(want.Spec.WireGuard.Client.AddressPools, pool.Name) {
-					dns = appendUnique(dns, pool.DNS...)
-				}
-			}
-			current.Status.ClientConfig = &sdn.VPNWireGuardClientConfig{Endpoint: net.JoinHostPort(gw.Status.Address, strconv.Itoa(int(r.listenPort(gw)))), ServerPublicKey: gw.Status.PublicKey, AllowedIPs: clientDestinationCIDRs(want, vpcs), DNS: dns, MTU: int32(wgClientTunnelMTU(vpcs)), PersistentKeepalive: 25}
+			dns := clientPoolDNS(gw, want)
+			allowed := clientDestinationCIDRs(want, vpcs, append(r.vpnDNSDestination(dns), gateways...))
+			current.Status.ClientConfig = &sdn.VPNWireGuardClientConfig{Endpoint: net.JoinHostPort(gw.Status.Address, strconv.Itoa(int(r.listenPort(gw)))), ServerPublicKey: gw.Status.PublicKey, AllowedIPs: allowed, DNS: dns, MTU: int32(wgClientTunnelMTU(vpcs)), PersistentKeepalive: 25}
 		}
 		reason, message := "ConfigurationPending", "waiting for current client configuration on every appliance"
 		if ready {

@@ -62,6 +62,10 @@ type config struct {
 	MTU           int      `json:"mtu,omitempty"`
 	Peers         []peer   `json:"peers"`
 	PeerInstances [][]peer `json:"peerInstances,omitempty"`
+	// The organisation Gateway /32s (and cluster DNS) tunnel traffic may reach
+	// through this appliance's own VPC address (vpnnet.MasqueradeOrgGateway).
+	GatewayDestinations []string `json:"gatewayDestinations,omitempty"`
+	DNSDestination      string   `json:"dnsDestination,omitempty"`
 }
 
 type peer struct {
@@ -175,6 +179,9 @@ func run(path string, log *slog.Logger) error {
 	}
 	// Enabling forwarding comes after the client policy is successfully attached.
 	if err := vpnnet.EnsureForwarding(); err != nil {
+		return err
+	}
+	if err := vpnnet.MasqueradeOrgGateway(cfg.GatewayDestinations, cfg.DNSDestination); err != nil {
 		return err
 	}
 	if cfg.MTU > 0 {

@@ -216,6 +216,63 @@ which socket-based approaches structurally cannot offer inside a VPC.
   (use PROXY protocol / L7 headers if the tenant needs it); a per-pod
   `FloatingIP` remains the source-preserving option for single workloads.
 
+### Organisation gateway
+
+An organisation's **internal** Gateway (Envoy Gateway in namespace mode: the
+proxy Deployment and its `LoadBalancer` Service live in the Gateway-owning
+namespace G, the address comes from a private platform reserve and is never
+announced) is reachable from that organisation's VPCs on **TCP 80/443 only**,
+and its apex names resolve there. Public Gateways are not handled. Off by
+default (`orgGateway.enabled`).
+
+- **Resolution** (`internal/orggateway`, shared by agent, responder and
+  controller). For a VPC in namespace N: N's `gatewayNamespaceLabel` names G,
+  accepted only if G is N or an ancestor through the namespaces' controller
+  `ownerReferences` (UIDs checked, 8 levels at most). G's proxy Service is the
+  one matching `orgGateway.serviceSelector` in G (`{namespace}` reads as G).
+  Its `status.loadBalancer.ingress` addresses count only inside
+  `orgGateway.addressCIDRs` (IPv4); an address claimed by a second Service, or
+  held by any other Service (LB status or `externalIPs`, a frontend Cilium could
+  serve instead), is dropped. Apexes are N's and G's `apexLabel` values that are DNS
+  names strictly under an `apexSuffixes` entry and outside the cluster domain.
+  No tenant object can widen any of it.
+- **Datapath.** The agent programs `org_gw[{net, address}]`. In `from_pod`,
+  before every other off-VPC path (explicit routes included), a non-gateway VPC
+  pod's TCP 80/443 to such an address (resolved off-VPC: a tenant CIDR covering
+  it shadows it) is
+  re-sourced to the pod's fabric IP, recorded in `org_gw_ct` and continues the
+  tcx chain (`TC_ACT_NEXT`): Cilium, chained after Cozyplane on the veth, sees
+  its own endpoint and load-balances the address to a proxy pod. Without a
+  fabric handle (secondary leg), or from a forwarding leg relaying a source it
+  does not own, the packet is dropped. In
+  `to_pod`, `gw_return` restores the VPC IP on the reply only when it matches a
+  recorded flow from the same net. A proxy on another node answers before
+  Cilium's reverse NAT (Cilium runs after Cozyplane there), so the agent also
+  programs `org_gw_be` (proxy endpoint and target port -> Gateway address and
+  port, from the proxy Service's controller-managed EndpointSlices; an endpoint
+  mapping to two targets, or inside the reserve, is dropped) and `gw_return`,
+  after trying the direct form, translates the reply back; it grants nothing
+  without the flow record.
+- **DNS.** For a steered query whose name is an apex or under one, the
+  resolver answers A with the Gateway's addresses (TTL 5); AAAA is NODATA.
+  Other record types, and other organisations' VPCs, go upstream.
+- **Scope.** The pod's SecurityGroup egress applies as on every north-south
+  path (`ns_egress_ok`): a grouped pod needs a `to: {cidr}` rule covering the
+  Gateway address on 80/443 (the portal's `sg-<vpc>` 0.0.0.0/0 rule does); only
+  the VPC boundary's Internet switch is waived. Peering does not extend it; a
+  VPC exported to other namespaces gives its attachments the owning namespace's
+  Gateway. The agent revokes every grant and flow record at startup and
+  re-grants from synced caches.
+- **Accepted residuals, all fail-closed by design.** A reserve address that any
+  non-Gateway Service holds (`externalIPs` or LB status) withdraws the grant
+  rather than risk a hijacked frontend; operators should deny Service
+  `externalIPs`. Overflowing `org_gw` or `org_gw_be` clears every grant.
+  `org_gw_ct` is a per-node LRU: extreme connection churn can evict another
+  flow's record, whose replies are then dropped.
+- **To prove on the lab**: the re-sourced flow reaching the proxy through
+  Cilium's KPR, with the proxy on the same and on another node, and the reply
+  source `to_pod` sees in each case.
+
 ## The etcd walkthrough (acceptance case)
 
 etcd pods (or VM-hosted members) in `vpc-a`, Services annotated into the VPC:

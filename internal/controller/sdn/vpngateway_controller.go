@@ -55,6 +55,7 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
+	"github.com/lllamnyp/cozyplane/internal/orggateway"
 	"github.com/lllamnyp/cozyplane/internal/vpnidentity"
 	"github.com/lllamnyp/cozyplane/internal/vpnlimits"
 	"github.com/lllamnyp/cozyplane/internal/vpnstatus"
@@ -99,6 +100,12 @@ type VPNGatewayConfig struct {
 	// traffic into the tunnel. Loopback/link-local/multicast are always refused
 	// on top of these.
 	InternalCIDRs []*net.IPNet
+	// OrgGateway adds the organisation Gateway's addresses to what clients and
+	// sites may reach (vpngateway_orggateway.go). Zero value: off.
+	OrgGateway orggateway.Config
+	// ClusterDNS is the cluster DNS ClusterIP; with OrgGateway.VPNDNS, a client
+	// pool pushing exactly it may reach it.
+	ClusterDNS string
 }
 
 // reservedCIDRs are always-forbidden remote prefixes, independent of the
@@ -248,6 +255,7 @@ func haMode(gw *sdnv1alpha1.VPNGateway) sdnv1alpha1.VPNGatewayHAMode {
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 
 // Reconcile realizes the gateway's appliance, grant, endpoint and routes.
 func (r *VPNGatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -1095,21 +1103,28 @@ func (r *VPNGatewayReconciler) buildWGConfig(ctx context.Context, gw *sdnv1alpha
 		Keepalive               int      `json:"keepalive,omitempty"`
 		AllowedDestinationCIDRs []string `json:"allowedDestinationCIDRs,omitempty"`
 	}
+	gateways, err := r.orgGatewayDestinations(ctx, gw.Namespace)
+	if err != nil {
+		return nil, err
+	}
 	cfg := struct {
-		PrivateKey    string            `json:"privateKey"`
-		PrivateKeys   []string          `json:"privateKeys,omitempty"`
-		ListenPort    int               `json:"listenPort,omitempty"`
-		MTU           int               `json:"mtu,omitempty"`
-		Peers         []peer            `json:"peers"`
-		PeerInstances [][]peer          `json:"peerInstances,omitempty"`
-		Routing       *vpnRoutingConfig `json:"routing,omitempty"`
-		ClientMode    bool              `json:"clientMode,omitempty"`
+		PrivateKey          string            `json:"privateKey"`
+		PrivateKeys         []string          `json:"privateKeys,omitempty"`
+		ListenPort          int               `json:"listenPort,omitempty"`
+		MTU                 int               `json:"mtu,omitempty"`
+		Peers               []peer            `json:"peers"`
+		PeerInstances       [][]peer          `json:"peerInstances,omitempty"`
+		Routing             *vpnRoutingConfig `json:"routing,omitempty"`
+		ClientMode          bool              `json:"clientMode,omitempty"`
+		GatewayDestinations []string          `json:"gatewayDestinations,omitempty"`
+		DNSDestination      string            `json:"dnsDestination,omitempty"`
 	}{
-		PrivateKeys: append([]string(nil), privateKeys...),
-		ListenPort:  int(r.listenPort(gw)),
-		MTU:         mtu,
-		Routing:     routingConfigFor(gw, servedVPCs),
-		ClientMode:  isWGClientGateway(gw),
+		PrivateKeys:         append([]string(nil), privateKeys...),
+		ListenPort:          int(r.listenPort(gw)),
+		MTU:                 mtu,
+		Routing:             routingConfigFor(gw, servedVPCs, gateways),
+		ClientMode:          isWGClientGateway(gw),
+		GatewayDestinations: gateways,
 	}
 	if len(privateKeys) > 0 {
 		cfg.PrivateKey = privateKeys[0]
@@ -1140,6 +1155,14 @@ func (r *VPNGatewayReconciler) buildWGConfig(ctx context.Context, gw *sdnv1alpha
 				return nil, fmt.Errorf("WireGuard peer %d preshared key has an invalid encoding", i)
 			}
 		}
+		var destinations []string
+		if c.Spec.WireGuard.Client != nil {
+			dns := r.vpnDNSDestination(clientPoolDNS(gw, c))
+			if len(dns) > 0 {
+				cfg.DNSDestination = r.Config.ClusterDNS
+			}
+			destinations = clientDestinationCIDRs(c, servedVPCs, append(dns, gateways...))
+		}
 		for instance := range peerInstances {
 			publicKey, endpoint := c.Spec.WireGuard.PeerPublicKey, c.Spec.WireGuard.PeerEndpoint
 			if len(c.Spec.WireGuard.PeerPublicKeys) > 0 {
@@ -1152,12 +1175,7 @@ func (r *VPNGatewayReconciler) buildWGConfig(ctx context.Context, gw *sdnv1alpha
 				Name: c.Name, PublicKey: publicKey, Endpoint: endpoint,
 				AllowedIPs:   append([]string(nil), c.Spec.RemoteCIDRs...),
 				PresharedKey: psk, Keepalive: int(c.Spec.WireGuard.PersistentKeepalive),
-				AllowedDestinationCIDRs: func() []string {
-					if c.Spec.WireGuard.Client != nil {
-						return clientDestinationCIDRs(c, servedVPCs)
-					}
-					return nil
-				}(),
+				AllowedDestinationCIDRs: destinations,
 			})
 		}
 	}
@@ -1252,18 +1270,29 @@ func (r *VPNGatewayReconciler) buildIPsecConfig(ctx context.Context, gw *sdnv1al
 	if gw.Spec.IPsec != nil {
 		defProposals = gw.Spec.IPsec.Proposals
 	}
+	gateways, err := r.orgGatewayDestinations(ctx, gw.Namespace)
+	if err != nil {
+		return nil, err
+	}
 	cfg := struct {
-		MTU         int               `json:"mtu,omitempty"`
-		LocalID     string            `json:"localIdentity,omitempty"`
-		Credentials *credentials      `json:"credentials,omitempty"`
-		Pools       []addressPool     `json:"pools,omitempty"`
-		Peers       []peer            `json:"peers"`
-		Routing     *vpnRoutingConfig `json:"routing,omitempty"`
-	}{MTU: mtu, Routing: routingConfigFor(gw, servedVPCs)}
+		MTU                 int               `json:"mtu,omitempty"`
+		LocalID             string            `json:"localIdentity,omitempty"`
+		Credentials         *credentials      `json:"credentials,omitempty"`
+		Pools               []addressPool     `json:"pools,omitempty"`
+		Peers               []peer            `json:"peers"`
+		Routing             *vpnRoutingConfig `json:"routing,omitempty"`
+		GatewayDestinations []string          `json:"gatewayDestinations,omitempty"`
+		DNSDestination      string            `json:"dnsDestination,omitempty"`
+	}{MTU: mtu, Routing: routingConfigFor(gw, servedVPCs, gateways), GatewayDestinations: gateways}
+	poolDNS := map[string][]string{} // pool name -> the cluster DNS /32 it may reach
 	if gw.Spec.IPsec != nil {
 		cfg.LocalID = gw.Spec.IPsec.LocalIdentity
 		for _, pool := range gw.Spec.IPsec.AddressPools {
 			cfg.Pools = append(cfg.Pools, addressPool{Name: pool.Name, CIDR: pool.CIDR, DNS: append([]string(nil), pool.DNS...)})
+			if dns := r.vpnDNSDestination(pool.DNS); len(dns) > 0 {
+				poolDNS[pool.Name] = dns
+				cfg.DNSDestination = r.Config.ClusterDNS
+			}
 		}
 		if ref := gw.Spec.IPsec.CredentialSecretRef; ref != "" {
 			cert, key, embeddedCA, err := r.readTLSCredential(ctx, gw.Namespace, ref)
@@ -1311,7 +1340,7 @@ func (r *VPNGatewayReconciler) buildIPsecConfig(ctx context.Context, gw *sdnv1al
 		}
 		p := peer{
 			Name:        c.Name,
-			LocalCIDRs:  unionVPCCIDRs(servedVPCs),
+			LocalCIDRs:  appendUnique(appendUnique(unionVPCCIDRs(servedVPCs), gateways...), poolDNS[c.Spec.IPsec.AddressPool]...),
 			PeerAddress: c.Spec.IPsec.PeerAddress,
 			StartAction: ipsecStartAction(c.Spec.IPsec),
 			RemoteCIDRs: append([]string(nil), c.Spec.RemoteCIDRs...),
@@ -1397,8 +1426,9 @@ func exactIKEIdentity(identity string) bool {
 }
 
 // routingConfigFor renders the active-active BGP contract; a hub advertises
-// every served VPC's CIDRs (docs/vpn.md §3.3).
-func routingConfigFor(gw *sdnv1alpha1.VPNGateway, servedVPCs []*sdnv1alpha1.VPC) *vpnRoutingConfig {
+// every served VPC's CIDRs (docs/vpn.md §3.3), plus the organisation Gateway
+// addresses its sites may reach.
+func routingConfigFor(gw *sdnv1alpha1.VPNGateway, servedVPCs []*sdnv1alpha1.VPC, gateways []string) *vpnRoutingConfig {
 	if haMode(gw) != sdnv1alpha1.VPNGatewayHAModeActiveActive || gw.Spec.HA == nil || gw.Spec.HA.ActiveActive == nil {
 		return nil
 	}
@@ -1407,7 +1437,7 @@ func routingConfigFor(gw *sdnv1alpha1.VPNGateway, servedVPCs []*sdnv1alpha1.VPC)
 		LocalASN:       aa.LocalASN,
 		PeerASN:        aa.PeerASN,
 		PeerAddresses:  append([]string(nil), aa.PeerAddresses...),
-		AdvertiseCIDRs: unionVPCCIDRs(servedVPCs),
+		AdvertiseCIDRs: appendUnique(unionVPCCIDRs(servedVPCs), gateways...),
 		BFD:            aa.BFD,
 	}
 }
@@ -2802,7 +2832,7 @@ func (r *VPNGatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &sdnv1alpha1.VPNConnection{}, vpnConnectionGatewayIndex, vpnConnectionGatewayKeys); err != nil {
 		return err
 	}
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&sdnv1alpha1.VPNGateway{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&appsv1.StatefulSet{}).
@@ -2814,9 +2844,14 @@ func (r *VPNGatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&sdnv1alpha1.VPNConnection{}, handler.EnqueueRequestsFromMapFunc(r.mapConnectionToGateway), builder.WithPredicates(vpnConnectionEvents())).
 		Watches(&sdnv1alpha1.Port{}, handler.EnqueueRequestsFromMapFunc(r.mapPortToVPNGateways)).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.mapPodToVPNGateways)).
-		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.mapCredentialToVPNGateways)).
-		Named("vpngateway").
-		Complete(r)
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.mapCredentialToVPNGateways))
+	if r.Config.OrgGateway.Enabled {
+		// The organisation Gateway's address and ownership feed every gateway
+		// config in the namespaces it serves (vpngateway_orggateway.go).
+		b = b.Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.mapOrgGatewayServiceToVPNGateways)).
+			Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.mapNamespaceToVPNGateways))
+	}
+	return b.Named("vpngateway").Complete(r)
 }
 
 // Credentials may be tenant-owned, so Owns(Secret) alone cannot observe their
