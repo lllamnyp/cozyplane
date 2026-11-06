@@ -105,6 +105,7 @@ Start with [design.md](docs/design.md) (the vision and the **design tenets**), t
 | [docs/control-plane.md](docs/control-plane.md) | The aggregated-apiserver control-plane design |
 | [docs/roadmap.md](docs/roadmap.md) | Checklist of what's built and what's outstanding, with open-issue index |
 | [docs/north-south.md](docs/north-south.md) | The VPC's one declared boundary: `VPCGateway`, eBPF egress NAT identity, metering, and why cozyplane announces nothing |
+| [docs/vpc-egress.md](docs/vpc-egress.md) | *Design* — VPC egress as first-class objects: `NATGateway`, `RouteTable`/`Route`, the `internet` target, and the SNAT mechanism (expiry, port blocks, the node cap) |
 | [docs/external-addresses.md](docs/external-addresses.md) | *Design* — how external addresses are sourced (a delegated Service); cozyplane allocates/attracts/reserves none |
 | [docs/multitenancy.md](docs/multitenancy.md) | The tenancy rules, each justified or dropped (a namespace *is* the tenant) |
 | [docs/live-migration.md](docs/live-migration.md) | VM live migration via persistent Ports (IP + MAC preservation) |

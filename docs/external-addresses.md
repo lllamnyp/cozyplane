@@ -224,9 +224,11 @@ Two independent gates, each in its right place: the **claim** governs reservatio
 the **EndpointSlice readiness** governs announcement (held-but-dark when the target
 dies). Neither knows about the other.
 
-cozyplane's entire claim surface is that annotation, written as an opaque string —
-no dependency on the claim CRDs, no informer, no module import (the repos are
-private and the API alpha; a Go import would couple builds). The annotation key
+cozyplane's claim surface is that annotation, written as an opaque string — no
+informer, no module import (the repos are private and the API alpha; a Go import
+would couple builds). The one read is the `NATGateway` controller's GET of a named
+claim's `status.addresses`, which decides the families of the Service it creates
+to attach that claim's addresses ([vpc-egress.md](vpc-egress.md) §2.1). The annotation key
 mirrors the address-controller's `well_known.go` constant, with the authority named
 at the mirror.
 
