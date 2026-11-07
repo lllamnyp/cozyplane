@@ -185,10 +185,11 @@ func TestPlanNATClaims(t *testing.T) {
 	if got := planNAT(in).claim; len(got) != 0 {
 		t.Errorf("claims while one is in flight = %d, want 0", len(got))
 	}
-	in = egInputs()
+	in = egInputs(egLease("egress", 1, "b", "a", "b", "c"), egLease("egress", 2, "b", "a", "b", "c"))
 	in.natgws[0].Status.Address = ""
-	if got := planNAT(in).claim; len(got) != 0 {
-		t.Errorf("claims for a NAT gateway without an address = %d, want 0", len(got))
+	in.live[datapath.NATBlock{NATGateway: 3, Block: 2}] = true
+	if plan := planNAT(in); len(plan.claim) != 0 || len(plan.release) != 1 || plan.release[0] != "uid-egress.1" {
+		t.Errorf("claims %d, release %v for a NAT gateway without an address, want none and the flowless block 1", len(plan.claim), plan.release)
 	}
 	in = egInputs(egLease("egress", 1, "b", "a", "b", "c"))
 	in.more[3] = true

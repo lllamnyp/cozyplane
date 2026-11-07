@@ -386,7 +386,8 @@ gateway share one port space.
   VPC for one TCP-established timeout and the block holds no live flow. While it
   hosts the VPC, it keeps its first block and deletes any other that has held no
   live flow for 10 minutes since the sweep last saw one or since the lease was
-  created. The
+  created. A NAT gateway without an address holds no block: its agents release
+  every block without a live flow. The
   controller deletes the leases of a node one TCP-established timeout after its Node
   object is gone, and all leases of a deleted NAT gateway.
 - **Readiness is not an input.** A NotReady node keeps its leases and flows, and no

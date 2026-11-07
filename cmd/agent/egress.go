@@ -278,8 +278,14 @@ func planNAT(in natInputs) natPlan {
 			Net: uint32(vpc.Status.VNI), BlockSize: uint16(g.Status.BlockSize), Blocks: blocks,
 		}
 		hosted := in.hosted[vpcKey{g.Namespace, g.Spec.VPCRef.Name}]
-		if g.Status.Address == "" && g.Status.Address6 == "" && len(leases) == 0 {
-			continue // nothing to SNAT to: claim once an address appears
+		if g.Status.Address == "" && g.Status.Address6 == "" {
+			// Nothing to SNAT to: hold no block until an address appears.
+			for _, l := range leases {
+				if !in.live[datapath.NATBlock{NATGateway: id, Block: uint16(l.Spec.Block)}] {
+					plan.release = append(plan.release, l.Name)
+				}
+			}
+			continue
 		}
 		if at, ok := in.pending[g.UID]; ok && in.now.Sub(at) < claimSettle {
 			continue // a claim is in flight; the cache has not shown it yet
