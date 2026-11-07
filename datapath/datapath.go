@@ -241,7 +241,7 @@ func (m *Manager) setUplinkMAC(mac net.HardwareAddr) error {
 
 // defaultRouteLink returns the ifindex and name of the IPv4 default-route link.
 func defaultRouteLink() (int, string, error) {
-	routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)
+	routes, err := routeList(nil, netlink.FAMILY_V4)
 	if err != nil {
 		return 0, "", fmt.Errorf("list routes: %w", err)
 	}
@@ -274,7 +274,7 @@ func DefaultRouteSrcIP() (net.IP, error) {
 	if err != nil {
 		return nil, err
 	}
-	addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+	addrs, err := addrList(link, netlink.FAMILY_V4)
 	if err != nil {
 		return nil, fmt.Errorf("list addrs on default-route link: %w", err)
 	}

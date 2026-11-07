@@ -133,7 +133,7 @@ func EnsureLocalFromVeth(net_ uint32, ip net.IP) (bool, error) {
 // returning its ifindex and the pinned MAC. ok is false when no such veth
 // exists on this node (e.g. the CNI ADD hasn't landed here).
 func vethForAddr(net_ uint32, ip net.IP) (ifindex int, mac net.HardwareAddr, ok bool, err error) {
-	links, err := netlink.LinkList()
+	links, err := linkList()
 	if err != nil {
 		return 0, nil, false, fmt.Errorf("list links: %w", err)
 	}
@@ -170,7 +170,7 @@ type RebuildStats struct {
 // ::/0 — `default dev <veth>` at metric 256, which outranks a host's RA
 // default and hijacks node v6 egress. Deleting the address removes that route.
 func healLinkLocalGW(l netlink.Link) (bool, error) {
-	addrs, err := netlink.AddrList(l, netlink.FAMILY_V6)
+	addrs, err := addrList(l, netlink.FAMILY_V6)
 	if err != nil {
 		return false, fmt.Errorf("list addrs: %w", err)
 	}
@@ -215,7 +215,7 @@ func healLinkLocalGW(l netlink.Link) (bool, error) {
 // the node's rebuild.
 func (m *Manager) RebuildLocalState() (RebuildStats, error) {
 	var stats RebuildStats
-	links, err := netlink.LinkList()
+	links, err := linkList()
 	if err != nil {
 		return stats, fmt.Errorf("list links: %w", err)
 	}
@@ -466,7 +466,7 @@ func rebuildVeth(l netlink.Link, idx int, rawNet uint32, ips []net.IP, mac net.H
 // No scope filter — a v6 device route reports scope global, not link (only v4
 // host routes carry SCOPE_LINK).
 func fabricRouteIP(l netlink.Link, podIPs []net.IP) (string, error) {
-	routes, err := netlink.RouteList(l, netlink.FAMILY_ALL)
+	routes, err := routeList(l, netlink.FAMILY_ALL)
 	if err != nil {
 		return "", fmt.Errorf("list routes: %w", err)
 	}

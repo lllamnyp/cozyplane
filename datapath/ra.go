@@ -59,7 +59,7 @@ func RunRAResponder(ctx context.Context, mtu int, rdnss net.IP, log *slog.Logger
 	}
 
 	scan := func() {
-		links, err := netlink.LinkList()
+		links, err := linkList()
 		if err != nil {
 			log.Warn("RA responder: list links", "err", err)
 			return

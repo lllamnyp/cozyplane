@@ -23,7 +23,6 @@ import (
 	"net"
 	"strings"
 
-	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
 
@@ -50,7 +49,7 @@ type LocalPortVeth struct {
 // (a VM whose Port is active on another node) without depending on Port events,
 // which are not emitted when a CNI ADD stages a migration target.
 func ListLocalPortVeths() ([]LocalPortVeth, error) {
-	links, err := netlink.LinkList()
+	links, err := linkList()
 	if err != nil {
 		return nil, fmt.Errorf("list links: %w", err)
 	}
