@@ -198,7 +198,8 @@ from the namespace it lives in.
   uses which.
 
 **RBAC.** The tenant role gains full access to `natgateways`, `routetables` and
-`routes` in its namespaces, and read access to their status. RBAC on Services and
+`routes` in its namespaces, and read access to their status. All three are
+ResourceQuota-countable, like the other tenant kinds. RBAC on Services and
 the LB allocator's scoping still decide who may obtain a public address
 ([external-addresses.md](external-addresses.md) §8). On `natportblocks`, the agent
 may create, delete and patch status, the controller may delete, and tenants have no
@@ -222,7 +223,9 @@ For a packet from a VPC Port:
    - the table's `Route` objects.
 
    At equal length, local wins over a `Route`, and a `Route` wins over a peer route.
-   A `Route` that overlaps the VPC's own CIDR is `Unresolved`. A `Route` more
+   A `Route` that lies inside the VPC's own CIDR (equal to it or more specific) is
+   `Unresolved`; a shorter prefix that contains it, such as `0.0.0.0/0`, is not,
+   because the local route is longer. A `Route` more
    specific than a peer route wins: with `10.50.0.0/16` peered and
    `10.50.99.0/24 → blackhole`, the /24 is dropped.
 4. **No match: drop.** The exception is the gateway pod: a `VPCGateway` family with
@@ -257,7 +260,7 @@ The controller sets each Route's `state`:
 | state | when | datapath |
 |-------|------|----------|
 | `Active` | the table is this VPC's and the target resolves | programmed |
-| `Unresolved` | the table is missing or another VPC's; the destination overlaps the VPC's own CIDR; the NAT gateway is missing, in another VPC, or has no address of the destination's family | programmed as blackhole |
+| `Unresolved` | the table is missing or another VPC's; the destination lies inside the VPC's own CIDR; the NAT gateway is missing, in another VPC, or has no address of the destination's family | programmed as blackhole |
 | `Conflict` | an older Route in the same table has the same destination | not programmed |
 
 An `Unresolved` route drops its traffic rather than letting it fall to a shorter
@@ -383,7 +386,7 @@ Later packets hit `nat_fwd`, are checked against `nat_rev`, and refresh it.
 
 **Reply on node a, R → 203.0.113.7:2400:**
 
-1. `from_uplink`: `nat_addr[203.0.113.7]` gives NAT gateway 7 and VPC 101.
+1. `from_uplink`: `nat_addrs[203.0.113.7]` gives NAT gateway 7 and VPC 101.
 2. Block `(2400 − 1024) / 1008 = 1`; `nat_blk_owner[{7, 1}]` gives node b. Node a
    Geneve-encapsulates the packet to b under VNI 101, unchanged.
 3. `from_overlay` on b repeats the lookup, finds itself the owner, and reverses the
@@ -415,7 +418,8 @@ the fabric bridge.
 | `exhausted` | 16 attempts found no free port |
 | `quota` | the VPC's flow quota on the node is spent |
 | `table_full` | `nat_fwd` or `nat_rev` is full |
-| `no_address` | the NAT gateway has no address of the packet's family |
+| `no_address` | the NAT gateway has no address of the packet's family, or serves another VPC |
+| `unsupported` | not TCP, UDP or an ICMP echo request |
 
 `route_drops[{net, reason}]` counts routing refusals per VPC: `blackhole`,
 `unresolved`, `no_floating_ip` (an `internet` route from a Port without one), and
@@ -431,7 +435,7 @@ path.
 | `port_rt` | HASH | `{net, Port IP}` → table id | agent, for local Ports |
 | `vpc_routes` | LPM | `{table id, prefix}` → `{kind, natgateway id}`; kind ∈ local, peer, nat, internet, blackhole | agent; local and peer entries are copied into every table of the VPC |
 | `nat_gw` | HASH | natgateway id → `{v4, v6, net, active blocks[8], count}` | agent, this node's blocks |
-| `nat_addr` | HASH | address → `{natgateway id, net}` | agent, every node |
+| `nat_addrs` | HASH | address → `{natgateway id, net}` | agent, every node |
 | `nat_blk_owner` | HASH | `{natgateway id, block}` → node IP | agent, every node |
 | `nat_fwd`, `nat_rev` | HASH | §4.2 | datapath; the agent's sweep deletes |
 | `nat_flows` | HASH | net → live flows on this node | datapath; the sweep recomputes |
@@ -464,7 +468,8 @@ own stack and instruction budget.
    the kernel clears a packet's mark when it leaves the pod's network namespace.
 
 The FloatingIP egress rewrite and the VPC SNAT move from `from_pod` into
-`vpc_egress`. Peered traffic from a Port with a table pays one extra tail call. On
+`vpc_egress`. Every off-VPC or peered packet of a VPC Port pays one tail call, and
+two when `vpc_egress` hands it back. On
 the reverse path, `from_uplink` and `from_overlay` replace `vpc_nat_reverse` with
 the block lookup of §4.4 and the ICMP-error translation of §4.5. The tail-call slots
 are 4 and 5 of `lb_prog`, which is not pinned.
@@ -473,16 +478,16 @@ are 4 and 5 of `lb_prog`, which is not pinned.
 
 **Controller**
 - allocates `NATGateway.status.id` and `RouteTable.status.id`;
-- owns each NAT gateway's per-family LoadBalancer Services and their
-  advertisement EndpointSlices (the code `VPCGateway` uses today), and writes the
-  addresses, `blockSize` and the block summary into status;
+- owns the LoadBalancer Services that obtain each NAT gateway's addresses (§2.1)
+  and their advertisement EndpointSlices, and writes the addresses, `blockSize`
+  and the block summary into status;
 - resolves Routes (§3.3) and the default table (§2.2);
 - deletes leases (§4.3);
 - performs the transition (§7).
 
 **Agent**
 - programs `port_rt` for local Ports, `vpc_routes` for every table of every VPC it
-  hosts a Port of, and `nat_gw`, `nat_addr` and `nat_blk_owner`;
+  hosts a Port of, and `nat_gw`, `nat_addrs` and `nat_blk_owner`;
 - claims, acks, activates and releases leases (§4.3);
 - sweeps `nat_rev` (§4.2) and serves the metrics (§8).
 
