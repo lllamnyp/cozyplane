@@ -140,8 +140,93 @@ func TestNATGatewayDynamicPerFamily(t *testing.T) {
 	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "t", Name: v4.Name + "-v4"}, eps); err != nil {
 		t.Fatalf("no v4 EndpointSlice: %v", err)
 	}
-	if len(eps.Endpoints) != 1 || eps.Endpoints[0].Addresses[0] != "203.0.113.7" || !*eps.Endpoints[0].Conditions.Ready {
-		t.Errorf("EndpointSlice = %+v, want one Ready self-addressed endpoint", eps.Endpoints)
+	if len(eps.Endpoints) != 0 {
+		t.Errorf("EndpointSlice = %+v, want no endpoint: the cluster has no Ready node", eps.Endpoints)
+	}
+	if v4.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyLocal {
+		t.Errorf("externalTrafficPolicy = %s, want Local", v4.Spec.ExternalTrafficPolicy)
+	}
+}
+
+func natNode(name, ip, boot string, ready bool) *corev1.Node {
+	st := corev1.ConditionFalse
+	if ready {
+		st = corev1.ConditionTrue
+	}
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: st}},
+			Addresses:  []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: ip}},
+			NodeInfo:   corev1.NodeSystemInfo{BootID: boot},
+		},
+	}
+}
+
+func natLease(uid string, block int32, active bool, acks ...localsdnv1alpha1.NATPortBlockAck) *localsdnv1alpha1.NATPortBlock {
+	return &localsdnv1alpha1.NATPortBlock{
+		ObjectMeta: metav1.ObjectMeta{Name: localsdnv1alpha1.NATPortBlockName(types.UID(uid), int(block)),
+			Labels: map[string]string{localsdnv1alpha1.LabelNATGatewayUID: uid}},
+		Spec:   localsdnv1alpha1.NATPortBlockSpec{Block: block, Node: "a"},
+		Status: localsdnv1alpha1.NATPortBlockStatus{Acks: acks, Active: active},
+	}
+}
+
+// The NAT Service's endpoints are the Ready nodes that acked every active lease
+// in their current boot, each with its nodeName, so the LB implementation
+// announces the address only from a node that can forward every leased port
+// (docs/vpc-egress.md §4.3). An inactive lease does not count.
+func TestNATGatewayEndpointsAreNATReadyNodes(t *testing.T) {
+	s := egressScheme(t)
+	gw := natgw("t", "egress", "v", "", "")
+	gw.UID = "gw-uid"
+	ack := func(node, boot string) localsdnv1alpha1.NATPortBlockAck {
+		return localsdnv1alpha1.NATPortBlockAck{Node: node, BootID: boot}
+	}
+	c := egressClient(t, s, vpcWithCIDRs("t", "v", 100, "10.0.0.0/24"), gw,
+		natNode("a", "10.1.0.1", "a1", true),
+		natNode("b", "10.1.0.2", "b2", true), // rebooted: its ack is from boot b1
+		natNode("c", "10.1.0.3", "c1", false),
+		natLease("gw-uid", 0, true, ack("a", "a1"), ack("b", "b1"), ack("c", "c1")),
+		natLease("gw-uid", 1, false, ack("a", "a1")),
+	)
+	reconcileNATGateway(t, s, c, "t", "egress")
+	v4 := ngwServices(t, c, "t", "egress")["dynamic-IPv4"]
+	setIngress(t, c, v4, "203.0.113.7")
+	reconcileNATGateway(t, s, c, "t", "egress")
+	eps := &discoveryv1.EndpointSlice{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "t", Name: v4.Name + "-v4"}, eps); err != nil {
+		t.Fatalf("no v4 EndpointSlice: %v", err)
+	}
+	if len(eps.Endpoints) != 1 || *eps.Endpoints[0].NodeName != "a" || eps.Endpoints[0].Addresses[0] != "10.1.0.1" {
+		t.Fatalf("endpoints = %+v, want only node a", eps.Endpoints)
+	}
+
+	// b re-acks in its current boot and joins.
+	l := &localsdnv1alpha1.NATPortBlock{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: localsdnv1alpha1.NATPortBlockName("gw-uid", 0)}, l); err != nil {
+		t.Fatal(err)
+	}
+	l.Status.Acks[1].BootID = "b2"
+	if err := c.Status().Update(context.Background(), l); err != nil {
+		t.Fatal(err)
+	}
+	reconcileNATGateway(t, s, c, "t", "egress")
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "t", Name: v4.Name + "-v4"}, eps); err != nil {
+		t.Fatal(err)
+	}
+	if len(eps.Endpoints) != 2 || *eps.Endpoints[1].NodeName != "b" {
+		t.Errorf("endpoints = %+v, want nodes a and b", eps.Endpoints)
+	}
+}
+
+// With no node NAT-ready, every Ready node is an endpoint.
+func TestNATReadyNodesFallsBackToReady(t *testing.T) {
+	nodes := []corev1.Node{*natNode("b", "10.1.0.2", "b2", true), *natNode("a", "10.1.0.1", "a2", true), *natNode("c", "10.1.0.3", "", false)}
+	leases := []localsdnv1alpha1.NATPortBlock{*natLease("u", 0, true, localsdnv1alpha1.NATPortBlockAck{Node: "a", BootID: "a1"})}
+	got := natReadyNodes(nodes, leases)
+	if len(got) != 2 || got[0].Name != "a" || got[1].Name != "b" {
+		t.Errorf("nodes = %v, want the Ready nodes a and b", got)
 	}
 }
 

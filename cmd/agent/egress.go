@@ -179,8 +179,11 @@ func portTableOf(p *sdnv1alpha1.Port, tables []*sdnv1alpha1.RouteTable) uint32 {
 type natPlan struct {
 	gateways map[uint32]datapath.NATGateway
 	owners   map[datapath.NATBlock]net.IP
-	// ack lists the leases this node has not acked yet.
+	// ack lists the leases this node has not acked in its current boot.
 	ack []string
+	// activate lists this node's leases every Ready node has now acked, to be
+	// marked active (sticky, docs/vpc-egress.md §4.3).
+	activate map[string]bool
 	// claim lists NAT gateways this node should claim one more block of.
 	claim []*sdnv1alpha1.NATGateway
 	// release lists this node's leases to delete.
@@ -195,24 +198,33 @@ type natInputs struct {
 	natgws    []*sdnv1alpha1.NATGateway
 	vpcs      map[vpcKey]*sdnv1alpha1.VPC
 	leases    []*localv1alpha1.NATPortBlock
-	ready     []string                 // Ready nodes
+	ready     map[string]string        // Ready nodes -> boot ID ("" = unknown)
+	selfBoot  string                   // this node's boot ID
 	nodeIP    func(name string) net.IP // Geneve endpoint of a node, self included
 	hosted    map[vpcKey]bool          // VPCs with a Port on this node
 	more      map[uint32]bool          // NAT gateway ids under allocation pressure
 	idleSince map[types.UID]time.Time  // when this node stopped hosting a NAT gateway's VPC
 	pending   map[types.UID]time.Time  // claims made that the cache does not show yet
 	live      map[datapath.NATBlock]bool
+	// blockIdle is when each of this node's blocks last held no live flow.
+	blockIdle map[datapath.NATBlock]time.Time
 	now       time.Time
 	idleGrace time.Duration
 }
 
+// extraBlockIdle is how long a block beyond a node's first must hold no live
+// flow before the node releases it while still hosting the VPC.
+const extraBlockIdle = 10 * time.Minute
+
 // planNAT decides nat_gw, nat_blk_owner, and the lease work (docs/vpc-egress.md
 // §4.3): every node programs every NAT gateway and every lease's owner; a node
-// allocates only from its blocks that every Ready node has acked.
+// allocates only from its blocks that are active, which a block becomes once
+// every Ready node has acked it in its current boot, and then stays.
 func planNAT(in natInputs) natPlan {
 	plan := natPlan{
 		gateways: map[uint32]datapath.NATGateway{},
 		owners:   map[datapath.NATBlock]net.IP{},
+		activate: map[string]bool{},
 		active:   map[uint32]int{},
 	}
 	byUID := map[types.UID]*sdnv1alpha1.NATGateway{}
@@ -230,7 +242,7 @@ func planNAT(in natInputs) natPlan {
 		}
 		acked := false
 		for _, a := range l.Status.Acks {
-			if a.Node == in.self {
+			if a.Node == in.self && (in.selfBoot == "" || a.BootID == in.selfBoot) {
 				acked = true
 			}
 		}
@@ -251,7 +263,12 @@ func planNAT(in natInputs) natPlan {
 		sort.Slice(leases, func(i, j int) bool { return leases[i].Spec.Block < leases[j].Spec.Block })
 		var blocks []uint16
 		for _, l := range leases {
-			if len(blocks) < datapath.NATGatewayBlocks && ackedByAll(l, in.ready) {
+			active := l.Status.Active
+			if !active && ackedByAll(l, in.ready) {
+				active = true
+				plan.activate[l.Name] = true
+			}
+			if active && len(blocks) < datapath.NATGatewayBlocks {
 				blocks = append(blocks, uint16(l.Spec.Block))
 			}
 		}
@@ -269,6 +286,20 @@ func planNAT(in natInputs) natPlan {
 			plan.claim = append(plan.claim, g)
 		case hosted && in.more[id] && len(leases) < datapath.NATGatewayBlocks:
 			plan.claim = append(plan.claim, g)
+		case hosted:
+			// Keep the first block; release extra ones that have held no
+			// flow for extraBlockIdle, so a burst does not hold blocks
+			// for good.
+			for _, l := range leases[1:] {
+				b := datapath.NATBlock{NATGateway: id, Block: uint16(l.Spec.Block)}
+				at, ok := in.blockIdle[b]
+				if c := l.CreationTimestamp.Time; c.After(at) {
+					at = c // a block claimed afresh starts idle at its claim
+				}
+				if ok && !in.live[b] && in.now.Sub(at) >= extraBlockIdle {
+					plan.release = append(plan.release, l.Name)
+				}
+			}
 		case !hosted:
 			since, ok := in.idleSince[g.UID]
 			if !ok || in.now.Sub(since) < in.idleGrace {
@@ -290,14 +321,16 @@ func planNAT(in natInputs) natPlan {
 // agent may claim again.
 const claimSettle = 30 * time.Second
 
-// ackedByAll reports whether every Ready node has acked a lease.
-func ackedByAll(l *localv1alpha1.NATPortBlock, ready []string) bool {
-	acked := map[string]bool{}
+// ackedByAll reports whether every Ready node has acked a lease in its current
+// boot. A node whose boot ID is unknown counts with an ack of any boot.
+func ackedByAll(l *localv1alpha1.NATPortBlock, ready map[string]string) bool {
+	acked := map[string]string{}
 	for _, a := range l.Status.Acks {
-		acked[a.Node] = true
+		acked[a.Node] = a.BootID
 	}
-	for _, n := range ready {
-		if !acked[n] {
+	for n, boot := range ready {
+		got, ok := acked[n]
+		if !ok || (boot != "" && got != boot) {
 			return false
 		}
 	}
@@ -349,14 +382,18 @@ type egressWatcher struct {
 
 	kick chan struct{}
 
-	mu        sync.Mutex
-	live      map[datapath.NATBlock]bool
-	flows     map[uint32]uint32 // natgw id -> live flows on this node
-	pending   map[types.UID]time.Time
-	pressure  map[uint32]uint64 // natgw id -> deep+exhausted seen
-	more      map[uint32]bool
-	idleSince map[types.UID]time.Time
-	active    map[uint32]int
+	mu      sync.Mutex
+	live    map[datapath.NATBlock]bool
+	flows   map[uint32]uint32 // natgw id -> live flows on this node
+	pending map[types.UID]time.Time
+	// pendingName is the lease each pending claim created, so the claim stops
+	// holding back the next one as soon as the cache shows it.
+	pendingName map[types.UID]string
+	blockIdle   map[datapath.NATBlock]time.Time
+	pressure    map[uint32]uint64 // natgw id -> deep+exhausted seen
+	more        map[uint32]bool
+	idleSince   map[types.UID]time.Time
+	active      map[uint32]int
 }
 
 // watchEgress starts the VPC egress watcher (docs/vpc-egress.md §6).
@@ -366,12 +403,14 @@ func watchEgress(ctx context.Context, sdn sdninformers.SharedInformerFactory, lo
 	w := &egressWatcher{
 		mgr: mgr, lc: lc, nodes: nodes, nodeIPs: nodeIPs, self: self, selfIP: net.ParseIP(selfIP),
 		log: log.With("component", "egress"), sdn: sdn, local: local,
-		kick:      make(chan struct{}, 1),
-		live:      map[datapath.NATBlock]bool{},
-		pressure:  map[uint32]uint64{},
-		more:      map[uint32]bool{},
-		idleSince: map[types.UID]time.Time{},
-		pending:   map[types.UID]time.Time{},
+		kick:        make(chan struct{}, 1),
+		live:        map[datapath.NATBlock]bool{},
+		pressure:    map[uint32]uint64{},
+		more:        map[uint32]bool{},
+		idleSince:   map[types.UID]time.Time{},
+		pending:     map[types.UID]time.Time{},
+		pendingName: map[types.UID]string{},
+		blockIdle:   map[datapath.NATBlock]time.Time{},
 	}
 	if err := mgr.ClearLegacyVPCNAT(); err != nil {
 		w.log.Warn("clear legacy VPC NAT maps", "err", err)
@@ -503,6 +542,19 @@ func (w *egressWatcher) resync(ctx context.Context) {
 
 	w.mu.Lock()
 	now := time.Now()
+	// A claim the cache already shows no longer holds back the next one, so
+	// under sustained pressure the agent claims a block per pressure poll
+	// rather than one per claimSettle.
+	seen := map[string]bool{}
+	for _, l := range leases {
+		seen[l.Name] = true
+	}
+	for uid, name := range w.pendingName {
+		if seen[name] {
+			delete(w.pending, uid)
+			delete(w.pendingName, uid)
+		}
+	}
 	for _, g := range natgws {
 		if hosted[vpcKey{g.Namespace, g.Spec.VPCRef.Name}] {
 			delete(w.idleSince, g.UID)
@@ -512,8 +564,8 @@ func (w *egressWatcher) resync(ctx context.Context) {
 	}
 	plan := planNAT(natInputs{
 		self: w.self, natgws: natgws, vpcs: vpcs, leases: leases,
-		ready: w.nodes.sortedNames(), nodeIP: w.nodeIP, hosted: hosted,
-		more: w.more, idleSince: w.idleSince, pending: w.pending, live: w.live,
+		ready: w.nodes.readyBoots(), selfBoot: w.nodes.bootID(w.self), nodeIP: w.nodeIP, hosted: hosted,
+		more: w.more, idleSince: w.idleSince, pending: w.pending, live: w.live, blockIdle: w.blockIdle,
 		now: now, idleGrace: egressCfg.timeouts.TCPEstablished,
 	})
 	w.active = plan.active
@@ -546,8 +598,15 @@ func (w *egressWatcher) resync(ctx context.Context) {
 
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
+	acked := map[string]bool{}
 	for _, name := range plan.ack {
-		w.ackLease(cctx, name)
+		w.ackLease(cctx, name, plan.activate[name] || leaseActive(leases, name))
+		acked[name] = true
+	}
+	for name := range plan.activate {
+		if !acked[name] {
+			w.ackLease(cctx, name, true)
+		}
 	}
 	for _, g := range plan.claim {
 		w.claimBlock(cctx, g, leases)
@@ -562,10 +621,26 @@ func (w *egressWatcher) resync(ctx context.Context) {
 	w.publishMetrics(natgws, vpcList)
 }
 
-// ackLease server-side-applies this node's entry into a lease's acks.
-func (w *egressWatcher) ackLease(ctx context.Context, name string) {
-	cfg := localapply.NATPortBlock(name).
-		WithStatus(localapply.NATPortBlockStatus().WithAcks(localapply.NATPortBlockAck().WithNode(w.self)))
+// leaseActive reports whether a lease is already marked active.
+func leaseActive(leases []*localv1alpha1.NATPortBlock, name string) bool {
+	for _, l := range leases {
+		if l.Name == name {
+			return l.Status.Active
+		}
+	}
+	return false
+}
+
+// ackLease server-side-applies this node's ack (with its boot ID) into a lease,
+// and for a lease this node holds, `active` once every Ready node has acked.
+// Each apply carries every field this node's manager owns, or SSA would drop
+// the ones left out.
+func (w *egressWatcher) ackLease(ctx context.Context, name string, active bool) {
+	st := localapply.NATPortBlockStatus().WithAcks(localapply.NATPortBlockAck().WithNode(w.self).WithBootID(w.nodes.bootID(w.self)))
+	if active {
+		st = st.WithActive(true)
+	}
+	cfg := localapply.NATPortBlock(name).WithStatus(st)
 	_, err := w.lc.LocalV1alpha1().NATPortBlocks().ApplyStatus(ctx, cfg,
 		metav1.ApplyOptions{FieldManager: "cozyplane-agent/" + w.self, Force: true})
 	if err != nil && !apierrors.IsNotFound(err) {
@@ -608,6 +683,7 @@ func (w *egressWatcher) claimBlock(ctx context.Context, g *sdnv1alpha1.NATGatewa
 		case err == nil:
 			w.mu.Lock()
 			w.pending[g.UID] = time.Now()
+			w.pendingName[g.UID] = lease.Name
 			w.mu.Unlock()
 			w.log.Info("claimed NAT port block", "natgateway", g.Namespace+"/"+g.Name, "block", b)
 			return
@@ -643,6 +719,20 @@ func (w *egressWatcher) sweep() {
 	w.mu.Lock()
 	w.live = res.LiveBlocks
 	w.flows = res.FlowsByNATGateway
+	now := time.Now()
+	for b := range w.blockIdle {
+		if _, known := bs[b.NATGateway]; !known || res.LiveBlocks[b] {
+			delete(w.blockIdle, b)
+		}
+	}
+	for id := range bs {
+		for blk := 0; blk < localv1alpha1.NATBlocks(bs[id]); blk++ {
+			b := datapath.NATBlock{NATGateway: id, Block: uint16(blk)}
+			if _, ok := w.blockIdle[b]; !ok && !res.LiveBlocks[b] {
+				w.blockIdle[b] = now
+			}
+		}
+	}
 	w.mu.Unlock()
 	keep := map[uint32]bool{}
 	for id := range bs {
@@ -707,9 +797,9 @@ func writeEgressMetrics(b *strings.Builder, node string) {
 	}
 	name := func(id uint32) [3]string { return s.natgwName[id] }
 	fmt.Fprintf(b, "# HELP cozyplane_nat_flows Live NAT flows through a NAT gateway (this node).\n# TYPE cozyplane_nat_flows gauge\n")
-	for id, c := range s.flows {
+	for id := range s.natgwName {
 		n := name(id)
-		fmt.Fprintf(b, "cozyplane_nat_flows{natgateway_namespace=%q,natgateway=%q,vpc=%q,node=%q} %d\n", n[0], n[1], n[2], node, c)
+		fmt.Fprintf(b, "cozyplane_nat_flows{natgateway_namespace=%q,natgateway=%q,vpc=%q,node=%q} %d\n", n[0], n[1], n[2], node, s.flows[id])
 	}
 	fmt.Fprintf(b, "# HELP cozyplane_nat_blocks Active port blocks this node holds of a NAT gateway.\n# TYPE cozyplane_nat_blocks gauge\n")
 	for id, c := range s.active {

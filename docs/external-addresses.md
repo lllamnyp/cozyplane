@@ -135,22 +135,16 @@ comes back *addressed to it*, and that reply must be attracted to a node for
 attraction as a FloatingIP — it rides a Service too. It differs in two ways, neither
 being "no Service":
 
-1. **`etp: Cluster`, with a self-addressed endpoint.** There is no single target pod to
-   hang an EndpointSlice on — the replies fan out by port shard across nodes — so the
-   Service is `etp: Cluster` and cozyplane demuxes: the reply lands on whichever node
-   attracts the address, `from_uplink` there runs `vpc_nat_reverse`, the port's shard
-   names the owning node, and the packet is forwarded over the overlay to it. This is
-   exactly what `vpc_nat_reverse` already does — "the reply arrives at whichever node
-   attracts the address; the port says who owns the flow."
-   The one thing this Service still needs is a **ready endpoint**: MetalLB (verified at
-   increment 1) advertises a LoadBalancer address only while its Service has one —
-   `etp: Cluster` does **not** exempt it (the earlier "announces unconditionally"
-   assumption was wrong). Since there is no target, cozyplane synthesizes a single
-   endpoint that is a pure **advertisement trigger**, not a delivery target: its address
-   is the assigned NAT address itself and it is `Ready` whenever the gateway is the VPC's
-   legitimate (exclusive) boundary. Nothing dials it — every proxy skips the Service via
-   `service-proxy-name`, and the real reverse path is `vpc_nat_reverse`. The endpoint
-   exists only to flip MetalLB's advertise gate; the reply path is unchanged.
+1. **`etp: Local`, with one endpoint per NAT-ready node.** There is no target pod:
+   a reply lands on whichever node attracts the address, `from_uplink` there finds
+   the port's block owner, and forwards the packet over the overlay to it. A node
+   can do that only once its agent has programmed the owner of every leased block,
+   so the controller lists those nodes as the Service's endpoints, each with its
+   `nodeName`, and the Service is `etp: Local`: the LB implementation announces the
+   address only from them ([vpc-egress.md](vpc-egress.md) §4.3). MetalLB advertises a
+   LoadBalancer address only while its Service has a ready endpoint (verified at
+   increment 1), so the endpoints are also the advertisement trigger. Nothing dials
+   them: every proxy skips the Service via `service-proxy-name`.
 2. **Prefers reservation.** A VPC's egress identity churning under live flows is bad,
    so the NAT identity is the strong candidate for a **claim** (§7) rather than a
    dynamic address. That is a preference for stability, satisfied by the claim layer —

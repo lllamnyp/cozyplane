@@ -175,7 +175,11 @@ spec:
   block: 3
   node: node-b
 status:
-  acks: [{node: node-a}, {node: node-b}, {node: node-c}]   # listType=map, key node
+  acks:                                  # listType=map, key node
+  - {node: node-a, bootID: 3e1d…}
+  - {node: node-b, bootID: 9a07…}
+  - {node: node-c, bootID: c4f2…}
+  active: true                           # set by the holder; never unset
 ```
 
 ### 2.6 Who may use a VPC, and who may configure it
@@ -348,11 +352,21 @@ gateway share one port space.
   the lowest unleased block, trying the next on `AlreadyExists`. Claiming when the
   Port appears usually activates the block before the workload connects out.
 - **Ack, then use.** An agent that sees a lease programs its `nat_blk_owner` entry,
-  then server-side-applies its own entry into `status.acks` (one field manager per
-  node, so agents never conflict). The owner allocates from the block only after
-  every Ready node has acked, so no reply reaches a node that does not know the
-  owner. A Ready node that never acks holds back every new block in the cluster;
-  the acks show which node it is.
+  then server-side-applies its own entry into `status.acks` with the node's boot ID
+  (`Node.status.nodeInfo.bootID`; one field manager per node, so agents never
+  conflict). An ack from an earlier boot does not count, so a rebooted node acks
+  every lease again. Once every Ready node has acked in its current boot, the
+  holder sets `status.active` in the same apply as its ack, and allocates from the
+  block. `active` is never unset: a reboot elsewhere does not stop a block in use.
+  A Ready node that never acks holds back every new block in the cluster; the acks
+  show which node it is.
+- **Attraction.** The controller lists as the endpoints of each NAT Service the
+  Ready nodes that have acked every active lease of the NAT gateway in their
+  current boot, each with its `nodeName`, and the Service is
+  `externalTrafficPolicy: Local`. The LB implementation therefore announces the
+  address only from a node that can forward a reply for every leased port. A
+  rebooted node attracts nothing until its agent has programmed the owner table and
+  acked. If no node qualifies, every Ready node is an endpoint.
 - **Allocation.** `nat_gw[natgateway id]` lists the node's active blocks, up to 8.
   The allocator makes up to 16 attempts at a random port of a random active block,
   inserting into `nat_rev` only if absent.
@@ -362,7 +376,10 @@ gateway share one port space.
   destination, so a block can be full toward one service and empty toward the rest;
   attempts measure that, ports in use do not.
 - **Release.** An agent deletes its lease once the node has hosted no Port of the
-  VPC for one TCP-established timeout and the block holds no live flow. The
+  VPC for one TCP-established timeout and the block holds no live flow. While it
+  hosts the VPC, it keeps its first block and deletes any other that has held no
+  live flow for 10 minutes since the sweep last saw one or since the lease was
+  created. The
   controller deletes the leases of a node one TCP-established timeout after its Node
   object is gone, and all leases of a deleted NAT gateway.
 - **Readiness is not an input.** A NotReady node keeps its leases and flows, and no
@@ -471,7 +488,10 @@ The FloatingIP egress rewrite and the VPC SNAT move from `from_pod` into
 `vpc_egress`. Every off-VPC or peered packet of a VPC Port pays one tail call, and
 two when `vpc_egress` hands it back. On
 the reverse path, `from_uplink` and `from_overlay` replace `vpc_nat_reverse` with
-the block lookup of §4.4 and the ICMP-error translation of §4.5. The tail-call slots
+the block lookup of §4.4 and the ICMP-error translation of §4.5. `from_uplink`
+passes a frame addressed to another host's MAC (`PACKET_OTHERHOST`) to the kernel
+untouched: an underlay that floods frames, such as an OCI VLAN, would otherwise
+deliver one reply per node that received it. The tail-call slots
 are 4 and 5 of `lb_prog`, which is not pinned.
 
 ## 6. Who does what
@@ -479,8 +499,8 @@ are 4 and 5 of `lb_prog`, which is not pinned.
 **Controller**
 - allocates `NATGateway.status.id` and `RouteTable.status.id`;
 - owns the LoadBalancer Services that obtain each NAT gateway's addresses (§2.1)
-  and their advertisement EndpointSlices, and writes the addresses, `blockSize`
-  and the block summary into status;
+  and their EndpointSlices, which list the NAT-ready nodes (§4.3), and writes the
+  addresses, `blockSize` and the block summary into status;
 - resolves Routes (§3.3) and the default table (§2.2);
 - deletes leases (§4.3);
 - performs the transition (§7).
@@ -542,7 +562,8 @@ traffic, and `door="eip"` counts `internet`-route traffic.
 | a SNATing node dies | its flows die; its leases go one TCP-established timeout after its Node object |
 | a node goes NotReady | nothing changes |
 | the controller is down | leases keep working; no new ids, Services, route resolution or lease deletion |
-| a Ready node's agent is down | new blocks wait for its ack |
+| a Ready node's agent is down | new blocks wait for its ack; the node stays an endpoint |
+| a node reboots | it is no endpoint until it has acked every active lease in its new boot (§4.3); active blocks stay active |
 | an agent restarts | the maps are pinned; leases are re-read |
 | upgrade | NAT flows through the old maps are lost once |
 | per-NIC anti-spoofing in the underlay | NAT egress is black-holed, as FloatingIP and DSR replies are today ([lb-ingress.md](lb-ingress.md), DSR caveats) |

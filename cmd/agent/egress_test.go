@@ -61,7 +61,7 @@ func TestPlanRoutesPrecedence(t *testing.T) {
 	bh := sdnv1alpha1.RouteTarget{Blackhole: &sdnv1alpha1.RouteBlackholeTarget{}}
 	routes := []*sdnv1alpha1.Route{
 		egRoute("main", "0.0.0.0/0", sdnv1alpha1.RouteStateActive, nat),
-		egRoute("main", "10.50.0.0/16", sdnv1alpha1.RouteStateActive, bh),  // same as the peer: the Route wins
+		egRoute("main", "10.50.0.0/16", sdnv1alpha1.RouteStateActive, bh),    // same as the peer: the Route wins
 		egRoute("main", "10.0.0.0/16", sdnv1alpha1.RouteStateUnresolved, bh), // same as local: local wins
 		egRoute("main", "198.51.100.0/24", "", nat),                          // not resolved yet
 		egRoute("main", "192.0.2.0/24", sdnv1alpha1.RouteStateConflict, bh),
@@ -134,7 +134,7 @@ func egInputs(leases ...*localv1alpha1.NATPortBlock) natInputs {
 		natgws: []*sdnv1alpha1.NATGateway{egNATGW("egress", 3)},
 		vpcs:   map[vpcKey]*sdnv1alpha1.VPC{{"t", "v"}: egVPC("v", 100, "10.0.0.0/16")},
 		leases: leases,
-		ready:  []string{"a", "b", "c"},
+		ready:  map[string]string{"a": "", "b": "", "c": ""},
 		nodeIP: func(n string) net.IP {
 			return map[string]net.IP{"a": net.IPv4(10, 0, 0, 1), "b": net.IPv4(10, 0, 0, 2), "c": net.IPv4(10, 0, 0, 3)}[n]
 		},
@@ -145,6 +145,7 @@ func egInputs(leases ...*localv1alpha1.NATPortBlock) natInputs {
 		live:      map[datapath.NATBlock]bool{},
 		now:       time.Unix(1e6, 0),
 		idleGrace: time.Hour,
+		blockIdle: map[datapath.NATBlock]time.Time{},
 	}
 }
 
@@ -205,6 +206,54 @@ func TestPlanNATRelease(t *testing.T) {
 	in.idleSince[types.UID("uid-egress")] = in.now.Add(-time.Minute)
 	if got := planNAT(in).release; len(got) != 0 {
 		t.Errorf("release before the grace = %v, want none", got)
+	}
+}
+
+// An ack from an earlier boot does not count: a rebooted node re-acks, and a
+// block is not activated until it has. Once active, a block stays active
+// whoever's ack goes stale (docs/vpc-egress.md §4.3).
+func TestPlanNATBootScopedAcks(t *testing.T) {
+	stale := egLease("egress", 1, "b", "a", "b", "c")
+	stale.Status.Acks[0].BootID = "a-old"
+	stale.Status.Acks[1].BootID = "b-old"
+	in := egInputs(stale)
+	in.ready = map[string]string{"a": "a-new", "b": "b-new", "c": ""}
+	in.selfBoot = "b-new"
+	plan := planNAT(in)
+	if len(plan.ack) != 1 || plan.ack[0] != stale.Name {
+		t.Errorf("acks to send = %v, want b to re-ack its stale lease", plan.ack)
+	}
+	if len(plan.gateways[3].Blocks) != 0 || len(plan.activate) != 0 {
+		t.Errorf("blocks %v / activate %v, want none: a has not acked this boot", plan.gateways[3].Blocks, plan.activate)
+	}
+
+	stale.Status.Acks[0].BootID = "a-new"
+	stale.Status.Acks[1].BootID = "b-new"
+	plan = planNAT(in)
+	if !plan.activate[stale.Name] || len(plan.gateways[3].Blocks) != 1 {
+		t.Errorf("activate %v / blocks %v, want the fully acked lease activated", plan.activate, plan.gateways[3].Blocks)
+	}
+
+	stale.Status.Active = true
+	stale.Status.Acks[0].BootID = "a-older"
+	plan = planNAT(in)
+	if len(plan.gateways[3].Blocks) != 1 || len(plan.activate) != 0 {
+		t.Errorf("blocks %v / activate %v, want an active lease to stay active", plan.gateways[3].Blocks, plan.activate)
+	}
+}
+
+// A hosting node keeps its first block and releases an extra one once it has
+// held no flow for extraBlockIdle.
+func TestPlanNATReleasesIdleExtraBlocks(t *testing.T) {
+	in := egInputs(egLease("egress", 1, "b", "a", "b", "c"), egLease("egress", 2, "b", "a", "b", "c"))
+	in.blockIdle[datapath.NATBlock{NATGateway: 3, Block: 1}] = in.now.Add(-time.Hour)
+	in.blockIdle[datapath.NATBlock{NATGateway: 3, Block: 2}] = in.now.Add(-time.Minute)
+	if got := planNAT(in).release; len(got) != 0 {
+		t.Errorf("release = %v, want none: block 1 is the first, block 2 idle only a minute", got)
+	}
+	in.blockIdle[datapath.NATBlock{NATGateway: 3, Block: 2}] = in.now.Add(-extraBlockIdle)
+	if got := planNAT(in).release; len(got) != 1 || got[0] != "uid-egress.2" {
+		t.Errorf("release = %v, want the idle extra block 2", got)
 	}
 }
 

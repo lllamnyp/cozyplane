@@ -80,6 +80,11 @@ type NATPortBlockSpec struct {
 // NATPortBlockAck records that one node's agent has programmed this block's owner.
 type NATPortBlockAck struct {
 	Node string `json:"node"`
+	// BootID is the acking node's boot ID (Node.status.nodeInfo.bootID). The
+	// datapath state an ack vouches for does not survive a reboot, so an ack
+	// counts only while the node's boot ID still matches.
+	// +optional
+	BootID string `json:"bootID,omitempty"`
 }
 
 // NATPortBlockStatus carries the per-node acknowledgements.
@@ -91,6 +96,12 @@ type NATPortBlockStatus struct {
 	// +listType=map
 	// +listMapKey=node
 	Acks []NATPortBlockAck `json:"acks,omitempty"`
+	// Active is set by the holder the first time every Ready node has acked.
+	// Once active a block stays active: a node that reboots and has not
+	// re-acked yet is kept from attracting the NAT gateway's address instead
+	// (docs/vpc-egress.md §4.3).
+	// +optional
+	Active bool `json:"active,omitempty"`
 }
 
 // +genclient

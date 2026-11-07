@@ -24,6 +24,10 @@ package v1alpha1
 // NATPortBlockAck records that one node's agent has programmed this block's owner.
 type NATPortBlockAckApplyConfiguration struct {
 	Node *string `json:"node,omitempty"`
+	// BootID is the acking node's boot ID (Node.status.nodeInfo.bootID). The
+	// datapath state an ack vouches for does not survive a reboot, so an ack
+	// counts only while the node's boot ID still matches.
+	BootID *string `json:"bootID,omitempty"`
 }
 
 // NATPortBlockAckApplyConfiguration constructs a declarative configuration of the NATPortBlockAck type for use with
@@ -37,5 +41,13 @@ func NATPortBlockAck() *NATPortBlockAckApplyConfiguration {
 // If called multiple times, the Node field is set to the value of the last call.
 func (b *NATPortBlockAckApplyConfiguration) WithNode(value string) *NATPortBlockAckApplyConfiguration {
 	b.Node = &value
+	return b
+}
+
+// WithBootID sets the BootID field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the BootID field is set to the value of the last call.
+func (b *NATPortBlockAckApplyConfiguration) WithBootID(value string) *NATPortBlockAckApplyConfiguration {
+	b.BootID = &value
 	return b
 }

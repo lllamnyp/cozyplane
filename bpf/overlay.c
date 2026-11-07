@@ -34,6 +34,7 @@
 #define AF_INET 2 // for bpf_redir_neigh.nh_family (vmlinux.h carries no macros)
 #define TC_ACT_OK 0
 #define TC_ACT_SHOT 2
+#define PACKET_OTHERHOST 3 // skb->pkt_type: addressed to another host's MAC
 #define LINK_LOCAL_GW 0xA9FE0101 // 169.254.1.1 (host order)
 
 // The hairpin loopback: when a ServiceVIP backend dials its own service and
@@ -5999,6 +6000,12 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 SEC("tc")
 int cozyplane_from_uplink(struct __sk_buff *skb)
 {
+	// A frame addressed to another host's MAC is not ours. An L2 fabric that
+	// floods (an OCI VLAN does) hands every node the frames for an address
+	// another node attracts; handling them would deliver one copy per node.
+	if (skb->pkt_type == PACKET_OTHERHOST)
+		return TC_ACT_OK;
+
 	struct iphdr *ip;
 	if (parse_ipv4(skb, &ip) < 0) {
 		// v6 inbound to a floating address: deliver to the local pod like the

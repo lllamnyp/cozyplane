@@ -33,12 +33,31 @@ import (
 // announce any more (tenet 3), so the electorate went with the election.
 type nodePoolIndex struct {
 	mu    sync.Mutex
-	nodes map[string]bool // Ready nodes
+	nodes map[string]bool   // Ready nodes
+	boot  map[string]string // node -> boot ID, every node seen
 	subs  []func()
 }
 
 func newNodePoolIndex() *nodePoolIndex {
-	return &nodePoolIndex{nodes: map[string]bool{}}
+	return &nodePoolIndex{nodes: map[string]bool{}, boot: map[string]string{}}
+}
+
+// readyBoots returns the Ready nodes with their boot IDs ("" when unknown).
+func (n *nodePoolIndex) readyBoots() map[string]string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	out := make(map[string]string, len(n.nodes))
+	for name := range n.nodes {
+		out[name] = n.boot[name]
+	}
+	return out
+}
+
+// bootID returns a node's boot ID, or "".
+func (n *nodePoolIndex) bootID(name string) string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.boot[name]
 }
 
 // onChange registers a callback fired whenever the node set changes: a block's
@@ -53,8 +72,10 @@ func (n *nodePoolIndex) onChange(f func()) {
 // may not be running to ack.
 func (n *nodePoolIndex) set(node *corev1.Node) {
 	ready := nodeReady(node)
+	boot := node.Status.NodeInfo.BootID
 	n.mu.Lock()
-	changed := n.nodes[node.Name] != ready
+	changed := n.nodes[node.Name] != ready || n.boot[node.Name] != boot
+	n.boot[node.Name] = boot
 	if ready {
 		n.nodes[node.Name] = true
 	} else {

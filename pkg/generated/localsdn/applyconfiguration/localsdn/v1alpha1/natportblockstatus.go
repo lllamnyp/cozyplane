@@ -27,6 +27,11 @@ type NATPortBlockStatusApplyConfiguration struct {
 	// holder allocates from the block only once every Ready node is listed.
 	// Each agent server-side-applies its own entry.
 	Acks []NATPortBlockAckApplyConfiguration `json:"acks,omitempty"`
+	// Active is set by the holder the first time every Ready node has acked.
+	// Once active a block stays active: a node that reboots and has not
+	// re-acked yet is kept from attracting the NAT gateway's address instead
+	// (docs/vpc-egress.md §4.3).
+	Active *bool `json:"active,omitempty"`
 }
 
 // NATPortBlockStatusApplyConfiguration constructs a declarative configuration of the NATPortBlockStatus type for use with
@@ -45,5 +50,13 @@ func (b *NATPortBlockStatusApplyConfiguration) WithAcks(values ...*NATPortBlockA
 		}
 		b.Acks = append(b.Acks, *values[i])
 	}
+	return b
+}
+
+// WithActive sets the Active field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Active field is set to the value of the last call.
+func (b *NATPortBlockStatusApplyConfiguration) WithActive(value bool) *NATPortBlockStatusApplyConfiguration {
+	b.Active = &value
 	return b
 }

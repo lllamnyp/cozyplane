@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -33,10 +34,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	localsdnv1alpha1 "github.com/lllamnyp/cozyplane/api/localsdn/v1alpha1"
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
@@ -125,6 +129,11 @@ func (r *NATGatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	setCond(&status.Conditions, sdnv1alpha1.NATGatewayConditionVPCResolved, vpcOK,
 		"VPCResolved", "spec.vpcRef names a realized VPC in this namespace")
 
+	var leases localsdnv1alpha1.NATPortBlockList
+	if err := r.List(ctx, &leases, client.MatchingLabels{localsdnv1alpha1.LabelNATGatewayUID: string(ngw.UID)}); err != nil {
+		return ctrl.Result{}, fmt.Errorf("list NATPortBlocks: %w", err)
+	}
+
 	var failures map[corev1.IPFamily]natFamilyFailure
 	if vpcOK {
 		slots, f, err := r.desiredSlots(ctx, ngw, vpc)
@@ -132,7 +141,11 @@ func (r *NATGatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			return ctrl.Result{}, err
 		}
 		failures = f
-		addrs, err := r.reconcileServices(ctx, ngw, slots)
+		var nodes corev1.NodeList
+		if err := r.List(ctx, &nodes); err != nil {
+			return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
+		}
+		addrs, err := r.reconcileServices(ctx, ngw, slots, natReadyNodes(nodes.Items, leases.Items))
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -156,10 +169,7 @@ func (r *NATGatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 	setAddressCondition(&status, vpcOK, failures)
 
-	leased, err := r.leasedBlocks(ctx, ngw)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
+	leased := len(leases.Items)
 	total := localsdnv1alpha1.NATBlocks(r.blockSize())
 	free := total - leased
 	if free < 0 {
@@ -396,7 +406,7 @@ func (r *NATGatewayReconciler) ownedServices(ctx context.Context, ngw *sdnv1alph
 
 // reconcileServices makes the owned Services exactly `slots` and returns each
 // slot's assigned address per family.
-func (r *NATGatewayReconciler) reconcileServices(ctx context.Context, ngw *sdnv1alpha1.NATGateway, slots []natSlot) (map[string]map[corev1.IPFamily]string, error) {
+func (r *NATGatewayReconciler) reconcileServices(ctx context.Context, ngw *sdnv1alpha1.NATGateway, slots []natSlot, nodes []*corev1.Node) (map[string]map[corev1.IPFamily]string, error) {
 	owned, err := r.ownedServices(ctx, ngw)
 	if err != nil {
 		return nil, err
@@ -424,14 +434,15 @@ func (r *NATGatewayReconciler) reconcileServices(ctx context.Context, ngw *sdnv1
 			if svc == nil {
 				continue // the cluster cannot serve these families
 			}
-		} else if reconcileClaimAnnotation(svc, s.claim) {
+		} else if changed := reconcileClaimAnnotation(svc, s.claim); changed || svc.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyLocal {
+			svc.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyLocal
 			if err := r.Update(ctx, svc); err != nil {
 				return nil, fmt.Errorf("update NAT gateway service: %w", err)
 			}
 		}
 		addrs := ingressByFamily(svc)
 		out[s.key] = addrs
-		if err := r.reconcileEndpointSlices(ctx, ngw, svc, addrs); err != nil {
+		if err := r.reconcileEndpointSlices(ctx, ngw, svc, addrs, nodes); err != nil {
 			return nil, err
 		}
 	}
@@ -516,7 +527,7 @@ func (r *NATGatewayReconciler) createService(ctx context.Context, ngw *sdnv1alph
 		},
 		Spec: corev1.ServiceSpec{
 			Type:                          corev1.ServiceTypeLoadBalancer,
-			ExternalTrafficPolicy:         corev1.ServiceExternalTrafficPolicyCluster,
+			ExternalTrafficPolicy:         corev1.ServiceExternalTrafficPolicyLocal,
 			AllocateLoadBalancerNodePorts: new(false),
 			IPFamilyPolicy:                &policy,
 			IPFamilies:                    append([]corev1.IPFamily(nil), s.families...),
@@ -541,10 +552,12 @@ func (r *NATGatewayReconciler) createService(ctx context.Context, ngw *sdnv1alph
 	return svc, nil
 }
 
-// reconcileEndpointSlices keeps one self-addressed, always-Ready EndpointSlice
-// per assigned family: the trigger that makes the LB implementation advertise
-// the address (docs/external-addresses.md §5). Nothing dials it.
-func (r *NATGatewayReconciler) reconcileEndpointSlices(ctx context.Context, ngw *sdnv1alpha1.NATGateway, svc *corev1.Service, addrs map[corev1.IPFamily]string) error {
+// reconcileEndpointSlices keeps one EndpointSlice per assigned family, with a
+// Ready endpoint per NAT-ready node (natReadyNodes) carrying its nodeName. With
+// externalTrafficPolicy Local, the LB implementation advertises the address
+// only from those nodes (docs/external-addresses.md §5). Nothing dials the
+// endpoints.
+func (r *NATGatewayReconciler) reconcileEndpointSlices(ctx context.Context, ngw *sdnv1alpha1.NATGateway, svc *corev1.Service, addrs map[corev1.IPFamily]string, nodes []*corev1.Node) error {
 	want := map[string]bool{}
 	for _, f := range []corev1.IPFamily{corev1.IPv4Protocol, corev1.IPv6Protocol} {
 		addr := addrs[f]
@@ -557,7 +570,15 @@ func (r *NATGatewayReconciler) reconcileEndpointSlices(ctx context.Context, ngw 
 		if f == corev1.IPv6Protocol {
 			addrType = discoveryv1.AddressTypeIPv6
 		}
-		ep := discoveryv1.Endpoint{Addresses: []string{addr}, Conditions: discoveryv1.EndpointConditions{Ready: new(true)}}
+		eps := make([]discoveryv1.Endpoint, 0, len(nodes))
+		for _, n := range nodes {
+			a := nodeAddress(n, f)
+			if a == "" {
+				a = addr
+			}
+			eps = append(eps, discoveryv1.Endpoint{Addresses: []string{a}, NodeName: new(n.Name),
+				Conditions: discoveryv1.EndpointConditions{Ready: new(true)}})
+		}
 		ports := []discoveryv1.EndpointPort{{Name: new("placeholder"), Port: new(int32(1)), Protocol: new(corev1.ProtocolTCP)}}
 		existing := &discoveryv1.EndpointSlice{}
 		switch err := r.Get(ctx, client.ObjectKey{Namespace: svc.Namespace, Name: name}, existing); {
@@ -573,7 +594,7 @@ func (r *NATGatewayReconciler) reconcileEndpointSlices(ctx context.Context, ngw 
 					},
 				},
 				AddressType: addrType,
-				Endpoints:   []discoveryv1.Endpoint{ep},
+				Endpoints:   eps,
 				Ports:       ports,
 			}
 			if err := controllerutil.SetControllerReference(svc, slice, r.Scheme); err != nil {
@@ -585,11 +606,10 @@ func (r *NATGatewayReconciler) reconcileEndpointSlices(ctx context.Context, ngw 
 		case err != nil:
 			return fmt.Errorf("get NAT gateway endpointslice: %w", err)
 		default:
-			if len(existing.Endpoints) == 1 && len(existing.Endpoints[0].Addresses) == 1 &&
-				existing.Endpoints[0].Addresses[0] == addr {
+			if sameNodeEndpoints(existing.Endpoints, eps) {
 				continue
 			}
-			existing.Endpoints = []discoveryv1.Endpoint{ep}
+			existing.Endpoints = eps
 			existing.Ports = ports
 			if err := r.Update(ctx, existing); err != nil {
 				return fmt.Errorf("update NAT gateway endpointslice: %w", err)
@@ -615,13 +635,84 @@ func (r *NATGatewayReconciler) reconcileEndpointSlices(ctx context.Context, ngw 
 	return nil
 }
 
-// leasedBlocks counts the NAT gateway's NATPortBlock leases.
-func (r *NATGatewayReconciler) leasedBlocks(ctx context.Context, ngw *sdnv1alpha1.NATGateway) (int, error) {
-	var list localsdnv1alpha1.NATPortBlockList
-	if err := r.List(ctx, &list, client.MatchingLabels{localsdnv1alpha1.LabelNATGatewayUID: string(ngw.UID)}); err != nil {
-		return 0, fmt.Errorf("list NATPortBlocks: %w", err)
+// sameNodeEndpoints compares endpoint lists by address and nodeName, in order.
+func sameNodeEndpoints(a, b []discoveryv1.Endpoint) bool {
+	if len(a) != len(b) {
+		return false
 	}
-	return len(list.Items), nil
+	for i := range a {
+		if len(a[i].Addresses) != 1 || a[i].Addresses[0] != b[i].Addresses[0] ||
+			a[i].NodeName == nil || *a[i].NodeName != *b[i].NodeName ||
+			a[i].Conditions.Ready == nil || !*a[i].Conditions.Ready {
+			return false
+		}
+	}
+	return true
+}
+
+// natReadyNodes returns, sorted by name, the Ready nodes that may attract the
+// NAT gateway's return traffic: those that have acked every active lease in
+// their current boot, so their nat_blk_owner forwards every leased port
+// (docs/vpc-egress.md §4.3). If no node qualifies, every Ready node does: an
+// address announced from an unready node beats one announced from none.
+func natReadyNodes(nodes []corev1.Node, leases []localsdnv1alpha1.NATPortBlock) []*corev1.Node {
+	var ready, qualified []*corev1.Node
+	for i := range nodes {
+		n := &nodes[i]
+		if !nodeReady(n) || !n.DeletionTimestamp.IsZero() {
+			continue
+		}
+		ready = append(ready, n)
+		ok := true
+		for j := range leases {
+			if leases[j].Status.Active && !ackedInBoot(&leases[j], n) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			qualified = append(qualified, n)
+		}
+	}
+	if len(qualified) == 0 {
+		qualified = ready
+	}
+	sort.Slice(qualified, func(i, j int) bool { return qualified[i].Name < qualified[j].Name })
+	return qualified
+}
+
+// ackedInBoot reports whether a node has acked a lease in its current boot. A
+// node that reports no boot ID counts with an ack of any boot.
+func ackedInBoot(l *localsdnv1alpha1.NATPortBlock, n *corev1.Node) bool {
+	for _, a := range l.Status.Acks {
+		if a.Node == n.Name && (n.Status.NodeInfo.BootID == "" || a.BootID == n.Status.NodeInfo.BootID) {
+			return true
+		}
+	}
+	return false
+}
+
+func nodeReady(n *corev1.Node) bool {
+	for _, c := range n.Status.Conditions {
+		if c.Type == corev1.NodeReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+// nodeAddress returns a node's InternalIP of a family, or "".
+func nodeAddress(n *corev1.Node, f corev1.IPFamily) string {
+	for _, a := range n.Status.Addresses {
+		if a.Type != corev1.NodeInternalIP {
+			continue
+		}
+		ip, err := netip.ParseAddr(a.Address)
+		if err == nil && (ip.Is4() == (f == corev1.IPv4Protocol)) {
+			return ip.String()
+		}
+	}
+	return ""
 }
 
 // ingressByFamily returns a Service's assigned LoadBalancer addresses by family.
@@ -726,8 +817,36 @@ func (r *NATGatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Service{}).
 		Watches(&sdnv1alpha1.VPC{}, handler.EnqueueRequestsFromMapFunc(r.mapVPC)).
 		Watches(&localsdnv1alpha1.NATPortBlock{}, handler.EnqueueRequestsFromMapFunc(mapLeaseToNATGateway)).
+		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(r.mapAll), builder.WithPredicates(natNodeChanged)).
 		Named("natgateway").
 		Complete(r)
+}
+
+// mapAll enqueues every NAT gateway: a node's readiness or boot changes which
+// nodes attract every NAT gateway's return traffic.
+func (r *NATGatewayReconciler) mapAll(ctx context.Context, _ client.Object) []ctrl.Request {
+	var list sdnv1alpha1.NATGatewayList
+	if err := r.List(ctx, &list); err != nil {
+		return nil
+	}
+	out := make([]ctrl.Request, 0, len(list.Items))
+	for i := range list.Items {
+		out = append(out, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(&list.Items[i])})
+	}
+	return out
+}
+
+// natNodeChanged passes node events that change natReadyNodes or nodeAddress.
+var natNodeChanged = predicate.Funcs{
+	UpdateFunc: func(e event.UpdateEvent) bool {
+		o, ok1 := e.ObjectOld.(*corev1.Node)
+		n, ok2 := e.ObjectNew.(*corev1.Node)
+		if !ok1 || !ok2 {
+			return true
+		}
+		return nodeReady(o) != nodeReady(n) || o.Status.NodeInfo.BootID != n.Status.NodeInfo.BootID ||
+			!reflect.DeepEqual(o.Status.Addresses, n.Status.Addresses) || o.DeletionTimestamp.IsZero() != n.DeletionTimestamp.IsZero()
+	},
 }
 
 func (r *NATGatewayReconciler) mapVPC(ctx context.Context, obj client.Object) []ctrl.Request {
