@@ -25,9 +25,8 @@ import (
 
 // nodePoolIndex is the agent's view of which nodes are Ready.
 //
-// It exists for one thing now: the VPC NAT gateway cuts the masquerade port space
-// into a shard per node (docs/north-south.md § increment 2), and every agent must
-// derive the same partition without coordinating. Sorted node names give that.
+// It exists for one thing: a NAT port block is used only once every Ready node
+// has acked its lease (docs/vpc-egress.md §4.3), so the agents need the Ready set.
 //
 // It used to carry, in addition, which ExternalPools each node could put a frame
 // on — the electorate for announcing floating addresses. Cozyplane does not
@@ -42,16 +41,16 @@ func newNodePoolIndex() *nodePoolIndex {
 	return &nodePoolIndex{nodes: map[string]bool{}}
 }
 
-// onChange registers a callback fired whenever the node set changes: a node
-// joining or leaving re-cuts the NAT port shards.
+// onChange registers a callback fired whenever the node set changes: a block's
+// required acks change with it.
 func (n *nodePoolIndex) onChange(f func()) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.subs = append(n.subs, f)
 }
 
-// set records a node's readiness. NotReady and gone are the same thing to a shard
-// that has to land somewhere alive.
+// set records a node's readiness. A NotReady node is not waited for: its agent
+// may not be running to ack.
 func (n *nodePoolIndex) set(node *corev1.Node) {
 	ready := nodeReady(node)
 	n.mu.Lock()
@@ -85,9 +84,7 @@ func (n *nodePoolIndex) del(name string) {
 	}
 }
 
-// sortedNames is the node order the NAT port shards are cut from. Sorted, so every
-// agent derives the same partition without coordinating. A node joining or leaving
-// re-cuts the shards and breaks live NAT flows — recorded in docs/north-south.md.
+// sortedNames returns the Ready nodes, sorted.
 func (n *nodePoolIndex) sortedNames() []string {
 	n.mu.Lock()
 	defer n.mu.Unlock()

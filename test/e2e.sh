@@ -98,6 +98,33 @@ spec: {vpcRef: {namespace: $1, name: $2}}
 EOF
 }
 
+# internet_table <ns> <vpc> <dst...>: give a VPC a default route table whose
+# routes send <dst> to the internet target, which a FloatingIP's egress (and
+# its replies to inbound clients) needs (docs/vpc-egress.md §3.2).
+internet_table() {
+  local ns="$1" v="$2"; shift 2
+  $K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: RouteTable
+metadata: {name: $v-public, namespace: $ns}
+spec: {vpcRef: {name: $v}, default: true}
+EOF
+  local i=0
+  for d in "$@"; do
+    i=$((i + 1))
+    $K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: Route
+metadata: {name: $v-public-$i, namespace: $ns}
+spec: {routeTableRef: {name: $v-public}, destination: "$d", target: {internet: {}}}
+EOF
+  done
+  for _ in $(seq 1 15); do
+    [ "$($K -n "$ns" get route "$v-public-1" -o jsonpath='{.status.state}' 2>/dev/null)" = Active ] && break
+    sleep 2
+  done
+}
+
 cleanup() {
   docker rm -f v6tgt >/dev/null 2>&1
   [ "${KEEP:-0}" = "1" ] || kind delete cluster --name "$CLUSTER" >/dev/null 2>&1
@@ -364,6 +391,7 @@ KNET6=$(docker network inspect kind -f '{{range .IPAM.Config}}{{.Subnet}}
 {{end}}' 2>/dev/null | grep : | head -1)
 V6PFX=${KNET6%%::*}
 FIP6="${V6PFX}:f10a::10"
+internet_table team-a vpc6a "::/0"
 V6A2IP=$(vpcip v6a2)
 $K apply -f - >/dev/null <<EOF
 apiVersion: sdn.cozystack.io/v1alpha1
@@ -717,6 +745,7 @@ phase "floating IP: external ingress, source-preserving"
 KNET=$(docker network inspect kind -f '{{range .IPAM.Config}}{{.Subnet}}{{"\n"}}{{end}}' 2>/dev/null | grep -v : | head -1)
 KPFX=$(echo "${KNET:-172.18.0.0/16}" | cut -d. -f1-2)
 FIP="${KPFX}.240.10"
+internet_table team-a vpc-a "0.0.0.0/0"
 A1IP=$(vpcip a1)
 $K apply -f - >/dev/null <<EOF
 apiVersion: sdn.cozystack.io/v1alpha1

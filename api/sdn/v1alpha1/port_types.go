@@ -70,6 +70,13 @@ type PortSpec struct {
 	// pod); agents route off-VPC traffic to it.
 	// +optional
 	Gateway bool `json:"gateway,omitempty"`
+
+	// RouteTable is the name of the RouteTable (in the VPC's namespace) this
+	// Port's traffic is routed by, copied by the CNI from the pod's
+	// sdn.cozystack.io/route-table annotation. Empty means the VPC's default
+	// table (docs/vpc-egress.md §2.4).
+	// +optional
+	RouteTable string `json:"routeTable,omitempty"`
 }
 
 // PortStatus is the controller-observed state of a Port.

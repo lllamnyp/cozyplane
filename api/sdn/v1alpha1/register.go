@@ -63,6 +63,12 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&SecurityGroupList{},
 		&HostFirewall{},
 		&HostFirewallList{},
+		&NATGateway{},
+		&NATGatewayList{},
+		&RouteTable{},
+		&RouteTableList{},
+		&Route{},
+		&RouteList{},
 	)
 	metav1.AddToGroupVersion(scheme, SchemeGroupVersion)
 

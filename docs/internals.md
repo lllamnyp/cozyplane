@@ -951,11 +951,25 @@ misses:
   informer cache could lag a *just-created* pod and GC would otherwise kill a
   newborn Port.
 
-`GatewayReconciler` realizes a **pool-less** `VPCGateway` as a per-VPC gateway
-Deployment (`cozyplane-gateway-<vni>`) in the system namespace. A gateway that
-*has* a pool is realized in eBPF instead — `vpc_nat_snat` SNATs at each pod's own
-veth to the VPC's own address, so the reconciler **deletes** the Deployment once
-`status.natAddress` is set (docs/north-south.md). The pod path is: a privileged
+`GatewayReconciler` realizes a `VPCGateway` family with `nat.enabled` but **no
+NAT address** as a per-VPC gateway Deployment (`cozyplane-gateway-<vni>`) in the
+system namespace. A family with an address is realized in eBPF instead, through the
+`NATGateway` the VPCGateway owns (docs/vpc-egress.md §7), so the reconciler
+**deletes** the Deployment once `status.natAddress` is set.
+
+`NATGatewayReconciler` allocates a NAT gateway's id, owns the LoadBalancer Services
+that obtain its addresses (one per claim, or one per VPC family without claims),
+and counts its `NATPortBlock` leases. `RouteTableReconciler` allocates table ids and
+picks each VPC's default table; `RouteReconciler` sets each Route's state
+(`Active` / `Unresolved` / `Conflict`); `NATPortBlockGCReconciler` deletes the
+leases of deleted NAT gateways and of nodes gone for the grace period. On the agent,
+`watchEgress` programs `vpc_routes`, `port_rt`, `nat_gw`, `nat_addrs` and
+`nat_blk_owner`, claims, acks and releases leases, and sweeps expired flows out of
+`nat_rev`/`nat_fwd` every 30 s. In the datapath, `from_pod` tail-calls `vpc_egress`
+(lb_prog slot 4) for every off-VPC or peered packet of a VPC Port; `vpc_egress`
+SNATs, rewrites to the FloatingIP or drops, or hands the packet back to `from_pod`
+(slot 5) marked `RT_DONE`. Replies and ICMP errors to a NAT gateway address go from
+`from_uplink`/`from_overlay` to `nat_reverse` (slot 6). The pod path is: a privileged
 pod running `cozyplane-gateway` with the `gateway-for` annotation, Recreate
 strategy (the `.1` Port claim cannot roll). Deletion (egress disabled or VPC
 gone) finds Deployments by VPC labels — the VNI-derived name is unknowable

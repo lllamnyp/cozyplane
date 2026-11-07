@@ -275,6 +275,10 @@ type PortSpec struct {
 	// Gateway marks the VPC's gateway port (the .1 leg of the egress gateway
 	// pod); agents route off-VPC traffic to it.
 	Gateway bool
+
+	// RouteTable names the Port's RouteTable in the VPC's namespace; empty means
+	// the VPC's default table (docs/vpc-egress.md §2.4).
+	RouteTable string
 }
 
 // PortStatus is the controller-observed state of a Port.
@@ -621,4 +625,154 @@ type HostFirewallList struct {
 	metav1.ListMeta
 
 	Items []HostFirewall
+}
+
+// Condition types surfaced in NATGateway status (docs/vpc-egress.md §2.1).
+const (
+	NATGatewayConditionVPCResolved       = "VPCResolved"
+	NATGatewayConditionAddressAssigned   = "AddressAssigned"
+	NATGatewayConditionCapacityAvailable = "CapacityAvailable"
+)
+
+// NATGatewaySpec declares a many-to-one egress identity for a VPC.
+type NATGatewaySpec struct {
+	VPCRef            LocalVPCRef
+	LoadBalancerClass string
+	// AddressClaimName / AddressClaimName6 name the IPAddressClaims whose IPv4 /
+	// IPv6 address the NAT gateway wears; both may name one dual-stack claim.
+	AddressClaimName  string
+	AddressClaimName6 string
+}
+
+// NATGatewayBlocks summarizes the NAT gateway's port-block leases.
+type NATGatewayBlocks struct {
+	Leased int32
+	Free   int32
+}
+
+// NATGatewayStatus is the observed state of a NATGateway.
+type NATGatewayStatus struct {
+	ID         int32
+	Address    string
+	Address6   string
+	BlockSize  int32
+	Blocks     NATGatewayBlocks
+	Conditions []metav1.Condition
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// NATGateway is a many-to-one egress identity for a VPC (docs/vpc-egress.md).
+type NATGateway struct {
+	metav1.TypeMeta
+	metav1.ObjectMeta
+
+	Spec   NATGatewaySpec
+	Status NATGatewayStatus
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// NATGatewayList contains a list of NATGateway.
+type NATGatewayList struct {
+	metav1.TypeMeta
+	metav1.ListMeta
+	Items []NATGateway
+}
+
+// RouteTableSpec declares a route table of a VPC.
+type RouteTableSpec struct {
+	VPCRef  LocalVPCRef
+	Default bool
+}
+
+// RouteTableStatus is the observed state of a RouteTable.
+type RouteTableStatus struct {
+	ID         int32
+	Conditions []metav1.Condition
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// RouteTable is a route table of a VPC (docs/vpc-egress.md §2.2).
+type RouteTable struct {
+	metav1.TypeMeta
+	metav1.ObjectMeta
+
+	Spec   RouteTableSpec
+	Status RouteTableStatus
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// RouteTableList contains a list of RouteTable.
+type RouteTableList struct {
+	metav1.TypeMeta
+	metav1.ListMeta
+	Items []RouteTable
+}
+
+// RouteState is the controller's verdict on a Route.
+type RouteState string
+
+const (
+	RouteStateActive     RouteState = "Active"
+	RouteStateUnresolved RouteState = "Unresolved"
+	RouteStateConflict   RouteState = "Conflict"
+)
+
+// LocalRouteTableRef references a RouteTable in the referring object's namespace.
+type LocalRouteTableRef struct {
+	Name string
+}
+
+// LocalNATGatewayRef references a NATGateway in the referring object's namespace.
+type LocalNATGatewayRef struct {
+	Name string
+}
+
+// RouteInternetTarget is the internet pseudo-target.
+type RouteInternetTarget struct{}
+
+// RouteBlackholeTarget is the blackhole target.
+type RouteBlackholeTarget struct{}
+
+// RouteTarget is where a route sends matching traffic; exactly one field is set.
+type RouteTarget struct {
+	NATGateway *LocalNATGatewayRef
+	Internet   *RouteInternetTarget
+	Blackhole  *RouteBlackholeTarget
+}
+
+// RouteSpec declares one route.
+type RouteSpec struct {
+	RouteTableRef LocalRouteTableRef
+	Destination   string
+	Target        RouteTarget
+}
+
+// RouteStatus is the observed state of a Route.
+type RouteStatus struct {
+	State      RouteState
+	Conditions []metav1.Condition
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// Route is one destination and one target in a RouteTable (docs/vpc-egress.md §2.3).
+type Route struct {
+	metav1.TypeMeta
+	metav1.ObjectMeta
+
+	Spec   RouteSpec
+	Status RouteStatus
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// RouteList contains a list of Route.
+type RouteList struct {
+	metav1.TypeMeta
+	metav1.ListMeta
+	Items []Route
 }

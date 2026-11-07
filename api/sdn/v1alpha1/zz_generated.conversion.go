@@ -157,6 +157,26 @@ func RegisterConversions(s *runtime.Scheme) error {
 	}); err != nil {
 		return err
 	}
+	if err := s.AddGeneratedConversionFunc((*LocalNATGatewayRef)(nil), (*sdn.LocalNATGatewayRef)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_LocalNATGatewayRef_To_sdn_LocalNATGatewayRef(a.(*LocalNATGatewayRef), b.(*sdn.LocalNATGatewayRef), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.LocalNATGatewayRef)(nil), (*LocalNATGatewayRef)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_LocalNATGatewayRef_To_v1alpha1_LocalNATGatewayRef(a.(*sdn.LocalNATGatewayRef), b.(*LocalNATGatewayRef), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*LocalRouteTableRef)(nil), (*sdn.LocalRouteTableRef)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_LocalRouteTableRef_To_sdn_LocalRouteTableRef(a.(*LocalRouteTableRef), b.(*sdn.LocalRouteTableRef), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.LocalRouteTableRef)(nil), (*LocalRouteTableRef)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_LocalRouteTableRef_To_v1alpha1_LocalRouteTableRef(a.(*sdn.LocalRouteTableRef), b.(*LocalRouteTableRef), scope)
+	}); err != nil {
+		return err
+	}
 	if err := s.AddGeneratedConversionFunc((*LocalVPCRef)(nil), (*sdn.LocalVPCRef)(nil), func(a, b interface{}, scope conversion.Scope) error {
 		return Convert_v1alpha1_LocalVPCRef_To_sdn_LocalVPCRef(a.(*LocalVPCRef), b.(*sdn.LocalVPCRef), scope)
 	}); err != nil {
@@ -164,6 +184,56 @@ func RegisterConversions(s *runtime.Scheme) error {
 	}
 	if err := s.AddGeneratedConversionFunc((*sdn.LocalVPCRef)(nil), (*LocalVPCRef)(nil), func(a, b interface{}, scope conversion.Scope) error {
 		return Convert_sdn_LocalVPCRef_To_v1alpha1_LocalVPCRef(a.(*sdn.LocalVPCRef), b.(*LocalVPCRef), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*NATGateway)(nil), (*sdn.NATGateway)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_NATGateway_To_sdn_NATGateway(a.(*NATGateway), b.(*sdn.NATGateway), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.NATGateway)(nil), (*NATGateway)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_NATGateway_To_v1alpha1_NATGateway(a.(*sdn.NATGateway), b.(*NATGateway), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*NATGatewayBlocks)(nil), (*sdn.NATGatewayBlocks)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_NATGatewayBlocks_To_sdn_NATGatewayBlocks(a.(*NATGatewayBlocks), b.(*sdn.NATGatewayBlocks), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.NATGatewayBlocks)(nil), (*NATGatewayBlocks)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_NATGatewayBlocks_To_v1alpha1_NATGatewayBlocks(a.(*sdn.NATGatewayBlocks), b.(*NATGatewayBlocks), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*NATGatewayList)(nil), (*sdn.NATGatewayList)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_NATGatewayList_To_sdn_NATGatewayList(a.(*NATGatewayList), b.(*sdn.NATGatewayList), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.NATGatewayList)(nil), (*NATGatewayList)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_NATGatewayList_To_v1alpha1_NATGatewayList(a.(*sdn.NATGatewayList), b.(*NATGatewayList), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*NATGatewaySpec)(nil), (*sdn.NATGatewaySpec)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_NATGatewaySpec_To_sdn_NATGatewaySpec(a.(*NATGatewaySpec), b.(*sdn.NATGatewaySpec), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.NATGatewaySpec)(nil), (*NATGatewaySpec)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_NATGatewaySpec_To_v1alpha1_NATGatewaySpec(a.(*sdn.NATGatewaySpec), b.(*NATGatewaySpec), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*NATGatewayStatus)(nil), (*sdn.NATGatewayStatus)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_NATGatewayStatus_To_sdn_NATGatewayStatus(a.(*NATGatewayStatus), b.(*sdn.NATGatewayStatus), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.NATGatewayStatus)(nil), (*NATGatewayStatus)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_NATGatewayStatus_To_v1alpha1_NATGatewayStatus(a.(*sdn.NATGatewayStatus), b.(*NATGatewayStatus), scope)
 	}); err != nil {
 		return err
 	}
@@ -204,6 +274,116 @@ func RegisterConversions(s *runtime.Scheme) error {
 	}
 	if err := s.AddGeneratedConversionFunc((*sdn.PortStatus)(nil), (*PortStatus)(nil), func(a, b interface{}, scope conversion.Scope) error {
 		return Convert_sdn_PortStatus_To_v1alpha1_PortStatus(a.(*sdn.PortStatus), b.(*PortStatus), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*Route)(nil), (*sdn.Route)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_Route_To_sdn_Route(a.(*Route), b.(*sdn.Route), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.Route)(nil), (*Route)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_Route_To_v1alpha1_Route(a.(*sdn.Route), b.(*Route), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*RouteBlackholeTarget)(nil), (*sdn.RouteBlackholeTarget)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_RouteBlackholeTarget_To_sdn_RouteBlackholeTarget(a.(*RouteBlackholeTarget), b.(*sdn.RouteBlackholeTarget), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.RouteBlackholeTarget)(nil), (*RouteBlackholeTarget)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_RouteBlackholeTarget_To_v1alpha1_RouteBlackholeTarget(a.(*sdn.RouteBlackholeTarget), b.(*RouteBlackholeTarget), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*RouteInternetTarget)(nil), (*sdn.RouteInternetTarget)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_RouteInternetTarget_To_sdn_RouteInternetTarget(a.(*RouteInternetTarget), b.(*sdn.RouteInternetTarget), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.RouteInternetTarget)(nil), (*RouteInternetTarget)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_RouteInternetTarget_To_v1alpha1_RouteInternetTarget(a.(*sdn.RouteInternetTarget), b.(*RouteInternetTarget), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*RouteList)(nil), (*sdn.RouteList)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_RouteList_To_sdn_RouteList(a.(*RouteList), b.(*sdn.RouteList), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.RouteList)(nil), (*RouteList)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_RouteList_To_v1alpha1_RouteList(a.(*sdn.RouteList), b.(*RouteList), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*RouteSpec)(nil), (*sdn.RouteSpec)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_RouteSpec_To_sdn_RouteSpec(a.(*RouteSpec), b.(*sdn.RouteSpec), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.RouteSpec)(nil), (*RouteSpec)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_RouteSpec_To_v1alpha1_RouteSpec(a.(*sdn.RouteSpec), b.(*RouteSpec), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*RouteStatus)(nil), (*sdn.RouteStatus)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_RouteStatus_To_sdn_RouteStatus(a.(*RouteStatus), b.(*sdn.RouteStatus), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.RouteStatus)(nil), (*RouteStatus)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_RouteStatus_To_v1alpha1_RouteStatus(a.(*sdn.RouteStatus), b.(*RouteStatus), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*RouteTable)(nil), (*sdn.RouteTable)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_RouteTable_To_sdn_RouteTable(a.(*RouteTable), b.(*sdn.RouteTable), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.RouteTable)(nil), (*RouteTable)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_RouteTable_To_v1alpha1_RouteTable(a.(*sdn.RouteTable), b.(*RouteTable), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*RouteTableList)(nil), (*sdn.RouteTableList)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_RouteTableList_To_sdn_RouteTableList(a.(*RouteTableList), b.(*sdn.RouteTableList), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.RouteTableList)(nil), (*RouteTableList)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_RouteTableList_To_v1alpha1_RouteTableList(a.(*sdn.RouteTableList), b.(*RouteTableList), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*RouteTableSpec)(nil), (*sdn.RouteTableSpec)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_RouteTableSpec_To_sdn_RouteTableSpec(a.(*RouteTableSpec), b.(*sdn.RouteTableSpec), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.RouteTableSpec)(nil), (*RouteTableSpec)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_RouteTableSpec_To_v1alpha1_RouteTableSpec(a.(*sdn.RouteTableSpec), b.(*RouteTableSpec), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*RouteTableStatus)(nil), (*sdn.RouteTableStatus)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_RouteTableStatus_To_sdn_RouteTableStatus(a.(*RouteTableStatus), b.(*sdn.RouteTableStatus), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.RouteTableStatus)(nil), (*RouteTableStatus)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_RouteTableStatus_To_v1alpha1_RouteTableStatus(a.(*sdn.RouteTableStatus), b.(*RouteTableStatus), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*RouteTarget)(nil), (*sdn.RouteTarget)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_RouteTarget_To_sdn_RouteTarget(a.(*RouteTarget), b.(*sdn.RouteTarget), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*sdn.RouteTarget)(nil), (*RouteTarget)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_sdn_RouteTarget_To_v1alpha1_RouteTarget(a.(*sdn.RouteTarget), b.(*RouteTarget), scope)
 	}); err != nil {
 		return err
 	}
@@ -848,6 +1028,46 @@ func Convert_sdn_HostFirewallStatus_To_v1alpha1_HostFirewallStatus(in *sdn.HostF
 	return autoConvert_sdn_HostFirewallStatus_To_v1alpha1_HostFirewallStatus(in, out, s)
 }
 
+func autoConvert_v1alpha1_LocalNATGatewayRef_To_sdn_LocalNATGatewayRef(in *LocalNATGatewayRef, out *sdn.LocalNATGatewayRef, s conversion.Scope) error {
+	out.Name = in.Name
+	return nil
+}
+
+// Convert_v1alpha1_LocalNATGatewayRef_To_sdn_LocalNATGatewayRef is an autogenerated conversion function.
+func Convert_v1alpha1_LocalNATGatewayRef_To_sdn_LocalNATGatewayRef(in *LocalNATGatewayRef, out *sdn.LocalNATGatewayRef, s conversion.Scope) error {
+	return autoConvert_v1alpha1_LocalNATGatewayRef_To_sdn_LocalNATGatewayRef(in, out, s)
+}
+
+func autoConvert_sdn_LocalNATGatewayRef_To_v1alpha1_LocalNATGatewayRef(in *sdn.LocalNATGatewayRef, out *LocalNATGatewayRef, s conversion.Scope) error {
+	out.Name = in.Name
+	return nil
+}
+
+// Convert_sdn_LocalNATGatewayRef_To_v1alpha1_LocalNATGatewayRef is an autogenerated conversion function.
+func Convert_sdn_LocalNATGatewayRef_To_v1alpha1_LocalNATGatewayRef(in *sdn.LocalNATGatewayRef, out *LocalNATGatewayRef, s conversion.Scope) error {
+	return autoConvert_sdn_LocalNATGatewayRef_To_v1alpha1_LocalNATGatewayRef(in, out, s)
+}
+
+func autoConvert_v1alpha1_LocalRouteTableRef_To_sdn_LocalRouteTableRef(in *LocalRouteTableRef, out *sdn.LocalRouteTableRef, s conversion.Scope) error {
+	out.Name = in.Name
+	return nil
+}
+
+// Convert_v1alpha1_LocalRouteTableRef_To_sdn_LocalRouteTableRef is an autogenerated conversion function.
+func Convert_v1alpha1_LocalRouteTableRef_To_sdn_LocalRouteTableRef(in *LocalRouteTableRef, out *sdn.LocalRouteTableRef, s conversion.Scope) error {
+	return autoConvert_v1alpha1_LocalRouteTableRef_To_sdn_LocalRouteTableRef(in, out, s)
+}
+
+func autoConvert_sdn_LocalRouteTableRef_To_v1alpha1_LocalRouteTableRef(in *sdn.LocalRouteTableRef, out *LocalRouteTableRef, s conversion.Scope) error {
+	out.Name = in.Name
+	return nil
+}
+
+// Convert_sdn_LocalRouteTableRef_To_v1alpha1_LocalRouteTableRef is an autogenerated conversion function.
+func Convert_sdn_LocalRouteTableRef_To_v1alpha1_LocalRouteTableRef(in *sdn.LocalRouteTableRef, out *LocalRouteTableRef, s conversion.Scope) error {
+	return autoConvert_sdn_LocalRouteTableRef_To_v1alpha1_LocalRouteTableRef(in, out, s)
+}
+
 func autoConvert_v1alpha1_LocalVPCRef_To_sdn_LocalVPCRef(in *LocalVPCRef, out *sdn.LocalVPCRef, s conversion.Scope) error {
 	out.Name = in.Name
 	return nil
@@ -866,6 +1086,146 @@ func autoConvert_sdn_LocalVPCRef_To_v1alpha1_LocalVPCRef(in *sdn.LocalVPCRef, ou
 // Convert_sdn_LocalVPCRef_To_v1alpha1_LocalVPCRef is an autogenerated conversion function.
 func Convert_sdn_LocalVPCRef_To_v1alpha1_LocalVPCRef(in *sdn.LocalVPCRef, out *LocalVPCRef, s conversion.Scope) error {
 	return autoConvert_sdn_LocalVPCRef_To_v1alpha1_LocalVPCRef(in, out, s)
+}
+
+func autoConvert_v1alpha1_NATGateway_To_sdn_NATGateway(in *NATGateway, out *sdn.NATGateway, s conversion.Scope) error {
+	out.ObjectMeta = in.ObjectMeta
+	if err := Convert_v1alpha1_NATGatewaySpec_To_sdn_NATGatewaySpec(&in.Spec, &out.Spec, s); err != nil {
+		return err
+	}
+	if err := Convert_v1alpha1_NATGatewayStatus_To_sdn_NATGatewayStatus(&in.Status, &out.Status, s); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Convert_v1alpha1_NATGateway_To_sdn_NATGateway is an autogenerated conversion function.
+func Convert_v1alpha1_NATGateway_To_sdn_NATGateway(in *NATGateway, out *sdn.NATGateway, s conversion.Scope) error {
+	return autoConvert_v1alpha1_NATGateway_To_sdn_NATGateway(in, out, s)
+}
+
+func autoConvert_sdn_NATGateway_To_v1alpha1_NATGateway(in *sdn.NATGateway, out *NATGateway, s conversion.Scope) error {
+	out.ObjectMeta = in.ObjectMeta
+	if err := Convert_sdn_NATGatewaySpec_To_v1alpha1_NATGatewaySpec(&in.Spec, &out.Spec, s); err != nil {
+		return err
+	}
+	if err := Convert_sdn_NATGatewayStatus_To_v1alpha1_NATGatewayStatus(&in.Status, &out.Status, s); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Convert_sdn_NATGateway_To_v1alpha1_NATGateway is an autogenerated conversion function.
+func Convert_sdn_NATGateway_To_v1alpha1_NATGateway(in *sdn.NATGateway, out *NATGateway, s conversion.Scope) error {
+	return autoConvert_sdn_NATGateway_To_v1alpha1_NATGateway(in, out, s)
+}
+
+func autoConvert_v1alpha1_NATGatewayBlocks_To_sdn_NATGatewayBlocks(in *NATGatewayBlocks, out *sdn.NATGatewayBlocks, s conversion.Scope) error {
+	out.Leased = in.Leased
+	out.Free = in.Free
+	return nil
+}
+
+// Convert_v1alpha1_NATGatewayBlocks_To_sdn_NATGatewayBlocks is an autogenerated conversion function.
+func Convert_v1alpha1_NATGatewayBlocks_To_sdn_NATGatewayBlocks(in *NATGatewayBlocks, out *sdn.NATGatewayBlocks, s conversion.Scope) error {
+	return autoConvert_v1alpha1_NATGatewayBlocks_To_sdn_NATGatewayBlocks(in, out, s)
+}
+
+func autoConvert_sdn_NATGatewayBlocks_To_v1alpha1_NATGatewayBlocks(in *sdn.NATGatewayBlocks, out *NATGatewayBlocks, s conversion.Scope) error {
+	out.Leased = in.Leased
+	out.Free = in.Free
+	return nil
+}
+
+// Convert_sdn_NATGatewayBlocks_To_v1alpha1_NATGatewayBlocks is an autogenerated conversion function.
+func Convert_sdn_NATGatewayBlocks_To_v1alpha1_NATGatewayBlocks(in *sdn.NATGatewayBlocks, out *NATGatewayBlocks, s conversion.Scope) error {
+	return autoConvert_sdn_NATGatewayBlocks_To_v1alpha1_NATGatewayBlocks(in, out, s)
+}
+
+func autoConvert_v1alpha1_NATGatewayList_To_sdn_NATGatewayList(in *NATGatewayList, out *sdn.NATGatewayList, s conversion.Scope) error {
+	out.ListMeta = in.ListMeta
+	out.Items = *(*[]sdn.NATGateway)(unsafe.Pointer(&in.Items))
+	return nil
+}
+
+// Convert_v1alpha1_NATGatewayList_To_sdn_NATGatewayList is an autogenerated conversion function.
+func Convert_v1alpha1_NATGatewayList_To_sdn_NATGatewayList(in *NATGatewayList, out *sdn.NATGatewayList, s conversion.Scope) error {
+	return autoConvert_v1alpha1_NATGatewayList_To_sdn_NATGatewayList(in, out, s)
+}
+
+func autoConvert_sdn_NATGatewayList_To_v1alpha1_NATGatewayList(in *sdn.NATGatewayList, out *NATGatewayList, s conversion.Scope) error {
+	out.ListMeta = in.ListMeta
+	out.Items = *(*[]NATGateway)(unsafe.Pointer(&in.Items))
+	return nil
+}
+
+// Convert_sdn_NATGatewayList_To_v1alpha1_NATGatewayList is an autogenerated conversion function.
+func Convert_sdn_NATGatewayList_To_v1alpha1_NATGatewayList(in *sdn.NATGatewayList, out *NATGatewayList, s conversion.Scope) error {
+	return autoConvert_sdn_NATGatewayList_To_v1alpha1_NATGatewayList(in, out, s)
+}
+
+func autoConvert_v1alpha1_NATGatewaySpec_To_sdn_NATGatewaySpec(in *NATGatewaySpec, out *sdn.NATGatewaySpec, s conversion.Scope) error {
+	if err := Convert_v1alpha1_LocalVPCRef_To_sdn_LocalVPCRef(&in.VPCRef, &out.VPCRef, s); err != nil {
+		return err
+	}
+	out.LoadBalancerClass = in.LoadBalancerClass
+	out.AddressClaimName = in.AddressClaimName
+	out.AddressClaimName6 = in.AddressClaimName6
+	return nil
+}
+
+// Convert_v1alpha1_NATGatewaySpec_To_sdn_NATGatewaySpec is an autogenerated conversion function.
+func Convert_v1alpha1_NATGatewaySpec_To_sdn_NATGatewaySpec(in *NATGatewaySpec, out *sdn.NATGatewaySpec, s conversion.Scope) error {
+	return autoConvert_v1alpha1_NATGatewaySpec_To_sdn_NATGatewaySpec(in, out, s)
+}
+
+func autoConvert_sdn_NATGatewaySpec_To_v1alpha1_NATGatewaySpec(in *sdn.NATGatewaySpec, out *NATGatewaySpec, s conversion.Scope) error {
+	if err := Convert_sdn_LocalVPCRef_To_v1alpha1_LocalVPCRef(&in.VPCRef, &out.VPCRef, s); err != nil {
+		return err
+	}
+	out.LoadBalancerClass = in.LoadBalancerClass
+	out.AddressClaimName = in.AddressClaimName
+	out.AddressClaimName6 = in.AddressClaimName6
+	return nil
+}
+
+// Convert_sdn_NATGatewaySpec_To_v1alpha1_NATGatewaySpec is an autogenerated conversion function.
+func Convert_sdn_NATGatewaySpec_To_v1alpha1_NATGatewaySpec(in *sdn.NATGatewaySpec, out *NATGatewaySpec, s conversion.Scope) error {
+	return autoConvert_sdn_NATGatewaySpec_To_v1alpha1_NATGatewaySpec(in, out, s)
+}
+
+func autoConvert_v1alpha1_NATGatewayStatus_To_sdn_NATGatewayStatus(in *NATGatewayStatus, out *sdn.NATGatewayStatus, s conversion.Scope) error {
+	out.ID = in.ID
+	out.Address = in.Address
+	out.Address6 = in.Address6
+	out.BlockSize = in.BlockSize
+	if err := Convert_v1alpha1_NATGatewayBlocks_To_sdn_NATGatewayBlocks(&in.Blocks, &out.Blocks, s); err != nil {
+		return err
+	}
+	out.Conditions = *(*[]v1.Condition)(unsafe.Pointer(&in.Conditions))
+	return nil
+}
+
+// Convert_v1alpha1_NATGatewayStatus_To_sdn_NATGatewayStatus is an autogenerated conversion function.
+func Convert_v1alpha1_NATGatewayStatus_To_sdn_NATGatewayStatus(in *NATGatewayStatus, out *sdn.NATGatewayStatus, s conversion.Scope) error {
+	return autoConvert_v1alpha1_NATGatewayStatus_To_sdn_NATGatewayStatus(in, out, s)
+}
+
+func autoConvert_sdn_NATGatewayStatus_To_v1alpha1_NATGatewayStatus(in *sdn.NATGatewayStatus, out *NATGatewayStatus, s conversion.Scope) error {
+	out.ID = in.ID
+	out.Address = in.Address
+	out.Address6 = in.Address6
+	out.BlockSize = in.BlockSize
+	if err := Convert_sdn_NATGatewayBlocks_To_v1alpha1_NATGatewayBlocks(&in.Blocks, &out.Blocks, s); err != nil {
+		return err
+	}
+	out.Conditions = *(*[]v1.Condition)(unsafe.Pointer(&in.Conditions))
+	return nil
+}
+
+// Convert_sdn_NATGatewayStatus_To_v1alpha1_NATGatewayStatus is an autogenerated conversion function.
+func Convert_sdn_NATGatewayStatus_To_v1alpha1_NATGatewayStatus(in *sdn.NATGatewayStatus, out *NATGatewayStatus, s conversion.Scope) error {
+	return autoConvert_sdn_NATGatewayStatus_To_v1alpha1_NATGatewayStatus(in, out, s)
 }
 
 func autoConvert_v1alpha1_Port_To_sdn_Port(in *Port, out *sdn.Port, s conversion.Scope) error {
@@ -933,6 +1293,7 @@ func autoConvert_v1alpha1_PortSpec_To_sdn_PortSpec(in *PortSpec, out *sdn.PortSp
 	out.PodNamespace = in.PodNamespace
 	out.PodName = in.PodName
 	out.Gateway = in.Gateway
+	out.RouteTable = in.RouteTable
 	return nil
 }
 
@@ -952,6 +1313,7 @@ func autoConvert_sdn_PortSpec_To_v1alpha1_PortSpec(in *sdn.PortSpec, out *PortSp
 	out.PodNamespace = in.PodNamespace
 	out.PodName = in.PodName
 	out.Gateway = in.Gateway
+	out.RouteTable = in.RouteTable
 	return nil
 }
 
@@ -978,6 +1340,276 @@ func autoConvert_sdn_PortStatus_To_v1alpha1_PortStatus(in *sdn.PortStatus, out *
 // Convert_sdn_PortStatus_To_v1alpha1_PortStatus is an autogenerated conversion function.
 func Convert_sdn_PortStatus_To_v1alpha1_PortStatus(in *sdn.PortStatus, out *PortStatus, s conversion.Scope) error {
 	return autoConvert_sdn_PortStatus_To_v1alpha1_PortStatus(in, out, s)
+}
+
+func autoConvert_v1alpha1_Route_To_sdn_Route(in *Route, out *sdn.Route, s conversion.Scope) error {
+	out.ObjectMeta = in.ObjectMeta
+	if err := Convert_v1alpha1_RouteSpec_To_sdn_RouteSpec(&in.Spec, &out.Spec, s); err != nil {
+		return err
+	}
+	if err := Convert_v1alpha1_RouteStatus_To_sdn_RouteStatus(&in.Status, &out.Status, s); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Convert_v1alpha1_Route_To_sdn_Route is an autogenerated conversion function.
+func Convert_v1alpha1_Route_To_sdn_Route(in *Route, out *sdn.Route, s conversion.Scope) error {
+	return autoConvert_v1alpha1_Route_To_sdn_Route(in, out, s)
+}
+
+func autoConvert_sdn_Route_To_v1alpha1_Route(in *sdn.Route, out *Route, s conversion.Scope) error {
+	out.ObjectMeta = in.ObjectMeta
+	if err := Convert_sdn_RouteSpec_To_v1alpha1_RouteSpec(&in.Spec, &out.Spec, s); err != nil {
+		return err
+	}
+	if err := Convert_sdn_RouteStatus_To_v1alpha1_RouteStatus(&in.Status, &out.Status, s); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Convert_sdn_Route_To_v1alpha1_Route is an autogenerated conversion function.
+func Convert_sdn_Route_To_v1alpha1_Route(in *sdn.Route, out *Route, s conversion.Scope) error {
+	return autoConvert_sdn_Route_To_v1alpha1_Route(in, out, s)
+}
+
+func autoConvert_v1alpha1_RouteBlackholeTarget_To_sdn_RouteBlackholeTarget(in *RouteBlackholeTarget, out *sdn.RouteBlackholeTarget, s conversion.Scope) error {
+	return nil
+}
+
+// Convert_v1alpha1_RouteBlackholeTarget_To_sdn_RouteBlackholeTarget is an autogenerated conversion function.
+func Convert_v1alpha1_RouteBlackholeTarget_To_sdn_RouteBlackholeTarget(in *RouteBlackholeTarget, out *sdn.RouteBlackholeTarget, s conversion.Scope) error {
+	return autoConvert_v1alpha1_RouteBlackholeTarget_To_sdn_RouteBlackholeTarget(in, out, s)
+}
+
+func autoConvert_sdn_RouteBlackholeTarget_To_v1alpha1_RouteBlackholeTarget(in *sdn.RouteBlackholeTarget, out *RouteBlackholeTarget, s conversion.Scope) error {
+	return nil
+}
+
+// Convert_sdn_RouteBlackholeTarget_To_v1alpha1_RouteBlackholeTarget is an autogenerated conversion function.
+func Convert_sdn_RouteBlackholeTarget_To_v1alpha1_RouteBlackholeTarget(in *sdn.RouteBlackholeTarget, out *RouteBlackholeTarget, s conversion.Scope) error {
+	return autoConvert_sdn_RouteBlackholeTarget_To_v1alpha1_RouteBlackholeTarget(in, out, s)
+}
+
+func autoConvert_v1alpha1_RouteInternetTarget_To_sdn_RouteInternetTarget(in *RouteInternetTarget, out *sdn.RouteInternetTarget, s conversion.Scope) error {
+	return nil
+}
+
+// Convert_v1alpha1_RouteInternetTarget_To_sdn_RouteInternetTarget is an autogenerated conversion function.
+func Convert_v1alpha1_RouteInternetTarget_To_sdn_RouteInternetTarget(in *RouteInternetTarget, out *sdn.RouteInternetTarget, s conversion.Scope) error {
+	return autoConvert_v1alpha1_RouteInternetTarget_To_sdn_RouteInternetTarget(in, out, s)
+}
+
+func autoConvert_sdn_RouteInternetTarget_To_v1alpha1_RouteInternetTarget(in *sdn.RouteInternetTarget, out *RouteInternetTarget, s conversion.Scope) error {
+	return nil
+}
+
+// Convert_sdn_RouteInternetTarget_To_v1alpha1_RouteInternetTarget is an autogenerated conversion function.
+func Convert_sdn_RouteInternetTarget_To_v1alpha1_RouteInternetTarget(in *sdn.RouteInternetTarget, out *RouteInternetTarget, s conversion.Scope) error {
+	return autoConvert_sdn_RouteInternetTarget_To_v1alpha1_RouteInternetTarget(in, out, s)
+}
+
+func autoConvert_v1alpha1_RouteList_To_sdn_RouteList(in *RouteList, out *sdn.RouteList, s conversion.Scope) error {
+	out.ListMeta = in.ListMeta
+	out.Items = *(*[]sdn.Route)(unsafe.Pointer(&in.Items))
+	return nil
+}
+
+// Convert_v1alpha1_RouteList_To_sdn_RouteList is an autogenerated conversion function.
+func Convert_v1alpha1_RouteList_To_sdn_RouteList(in *RouteList, out *sdn.RouteList, s conversion.Scope) error {
+	return autoConvert_v1alpha1_RouteList_To_sdn_RouteList(in, out, s)
+}
+
+func autoConvert_sdn_RouteList_To_v1alpha1_RouteList(in *sdn.RouteList, out *RouteList, s conversion.Scope) error {
+	out.ListMeta = in.ListMeta
+	out.Items = *(*[]Route)(unsafe.Pointer(&in.Items))
+	return nil
+}
+
+// Convert_sdn_RouteList_To_v1alpha1_RouteList is an autogenerated conversion function.
+func Convert_sdn_RouteList_To_v1alpha1_RouteList(in *sdn.RouteList, out *RouteList, s conversion.Scope) error {
+	return autoConvert_sdn_RouteList_To_v1alpha1_RouteList(in, out, s)
+}
+
+func autoConvert_v1alpha1_RouteSpec_To_sdn_RouteSpec(in *RouteSpec, out *sdn.RouteSpec, s conversion.Scope) error {
+	if err := Convert_v1alpha1_LocalRouteTableRef_To_sdn_LocalRouteTableRef(&in.RouteTableRef, &out.RouteTableRef, s); err != nil {
+		return err
+	}
+	out.Destination = in.Destination
+	if err := Convert_v1alpha1_RouteTarget_To_sdn_RouteTarget(&in.Target, &out.Target, s); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Convert_v1alpha1_RouteSpec_To_sdn_RouteSpec is an autogenerated conversion function.
+func Convert_v1alpha1_RouteSpec_To_sdn_RouteSpec(in *RouteSpec, out *sdn.RouteSpec, s conversion.Scope) error {
+	return autoConvert_v1alpha1_RouteSpec_To_sdn_RouteSpec(in, out, s)
+}
+
+func autoConvert_sdn_RouteSpec_To_v1alpha1_RouteSpec(in *sdn.RouteSpec, out *RouteSpec, s conversion.Scope) error {
+	if err := Convert_sdn_LocalRouteTableRef_To_v1alpha1_LocalRouteTableRef(&in.RouteTableRef, &out.RouteTableRef, s); err != nil {
+		return err
+	}
+	out.Destination = in.Destination
+	if err := Convert_sdn_RouteTarget_To_v1alpha1_RouteTarget(&in.Target, &out.Target, s); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Convert_sdn_RouteSpec_To_v1alpha1_RouteSpec is an autogenerated conversion function.
+func Convert_sdn_RouteSpec_To_v1alpha1_RouteSpec(in *sdn.RouteSpec, out *RouteSpec, s conversion.Scope) error {
+	return autoConvert_sdn_RouteSpec_To_v1alpha1_RouteSpec(in, out, s)
+}
+
+func autoConvert_v1alpha1_RouteStatus_To_sdn_RouteStatus(in *RouteStatus, out *sdn.RouteStatus, s conversion.Scope) error {
+	out.State = sdn.RouteState(in.State)
+	out.Conditions = *(*[]v1.Condition)(unsafe.Pointer(&in.Conditions))
+	return nil
+}
+
+// Convert_v1alpha1_RouteStatus_To_sdn_RouteStatus is an autogenerated conversion function.
+func Convert_v1alpha1_RouteStatus_To_sdn_RouteStatus(in *RouteStatus, out *sdn.RouteStatus, s conversion.Scope) error {
+	return autoConvert_v1alpha1_RouteStatus_To_sdn_RouteStatus(in, out, s)
+}
+
+func autoConvert_sdn_RouteStatus_To_v1alpha1_RouteStatus(in *sdn.RouteStatus, out *RouteStatus, s conversion.Scope) error {
+	out.State = RouteState(in.State)
+	out.Conditions = *(*[]v1.Condition)(unsafe.Pointer(&in.Conditions))
+	return nil
+}
+
+// Convert_sdn_RouteStatus_To_v1alpha1_RouteStatus is an autogenerated conversion function.
+func Convert_sdn_RouteStatus_To_v1alpha1_RouteStatus(in *sdn.RouteStatus, out *RouteStatus, s conversion.Scope) error {
+	return autoConvert_sdn_RouteStatus_To_v1alpha1_RouteStatus(in, out, s)
+}
+
+func autoConvert_v1alpha1_RouteTable_To_sdn_RouteTable(in *RouteTable, out *sdn.RouteTable, s conversion.Scope) error {
+	out.ObjectMeta = in.ObjectMeta
+	if err := Convert_v1alpha1_RouteTableSpec_To_sdn_RouteTableSpec(&in.Spec, &out.Spec, s); err != nil {
+		return err
+	}
+	if err := Convert_v1alpha1_RouteTableStatus_To_sdn_RouteTableStatus(&in.Status, &out.Status, s); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Convert_v1alpha1_RouteTable_To_sdn_RouteTable is an autogenerated conversion function.
+func Convert_v1alpha1_RouteTable_To_sdn_RouteTable(in *RouteTable, out *sdn.RouteTable, s conversion.Scope) error {
+	return autoConvert_v1alpha1_RouteTable_To_sdn_RouteTable(in, out, s)
+}
+
+func autoConvert_sdn_RouteTable_To_v1alpha1_RouteTable(in *sdn.RouteTable, out *RouteTable, s conversion.Scope) error {
+	out.ObjectMeta = in.ObjectMeta
+	if err := Convert_sdn_RouteTableSpec_To_v1alpha1_RouteTableSpec(&in.Spec, &out.Spec, s); err != nil {
+		return err
+	}
+	if err := Convert_sdn_RouteTableStatus_To_v1alpha1_RouteTableStatus(&in.Status, &out.Status, s); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Convert_sdn_RouteTable_To_v1alpha1_RouteTable is an autogenerated conversion function.
+func Convert_sdn_RouteTable_To_v1alpha1_RouteTable(in *sdn.RouteTable, out *RouteTable, s conversion.Scope) error {
+	return autoConvert_sdn_RouteTable_To_v1alpha1_RouteTable(in, out, s)
+}
+
+func autoConvert_v1alpha1_RouteTableList_To_sdn_RouteTableList(in *RouteTableList, out *sdn.RouteTableList, s conversion.Scope) error {
+	out.ListMeta = in.ListMeta
+	out.Items = *(*[]sdn.RouteTable)(unsafe.Pointer(&in.Items))
+	return nil
+}
+
+// Convert_v1alpha1_RouteTableList_To_sdn_RouteTableList is an autogenerated conversion function.
+func Convert_v1alpha1_RouteTableList_To_sdn_RouteTableList(in *RouteTableList, out *sdn.RouteTableList, s conversion.Scope) error {
+	return autoConvert_v1alpha1_RouteTableList_To_sdn_RouteTableList(in, out, s)
+}
+
+func autoConvert_sdn_RouteTableList_To_v1alpha1_RouteTableList(in *sdn.RouteTableList, out *RouteTableList, s conversion.Scope) error {
+	out.ListMeta = in.ListMeta
+	out.Items = *(*[]RouteTable)(unsafe.Pointer(&in.Items))
+	return nil
+}
+
+// Convert_sdn_RouteTableList_To_v1alpha1_RouteTableList is an autogenerated conversion function.
+func Convert_sdn_RouteTableList_To_v1alpha1_RouteTableList(in *sdn.RouteTableList, out *RouteTableList, s conversion.Scope) error {
+	return autoConvert_sdn_RouteTableList_To_v1alpha1_RouteTableList(in, out, s)
+}
+
+func autoConvert_v1alpha1_RouteTableSpec_To_sdn_RouteTableSpec(in *RouteTableSpec, out *sdn.RouteTableSpec, s conversion.Scope) error {
+	if err := Convert_v1alpha1_LocalVPCRef_To_sdn_LocalVPCRef(&in.VPCRef, &out.VPCRef, s); err != nil {
+		return err
+	}
+	out.Default = in.Default
+	return nil
+}
+
+// Convert_v1alpha1_RouteTableSpec_To_sdn_RouteTableSpec is an autogenerated conversion function.
+func Convert_v1alpha1_RouteTableSpec_To_sdn_RouteTableSpec(in *RouteTableSpec, out *sdn.RouteTableSpec, s conversion.Scope) error {
+	return autoConvert_v1alpha1_RouteTableSpec_To_sdn_RouteTableSpec(in, out, s)
+}
+
+func autoConvert_sdn_RouteTableSpec_To_v1alpha1_RouteTableSpec(in *sdn.RouteTableSpec, out *RouteTableSpec, s conversion.Scope) error {
+	if err := Convert_sdn_LocalVPCRef_To_v1alpha1_LocalVPCRef(&in.VPCRef, &out.VPCRef, s); err != nil {
+		return err
+	}
+	out.Default = in.Default
+	return nil
+}
+
+// Convert_sdn_RouteTableSpec_To_v1alpha1_RouteTableSpec is an autogenerated conversion function.
+func Convert_sdn_RouteTableSpec_To_v1alpha1_RouteTableSpec(in *sdn.RouteTableSpec, out *RouteTableSpec, s conversion.Scope) error {
+	return autoConvert_sdn_RouteTableSpec_To_v1alpha1_RouteTableSpec(in, out, s)
+}
+
+func autoConvert_v1alpha1_RouteTableStatus_To_sdn_RouteTableStatus(in *RouteTableStatus, out *sdn.RouteTableStatus, s conversion.Scope) error {
+	out.ID = in.ID
+	out.Conditions = *(*[]v1.Condition)(unsafe.Pointer(&in.Conditions))
+	return nil
+}
+
+// Convert_v1alpha1_RouteTableStatus_To_sdn_RouteTableStatus is an autogenerated conversion function.
+func Convert_v1alpha1_RouteTableStatus_To_sdn_RouteTableStatus(in *RouteTableStatus, out *sdn.RouteTableStatus, s conversion.Scope) error {
+	return autoConvert_v1alpha1_RouteTableStatus_To_sdn_RouteTableStatus(in, out, s)
+}
+
+func autoConvert_sdn_RouteTableStatus_To_v1alpha1_RouteTableStatus(in *sdn.RouteTableStatus, out *RouteTableStatus, s conversion.Scope) error {
+	out.ID = in.ID
+	out.Conditions = *(*[]v1.Condition)(unsafe.Pointer(&in.Conditions))
+	return nil
+}
+
+// Convert_sdn_RouteTableStatus_To_v1alpha1_RouteTableStatus is an autogenerated conversion function.
+func Convert_sdn_RouteTableStatus_To_v1alpha1_RouteTableStatus(in *sdn.RouteTableStatus, out *RouteTableStatus, s conversion.Scope) error {
+	return autoConvert_sdn_RouteTableStatus_To_v1alpha1_RouteTableStatus(in, out, s)
+}
+
+func autoConvert_v1alpha1_RouteTarget_To_sdn_RouteTarget(in *RouteTarget, out *sdn.RouteTarget, s conversion.Scope) error {
+	out.NATGateway = (*sdn.LocalNATGatewayRef)(unsafe.Pointer(in.NATGateway))
+	out.Internet = (*sdn.RouteInternetTarget)(unsafe.Pointer(in.Internet))
+	out.Blackhole = (*sdn.RouteBlackholeTarget)(unsafe.Pointer(in.Blackhole))
+	return nil
+}
+
+// Convert_v1alpha1_RouteTarget_To_sdn_RouteTarget is an autogenerated conversion function.
+func Convert_v1alpha1_RouteTarget_To_sdn_RouteTarget(in *RouteTarget, out *sdn.RouteTarget, s conversion.Scope) error {
+	return autoConvert_v1alpha1_RouteTarget_To_sdn_RouteTarget(in, out, s)
+}
+
+func autoConvert_sdn_RouteTarget_To_v1alpha1_RouteTarget(in *sdn.RouteTarget, out *RouteTarget, s conversion.Scope) error {
+	out.NATGateway = (*LocalNATGatewayRef)(unsafe.Pointer(in.NATGateway))
+	out.Internet = (*RouteInternetTarget)(unsafe.Pointer(in.Internet))
+	out.Blackhole = (*RouteBlackholeTarget)(unsafe.Pointer(in.Blackhole))
+	return nil
+}
+
+// Convert_sdn_RouteTarget_To_v1alpha1_RouteTarget is an autogenerated conversion function.
+func Convert_sdn_RouteTarget_To_v1alpha1_RouteTarget(in *sdn.RouteTarget, out *RouteTarget, s conversion.Scope) error {
+	return autoConvert_sdn_RouteTarget_To_v1alpha1_RouteTarget(in, out, s)
 }
 
 func autoConvert_v1alpha1_SecurityGroup_To_sdn_SecurityGroup(in *SecurityGroup, out *sdn.SecurityGroup, s conversion.Scope) error {

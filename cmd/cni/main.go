@@ -217,11 +217,13 @@ func cmdAdd(args *skel.CmdArgs) error {
 	// is unreachable, fall back to the default network). A virt-launcher pod also
 	// carries its VM name, which keys the persistent Port (VPC IP + MAC that
 	// survive live migration).
-	vpcAnno, gwAnno, vmName, podLabels := "", "", "", ""
+	vpcAnno, gwAnno, vmName, podLabels, routeTable := "", "", "", "", ""
 	if core, e := coreClient(); e == nil && podNS != "" && podName != "" {
 		if pod, e := core.CoreV1().Pods(podNS).Get(ctx, podName, metav1.GetOptions{}); e == nil {
 			vpcAnno = pod.Annotations[vpcAnnotation]
 			gwAnno = pod.Annotations[gatewayAnnotation]
+			// The pod chooses its route table (docs/vpc-egress.md §2.4).
+			routeTable = pod.Annotations[sdnv1alpha1.AnnotationRouteTable]
 			vmName = pod.Labels[sdnv1alpha1.KubeVirtLabelVMName]
 			// Snapshot the pod's labels for SecurityGroup membership: the
 			// controller resolves Port.status.groups from this claim-time copy.
@@ -238,7 +240,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 			return fmt.Errorf("%s and %s are mutually exclusive: a gateway pod lives on the default network", vpcAnnotation, gatewayAnnotation)
 		}
 		vpcNS, vpcName := parseVPCRef(vpcAnno, podNS)
-		return addVPC(ctx, args, conf, vpcNS, vpcName, podNS, podName, podUID, vmName, podLabels)
+		return addVPC(ctx, args, conf, vpcNS, vpcName, podNS, podName, podUID, vmName, podLabels, routeTable)
 	}
 	result, err := addDefault(ctx, args, conf)
 	if err != nil {
@@ -334,7 +336,7 @@ func hostIPNet(ip net.IP) *net.IPNet {
 // addVPC attaches the pod to a VPC using the dual-address bridge: the pod's
 // interface gets the VPC (tenant) IP, while status.podIP is a unique fabric IP
 // from the node pod CIDR that the bridge DNATs to the VPC IP.
-func addVPC(ctx context.Context, args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, podUID, vmName, podLabels string) (err error) {
+func addVPC(ctx context.Context, args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, podUID, vmName, podLabels, routeTable string) (err error) {
 	client, err := sdnClient()
 	if err != nil {
 		return fmt.Errorf("sdn client: %w", err)
@@ -407,7 +409,7 @@ func addVPC(ctx context.Context, args *skel.CmdArgs, conf *NetConf, vpcNS, vpcNa
 
 	// VPC IP + MAC: bind the VM's persistent Port (survives migration) or claim a
 	// fresh one. bound => the Port pre-existed; never delete it on our error.
-	vpcIP, pinnedMAC, port, bound, err := attachPort(ctx, client, vpc, vpcNS, state, fabricIP.String(), podNS, podName, podUID, vmName, podLabels)
+	vpcIP, pinnedMAC, port, bound, err := attachPort(ctx, client, vpc, vpcNS, state, fabricIP.String(), podNS, podName, podUID, vmName, podLabels, routeTable)
 	if err != nil {
 		return err
 	}
@@ -651,10 +653,11 @@ func requireVPCBinding(ctx context.Context, client sdnclientset.Interface, podNS
 // rebindPodIdentity re-points a reused persistent Port at the pod binding it
 // now: the identity labels the controller reverse-indexes on, the spec's
 // pod name/namespace, and the pod-labels snapshot. A no-op when nothing moved.
-func rebindPodIdentity(ctx context.Context, client sdnclientset.Interface, p *sdnv1alpha1.Port, podNS, podName, podUID, podLabels string) error {
+func rebindPodIdentity(ctx context.Context, client sdnclientset.Interface, p *sdnv1alpha1.Port, podNS, podName, podUID, podLabels, routeTable string) error {
 	if p.Labels[sdnv1alpha1.LabelPodNamespace] == podNS &&
 		p.Labels[sdnv1alpha1.LabelPodName] == podName &&
 		p.Labels[sdnv1alpha1.LabelPodUID] == podUID &&
+		p.Spec.RouteTable == routeTable &&
 		(podLabels == "" || p.Annotations[sdnv1alpha1.AnnotationPodLabels] == podLabels) {
 		return nil
 	}
@@ -669,6 +672,9 @@ func rebindPodIdentity(ctx context.Context, client sdnclientset.Interface, p *sd
 		"spec": map[string]any{
 			"podNamespace": podNS,
 			"podName":      podName,
+			// A VM keeps the table its launcher pod names across a live
+			// migration (docs/vpc-egress.md §2.4).
+			"routeTable": routeTable,
 		},
 	}
 	if podLabels != "" {
@@ -699,7 +705,7 @@ func rebindPodIdentity(ctx context.Context, client sdnclientset.Interface, p *sd
 //     exists (found by the LabelVMName label, not the name) — reusing the pinned
 //     VPC IP + MAC so they survive live migration — or, on the VM's first pod,
 //     creates it (atomic IP claim as above, plus a stable MAC and the VM label).
-func attachPort(ctx context.Context, client sdnclientset.Interface, vpc *sdnv1alpha1.VPC, vpcNS string, state *datapath.AgentState, fabricIP, podNS, podName, podUID, vmName, podLabels string) (net.IP, net.HardwareAddr, *sdnv1alpha1.Port, bool, error) {
+func attachPort(ctx context.Context, client sdnclientset.Interface, vpc *sdnv1alpha1.VPC, vpcNS string, state *datapath.AgentState, fabricIP, podNS, podName, podUID, vmName, podLabels, routeTable string) (net.IP, net.HardwareAddr, *sdnv1alpha1.Port, bool, error) {
 	_, ipnet, err := net.ParseCIDR(vpc.Spec.CIDRs[0])
 	if err != nil {
 		return nil, nil, nil, false, fmt.Errorf("parse vpc CIDR: %w", err)
@@ -730,7 +736,7 @@ func attachPort(ctx context.Context, client sdnclientset.Interface, vpc *sdnv1al
 			// (docs/security-groups.md § Membership). Best-effort: a failure
 			// here must not fail the ADD, and the controller still has the
 			// snapshot to fall back on.
-			if err := rebindPodIdentity(ctx, client, p, podNS, podName, podUID, podLabels); err != nil {
+			if err := rebindPodIdentity(ctx, client, p, podNS, podName, podUID, podLabels, routeTable); err != nil {
 				fmt.Fprintf(os.Stderr, "cozyplane: rebind pod identity on %s: %v\n", p.Name, err)
 			}
 			return ip, mac, p, true, nil
@@ -791,6 +797,7 @@ func attachPort(ctx context.Context, client sdnclientset.Interface, vpc *sdnv1al
 			NodeIP:       state.NodeIP,
 			PodNamespace: podNS,
 			PodName:      podName,
+			RouteTable:   routeTable,
 		}
 		if vmName != "" {
 			labels[labelVMName] = vmName

@@ -19,7 +19,6 @@ package main
 import (
 	"context"
 	"log/slog"
-	"net"
 	"sync"
 
 	"k8s.io/apimachinery/pkg/labels"
@@ -41,8 +40,10 @@ import (
 //
 // Recompute-and-diff against the pinned map, like every other watcher here: the
 // map outlives the agent, so a gateway deleted while it was down must be pruned.
-func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFactory, mgr *datapath.Manager,
-	nodes *nodePoolIndex, nodeIPs *nodeIPIndex, selfName, selfIP string, log *slog.Logger) {
+//
+// A VPCGateway's egress (nat.enabled) is a NATGateway the controller creates for
+// it; the agent programs that in watchEgress (docs/vpc-egress.md §7).
+func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFactory, mgr *datapath.Manager, log *slog.Logger) {
 	gws := factory.Sdn().V1alpha1().VPCGateways()
 	vpcs := factory.Sdn().V1alpha1().VPCs()
 
@@ -62,97 +63,6 @@ func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFa
 			return
 		}
 		desired := desiredVPCIngress(allGWs, allVPCs)
-
-		// The VPC's egress identity, and this node's slice of its port space.
-		// Every node programs the WHOLE shard table: any node may be the one the
-		// fabric hands a reply to, and it must know which node's connection table
-		// holds the flow (docs/north-south.md § increment 2).
-		wantNAT := desiredVPCNAT(allGWs, allVPCs)
-		order := nodes.sortedNames()
-		selfShard := indexOf(order, selfName)
-		curNAT, err := mgr.VPCNATs()
-		if err != nil {
-			log.Error("read vpc_nat map", "err", err)
-			return
-		}
-		for vni, id := range wantNAT {
-			// The FIB decides which link serves the identity: on a multi-NIC node
-			// the address may live on a non-default link (an OCI VLAN), where
-			// from_uplink must attach for vpc_nat_reverse to see the replies.
-			// Pools used to trigger this unconditionally; now the address itself
-			// does (docs/external-addresses.md §9).
-			for _, addr := range []string{id.V4, id.V6} {
-				if addr == "" {
-					continue
-				}
-				if err := mgr.EnsureFloatingUplink(addr); err != nil {
-					log.Warn("ensure NAT uplink", "vni", vni, "addr", addr, "err", err)
-				}
-			}
-			if selfShard >= 0 {
-				base, span, ok := datapath.NATShardFor(selfShard)
-				if !ok {
-					log.Warn("more nodes than NAT port shards; this node cannot NAT",
-						"node", selfName, "index", selfShard, "shards", datapath.NATShards)
-				} else if err := mgr.SetVPCNAT(vni, id.V4, id.V6, base, span); err != nil {
-					log.Error("set vpc nat", "vni", vni, "v4", id.V4, "v6", id.V6, "err", err)
-					continue
-				}
-			}
-			for i, n := range order {
-				if i >= datapath.NATShards {
-					break
-				}
-				// nodeIPIndex holds only the OTHER nodes — it exists to feed
-				// `remotes`, and watchNodes skips self. But the shard table must
-				// name every node INCLUDING this one, or the reverse lookup misses
-				// on exactly the node that holds the flow: the reply falls through
-				// to the kernel, which ARPs for an address the node itself
-				// announces. (It did. That is how this was found.)
-				ip := nodeIPs.get(n)
-				if n == selfName {
-					ip = net.ParseIP(selfIP)
-				}
-				if ip == nil {
-					continue
-				}
-				// One shard table per family: a reply arrives addressed to the v4
-				// or the v6 identity, and each demuxes through nat_owner by its own
-				// address.
-				for _, addr := range []string{id.V4, id.V6} {
-					if addr == "" {
-						continue
-					}
-					if err := mgr.SetNATOwner(addr, uint16(i), ip); err != nil {
-						log.Error("set nat owner", "addr", addr, "shard", i, "err", err)
-					}
-				}
-			}
-			// Nothing here ATTRACTS the address (docs/north-south.md, tenet 3):
-			// the platform must make the fabric hand it to a node — a CCM, a
-			// static route, an address configured on a node. Whichever node it
-			// lands on, from_uplink un-NATs the reply or forwards it to the node
-			// whose shard owns the flow, so delivery does not care.
-			if curNAT[vni] != id {
-				log.Info("VPC egresses as its own address", "vni", vni, "v4", id.V4, "v6", id.V6)
-			}
-		}
-		for vni, id := range curNAT {
-			if _, ok := wantNAT[vni]; !ok {
-				if err := mgr.DelVPCNAT(vni, id.V4, id.V6); err != nil {
-					log.Error("del vpc nat", "vni", vni, "err", err)
-					continue
-				}
-				for i := range datapath.NATShards {
-					for _, addr := range []string{id.V4, id.V6} {
-						if addr != "" {
-							_ = mgr.DelNATOwner(addr, uint16(i))
-						}
-					}
-				}
-				log.Info("VPC lost its egress identity", "vni", vni, "v4", id.V4, "v6", id.V6)
-			}
-		}
 
 		current, err := mgr.VPCIngresses()
 		if err != nil {
@@ -185,8 +95,6 @@ func watchVPCGateways(ctx context.Context, factory sdninformers.SharedInformerFa
 		DeleteFunc: func(any) { resync() },
 	}
 	_, _ = gws.Informer().AddEventHandler(onAny)
-	// The node set decides both the port shards and the announcer.
-	nodes.onChange(resync)
 	// VPCs too: the gate is keyed by VNI, which the VPC's status carries.
 	_, _ = vpcs.Informer().AddEventHandler(onAny)
 
@@ -216,34 +124,4 @@ func desiredVPCIngress(gws []*sdnv1alpha1.VPCGateway, vpcs []*sdnv1alpha1.VPC) m
 		}
 	}
 	return out
-}
-
-// desiredVPCNAT is the set of VNIs with an allocated egress identity, keyed to the
-// address(es) their traffic wears on the wire — a v4 and/or a v6 (docs/north-south.md
-// §6a). A VPC's boundary is its OLDEST gateway.
-func desiredVPCNAT(gws []*sdnv1alpha1.VPCGateway, vpcs []*sdnv1alpha1.VPC) map[uint32]datapath.NATIdentity {
-	byNS := map[string][]sdnv1alpha1.VPCGateway{}
-	for _, g := range gws {
-		byNS[g.Namespace] = append(byNS[g.Namespace], *g)
-	}
-	out := map[uint32]datapath.NATIdentity{}
-	for _, vpc := range vpcs {
-		if vpc.Status.VNI == 0 {
-			continue
-		}
-		gw := sdnv1alpha1.EffectiveGateway(byNS[vpc.Namespace], vpc.Name)
-		if gw != nil && gw.Spec.NAT.Enabled && (gw.Status.NATAddress != "" || gw.Status.NATAddress6 != "") {
-			out[uint32(vpc.Status.VNI)] = datapath.NATIdentity{V4: gw.Status.NATAddress, V6: gw.Status.NATAddress6}
-		}
-	}
-	return out
-}
-
-func indexOf(names []string, self string) int {
-	for i, n := range names {
-		if n == self {
-			return i
-		}
-	}
-	return -1
 }

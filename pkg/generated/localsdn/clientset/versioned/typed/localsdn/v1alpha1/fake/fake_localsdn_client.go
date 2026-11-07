@@ -32,6 +32,10 @@ func (c *FakeLocalV1alpha1) FabricIPs() v1alpha1.FabricIPInterface {
 	return newFakeFabricIPs(c)
 }
 
+func (c *FakeLocalV1alpha1) NATPortBlocks() v1alpha1.NATPortBlockInterface {
+	return newFakeNATPortBlocks(c)
+}
+
 // RESTClient returns a RESTClient that is used to communicate
 // with API server by this client implementation.
 func (c *FakeLocalV1alpha1) RESTClient() rest.Interface {

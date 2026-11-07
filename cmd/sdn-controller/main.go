@@ -72,6 +72,8 @@ func main() {
 		gatewayNamespace     string
 		internalCIDRs        string
 		clusterDNS           string
+		natBlockSize         int
+		natNodeGoneGrace     time.Duration
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
@@ -92,6 +94,10 @@ func main() {
 		"comma-separated cluster-internal CIDRs gateways must not forward tenant traffic to (pod, service, node networks)")
 	flag.StringVar(&clusterDNS, "cluster-dns", "",
 		"cluster DNS ClusterIP gateways allow on :53")
+	flag.IntVar(&natBlockSize, "nat-block-size", sdncontroller.DefaultNATBlockSize,
+		"ports per NAT gateway port block (docs/vpc-egress.md §4.3); at most 64512/size nodes can NAT through one NAT gateway at once")
+	flag.DurationVar(&natNodeGoneGrace, "nat-node-gone-grace", sdncontroller.DefaultNATNodeGoneGrace,
+		"how long a deleted node's NAT port blocks stay leased (one TCP-established timeout)")
 
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
@@ -178,6 +184,8 @@ func main() {
 		gatewayNamespace: gatewayNamespace,
 		internalCIDRs:    internalCIDRs,
 		clusterDNS:       clusterDNS,
+		natBlockSize:     natBlockSize,
+		natNodeGoneGrace: natNodeGoneGrace,
 	}
 	gate := &apigate.Gate{
 		Name: sdnv1alpha1.SchemeGroupVersion.String(),
@@ -188,7 +196,8 @@ func main() {
 			// than just the group) keeps a half-registered apiserver — group
 			// advertised, registries not installed — from opening the gate.
 			Resources: []string{"vpcs", "vpcbindings", "vpcpeerings", "vpcgateways",
-				"ports", "securitygroups", "servicevips", "floatingips"},
+				"ports", "securitygroups", "servicevips", "floatingips",
+				"natgateways", "routetables", "routes"},
 		},
 		Interval: apiGroupPollInterval,
 		Register: func(context.Context) error { return setupSDNControllers(mgr, gateCfg) },
@@ -214,6 +223,8 @@ type sdnControllerConfig struct {
 	gatewayNamespace string
 	internalCIDRs    string
 	clusterDNS       string
+	natBlockSize     int
+	natNodeGoneGrace time.Duration
 }
 
 // setupSDNControllers registers every controller that watches a
@@ -300,6 +311,35 @@ func setupSDNControllers(mgr manager.Manager, cfg sdnControllerConfig) error {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("unable to create controller %s: %w", "VPCGateway", err)
+	}
+
+	if err := (&sdncontroller.NATGatewayReconciler{
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Reader:    mgr.GetAPIReader(),
+		BlockSize: cfg.natBlockSize,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create controller %s: %w", "NATGateway", err)
+	}
+
+	if err := (&sdncontroller.RouteTableReconciler{
+		Client: mgr.GetClient(),
+		Reader: mgr.GetAPIReader(),
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create controller %s: %w", "RouteTable", err)
+	}
+
+	if err := (&sdncontroller.RouteReconciler{
+		Client: mgr.GetClient(),
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create controller %s: %w", "Route", err)
+	}
+
+	if err := (&sdncontroller.NATPortBlockGCReconciler{
+		Client:        mgr.GetClient(),
+		NodeGoneGrace: cfg.natNodeGoneGrace,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create controller %s: %w", "NATPortBlockGC", err)
 	}
 
 	if cfg.gatewayImage != "" {

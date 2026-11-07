@@ -30,9 +30,33 @@ type FloatingIPNamespaceListerExpansion interface{}
 // HostFirewallLister.
 type HostFirewallListerExpansion interface{}
 
+// NATGatewayListerExpansion allows custom methods to be added to
+// NATGatewayLister.
+type NATGatewayListerExpansion interface{}
+
+// NATGatewayNamespaceListerExpansion allows custom methods to be added to
+// NATGatewayNamespaceLister.
+type NATGatewayNamespaceListerExpansion interface{}
+
 // PortListerExpansion allows custom methods to be added to
 // PortLister.
 type PortListerExpansion interface{}
+
+// RouteListerExpansion allows custom methods to be added to
+// RouteLister.
+type RouteListerExpansion interface{}
+
+// RouteNamespaceListerExpansion allows custom methods to be added to
+// RouteNamespaceLister.
+type RouteNamespaceListerExpansion interface{}
+
+// RouteTableListerExpansion allows custom methods to be added to
+// RouteTableLister.
+type RouteTableListerExpansion interface{}
+
+// RouteTableNamespaceListerExpansion allows custom methods to be added to
+// RouteTableNamespaceLister.
+type RouteTableNamespaceListerExpansion interface{}
 
 // SecurityGroupListerExpansion allows custom methods to be added to
 // SecurityGroupLister.

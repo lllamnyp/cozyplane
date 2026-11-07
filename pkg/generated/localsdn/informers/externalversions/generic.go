@@ -55,6 +55,8 @@ func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource
 	// Group=local.sdn.cozystack.io, Version=v1alpha1
 	case v1alpha1.SchemeGroupVersion.WithResource("fabricips"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Local().V1alpha1().FabricIPs().Informer()}, nil
+	case v1alpha1.SchemeGroupVersion.WithResource("natportblocks"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Local().V1alpha1().NATPortBlocks().Informer()}, nil
 
 	}
 

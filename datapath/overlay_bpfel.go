@@ -138,11 +138,82 @@ type overlayLpmKey struct {
 	Addr      overlayAddr128
 }
 
+type overlayNatAddrVal struct {
+	_         structs.HostLayout
+	Natgw     uint32
+	Net       uint32
+	BlockSize uint16
+	Pad       uint16
+}
+
+type overlayNatBlkKey struct {
+	_     structs.HostLayout
+	Natgw uint32
+	Block uint16
+	Pad   uint16
+}
+
+type overlayNatFwdKey struct {
+	_          structs.HostLayout
+	Proto      uint8
+	Pad        [3]uint8
+	Net        uint32
+	PodIp      overlayAddr128
+	RemoteIp   overlayAddr128
+	PodPort    uint16
+	RemotePort uint16
+}
+
+type overlayNatFwdVal struct {
+	_     structs.HostLayout
+	Natgw uint32
+	Port  uint16
+	Pad   uint16
+}
+
+type overlayNatGw struct {
+	_         structs.HostLayout
+	Ip        overlayAddr128
+	Ip6       overlayAddr128
+	Net       uint32
+	BlockSize uint16
+	Nblocks   uint8
+	Pad       uint8
+	Blocks    [8]uint16
+}
+
+type overlayNatRevKey struct {
+	_          structs.HostLayout
+	Proto      uint8
+	Pad        uint8
+	Port       uint16
+	Natgw      uint32
+	RemoteIp   overlayAddr128
+	RemotePort uint16
+	Pad2       uint16
+}
+
+type overlayNatRevVal struct {
+	_        structs.HostLayout
+	LastSeen uint64
+	Net      uint32
+	PodIp    overlayAddr128
+	PodPort  uint16
+	Flags    uint8
+	Pad      uint8
+}
+
 type overlayNatShardKey struct {
 	_     structs.HostLayout
 	Ip    overlayAddr128
 	Shard uint16
 	Pad   uint16
+}
+
+type overlayNatStatKey struct {
+	_       structs.HostLayout
+	Natgw   uint32
+	Counter uint32
 }
 
 type overlayNpAllowKey struct {
@@ -206,6 +277,19 @@ type overlayPeerKey struct {
 	_      structs.HostLayout
 	SrcNet uint32
 	DstNet uint32
+}
+
+type overlayRouteDropKey struct {
+	_      structs.HostLayout
+	Net    uint32
+	Reason uint32
+}
+
+type overlayRtVal struct {
+	_     structs.HostLayout
+	Kind  uint8
+	Pad   uint8
+	Natgw uint16
 }
 
 type overlaySgCidrKey struct {
@@ -353,8 +437,15 @@ const (
 	overlayMapLocals                = "locals"
 	overlayMapMasqSrcs              = "masq_srcs"
 	overlayMapMigrateFwd            = "migrate_fwd"
+	overlayMapNatAddrs              = "nat_addrs"
+	overlayMapNatBlkOwner           = "nat_blk_owner"
+	overlayMapNatFlows              = "nat_flows"
+	overlayMapNatFwd                = "nat_fwd"
+	overlayMapNatGw                 = "nat_gw"
 	overlayMapNatOf                 = "nat_of"
 	overlayMapNatOwner              = "nat_owner"
+	overlayMapNatRev                = "nat_rev"
+	overlayMapNatStats              = "nat_stats"
 	overlayMapNetworks              = "networks"
 	overlayMapNodeIp6               = "node_ip6"
 	overlayMapNodeRemotes           = "node_remotes"
@@ -367,8 +458,10 @@ const (
 	overlayMapNpScratch             = "np_scratch"
 	overlayMapParams                = "params"
 	overlayMapPeers                 = "peers"
+	overlayMapPortRt                = "port_rt"
 	overlayMapPorts                 = "ports"
 	overlayMapRemotes               = "remotes"
+	overlayMapRouteDrops            = "route_drops"
 	overlayMapSgCidr                = "sg_cidr"
 	overlayMapSgDrops               = "sg_drops"
 	overlayMapSgEgress              = "sg_egress"
@@ -382,6 +475,7 @@ const (
 	overlayMapVpcCounters           = "vpc_counters"
 	overlayMapVpcIngress            = "vpc_ingress"
 	overlayMapVpcNat                = "vpc_nat"
+	overlayMapVpcRoutes             = "vpc_routes"
 	overlayProgCozyplaneFromOverlay = "cozyplane_from_overlay"
 	overlayProgCozyplaneFromPod     = "cozyplane_from_pod"
 	overlayProgCozyplaneFromUplink  = "cozyplane_from_uplink"
@@ -389,7 +483,9 @@ const (
 	overlayProgCozyplaneHfIngress   = "cozyplane_hf_ingress"
 	overlayProgCozyplaneLbDsr       = "cozyplane_lb_dsr"
 	overlayProgCozyplaneLbIngress   = "cozyplane_lb_ingress"
+	overlayProgCozyplaneNatReverse  = "cozyplane_nat_reverse"
 	overlayProgCozyplaneToPod       = "cozyplane_to_pod"
+	overlayProgCozyplaneVpcEgress   = "cozyplane_vpc_egress"
 )
 
 // loadOverlay returns the embedded CollectionSpec for overlay.
@@ -441,7 +537,9 @@ type overlayProgramSpecs struct {
 	CozyplaneHfIngress   *ebpf.ProgramSpec `ebpf:"cozyplane_hf_ingress"`
 	CozyplaneLbDsr       *ebpf.ProgramSpec `ebpf:"cozyplane_lb_dsr"`
 	CozyplaneLbIngress   *ebpf.ProgramSpec `ebpf:"cozyplane_lb_ingress"`
+	CozyplaneNatReverse  *ebpf.ProgramSpec `ebpf:"cozyplane_nat_reverse"`
 	CozyplaneToPod       *ebpf.ProgramSpec `ebpf:"cozyplane_to_pod"`
+	CozyplaneVpcEgress   *ebpf.ProgramSpec `ebpf:"cozyplane_vpc_egress"`
 }
 
 // overlayMapSpecs contains maps before they are loaded into the kernel.
@@ -472,8 +570,15 @@ type overlayMapSpecs struct {
 	Locals         *ebpf.MapSpec `ebpf:"locals"`
 	MasqSrcs       *ebpf.MapSpec `ebpf:"masq_srcs"`
 	MigrateFwd     *ebpf.MapSpec `ebpf:"migrate_fwd"`
+	NatAddrs       *ebpf.MapSpec `ebpf:"nat_addrs"`
+	NatBlkOwner    *ebpf.MapSpec `ebpf:"nat_blk_owner"`
+	NatFlows       *ebpf.MapSpec `ebpf:"nat_flows"`
+	NatFwd         *ebpf.MapSpec `ebpf:"nat_fwd"`
+	NatGw          *ebpf.MapSpec `ebpf:"nat_gw"`
 	NatOf          *ebpf.MapSpec `ebpf:"nat_of"`
 	NatOwner       *ebpf.MapSpec `ebpf:"nat_owner"`
+	NatRev         *ebpf.MapSpec `ebpf:"nat_rev"`
+	NatStats       *ebpf.MapSpec `ebpf:"nat_stats"`
 	Networks       *ebpf.MapSpec `ebpf:"networks"`
 	NodeIp6        *ebpf.MapSpec `ebpf:"node_ip6"`
 	NodeRemotes    *ebpf.MapSpec `ebpf:"node_remotes"`
@@ -486,8 +591,10 @@ type overlayMapSpecs struct {
 	NpScratch      *ebpf.MapSpec `ebpf:"np_scratch"`
 	Params         *ebpf.MapSpec `ebpf:"params"`
 	Peers          *ebpf.MapSpec `ebpf:"peers"`
+	PortRt         *ebpf.MapSpec `ebpf:"port_rt"`
 	Ports          *ebpf.MapSpec `ebpf:"ports"`
 	Remotes        *ebpf.MapSpec `ebpf:"remotes"`
+	RouteDrops     *ebpf.MapSpec `ebpf:"route_drops"`
 	SgCidr         *ebpf.MapSpec `ebpf:"sg_cidr"`
 	SgDrops        *ebpf.MapSpec `ebpf:"sg_drops"`
 	SgEgress       *ebpf.MapSpec `ebpf:"sg_egress"`
@@ -501,6 +608,7 @@ type overlayMapSpecs struct {
 	VpcCounters    *ebpf.MapSpec `ebpf:"vpc_counters"`
 	VpcIngress     *ebpf.MapSpec `ebpf:"vpc_ingress"`
 	VpcNat         *ebpf.MapSpec `ebpf:"vpc_nat"`
+	VpcRoutes      *ebpf.MapSpec `ebpf:"vpc_routes"`
 }
 
 // overlayVariableSpecs contains global variables before they are loaded into the kernel.
@@ -553,8 +661,15 @@ type overlayMaps struct {
 	Locals         *ebpf.Map `ebpf:"locals"`
 	MasqSrcs       *ebpf.Map `ebpf:"masq_srcs"`
 	MigrateFwd     *ebpf.Map `ebpf:"migrate_fwd"`
+	NatAddrs       *ebpf.Map `ebpf:"nat_addrs"`
+	NatBlkOwner    *ebpf.Map `ebpf:"nat_blk_owner"`
+	NatFlows       *ebpf.Map `ebpf:"nat_flows"`
+	NatFwd         *ebpf.Map `ebpf:"nat_fwd"`
+	NatGw          *ebpf.Map `ebpf:"nat_gw"`
 	NatOf          *ebpf.Map `ebpf:"nat_of"`
 	NatOwner       *ebpf.Map `ebpf:"nat_owner"`
+	NatRev         *ebpf.Map `ebpf:"nat_rev"`
+	NatStats       *ebpf.Map `ebpf:"nat_stats"`
 	Networks       *ebpf.Map `ebpf:"networks"`
 	NodeIp6        *ebpf.Map `ebpf:"node_ip6"`
 	NodeRemotes    *ebpf.Map `ebpf:"node_remotes"`
@@ -567,8 +682,10 @@ type overlayMaps struct {
 	NpScratch      *ebpf.Map `ebpf:"np_scratch"`
 	Params         *ebpf.Map `ebpf:"params"`
 	Peers          *ebpf.Map `ebpf:"peers"`
+	PortRt         *ebpf.Map `ebpf:"port_rt"`
 	Ports          *ebpf.Map `ebpf:"ports"`
 	Remotes        *ebpf.Map `ebpf:"remotes"`
+	RouteDrops     *ebpf.Map `ebpf:"route_drops"`
 	SgCidr         *ebpf.Map `ebpf:"sg_cidr"`
 	SgDrops        *ebpf.Map `ebpf:"sg_drops"`
 	SgEgress       *ebpf.Map `ebpf:"sg_egress"`
@@ -582,6 +699,7 @@ type overlayMaps struct {
 	VpcCounters    *ebpf.Map `ebpf:"vpc_counters"`
 	VpcIngress     *ebpf.Map `ebpf:"vpc_ingress"`
 	VpcNat         *ebpf.Map `ebpf:"vpc_nat"`
+	VpcRoutes      *ebpf.Map `ebpf:"vpc_routes"`
 }
 
 func (m *overlayMaps) Close() error {
@@ -610,8 +728,15 @@ func (m *overlayMaps) Close() error {
 		m.Locals,
 		m.MasqSrcs,
 		m.MigrateFwd,
+		m.NatAddrs,
+		m.NatBlkOwner,
+		m.NatFlows,
+		m.NatFwd,
+		m.NatGw,
 		m.NatOf,
 		m.NatOwner,
+		m.NatRev,
+		m.NatStats,
 		m.Networks,
 		m.NodeIp6,
 		m.NodeRemotes,
@@ -624,8 +749,10 @@ func (m *overlayMaps) Close() error {
 		m.NpScratch,
 		m.Params,
 		m.Peers,
+		m.PortRt,
 		m.Ports,
 		m.Remotes,
+		m.RouteDrops,
 		m.SgCidr,
 		m.SgDrops,
 		m.SgEgress,
@@ -639,6 +766,7 @@ func (m *overlayMaps) Close() error {
 		m.VpcCounters,
 		m.VpcIngress,
 		m.VpcNat,
+		m.VpcRoutes,
 	)
 }
 
@@ -659,7 +787,9 @@ type overlayPrograms struct {
 	CozyplaneHfIngress   *ebpf.Program `ebpf:"cozyplane_hf_ingress"`
 	CozyplaneLbDsr       *ebpf.Program `ebpf:"cozyplane_lb_dsr"`
 	CozyplaneLbIngress   *ebpf.Program `ebpf:"cozyplane_lb_ingress"`
+	CozyplaneNatReverse  *ebpf.Program `ebpf:"cozyplane_nat_reverse"`
 	CozyplaneToPod       *ebpf.Program `ebpf:"cozyplane_to_pod"`
+	CozyplaneVpcEgress   *ebpf.Program `ebpf:"cozyplane_vpc_egress"`
 }
 
 func (p *overlayPrograms) Close() error {
@@ -671,7 +801,9 @@ func (p *overlayPrograms) Close() error {
 		p.CozyplaneHfIngress,
 		p.CozyplaneLbDsr,
 		p.CozyplaneLbIngress,
+		p.CozyplaneNatReverse,
 		p.CozyplaneToPod,
+		p.CozyplaneVpcEgress,
 	)
 }
 

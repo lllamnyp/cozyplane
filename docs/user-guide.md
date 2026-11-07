@@ -325,14 +325,12 @@ plus the allocator's own scoping ([external-addresses.md](external-addresses.md)
 A VPC has **exactly one** boundary (the oldest gateway wins), and everything
 that crosses it is counted per VPC and per door — `cozyplane_vpc_ns_bytes_total`.
 
-**With NAT addresses assigned, there is no gateway pod.** Egress is
-realized in eBPF at each pod's own veth: the VPC's off-net traffic is SNATed
-straight out the uplink to `status.natAddress` / `natAddress6` — **an address of
-the VPC's own**, assigned by the LB implementation. It is distributed across nodes (each node draws ports from its
-own shard of the address), so there is no hairpin, no single conntrack point, and no
-per-VPC single point of failure. Cluster-internal destinations are still refused;
-cluster DNS still works, because the split-horizon resolver serves VPC pods directly
-and never needed a pod to proxy it.
+**`nat.enabled` creates egress objects.** The controller creates a `NATGateway`
+named after the VPCGateway, a default `RouteTable` if the VPC has none, and a
+`0.0.0.0/0` (and `::/0`) `Route` to that NAT gateway for each family it holds an
+address for (see the next section). `status.natAddress` / `natAddress6` mirror the
+NAT gateway's addresses. Cluster-internal destinations are still refused; cluster
+DNS still works, because the split-horizon resolver serves VPC pods directly.
 
 Only a family with **no assigned NAT address** (no LB implementation, or one that
 cannot serve that family) still spawns a per-VPC **gateway pod** (a default-network pod with a second leg on the VPC's reserved `.1`), which
@@ -348,8 +346,53 @@ kubectl exec app-1 -- nslookup example.com       # resolves (via the gateway)
 kubectl exec app-1 -- wget -qO- http://<any-cluster-pod-ip>   # still blocked
 ```
 
-Setting `nat.enabled: false` (or deleting the VPCGateway, or the VPC) tears the
-gateway down and the VPC closes again.
+Setting `nat.enabled: false` (or deleting the VPCGateway, or the VPC) deletes the
+objects it created and the VPC closes again.
+
+## Reach the internet: NAT gateways and route tables
+
+A VPC pod's traffic leaving the VPC follows its **route table**
+([docs/vpc-egress.md](vpc-egress.md)). Without one it has no internet, through a
+FloatingIP or otherwise.
+
+```yaml
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: NATGateway
+metadata: {name: egress, namespace: team-a}
+spec:
+  vpcRef: {name: vpc-a}
+  # addressClaimName: c     # optional: an IPAddressClaim whose IPv4 address it wears
+  # addressClaimName6: c    # optional: ... whose IPv6 address it wears (may be the same Dual claim)
+---
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: RouteTable
+metadata: {name: main, namespace: team-a}
+spec: {vpcRef: {name: vpc-a}, default: true}   # the table of every pod that names none
+---
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: Route
+metadata: {name: default, namespace: team-a}
+spec:
+  routeTableRef: {name: main}
+  destination: 0.0.0.0/0
+  target: {natGateway: {name: egress}}          # or {internet: {}} or {blackhole: {}}
+```
+
+- A pod picks a table with the annotation `sdn.cozystack.io/route-table: <name>`;
+  without it, it gets the VPC's default table.
+- `internet: {}` sends the pod out as its **FloatingIP**; a pod without one is
+  dropped. A FloatingIP workload needs a table with `0.0.0.0/0 → internet`, or its
+  replies to inbound clients leave through the NAT gateway and break.
+- Longest prefix wins, over the VPC's own CIDR, its peers' CIDRs and the Routes:
+  `192.0.2.0/24 → natGateway partner` in a table whose default is `internet` sends a
+  FloatingIP workload to the partner as the `partner` NAT gateway's address.
+- Only the VPC's own namespace can create NAT gateways, tables and routes; a
+  namespace that attaches pods through a `VPCBinding` can choose among the tables.
+
+Each node SNATs its own pods; the NAT gateway's port space is leased to nodes in
+blocks (`kubectl get natportblocks`). At most `64512 / blockSize` nodes can NAT
+through one NAT gateway at once — 64 at the default block size (#66). Refusals are
+counted by reason in `cozyplane_nat_drops_total` and `cozyplane_route_drops_total`.
 
 **Ingress is closed by default too.** A `Service` of type `LoadBalancer` whose
 backends are VPC pods is *refused* unless this VPC's gateway sets

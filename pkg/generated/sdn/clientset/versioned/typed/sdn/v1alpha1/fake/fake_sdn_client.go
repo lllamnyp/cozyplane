@@ -36,8 +36,20 @@ func (c *FakeSdnV1alpha1) HostFirewalls() v1alpha1.HostFirewallInterface {
 	return newFakeHostFirewalls(c)
 }
 
+func (c *FakeSdnV1alpha1) NATGateways(namespace string) v1alpha1.NATGatewayInterface {
+	return newFakeNATGateways(c, namespace)
+}
+
 func (c *FakeSdnV1alpha1) Ports() v1alpha1.PortInterface {
 	return newFakePorts(c)
+}
+
+func (c *FakeSdnV1alpha1) Routes(namespace string) v1alpha1.RouteInterface {
+	return newFakeRoutes(c, namespace)
+}
+
+func (c *FakeSdnV1alpha1) RouteTables(namespace string) v1alpha1.RouteTableInterface {
+	return newFakeRouteTables(c, namespace)
 }
 
 func (c *FakeSdnV1alpha1) SecurityGroups(namespace string) v1alpha1.SecurityGroupInterface {

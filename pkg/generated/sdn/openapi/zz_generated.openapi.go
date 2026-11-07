@@ -44,11 +44,29 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.HostFirewallRule":        schema_cozyplane_api_sdn_v1alpha1_HostFirewallRule(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.HostFirewallSpec":        schema_cozyplane_api_sdn_v1alpha1_HostFirewallSpec(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.HostFirewallStatus":      schema_cozyplane_api_sdn_v1alpha1_HostFirewallStatus(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalNATGatewayRef":      schema_cozyplane_api_sdn_v1alpha1_LocalNATGatewayRef(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalRouteTableRef":      schema_cozyplane_api_sdn_v1alpha1_LocalRouteTableRef(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalVPCRef":             schema_cozyplane_api_sdn_v1alpha1_LocalVPCRef(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.NATGateway":              schema_cozyplane_api_sdn_v1alpha1_NATGateway(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.NATGatewayBlocks":        schema_cozyplane_api_sdn_v1alpha1_NATGatewayBlocks(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.NATGatewayList":          schema_cozyplane_api_sdn_v1alpha1_NATGatewayList(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.NATGatewaySpec":          schema_cozyplane_api_sdn_v1alpha1_NATGatewaySpec(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.NATGatewayStatus":        schema_cozyplane_api_sdn_v1alpha1_NATGatewayStatus(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.Port":                    schema_cozyplane_api_sdn_v1alpha1_Port(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortList":                schema_cozyplane_api_sdn_v1alpha1_PortList(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortSpec":                schema_cozyplane_api_sdn_v1alpha1_PortSpec(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortStatus":              schema_cozyplane_api_sdn_v1alpha1_PortStatus(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.Route":                   schema_cozyplane_api_sdn_v1alpha1_Route(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteBlackholeTarget":    schema_cozyplane_api_sdn_v1alpha1_RouteBlackholeTarget(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteInternetTarget":     schema_cozyplane_api_sdn_v1alpha1_RouteInternetTarget(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteList":               schema_cozyplane_api_sdn_v1alpha1_RouteList(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteSpec":               schema_cozyplane_api_sdn_v1alpha1_RouteSpec(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteStatus":             schema_cozyplane_api_sdn_v1alpha1_RouteStatus(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteTable":              schema_cozyplane_api_sdn_v1alpha1_RouteTable(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteTableList":          schema_cozyplane_api_sdn_v1alpha1_RouteTableList(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteTableSpec":          schema_cozyplane_api_sdn_v1alpha1_RouteTableSpec(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteTableStatus":        schema_cozyplane_api_sdn_v1alpha1_RouteTableStatus(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteTarget":             schema_cozyplane_api_sdn_v1alpha1_RouteTarget(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.SecurityGroup":           schema_cozyplane_api_sdn_v1alpha1_SecurityGroup(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.SecurityGroupEgressRule": schema_cozyplane_api_sdn_v1alpha1_SecurityGroupEgressRule(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.SecurityGroupList":       schema_cozyplane_api_sdn_v1alpha1_SecurityGroupList(ref),
@@ -689,6 +707,50 @@ func schema_cozyplane_api_sdn_v1alpha1_HostFirewallStatus(ref common.ReferenceCa
 	}
 }
 
+func schema_cozyplane_api_sdn_v1alpha1_LocalNATGatewayRef(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "LocalNATGatewayRef references a NATGateway in the referring object's namespace.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"name": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Name is the NATGateway name.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"name"},
+			},
+		},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_LocalRouteTableRef(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "LocalRouteTableRef references a RouteTable in the referring object's namespace.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"name": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Name is the RouteTable name.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"name"},
+			},
+		},
+	}
+}
+
 func schema_cozyplane_api_sdn_v1alpha1_LocalVPCRef(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
@@ -708,6 +770,247 @@ func schema_cozyplane_api_sdn_v1alpha1_LocalVPCRef(ref common.ReferenceCallback)
 				Required: []string{"name"},
 			},
 		},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_NATGateway(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "NATGateway is a many-to-one egress identity for a VPC: at most one address per IP family. Routes with a natGateway target send traffic through it (docs/vpc-egress.md).",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"metadata": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref(v1.ObjectMeta{}.OpenAPIModelName()),
+						},
+					},
+					"spec": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.NATGatewaySpec"),
+						},
+					},
+					"status": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.NATGatewayStatus"),
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.NATGatewaySpec", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.NATGatewayStatus", v1.ObjectMeta{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_NATGatewayBlocks(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "NATGatewayBlocks summarizes the NAT gateway's port-block leases.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"leased": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Leased is the number of blocks some node holds.",
+							Default:     0,
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"free": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Free is the number of blocks no node holds.",
+							Default:     0,
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+				},
+				Required: []string{"leased", "free"},
+			},
+		},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_NATGatewayList(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "NATGatewayList contains a list of NATGateway.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"metadata": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref(v1.ListMeta{}.OpenAPIModelName()),
+						},
+					},
+					"items": {
+						SchemaProps: spec.SchemaProps{
+							Type: []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.NATGateway"),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"items"},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.NATGateway", v1.ListMeta{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_NATGatewaySpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "NATGatewaySpec declares a many-to-one egress identity for a VPC.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"vpcRef": {
+						SchemaProps: spec.SchemaProps{
+							Description: "VPCRef is the VPC this NAT gateway serves, in this namespace. Immutable.",
+							Default:     map[string]interface{}{},
+							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalVPCRef"),
+						},
+					},
+					"loadBalancerClass": {
+						SchemaProps: spec.SchemaProps{
+							Description: "LoadBalancerClass selects the load-balancer implementation that assigns and attracts the addresses. Empty uses the cluster's default.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"addressClaimName": {
+						SchemaProps: spec.SchemaProps{
+							Description: "AddressClaimName names the IPAddressClaim (local.sdn.cozystack.io) whose IPv4 address this NAT gateway wears. AddressClaimName6 names the claim whose IPv6 address it wears; both may name the same dual-stack claim. With neither set, the NAT gateway serves every family of the VPC with addresses the LB implementation assigns; with either set, it serves exactly the families whose field is set (docs/vpc-egress.md §2.1).",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"addressClaimName6": {
+						SchemaProps: spec.SchemaProps{
+							Type:   []string{"string"},
+							Format: "",
+						},
+					},
+				},
+				Required: []string{"vpcRef"},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalVPCRef"},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_NATGatewayStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "NATGatewayStatus is the observed state of a NATGateway.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"id": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ID is the cluster-unique datapath identifier of this NAT gateway, allocated by the controller (1..65535). Zero means unallocated.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"address": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Address is the IPv4 address the NAT gateway's v4 egress wears. Empty means none.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"address6": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Address6 is the IPv6 counterpart.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"blockSize": {
+						SchemaProps: spec.SchemaProps{
+							Description: "BlockSize is the number of ports in one port block (docs/vpc-egress.md §4.3). Every agent divides by this value, so it is published here rather than configured per node.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"blocks": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Blocks summarizes the leases.",
+							Default:     map[string]interface{}{},
+							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.NATGatewayBlocks"),
+						},
+					},
+					"conditions": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"type",
+								},
+								"x-kubernetes-list-type": "map",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "Conditions is the detailed state.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref(v1.Condition{}.OpenAPIModelName()),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.NATGatewayBlocks", v1.Condition{}.OpenAPIModelName()},
 	}
 }
 
@@ -872,6 +1175,13 @@ func schema_cozyplane_api_sdn_v1alpha1_PortSpec(ref common.ReferenceCallback) co
 							Format:      "",
 						},
 					},
+					"routeTable": {
+						SchemaProps: spec.SchemaProps{
+							Description: "RouteTable is the name of the RouteTable (in the VPC's namespace) this Port's traffic is routed by, copied by the CNI from the pod's sdn.cozystack.io/route-table annotation. Empty means the VPC's default table (docs/vpc-egress.md §2.4).",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
 				},
 				Required: []string{"vpcRef", "ip", "node", "nodeIP"},
 			},
@@ -911,6 +1221,409 @@ func schema_cozyplane_api_sdn_v1alpha1_PortStatus(ref common.ReferenceCallback) 
 				},
 			},
 		},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_Route(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "Route is one destination and one target in a RouteTable, kept as its own object so different owners can manage the routes of one table (docs/vpc-egress.md §2.3).",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"metadata": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref(v1.ObjectMeta{}.OpenAPIModelName()),
+						},
+					},
+					"spec": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteSpec"),
+						},
+					},
+					"status": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteStatus"),
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteSpec", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteStatus", v1.ObjectMeta{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_RouteBlackholeTarget(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "RouteBlackholeTarget is the blackhole target. It has no fields.",
+				Type:        []string{"object"},
+			},
+		},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_RouteInternetTarget(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "RouteInternetTarget is the internet pseudo-target. It has no fields.",
+				Type:        []string{"object"},
+			},
+		},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_RouteList(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "RouteList contains a list of Route.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"metadata": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref(v1.ListMeta{}.OpenAPIModelName()),
+						},
+					},
+					"items": {
+						SchemaProps: spec.SchemaProps{
+							Type: []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.Route"),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"items"},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.Route", v1.ListMeta{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_RouteSpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "RouteSpec declares one route: a destination and a target.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"routeTableRef": {
+						SchemaProps: spec.SchemaProps{
+							Description: "RouteTableRef is the table this route belongs to, in this namespace.",
+							Default:     map[string]interface{}{},
+							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalRouteTableRef"),
+						},
+					},
+					"destination": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Destination is the canonical CIDR this route matches (v4 or v6).",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"target": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Target is where matching traffic goes.",
+							Default:     map[string]interface{}{},
+							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteTarget"),
+						},
+					},
+				},
+				Required: []string{"routeTableRef", "destination", "target"},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalRouteTableRef", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteTarget"},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_RouteStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "RouteStatus is the observed state of a Route.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"state": {
+						SchemaProps: spec.SchemaProps{
+							Description: "State is the controller's verdict.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"conditions": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"type",
+								},
+								"x-kubernetes-list-type": "map",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "Conditions is the detailed state.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref(v1.Condition{}.OpenAPIModelName()),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			v1.Condition{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_RouteTable(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "RouteTable is a route table of a VPC. It holds no routes itself; Route objects reference it. A pod chooses its table with the sdn.cozystack.io/route-table annotation (docs/vpc-egress.md §2.4).",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"metadata": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref(v1.ObjectMeta{}.OpenAPIModelName()),
+						},
+					},
+					"spec": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteTableSpec"),
+						},
+					},
+					"status": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteTableStatus"),
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteTableSpec", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteTableStatus", v1.ObjectMeta{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_RouteTableList(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "RouteTableList contains a list of RouteTable.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"metadata": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref(v1.ListMeta{}.OpenAPIModelName()),
+						},
+					},
+					"items": {
+						SchemaProps: spec.SchemaProps{
+							Type: []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteTable"),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"items"},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteTable", v1.ListMeta{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_RouteTableSpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "RouteTableSpec declares a route table of a VPC.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"vpcRef": {
+						SchemaProps: spec.SchemaProps{
+							Description: "VPCRef is the VPC this table belongs to, in this namespace. Immutable.",
+							Default:     map[string]interface{}{},
+							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalVPCRef"),
+						},
+					},
+					"default": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Default makes this the table of every Port of the VPC whose pod names no table. At most one table per VPC is the default: the oldest wins.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"vpcRef"},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalVPCRef"},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_RouteTableStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "RouteTableStatus is the observed state of a RouteTable.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"id": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ID is the cluster-unique datapath identifier of this table, allocated by the controller (1..2^24-1). Zero means unallocated.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"conditions": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"type",
+								},
+								"x-kubernetes-list-type": "map",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "Conditions is the detailed state.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref(v1.Condition{}.OpenAPIModelName()),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			v1.Condition{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_RouteTarget(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "RouteTarget is where a route sends matching traffic. Exactly one field is set.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"natGateway": {
+						SchemaProps: spec.SchemaProps{
+							Description: "NATGateway SNATs the traffic to the named NAT gateway's address of the packet's family, for every source (docs/vpc-egress.md §3.2).",
+							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalNATGatewayRef"),
+						},
+					},
+					"internet": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Internet sends the traffic out as the source Port's FloatingIP; a Port without one is dropped.",
+							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteInternetTarget"),
+						},
+					},
+					"blackhole": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Blackhole drops the traffic.",
+							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteBlackholeTarget"),
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.LocalNATGatewayRef", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteBlackholeTarget", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.RouteInternetTarget"},
 	}
 }
 
