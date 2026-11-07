@@ -362,3 +362,47 @@ func TestFloatingIPUnrelatedConditionKeepsTransitionTimeOnPartialChange(t *testi
 			serviceReady.LastTransitionTime, past)
 	}
 }
+
+// A FloatingIP naming a claim takes only the claim's address. Any other address
+// the Service holds (the LB implementation assigned it from its pools because
+// the claim is missing, unbound or attached elsewhere) is not published, and the
+// endpoint stays not-ready so the address is not announced.
+func TestFloatingIPClaimNotAttached(t *testing.T) {
+	s := claimScheme(t)
+	fip := floatingIP("team-a", "web", "vpc-a", "10.0.0.5")
+	fip.Spec.AddressClaimName = "my-eip"
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(livePort("team-a", "vpc-a", "10.0.0.5", "node-1"), fip, ipClaim("team-a", "my-eip", "Bound", "203.0.113.9")).
+		WithStatusSubresource(&sdnv1alpha1.FloatingIP{}, &corev1.Service{}).Build()
+	reconcile := func() *sdnv1alpha1.FloatingIP {
+		t.Helper()
+		r := &FloatingIPReconciler{Client: c, Scheme: s}
+		key := types.NamespacedName{Namespace: "team-a", Name: "web"}
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+		got := &sdnv1alpha1.FloatingIP{}
+		if err := c.Get(context.Background(), key, got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	reconcile()
+	assignServiceAddress(t, c, ownedFloatingService(t, c, "team-a", "web"), "203.0.113.50")
+	got := reconcile()
+	cond := meta.FindStatusCondition(got.Status.Conditions, sdnv1alpha1.FloatingIPConditionAddressAssigned)
+	if got.Status.Address != "" || got.Status.Phase == sdnv1alpha1.FloatingIPPhaseReady || cond == nil || cond.Reason != "ClaimNotAttached" {
+		t.Errorf("address %q phase %s AddressAssigned %+v, want none, Pending, ClaimNotAttached", got.Status.Address, got.Status.Phase, cond)
+	}
+	if eps := ownedEndpointSlice(t, c, "team-a", "web"); eps == nil || *eps.Endpoints[0].Conditions.Ready {
+		t.Errorf("endpoint slice %+v, want a not-ready endpoint", eps)
+	}
+
+	assignServiceAddress(t, c, ownedFloatingService(t, c, "team-a", "web"), "203.0.113.9")
+	if got = reconcile(); got.Status.Address != "203.0.113.9" || got.Status.Phase != sdnv1alpha1.FloatingIPPhaseReady {
+		t.Errorf("address %q phase %s, want the claim's address and Ready", got.Status.Address, got.Status.Phase)
+	}
+	if eps := ownedEndpointSlice(t, c, "team-a", "web"); eps == nil || !*eps.Endpoints[0].Conditions.Ready {
+		t.Errorf("endpoint slice %+v, want a ready endpoint", eps)
+	}
+}

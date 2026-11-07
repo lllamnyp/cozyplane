@@ -274,6 +274,7 @@ func setupSDNControllers(mgr manager.Manager, cfg sdnControllerConfig) error {
 	if err := (&sdncontroller.FloatingIPReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		Reader: mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("unable to create controller %s: %w", "FloatingIP", err)
 	}

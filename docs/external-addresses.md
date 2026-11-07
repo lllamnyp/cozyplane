@@ -204,12 +204,19 @@ never a Service**, so there is no IP to share, and the earlier claim-owns-the-Se
 
 - **Dynamic (no `addressClaimName`):** the FloatingIP/VPCGateway owns its one
   Service; the LB implementation auto-assigns; the address lives for the object's
-  lifetime.
+  lifetime. If the address-controller's auto-claim attaches a claim to the Service
+  (one the Service controls), the Service keeps that annotation, and the auto-claim
+  class supplies the address.
 - **Reserved (`addressClaimName` set):** the **same** owned Service, plus the one
   annotation. The driver pins the claim's address onto it, and cozyplane consumes
   `status.loadBalancer.ingress` exactly as in the dynamic case — reserved and
   dynamic are one code path. The address lives for the **claim's** lifetime and
-  survives the FloatingIP — the AWS-EIP semantics.
+  survives the FloatingIP — the AWS-EIP semantics. cozyplane takes the Service's
+  address only if it is one of the claim's: when the driver did not pin (the claim is
+  missing, unbound, or attached to another Service), the LB implementation may
+  assign one from its pools. That address is not published, the endpoint stays
+  not-ready so it is not announced, and `AddressAssigned` is `False` with reason
+  `ClaimNotAttached`.
 - **Per family:** association is one-claim-one-Service and the gateway's Services
   are single-family, so the NAT identity takes one single-family claim per family
   (`nat.addressClaimName` / `nat.addressClaimName6`).
@@ -220,9 +227,11 @@ dies). Neither knows about the other.
 
 cozyplane's claim surface is that annotation, written as an opaque string — no
 informer, no module import (the repos are private and the API alpha; a Go import
-would couple builds). The one read is the `NATGateway` controller's GET of a named
-claim's `status.addresses`, which decides the families of the Service it creates
-to attach that claim's addresses ([vpc-egress.md](vpc-egress.md) §2.1). The annotation key
+would couple builds). The reads are GETs of a claim: a named claim's
+`status.addresses`, which decides the families of the Service the `NATGateway`
+controller creates ([vpc-egress.md](vpc-egress.md) §2.1) and which address a
+FloatingIP or NAT gateway accepts, and the controller of an annotated claim, which
+identifies an auto-claim. The annotation key
 mirrors the address-controller's `well_known.go` constant, with the authority named
 at the mirror.
 

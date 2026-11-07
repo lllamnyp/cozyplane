@@ -29,7 +29,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -358,46 +357,9 @@ func planNATSlots(inVPC map[corev1.IPFamily]bool, claims map[corev1.IPFamily]str
 	return slots, failures
 }
 
-// claimInfo reads a claim's phase and the families of its bound addresses.
+// claimInfo reads a claim (readClaim).
 func (r *NATGatewayReconciler) claimInfo(ctx context.Context, namespace, name string) (natClaimInfo, error) {
-	u := &unstructured.Unstructured{}
-	u.SetGroupVersionKind(ipAddressClaimGVK)
-	err := r.reader().Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, u)
-	switch {
-	case meta.IsNoMatchError(err):
-		return natClaimInfo{apiMissing: true}, nil
-	case apierrors.IsNotFound(err):
-		return natClaimInfo{}, nil
-	case err != nil:
-		return natClaimInfo{}, fmt.Errorf("get IPAddressClaim %s/%s: %w", namespace, name, err)
-	}
-	info := natClaimInfo{found: true}
-	phase, _, _ := unstructured.NestedString(u.Object, "status", "phase")
-	info.bound = phase == "Bound"
-	addrs, _, _ := unstructured.NestedSlice(u.Object, "status", "addresses")
-	info.addresses = map[corev1.IPFamily]string{}
-	for _, a := range addrs {
-		m, ok := a.(map[string]any)
-		if !ok {
-			continue
-		}
-		s, _ := m["address"].(string)
-		if ip, err := netip.ParseAddr(s); err == nil {
-			f := corev1.IPv6Protocol
-			if ip.Is4() || ip.Is4In6() {
-				f = corev1.IPv4Protocol
-			}
-			if info.addresses[f] == "" {
-				info.addresses[f] = ip.Unmap().String()
-			}
-		}
-	}
-	for _, f := range []corev1.IPFamily{corev1.IPv4Protocol, corev1.IPv6Protocol} {
-		if info.addresses[f] != "" {
-			info.families = append(info.families, f)
-		}
-	}
-	return info, nil
+	return readClaim(ctx, r.reader(), namespace, name)
 }
 
 // ownedServices lists the Services this NAT gateway controls, by slot.
@@ -478,24 +440,9 @@ func (r *NATGatewayReconciler) reconcileServices(ctx context.Context, ngw *sdnv1
 
 type addrsBySlot = map[string]map[corev1.IPFamily]string
 
-// wantClaim is the claim annotation a slot's Service should carry: the slot's
-// claim, or, for a dynamic slot, the claim the address-controller's auto-claim
-// created for this Service (one it controls), so the platform's auto-claim
-// policy applies to NAT addresses too.
+// wantClaim is the claim annotation a slot's Service should carry (keepAutoClaim).
 func (r *NATGatewayReconciler) wantClaim(ctx context.Context, svc *corev1.Service, claim string) string {
-	cur := svc.Annotations[addressClaimAnnotation]
-	if claim != "" || cur == "" {
-		return claim
-	}
-	u := &unstructured.Unstructured{}
-	u.SetGroupVersionKind(ipAddressClaimGVK)
-	if err := r.reader().Get(ctx, types.NamespacedName{Namespace: svc.Namespace, Name: cur}, u); err != nil {
-		return claim
-	}
-	if c := metav1.GetControllerOf(u); c != nil && c.UID == svc.UID {
-		return cur
-	}
-	return claim
+	return keepAutoClaim(ctx, r.reader(), svc, claim)
 }
 
 // deleteServices deletes the owned Services whose slot is not in keep.
