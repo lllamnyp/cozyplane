@@ -355,7 +355,8 @@ gateway share one port space.
 - **Owner table.** Every agent programs `nat_blk_owner[{natgateway id, block}] → node`
   for every lease, acked or not, because any node may receive any reply.
 - **Claim.** An agent hosting a Port of the NAT gateway's VPC creates the lease for
-  the lowest unleased block, trying the next on `AlreadyExists`. Claiming when the
+  the lowest unleased block, trying the next on `AlreadyExists`, once the NAT
+  gateway has an address. Claiming when the
   Port appears usually activates the block before the workload connects out.
 - **Ack, then use.** An agent that sees a lease programs its `nat_blk_owner` entry,
   then server-side-applies its own entry into `status.acks` with the node's boot ID

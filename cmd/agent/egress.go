@@ -278,6 +278,9 @@ func planNAT(in natInputs) natPlan {
 			Net: uint32(vpc.Status.VNI), BlockSize: uint16(g.Status.BlockSize), Blocks: blocks,
 		}
 		hosted := in.hosted[vpcKey{g.Namespace, g.Spec.VPCRef.Name}]
+		if g.Status.Address == "" && g.Status.Address6 == "" && len(leases) == 0 {
+			continue // nothing to SNAT to: claim once an address appears
+		}
 		if at, ok := in.pending[g.UID]; ok && in.now.Sub(at) < claimSettle {
 			continue // a claim is in flight; the cache has not shown it yet
 		}
@@ -611,8 +614,20 @@ func (w *egressWatcher) resync(ctx context.Context) {
 	for _, g := range plan.claim {
 		w.claimBlock(cctx, g, leases)
 	}
+	uids := map[string]types.UID{}
+	for _, l := range leases {
+		uids[l.Name] = l.UID
+	}
 	for _, name := range plan.release {
-		if err := w.lc.LocalV1alpha1().NATPortBlocks().Delete(cctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		// The UID precondition keeps a release planned from a stale cache from
+		// deleting the lease another node has since claimed under the name.
+		err := w.lc.LocalV1alpha1().NATPortBlocks().Delete(cctx, name, metav1.DeleteOptions{
+			Preconditions: &metav1.Preconditions{UID: new(uids[name])},
+		})
+		switch {
+		case apierrors.IsNotFound(err) || apierrors.IsConflict(err):
+			continue // already released
+		case err != nil:
 			w.log.Error("release NAT port block", "lease", name, "err", err)
 			continue
 		}
