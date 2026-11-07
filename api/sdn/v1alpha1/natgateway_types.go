@@ -39,6 +39,7 @@ const (
 	NATGatewayReasonClaimNotFound      = "ClaimNotFound"
 	NATGatewayReasonClaimNotBound      = "ClaimNotBound"
 	NATGatewayReasonClaimFamilyMissing = "ClaimFamilyMissing"
+	NATGatewayReasonClaimNotAttached   = "ClaimNotAttached"
 	NATGatewayReasonFamilyNotInVPC     = "FamilyNotInVPC"
 	NATGatewayReasonAddressPending     = "AddressPending"
 )

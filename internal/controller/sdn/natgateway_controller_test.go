@@ -307,6 +307,32 @@ func TestNATGatewayClaimFailures(t *testing.T) {
 
 // Without the claim API, a set field gets a single-family Service carrying the
 // (inert) annotation, and the LB implementation assigns.
+// A claimed Service whose assigned address is not the claim's (the driver did
+// not pin it, e.g. the claim is attached to another Service) yields no address:
+// it is neither published nor announced.
+func TestNATGatewayClaimNotAttached(t *testing.T) {
+	s := claimScheme(t)
+	c := egressClient(t, s, vpcWithCIDRs("t", "v", 100, "10.0.0.0/24"),
+		natgw("t", "egress", "v", "c4", ""), ipClaim("t", "c4", "Bound", "203.0.113.9"),
+		natNode("a", "10.1.0.1", "a1", true))
+	reconcileNATGateway(t, s, c, "t", "egress")
+	svc := ngwServices(t, c, "t", "egress")["c4"]
+	setIngress(t, c, svc, "203.0.113.50")
+	g := reconcileNATGateway(t, s, c, "t", "egress")
+	if cond := addrCond(g); g.Status.Address != "" || cond == nil || cond.Reason != sdnv1alpha1.NATGatewayReasonClaimNotAttached {
+		t.Errorf("address %q, AddressAssigned %+v, want none and ClaimNotAttached", g.Status.Address, cond)
+	}
+	eps := &discoveryv1.EndpointSlice{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "t", Name: svc.Name + "-v4"}, eps); err == nil {
+		t.Errorf("EndpointSlice %+v exists, want none for a foreign address", eps.Endpoints)
+	}
+
+	setIngress(t, c, svc, "203.0.113.9")
+	if g = reconcileNATGateway(t, s, c, "t", "egress"); g.Status.Address != "203.0.113.9" {
+		t.Errorf("address = %q, want the claim's once the Service holds it", g.Status.Address)
+	}
+}
+
 func TestNATGatewayClaimAPIMissing(t *testing.T) {
 	s := egressScheme(t)
 	c := egressClient(t, s, vpcWithCIDRs("t", "v", 100, "10.0.0.0/24", "fd00::/64"), natgw("t", "egress", "v", "c4", ""))

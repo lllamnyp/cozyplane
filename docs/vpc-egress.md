@@ -104,6 +104,7 @@ status:
   | `ClaimNotFound` | the named claim does not exist |
   | `ClaimNotBound` | the claim is `Pending` or `Lost` |
   | `ClaimFamilyMissing` | the claim has no address of the field's family, e.g. an IPv6-only claim in `addressClaimName` |
+  | `ClaimNotAttached` | the Service holds an address of the family that is not the claim's, e.g. because the claim is attached to another Service and the LB implementation assigned one from its pools; the address is neither published nor announced |
   | `FamilyNotInVPC` | the field's family is not one of the VPC's |
   | `AddressPending` | the Service has no address of the family yet |
 - **`CapacityAvailable=False`** means no block of this NAT gateway is free (§4.3).

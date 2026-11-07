@@ -81,6 +81,9 @@ type natSlot struct {
 	claim    string            // "" = dynamic
 	families []corev1.IPFamily // the Service's families, v4 first
 	serves   []corev1.IPFamily // families whose address the NAT gateway takes from it
+	// want is the claim's bound address per family; nil when there is no
+	// claim or the claim API is not installed.
+	want map[corev1.IPFamily]string
 }
 
 // natFamilyFailure is why a served family has no address.
@@ -94,6 +97,7 @@ type natClaimInfo struct {
 	found      bool
 	bound      bool
 	families   []corev1.IPFamily
+	addresses  map[corev1.IPFamily]string
 }
 
 // Reconcile computes the NAT gateway's id, Services, addresses and conditions.
@@ -145,13 +149,19 @@ func (r *NATGatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if err := r.List(ctx, &nodes); err != nil {
 			return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
 		}
-		addrs, err := r.reconcileServices(ctx, ngw, slots, natReadyNodes(nodes.Items, leases.Items))
+		addrs, foreign, err := r.reconcileServices(ctx, ngw, slots, natReadyNodes(nodes.Items, leases.Items))
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 		for _, s := range slots {
 			for _, fam := range s.serves {
 				a := addrs[s.key][fam]
+				if held := foreign[s.key][fam]; held != "" {
+					failures[fam] = natFamilyFailure{sdnv1alpha1.NATGatewayReasonClaimNotAttached,
+						fmt.Sprintf("the LoadBalancer Service holds %s, not IPAddressClaim %q's %s; the claim may be attached to another Service",
+							held, s.claim, s.want[fam])}
+					continue
+				}
 				if a == "" {
 					failures[fam] = natFamilyFailure{sdnv1alpha1.NATGatewayReasonAddressPending,
 						"the LoadBalancer Service has no " + familyLabelValue(fam) + " address yet"}
@@ -341,7 +351,7 @@ func planNATSlots(inVPC map[corev1.IPFamily]bool, claims map[corev1.IPFamily]str
 					fmt.Sprintf("IPAddressClaim %q has no %s address", c, familyLabelValue(f))}
 			}
 			if len(served) > 0 {
-				slots = append(slots, natSlot{key: c, claim: c, families: info.families, serves: served})
+				slots = append(slots, natSlot{key: c, claim: c, families: info.families, serves: served, want: info.addresses})
 			}
 		}
 	}
@@ -365,7 +375,7 @@ func (r *NATGatewayReconciler) claimInfo(ctx context.Context, namespace, name st
 	phase, _, _ := unstructured.NestedString(u.Object, "status", "phase")
 	info.bound = phase == "Bound"
 	addrs, _, _ := unstructured.NestedSlice(u.Object, "status", "addresses")
-	has := map[corev1.IPFamily]bool{}
+	info.addresses = map[corev1.IPFamily]string{}
 	for _, a := range addrs {
 		m, ok := a.(map[string]any)
 		if !ok {
@@ -373,15 +383,17 @@ func (r *NATGatewayReconciler) claimInfo(ctx context.Context, namespace, name st
 		}
 		s, _ := m["address"].(string)
 		if ip, err := netip.ParseAddr(s); err == nil {
+			f := corev1.IPv6Protocol
 			if ip.Is4() || ip.Is4In6() {
-				has[corev1.IPv4Protocol] = true
-			} else {
-				has[corev1.IPv6Protocol] = true
+				f = corev1.IPv4Protocol
+			}
+			if info.addresses[f] == "" {
+				info.addresses[f] = ip.Unmap().String()
 			}
 		}
 	}
 	for _, f := range []corev1.IPFamily{corev1.IPv4Protocol, corev1.IPv6Protocol} {
-		if has[f] {
+		if info.addresses[f] != "" {
 			info.families = append(info.families, f)
 		}
 	}
@@ -405,12 +417,14 @@ func (r *NATGatewayReconciler) ownedServices(ctx context.Context, ngw *sdnv1alph
 }
 
 // reconcileServices makes the owned Services exactly `slots` and returns each
-// slot's assigned address per family.
-func (r *NATGatewayReconciler) reconcileServices(ctx context.Context, ngw *sdnv1alpha1.NATGateway, slots []natSlot, nodes []*corev1.Node) (map[string]map[corev1.IPFamily]string, error) {
+// slot's assigned address per family, and the addresses a claimed slot's
+// Service holds that are not its claim's.
+func (r *NATGatewayReconciler) reconcileServices(ctx context.Context, ngw *sdnv1alpha1.NATGateway, slots []natSlot, nodes []*corev1.Node) (addrsBySlot, map[string]map[corev1.IPFamily]string, error) {
 	owned, err := r.ownedServices(ctx, ngw)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	foreign := map[string]map[corev1.IPFamily]string{}
 	keep := map[string]bool{}
 	out := map[string]map[corev1.IPFamily]string{}
 	for _, s := range slots {
@@ -418,18 +432,18 @@ func (r *NATGatewayReconciler) reconcileServices(ctx context.Context, ngw *sdnv1
 		svc := owned[s.key]
 		if svc != nil && !sameFamilies(svc.Spec.IPFamilies, s.families) {
 			if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
-				return nil, fmt.Errorf("delete NAT gateway service for a family change: %w", err)
+				return nil, nil, fmt.Errorf("delete NAT gateway service for a family change: %w", err)
 			}
 			svc = nil
 		}
 		if svc == nil {
 			if svc, err = r.adoptGatewayService(ctx, ngw, s); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 		if svc == nil {
 			if svc, err = r.createService(ctx, ngw, s); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if svc == nil {
 				continue // the cluster cannot serve these families
@@ -437,17 +451,32 @@ func (r *NATGatewayReconciler) reconcileServices(ctx context.Context, ngw *sdnv1
 		} else if changed := reconcileClaimAnnotation(svc, s.claim); changed || svc.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyLocal {
 			svc.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyLocal
 			if err := r.Update(ctx, svc); err != nil {
-				return nil, fmt.Errorf("update NAT gateway service: %w", err)
+				return nil, nil, fmt.Errorf("update NAT gateway service: %w", err)
 			}
 		}
 		addrs := ingressByFamily(svc)
+		// A claimed slot takes only its claim's address. Anything else is
+		// what the LB implementation assigned when the claim's driver did
+		// not pin, e.g. because the claim is attached to another Service; it
+		// is neither published nor announced.
+		for f, a := range addrs {
+			if s.want != nil && a != s.want[f] {
+				if foreign[s.key] == nil {
+					foreign[s.key] = map[corev1.IPFamily]string{}
+				}
+				foreign[s.key][f] = a
+				delete(addrs, f)
+			}
+		}
 		out[s.key] = addrs
 		if err := r.reconcileEndpointSlices(ctx, ngw, svc, addrs, nodes); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
-	return out, r.deleteServices(ctx, ngw, keep)
+	return out, foreign, r.deleteServices(ctx, ngw, keep)
 }
+
+type addrsBySlot = map[string]map[corev1.IPFamily]string
 
 // deleteServices deletes the owned Services whose slot is not in keep.
 func (r *NATGatewayReconciler) deleteServices(ctx context.Context, ngw *sdnv1alpha1.NATGateway, keep map[string]bool) error {
