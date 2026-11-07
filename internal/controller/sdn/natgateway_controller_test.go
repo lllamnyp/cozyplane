@@ -333,6 +333,35 @@ func TestNATGatewayClaimNotAttached(t *testing.T) {
 	}
 }
 
+// A dynamic slot keeps the claim the address-controller's auto-claim created
+// for its Service, and drops any other.
+func TestNATGatewayKeepsAutoClaim(t *testing.T) {
+	s := claimScheme(t)
+	c := egressClient(t, s, vpcWithCIDRs("t", "v", 100, "10.0.0.0/24"), natgw("t", "egress", "v", "", ""))
+	reconcileNATGateway(t, s, c, "t", "egress")
+	svc := ngwServices(t, c, "t", "egress")["dynamic-IPv4"]
+	auto := ipClaim("t", svc.Name, "Bound", "203.0.113.9")
+	auto.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: "v1", Kind: "Service", Name: svc.Name, UID: svc.UID, Controller: new(true)}})
+	other := ipClaim("t", "someone-elses", "Bound", "203.0.113.10")
+	for _, o := range []client.Object{auto, other} {
+		if err := c.Create(context.Background(), o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for claim, keep := range map[string]bool{svc.Name: true, "someone-elses": false} {
+		svc := ngwServices(t, c, "t", "egress")["dynamic-IPv4"]
+		svc.Annotations = map[string]string{addressClaimAnnotation: claim}
+		if err := c.Update(context.Background(), svc); err != nil {
+			t.Fatal(err)
+		}
+		reconcileNATGateway(t, s, c, "t", "egress")
+		got := ngwServices(t, c, "t", "egress")["dynamic-IPv4"].Annotations[addressClaimAnnotation]
+		if (got == claim) != keep {
+			t.Errorf("claim %q: annotation after reconcile = %q, keep = %v", claim, got, keep)
+		}
+	}
+}
+
 func TestNATGatewayClaimAPIMissing(t *testing.T) {
 	s := egressScheme(t)
 	c := egressClient(t, s, vpcWithCIDRs("t", "v", 100, "10.0.0.0/24", "fd00::/64"), natgw("t", "egress", "v", "c4", ""))

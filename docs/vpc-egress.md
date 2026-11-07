@@ -96,6 +96,11 @@ status:
   informer, no Go import of the address-controller). If the claim API is not
   installed, it creates one single-family Service per set field; the annotation then
   has no effect and the LB implementation assigns the address.
+- **Auto-claim.** With neither field set, a Service keeps a claim annotation that
+  names a claim the Service controls: the one the address-controller's auto-claim
+  creates for a LoadBalancer Service that names none. The platform's auto-claim
+  class then supplies the NAT gateway's dynamic address. The controller removes any
+  other claim annotation.
 - **Failures** are per family: `AddressAssigned=False` with a reason, and that
   family's routes are `Unresolved` (§3.3).
 

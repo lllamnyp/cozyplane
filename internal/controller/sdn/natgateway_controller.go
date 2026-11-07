@@ -448,7 +448,7 @@ func (r *NATGatewayReconciler) reconcileServices(ctx context.Context, ngw *sdnv1
 			if svc == nil {
 				continue // the cluster cannot serve these families
 			}
-		} else if changed := reconcileClaimAnnotation(svc, s.claim); changed || svc.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyLocal {
+		} else if changed := reconcileClaimAnnotation(svc, r.wantClaim(ctx, svc, s.claim)); changed || svc.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyLocal {
 			svc.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyLocal
 			if err := r.Update(ctx, svc); err != nil {
 				return nil, nil, fmt.Errorf("update NAT gateway service: %w", err)
@@ -477,6 +477,26 @@ func (r *NATGatewayReconciler) reconcileServices(ctx context.Context, ngw *sdnv1
 }
 
 type addrsBySlot = map[string]map[corev1.IPFamily]string
+
+// wantClaim is the claim annotation a slot's Service should carry: the slot's
+// claim, or, for a dynamic slot, the claim the address-controller's auto-claim
+// created for this Service (one it controls), so the platform's auto-claim
+// policy applies to NAT addresses too.
+func (r *NATGatewayReconciler) wantClaim(ctx context.Context, svc *corev1.Service, claim string) string {
+	cur := svc.Annotations[addressClaimAnnotation]
+	if claim != "" || cur == "" {
+		return claim
+	}
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(ipAddressClaimGVK)
+	if err := r.reader().Get(ctx, types.NamespacedName{Namespace: svc.Namespace, Name: cur}, u); err != nil {
+		return claim
+	}
+	if c := metav1.GetControllerOf(u); c != nil && c.UID == svc.UID {
+		return cur
+	}
+	return claim
+}
 
 // deleteServices deletes the owned Services whose slot is not in keep.
 func (r *NATGatewayReconciler) deleteServices(ctx context.Context, ngw *sdnv1alpha1.NATGateway, keep map[string]bool) error {
