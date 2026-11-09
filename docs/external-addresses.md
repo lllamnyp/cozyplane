@@ -204,9 +204,11 @@ never a Service**, so there is no IP to share, and the earlier claim-owns-the-Se
 
 - **Dynamic (no `addressClaimName`):** the FloatingIP/VPCGateway owns its one
   Service; the LB implementation auto-assigns; the address lives for the object's
-  lifetime. If the address-controller's auto-claim attaches a claim to the Service
-  (one the Service controls), the Service keeps that annotation, and the auto-claim
-  class supplies the address.
+  lifetime. cozyplane changes or removes the claim annotation only if no other
+  field manager owns it, so an annotation the address-controller's auto-claim wrote
+  stays, and the auto-claim class supplies the address. Naming a claim then
+  replaces the Service: only a new one can carry it without touching the other
+  manager's field.
 - **Reserved (`addressClaimName` set):** the **same** owned Service, plus the one
   annotation. The driver pins the claim's address onto it, and cozyplane consumes
   `status.loadBalancer.ingress` exactly as in the dynamic case — reserved and
@@ -230,8 +232,7 @@ informer, no module import (the repos are private and the API alpha; a Go import
 would couple builds). The reads are GETs of a claim: a named claim's
 `status.addresses`, which decides the families of the Service the `NATGateway`
 controller creates ([vpc-egress.md](vpc-egress.md) §2.1) and which address a
-FloatingIP or NAT gateway accepts, and the controller of an annotated claim, which
-identifies an auto-claim. The annotation key
+FloatingIP or NAT gateway accepts. The annotation key
 mirrors the address-controller's `well_known.go` constant, with the authority named
 at the mirror.
 

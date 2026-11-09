@@ -406,3 +406,45 @@ func TestFloatingIPClaimNotAttached(t *testing.T) {
 		t.Errorf("endpoint slice %+v, want a ready endpoint", eps)
 	}
 }
+
+// A FloatingIP leaves a claim annotation another field manager set while it names
+// no claim; naming one then replaces the Service, since only a new Service can
+// carry it without touching the other manager's field.
+func TestFloatingIPClaimAnnotationOwnership(t *testing.T) {
+	s := gatewayScheme(t)
+	base := fake.NewClientBuilder().WithScheme(s).WithReturnManagedFields().
+		WithObjects(livePort("team-a", "vpc-a", "10.0.0.5", "node-1"), floatingIP("team-a", "web", "vpc-a", "10.0.0.5")).
+		WithStatusSubresource(&sdnv1alpha1.FloatingIP{}, &corev1.Service{}).Build()
+	ours := client.WithFieldOwner(base, FieldOwner)
+	reconcile := func() {
+		t.Helper()
+		r := &FloatingIPReconciler{Client: ours, Scheme: s}
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "team-a", Name: "web"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reconcile()
+	svc := ownedFloatingService(t, base, "team-a", "web")
+	svc.Annotations = map[string]string{addressClaimAnnotation: "auto"}
+	if err := client.WithFieldOwner(base, "address-controller").Update(context.Background(), svc); err != nil {
+		t.Fatal(err)
+	}
+	reconcile()
+	if got := ownedFloatingService(t, base, "team-a", "web"); got.Name != svc.Name || got.Annotations[addressClaimAnnotation] != "auto" {
+		t.Errorf("service %s annotation %q, want the same Service with auto left in place", got.Name, got.Annotations[addressClaimAnnotation])
+	}
+
+	fip := &sdnv1alpha1.FloatingIP{}
+	if err := base.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: "web"}, fip); err != nil {
+		t.Fatal(err)
+	}
+	fip.Spec.AddressClaimName = "my-eip"
+	if err := base.Update(context.Background(), fip); err != nil {
+		t.Fatal(err)
+	}
+	reconcile() // deletes the Service carrying the other claim
+	reconcile() // creates its replacement
+	if got := ownedFloatingService(t, base, "team-a", "web"); got == nil || got.Name == svc.Name || got.Annotations[addressClaimAnnotation] != "my-eip" {
+		t.Errorf("service %v, want a new Service annotated my-eip", got)
+	}
+}

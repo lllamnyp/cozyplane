@@ -257,12 +257,22 @@ func (r *FloatingIPReconciler) ensureService(ctx context.Context, fip *sdnv1alph
 		// Reservation (docs/external-addresses.md §7): keep the association
 		// annotation in step with spec.addressClaimName; the claim's driver
 		// does the pinning.
-		if reconcileClaimAnnotation(svc, keepAutoClaim(ctx, r.reader(), svc, fip.Spec.AddressClaimName)) {
+		changed, replace := syncClaimAnnotation(svc, fip.Spec.AddressClaimName)
+		switch {
+		case replace:
+			// It carries another manager's claim: only a new Service can
+			// carry this FloatingIP's.
+			if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
+				return nil, fmt.Errorf("delete floating service carrying another claim: %w", err)
+			}
+		case changed:
 			if err := r.Update(ctx, svc); err != nil {
 				return nil, fmt.Errorf("update floating service annotations: %w", err)
 			}
+			return svc, nil
+		default:
+			return svc, nil
 		}
-		return svc, nil
 	}
 	svc = &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{

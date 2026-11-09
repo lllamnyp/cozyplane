@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
@@ -333,32 +334,38 @@ func TestNATGatewayClaimNotAttached(t *testing.T) {
 	}
 }
 
-// A dynamic slot keeps the claim the address-controller's auto-claim created
-// for its Service, and drops any other.
-func TestNATGatewayKeepsAutoClaim(t *testing.T) {
+// The NAT gateway controller changes and removes only the claim annotation it
+// wrote. One another field manager set (the address-controller's auto-claim, on
+// a Service that names no claim) stays; when a claimed slot finds one, its
+// Service is replaced (docs/vpc-egress.md §2.1).
+func TestNATGatewayClaimAnnotationOwnership(t *testing.T) {
 	s := claimScheme(t)
-	c := egressClient(t, s, vpcWithCIDRs("t", "v", 100, "10.0.0.0/24"), natgw("t", "egress", "v", "", ""))
-	reconcileNATGateway(t, s, c, "t", "egress")
-	svc := ngwServices(t, c, "t", "egress")["dynamic-IPv4"]
-	auto := ipClaim("t", svc.Name, "Bound", "203.0.113.9")
-	auto.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: "v1", Kind: "Service", Name: svc.Name, UID: svc.UID, Controller: new(true)}})
-	other := ipClaim("t", "someone-elses", "Bound", "203.0.113.10")
-	for _, o := range []client.Object{auto, other} {
-		if err := c.Create(context.Background(), o); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for claim, keep := range map[string]bool{svc.Name: true, "someone-elses": false} {
-		svc := ngwServices(t, c, "t", "egress")["dynamic-IPv4"]
+	base := fake.NewClientBuilder().WithScheme(s).WithReturnManagedFields().
+		WithObjects(vpcWithCIDRs("t", "v", 100, "10.0.0.0/24"), natgw("t", "egress", "v", "", ""),
+			ipClaim("t", "c4", "Bound", "203.0.113.9")).
+		WithStatusSubresource(&sdnv1alpha1.NATGateway{}, &corev1.Service{}).Build()
+	ours := client.WithFieldOwner(base, FieldOwner)
+	theirs := client.WithFieldOwner(base, "address-controller")
+	annotate := func(c client.Client, claim string) {
+		t.Helper()
+		svc := ngwServices(t, base, "t", "egress")["dynamic-IPv4"]
 		svc.Annotations = map[string]string{addressClaimAnnotation: claim}
 		if err := c.Update(context.Background(), svc); err != nil {
 			t.Fatal(err)
 		}
-		reconcileNATGateway(t, s, c, "t", "egress")
-		got := ngwServices(t, c, "t", "egress")["dynamic-IPv4"].Annotations[addressClaimAnnotation]
-		if (got == claim) != keep {
-			t.Errorf("claim %q: annotation after reconcile = %q, keep = %v", claim, got, keep)
-		}
+	}
+	reconcileNATGateway(t, s, ours, "t", "egress")
+
+	annotate(theirs, "auto")
+	reconcileNATGateway(t, s, ours, "t", "egress")
+	if got := ngwServices(t, base, "t", "egress")["dynamic-IPv4"].Annotations[addressClaimAnnotation]; got != "auto" {
+		t.Errorf("another manager's annotation = %q after reconcile, want it left as auto", got)
+	}
+
+	annotate(ours, "stale")
+	reconcileNATGateway(t, s, ours, "t", "egress")
+	if got, ok := ngwServices(t, base, "t", "egress")["dynamic-IPv4"].Annotations[addressClaimAnnotation]; ok {
+		t.Errorf("cozyplane's own annotation = %q after reconcile, want it removed", got)
 	}
 }
 

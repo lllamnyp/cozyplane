@@ -392,6 +392,16 @@ func (r *NATGatewayReconciler) reconcileServices(ctx context.Context, ngw *sdnv1
 	for _, s := range slots {
 		keep[s.key] = true
 		svc := owned[s.key]
+		if svc != nil {
+			if _, replace := syncClaimAnnotation(svc.DeepCopy(), s.claim); replace {
+				// It carries another manager's claim: only a new Service
+				// can carry this slot's.
+				if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
+					return nil, nil, fmt.Errorf("delete NAT gateway service carrying another claim: %w", err)
+				}
+				svc = nil
+			}
+		}
 		if svc != nil && !sameFamilies(svc.Spec.IPFamilies, s.families) {
 			if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
 				return nil, nil, fmt.Errorf("delete NAT gateway service for a family change: %w", err)
@@ -410,7 +420,7 @@ func (r *NATGatewayReconciler) reconcileServices(ctx context.Context, ngw *sdnv1
 			if svc == nil {
 				continue // the cluster cannot serve these families
 			}
-		} else if changed := reconcileClaimAnnotation(svc, r.wantClaim(ctx, svc, s.claim)); changed || svc.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyLocal {
+		} else if changed, _ := syncClaimAnnotation(svc, s.claim); changed || svc.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyLocal {
 			svc.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyLocal
 			if err := r.Update(ctx, svc); err != nil {
 				return nil, nil, fmt.Errorf("update NAT gateway service: %w", err)
@@ -439,11 +449,6 @@ func (r *NATGatewayReconciler) reconcileServices(ctx context.Context, ngw *sdnv1
 }
 
 type addrsBySlot = map[string]map[corev1.IPFamily]string
-
-// wantClaim is the claim annotation a slot's Service should carry (keepAutoClaim).
-func (r *NATGatewayReconciler) wantClaim(ctx context.Context, svc *corev1.Service, claim string) string {
-	return keepAutoClaim(ctx, r.reader(), svc, claim)
-}
 
 // deleteServices deletes the owned Services whose slot is not in keep.
 func (r *NATGatewayReconciler) deleteServices(ctx context.Context, ngw *sdnv1alpha1.NATGateway, keep map[string]bool) error {
@@ -492,7 +497,7 @@ func (r *NATGatewayReconciler) adoptGatewayService(ctx context.Context, ngw *sdn
 		if err := controllerutil.SetControllerReference(ngw, svc, r.Scheme); err != nil {
 			return nil, err
 		}
-		reconcileClaimAnnotation(svc, s.claim)
+		syncClaimAnnotation(svc, s.claim)
 		if err := r.Update(ctx, svc); err != nil {
 			return nil, fmt.Errorf("adopt VPCGateway NAT service: %w", err)
 		}

@@ -18,6 +18,7 @@ package sdn
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/netip"
 
@@ -73,22 +74,47 @@ func readClaim(ctx context.Context, rd client.Reader, namespace, name string) (n
 	return info, nil
 }
 
-// keepAutoClaim is the claim annotation a Service should carry: claim, or, when
-// claim is empty, the claim the address-controller's auto-claim
-// created for this Service (one it controls), so the platform's auto-claim
-// policy applies to cozyplane's Services too.
-func keepAutoClaim(ctx context.Context, rd client.Reader, svc *corev1.Service, claim string) string {
+// FieldOwner is the field manager of every sdn controller write. annotationOwnedByOthers
+// checks ownership against it, so the writer and the check cannot drift. The
+// value is the name the manager had before it was set explicitly, so the
+// annotations it wrote then are still its own.
+const FieldOwner = "sdn-controller"
+
+// annotationOwnedByOthers reports whether a field manager other than FieldOwner
+// owns the annotation key on obj.
+func annotationOwnedByOthers(obj metav1.Object, key string) bool {
+	for _, mf := range obj.GetManagedFields() {
+		if mf.Manager == FieldOwner || mf.FieldsV1 == nil {
+			continue
+		}
+		var fields struct {
+			Metadata struct {
+				Annotations map[string]json.RawMessage `json:"f:annotations"`
+			} `json:"f:metadata"`
+		}
+		if json.Unmarshal(mf.FieldsV1.Raw, &fields) != nil {
+			continue
+		}
+		if _, ok := fields.Metadata.Annotations["f:"+key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// syncClaimAnnotation moves the Service's claim annotation to want, unless
+// another field manager owns it: cozyplane changes and removes only what it
+// wrote. A foreign annotation stays when want is empty (the address-controller's
+// auto-claim sets one on a Service that names no claim); replace reports that
+// want names a different claim, which the Service can carry only if it is
+// replaced.
+func syncClaimAnnotation(svc *corev1.Service, want string) (changed, replace bool) {
 	cur := svc.Annotations[addressClaimAnnotation]
-	if claim != "" || cur == "" {
-		return claim
+	if cur == want {
+		return false, false
 	}
-	u := &unstructured.Unstructured{}
-	u.SetGroupVersionKind(ipAddressClaimGVK)
-	if err := rd.Get(ctx, types.NamespacedName{Namespace: svc.Namespace, Name: cur}, u); err != nil {
-		return claim
+	if cur != "" && annotationOwnedByOthers(svc, addressClaimAnnotation) {
+		return false, want != ""
 	}
-	if c := metav1.GetControllerOf(u); c != nil && c.UID == svc.UID {
-		return cur
-	}
-	return claim
+	return reconcileClaimAnnotation(svc, want), false
 }
