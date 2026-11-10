@@ -100,6 +100,69 @@ func TestPlanTCX(t *testing.T) {
 	}
 }
 
+// A peer CNI sharing the veth programs its endpoint after CNI ADD returns, so
+// the order we established at attach time is not the order that survives. These
+// are the states the reconciler has to tell apart, and the rule is not
+// symmetric: a VPC leg needs our terminal verdicts FIRST, the default network
+// needs the peer's load-balancing and conntrack to see the packet first.
+func TestTCXOrderOK(t *testing.T) {
+	tests := []struct {
+		name      string
+		ours      int
+		n         int
+		wantFirst bool
+		want      bool
+	}{{
+		// Nobody else is here. There is no "before" or "after" to be in.
+		name: "alone on a VPC leg", ours: 0, n: 1, wantFirst: true, want: true,
+	}, {
+		name: "alone on the default network", ours: 0, n: 1, wantFirst: false, want: true,
+	}, {
+		name: "VPC leg, we run first", ours: 0, n: 2, wantFirst: true, want: true,
+	}, {
+		// The state that costs isolation: the peer sees the tenant address
+		// before our verdict, and an overlapping address reads as a fabric one.
+		name: "VPC leg, the peer got ahead of us", ours: 1, n: 2, wantFirst: true, want: false,
+	}, {
+		name: "default network, we run last", ours: 1, n: 2, wantFirst: false, want: true,
+	}, {
+		// Here being first is the defect: we would rewrite before the peer's
+		// conntrack and service load-balancing ever saw the packet.
+		name: "default network, we got ahead of the peer", ours: 0, n: 2, wantFirst: false, want: false,
+	}, {
+		name: "default network, stuck in the middle of three", ours: 1, n: 3, wantFirst: false, want: false,
+	}, {
+		name: "VPC leg, third of three", ours: 2, n: 3, wantFirst: true, want: false,
+	}, {
+		// Not attached. Not an ordering fault, but Cilium has been seen to leave
+		// a stale pin behind while replacing a hook's list, and this loop is the
+		// only one that revisits a live veth — so it must not call this fine.
+		name: "not attached at all", ours: -1, n: 1, wantFirst: true, want: false,
+	}, {
+		name: "not attached, default network", ours: -1, n: 2, wantFirst: false, want: false,
+	}}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tcxOrderOK(tc.ours, tc.n, tc.wantFirst); got != tc.want {
+				t.Errorf("tcxOrderOK(%d, %d, %v) = %v, want %v",
+					tc.ours, tc.n, tc.wantFirst, got, tc.want)
+			}
+		})
+	}
+}
+
+// Being alone must never ask for a repair, whichever end we would otherwise
+// want: a reconciler that moved a lone link would detach and re-attach it every
+// tick, opening an unclassified window each time for nothing.
+func TestTCXOrderAloneNeverMoves(t *testing.T) {
+	for _, wantFirst := range []bool{true, false} {
+		if !tcxOrderOK(0, 1, wantFirst) {
+			t.Errorf("a lone link with wantFirst=%v was judged out of order", wantFirst)
+		}
+	}
+}
+
 func TestPlanTCXEmpty(t *testing.T) {
 	// No links of ours: the caller must take the fresh-attach path, so there is
 	// no survivor to point at.
