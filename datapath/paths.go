@@ -48,7 +48,7 @@ const (
 	cfgVNI           = uint32(1)
 	// cfgNATVPCQuota is the live NAT flows one VPC may hold on this node
 	// (docs/vpc-egress.md §4.2); 0 = no limit.
-	cfgNATVPCQuota = uint32(11)
+	cfgNATVPCQuota   = uint32(11)
 	cfgUplinkIfindex = uint32(2)
 	// cfgNodeIP is the node's v4 InternalIP (raw network-order bytes, native
 	// read): the Geneve/DNS-steer node handle. Distinct from cfgMasqIP below.
