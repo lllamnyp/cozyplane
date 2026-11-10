@@ -21,3 +21,7 @@ package v1alpha1
 // FabricIPListerExpansion allows custom methods to be added to
 // FabricIPLister.
 type FabricIPListerExpansion interface{}
+
+// NATPortBlockListerExpansion allows custom methods to be added to
+// NATPortBlockLister.
+type NATPortBlockListerExpansion interface{}

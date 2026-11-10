@@ -49,6 +49,7 @@ const (
 var sdnPlurals = []string{
 	"vpcs", "vpcbindings", "vpcpeerings", "vpcgateways", "ports", "externalpools",
 	"floatingips", "servicevips", "securitygroups", "hostfirewalls",
+	"natgateways", "routetables", "routes",
 }
 
 var apiServiceGVR = schema.GroupVersionResource{

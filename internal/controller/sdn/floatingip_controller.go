@@ -53,6 +53,15 @@ type FloatingIPReconciler struct {
 	client.Client
 
 	Scheme *runtime.Scheme
+	// Reader reads IPAddressClaims uncached; nil falls back to Client.
+	Reader client.Reader
+}
+
+func (r *FloatingIPReconciler) reader() client.Reader {
+	if r.Reader != nil {
+		return r.Reader
+	}
+	return r.Client
 }
 
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=floatingips,verbs=get;list;watch
@@ -94,16 +103,25 @@ func (r *FloatingIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// binding gets no Service — an address it could never program is a leak.
 	var svc *corev1.Service
 	var err error
+	var foreign, claimMsg string
 	if exclusive {
 		svc, err = r.ensureService(ctx, fip)
+		if err == nil && svc != nil {
+			foreign, claimMsg, err = r.foreignAddress(ctx, fip, ingressAddress(svc))
+		}
 		// The LB implementation announces the address only while the owned Service
 		// has a ready endpoint (MetalLB gates L2/BGP advertisement on endpoints —
 		// verified on dev4). The Service is selectorless, so cozyplane synthesizes
 		// one endpoint, ready iff the target Port is live: this makes announcement
 		// track liveness (address held but dark when the target is gone), matching
-		// the datapath, which only delivers to a live target.
+		// the datapath, which only delivers to a live target. An address that is
+		// not the claim's stays dark too.
 		if err == nil && svc != nil {
-			err = r.ensureEndpointSlice(ctx, svc, fip, targetNode)
+			node := targetNode
+			if foreign != "" {
+				node = ""
+			}
+			err = r.ensureEndpointSlice(ctx, svc, fip, node)
 		}
 	} else {
 		err = r.deleteOwnedService(ctx, fip) // its owned EndpointSlice cascades with it
@@ -113,6 +131,9 @@ func (r *FloatingIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	address := ingressAddress(svc)
+	if foreign != "" {
+		address = ""
+	}
 	addressAssigned := address != ""
 
 	status := sdnv1alpha1.FloatingIPStatus{
@@ -123,8 +144,13 @@ func (r *FloatingIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	setFIPCondition(&status, sdnv1alpha1.FloatingIPConditionServiceReady, svc != nil,
 		"ServiceReady", "the owned LoadBalancer Service exists")
-	setFIPCondition(&status, sdnv1alpha1.FloatingIPConditionAddressAssigned, addressAssigned,
-		"AddressAssigned", "the load-balancer implementation assigned an address")
+	if foreign != "" {
+		meta.SetStatusCondition(&status.Conditions, metav1.Condition{Type: sdnv1alpha1.FloatingIPConditionAddressAssigned,
+			Status: metav1.ConditionFalse, Reason: "ClaimNotAttached", Message: claimMsg})
+	} else {
+		setFIPCondition(&status, sdnv1alpha1.FloatingIPConditionAddressAssigned, addressAssigned,
+			"AddressAssigned", "the load-balancer implementation assigned an address")
+	}
 	setFIPCondition(&status, sdnv1alpha1.FloatingIPConditionTargetLive, targetLive,
 		"TargetLive", "the target tenant IP belongs to a running pod's Port")
 	if exclusive {
@@ -231,12 +257,22 @@ func (r *FloatingIPReconciler) ensureService(ctx context.Context, fip *sdnv1alph
 		// Reservation (docs/external-addresses.md §7): keep the association
 		// annotation in step with spec.addressClaimName; the claim's driver
 		// does the pinning.
-		if reconcileClaimAnnotation(svc, fip.Spec.AddressClaimName) {
+		changed, replace := syncClaimAnnotation(svc, fip.Spec.AddressClaimName)
+		switch {
+		case replace:
+			// It carries another manager's claim: only a new Service can
+			// carry this FloatingIP's.
+			if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
+				return nil, fmt.Errorf("delete floating service carrying another claim: %w", err)
+			}
+		case changed:
 			if err := r.Update(ctx, svc); err != nil {
 				return nil, fmt.Errorf("update floating service annotations: %w", err)
 			}
+			return svc, nil
+		default:
+			return svc, nil
 		}
-		return svc, nil
 	}
 	svc = &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -265,6 +301,28 @@ func (r *FloatingIPReconciler) ensureService(ctx context.Context, fip *sdnv1alph
 		return nil, fmt.Errorf("create floating service: %w", err)
 	}
 	return svc, nil
+}
+
+// foreignAddress returns the Service's address if the FloatingIP names a claim
+// and the address is not the claim's, with the reason. The Service then got the
+// address from the LB implementation's pools, e.g. because the claim is missing,
+// unbound, or attached to another Service. With no claim, or no claim API, every
+// address is the FloatingIP's.
+func (r *FloatingIPReconciler) foreignAddress(ctx context.Context, fip *sdnv1alpha1.FloatingIP, addr string) (string, string, error) {
+	claim := fip.Spec.AddressClaimName
+	if claim == "" || addr == "" {
+		return "", "", nil
+	}
+	info, err := readClaim(ctx, r.reader(), fip.Namespace, claim)
+	if err != nil || info.apiMissing {
+		return "", "", err
+	}
+	for _, a := range info.addresses {
+		if a == addr {
+			return "", "", nil
+		}
+	}
+	return addr, fmt.Sprintf("the LoadBalancer Service holds %s, which is not an address of IPAddressClaim %q; the claim may be missing, unbound, or attached to another Service", addr, claim), nil
 }
 
 // deleteOwnedService removes the FloatingIP's Service — a losing (non-exclusive)

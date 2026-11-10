@@ -29,6 +29,7 @@ import (
 type LocalV1alpha1Interface interface {
 	RESTClient() rest.Interface
 	FabricIPsGetter
+	NATPortBlocksGetter
 }
 
 // LocalV1alpha1Client is used to interact with features provided by the local.sdn.cozystack.io group.
@@ -38,6 +39,10 @@ type LocalV1alpha1Client struct {
 
 func (c *LocalV1alpha1Client) FabricIPs() FabricIPInterface {
 	return newFabricIPs(c)
+}
+
+func (c *LocalV1alpha1Client) NATPortBlocks() NATPortBlockInterface {
+	return newNATPortBlocks(c)
 }
 
 // NewForConfig creates a new LocalV1alpha1Client for the given config.

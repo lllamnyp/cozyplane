@@ -25,37 +25,57 @@ import (
 
 // nodePoolIndex is the agent's view of which nodes are Ready.
 //
-// It exists for one thing now: the VPC NAT gateway cuts the masquerade port space
-// into a shard per node (docs/north-south.md § increment 2), and every agent must
-// derive the same partition without coordinating. Sorted node names give that.
+// It exists for one thing: a NAT port block is used only once every Ready node
+// has acked its lease (docs/vpc-egress.md §4.3), so the agents need the Ready set.
 //
 // It used to carry, in addition, which ExternalPools each node could put a frame
 // on — the electorate for announcing floating addresses. Cozyplane does not
 // announce any more (tenet 3), so the electorate went with the election.
 type nodePoolIndex struct {
 	mu    sync.Mutex
-	nodes map[string]bool // Ready nodes
+	nodes map[string]bool   // Ready nodes
+	boot  map[string]string // node -> boot ID, every node seen
 	subs  []func()
 }
 
 func newNodePoolIndex() *nodePoolIndex {
-	return &nodePoolIndex{nodes: map[string]bool{}}
+	return &nodePoolIndex{nodes: map[string]bool{}, boot: map[string]string{}}
 }
 
-// onChange registers a callback fired whenever the node set changes: a node
-// joining or leaving re-cuts the NAT port shards.
+// readyBoots returns the Ready nodes with their boot IDs ("" when unknown).
+func (n *nodePoolIndex) readyBoots() map[string]string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	out := make(map[string]string, len(n.nodes))
+	for name := range n.nodes {
+		out[name] = n.boot[name]
+	}
+	return out
+}
+
+// bootID returns a node's boot ID, or "".
+func (n *nodePoolIndex) bootID(name string) string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.boot[name]
+}
+
+// onChange registers a callback fired whenever the node set changes: a block's
+// required acks change with it.
 func (n *nodePoolIndex) onChange(f func()) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.subs = append(n.subs, f)
 }
 
-// set records a node's readiness. NotReady and gone are the same thing to a shard
-// that has to land somewhere alive.
+// set records a node's readiness. A NotReady node is not waited for: its agent
+// may not be running to ack.
 func (n *nodePoolIndex) set(node *corev1.Node) {
 	ready := nodeReady(node)
+	boot := node.Status.NodeInfo.BootID
 	n.mu.Lock()
-	changed := n.nodes[node.Name] != ready
+	changed := n.nodes[node.Name] != ready || n.boot[node.Name] != boot
+	n.boot[node.Name] = boot
 	if ready {
 		n.nodes[node.Name] = true
 	} else {
@@ -85,9 +105,7 @@ func (n *nodePoolIndex) del(name string) {
 	}
 }
 
-// sortedNames is the node order the NAT port shards are cut from. Sorted, so every
-// agent derives the same partition without coordinating. A node joining or leaving
-// re-cuts the shards and breaks live NAT flows — recorded in docs/north-south.md.
+// sortedNames returns the Ready nodes, sorted.
 func (n *nodePoolIndex) sortedNames() []string {
 	n.mu.Lock()
 	defer n.mu.Unlock()

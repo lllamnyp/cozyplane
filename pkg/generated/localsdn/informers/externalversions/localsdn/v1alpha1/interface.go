@@ -26,6 +26,8 @@ import (
 type Interface interface {
 	// FabricIPs returns a FabricIPInformer.
 	FabricIPs() FabricIPInformer
+	// NATPortBlocks returns a NATPortBlockInformer.
+	NATPortBlocks() NATPortBlockInformer
 }
 
 type version struct {
@@ -42,4 +44,9 @@ func New(f internalinterfaces.SharedInformerFactory, namespace string, tweakList
 // FabricIPs returns a FabricIPInformer.
 func (v *version) FabricIPs() FabricIPInformer {
 	return &fabricIPInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
+}
+
+// NATPortBlocks returns a NATPortBlockInformer.
+func (v *version) NATPortBlocks() NATPortBlockInformer {
+	return &nATPortBlockInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
 }

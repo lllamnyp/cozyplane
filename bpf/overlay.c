@@ -34,6 +34,7 @@
 #define AF_INET 2 // for bpf_redir_neigh.nh_family (vmlinux.h carries no macros)
 #define TC_ACT_OK 0
 #define TC_ACT_SHOT 2
+#define PACKET_OTHERHOST 3 // skb->pkt_type: addressed to another host's MAC
 #define LINK_LOCAL_GW 0xA9FE0101 // 169.254.1.1 (host order)
 
 // The hairpin loopback: when a ServiceVIP backend dials its own service and
@@ -476,6 +477,230 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } nat_owner SEC(".maps");
 
+// ---------------------------------------------------------------------------
+// VPC egress: route tables and NAT gateways (docs/vpc-egress.md).
+//
+// vpc_nat, nat_of and nat_owner above are no longer read or written: the
+// definitions stay because dropping or reshaping a pinned map strands or rejects
+// the pin on every upgraded node (§5.1).
+
+// RT_DONE marks a packet vpc_egress has routed and handed back to from_pod
+// (local, peer, no table, or no match) so from_pod does not tail-call it again.
+// from_pod clears it on entry; a pod cannot forge it, because the kernel clears
+// a packet's mark when it leaves the pod's network namespace (§5.2).
+#define RT_DONE 0x040000 // bit 18
+
+// vpc_routes entry kinds (§5.1).
+#define RT_LOCAL      1
+#define RT_PEER       2
+#define RT_NAT        3
+#define RT_INTERNET   4
+#define RT_BLACKHOLE  5
+#define RT_UNRESOLVED 6
+
+struct rt_val {
+	__u8 kind;
+	__u8 pad;
+	__u16 natgw; // NAT gateway id, for RT_NAT
+};
+
+// port_rt: a local VPC Port {net, VPC IP} -> its route table id. Absent means the
+// Port has no table: only its local and peer routes apply.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct local_key);
+	__type(value, __u32);
+	__uint(max_entries, 65536);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} port_rt SEC(".maps");
+
+// vpc_routes: {table id, prefix} -> route. The agent copies each VPC's local and
+// peer CIDRs into every table of the VPC, so one longest-prefix lookup decides
+// between local, peer and explicit routes (§3.1).
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__type(key, struct lpm_key);
+	__type(value, struct rt_val);
+	__uint(max_entries, 16384);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} vpc_routes SEC(".maps");
+
+#define NAT_BASE_PORT  1024 // ports 1024..65535 are cut into blocks (§4.3)
+#define NATGW_BLOCKS   8    // active blocks a node may hold per NAT gateway
+#define NAT_ATTEMPTS   16   // allocation attempts
+#define NAT_DEEP       8    // an allocation needing more attempts is "deep"
+
+// nat_gw: NAT gateway id -> its addresses and THIS node's active blocks. Written
+// on every node; nblocks 0 means this node may not NAT through it yet.
+struct nat_gw {
+	struct addr128 ip;  // v4 address (NAT64 form); zero = none
+	struct addr128 ip6; // v6 address; zero = none
+	__u32 net;          // the VPC
+	__u16 block_size;
+	__u8 nblocks;
+	__u8 pad;
+	__u16 blocks[NATGW_BLOCKS];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u32);
+	__type(value, struct nat_gw);
+	__uint(max_entries, 4096);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} nat_gw SEC(".maps");
+
+// nat_addrs: a NAT gateway address -> whose it is, on every node: a reply may
+// arrive at any node.
+struct nat_addr_val {
+	__u32 natgw;
+	__u32 net;
+	__u16 block_size;
+	__u16 pad;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct addr128);
+	__type(value, struct nat_addr_val);
+	__uint(max_entries, 8192);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} nat_addrs SEC(".maps");
+
+struct nat_blk_key {
+	__u32 natgw;
+	__u16 block;
+	__u16 pad;
+};
+
+// nat_blk_owner: {NAT gateway, block} -> the Geneve endpoint (host order, as
+// `remotes` stores it) of the node that holds the block's flows.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct nat_blk_key);
+	__type(value, __u32);
+	__uint(max_entries, 65536);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} nat_blk_owner SEC(".maps");
+
+// NAT connection state (§4.2): nat_rev is the flow, nat_fwd its egress index.
+// Plain hash maps: a full map refuses the new flow; nothing is evicted. Only
+// the agent's sweep deletes, and it deletes both halves together.
+struct nat_fwd_key {
+	__u8 proto;
+	__u8 pad[3];
+	__u32 net;
+	struct addr128 pod_ip;
+	struct addr128 remote_ip;
+	__u16 pod_port;    // network order; the echo id for ICMP
+	__u16 remote_port; // network order; 0 for ICMP
+};
+
+struct nat_fwd_val {
+	__u32 natgw;
+	__u16 port; // network order
+	__u16 pad;
+};
+
+struct nat_rev_key {
+	__u8 proto;
+	__u8 pad;
+	__u16 port; // network order: the NAT gateway's port
+	__u32 natgw;
+	struct addr128 remote_ip;
+	__u16 remote_port; // network order; 0 for ICMP
+	__u16 pad2;
+};
+
+#define NAT_F_REPLY 1 // the reply direction has been seen
+#define NAT_F_FIN   2 // a TCP FIN or RST has been seen
+
+struct nat_rev_val {
+	__u64 last_seen; // bpf_ktime_get_ns
+	__u32 net;
+	struct addr128 pod_ip;
+	__u16 pod_port; // network order
+	__u8 flags;
+	__u8 pad;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct nat_fwd_key);
+	__type(value, struct nat_fwd_val);
+	__uint(max_entries, 262144);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} nat_fwd SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct nat_rev_key);
+	__type(value, struct nat_rev_val);
+	__uint(max_entries, 262144);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} nat_rev SEC(".maps");
+
+// nat_flows: a VPC's live NAT flows on this node, for the quota. The datapath
+// increments; the agent's sweep recomputes it.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u32);
+	__type(value, __u32);
+	__uint(max_entries, 4096);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} nat_flows SEC(".maps");
+
+// nat_stats counters (§4.6).
+#define NATS_NO_BLOCK    0
+#define NATS_EXHAUSTED   1
+#define NATS_QUOTA       2
+#define NATS_TABLE_FULL  3
+#define NATS_NO_ADDRESS  4
+#define NATS_DEEP        5
+#define NATS_UNSUPPORTED 6
+
+struct nat_stat_key {
+	__u32 natgw;
+	__u32 counter;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct nat_stat_key);
+	__type(value, __u64);
+	__uint(max_entries, 32768);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} nat_stats SEC(".maps");
+
+// route_drops reasons (§4.6).
+#define RTD_BLACKHOLE      0
+#define RTD_UNRESOLVED     1
+#define RTD_NO_FLOATING_IP 2
+#define RTD_NO_ROUTE       3
+
+struct route_drop_key {
+	__u32 net;
+	__u32 reason;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct route_drop_key);
+	__type(value, __u64);
+	__uint(max_entries, 16384);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} route_drops SEC(".maps");
+
 // vpc_ingress: net (VNI) -> 1, present only for a VPC whose gateway admits
 // LoadBalancer ingress (docs/north-south.md, tenet 7 — "nothing crosses by
 // default"). Absent means a Service type=LoadBalancer must NOT be able to open a
@@ -601,6 +826,8 @@ struct {
 #define CFG_HF_ENABLED     9 // 1 while a HostFirewall selects this node: arms
                              // the hf_ingress tail calls and the hf_ct pin
                              // writes. Set after the rule sync, cleared first.
+#define CFG_NAT_VPC_QUOTA 11 // live NAT flows one VPC may hold on this node
+                             // (docs/vpc-egress.md §4.2); 0 = no limit
 #define CFG_HF_EG_ENABLED 10 // 1 while a selecting HostFirewall declares
                              // policyTypes: Egress — the node's OWN new flows
                              // are default-deny (node->node and node->local-pod
@@ -3097,197 +3324,6 @@ static __always_inline int encap_lb(struct __sk_buff *skb, __u32 node_ip,
 	return bpf_redirect(geneve, 0);
 }
 
-#define NAT_MISS -1
-
-// vpc_nat_snat: a VPC pod's off-VPC egress, SNATed to the VPC's own address
-// (docs/north-south.md § increment 2). Run in from_pod at the POD's veth — the
-// only place the tenant is identifiable, since VPC CIDRs overlap and a source
-// address at the uplink names no one.
-//
-// The tenant->system boundary the gateway pod's netns firewall used to enforce is
-// preserved here: cluster-internal destinations are refused (is_internal), and the
-// SecurityGroup egress gate applies exactly as it does on the gateway path. DNS
-// never reaches this point — dns_steer already sent it to the split-horizon
-// resolver, for every VPC pod alike.
-//
-// The ct_fwd/ct_rev machinery is masq_snat's, unchanged: the same problem with
-// `net` set and a per-VPC address in place of the node's. Ports come from THIS
-// node's shard, so a reply can be demuxed back to the node holding the state.
-static __always_inline int vpc_nat_snat(struct __sk_buff *skb, struct pkt *p, __u32 net)
-{
-	struct vpc_nat *nat = bpf_map_lookup_elem(&vpc_nat, &net);
-	if (!nat)
-		return NAT_MISS; // no gateway, or no NAT identity: a closed island
-	if (is_internal(p->dst))
-		return NAT_MISS; // the tenant->system boundary: not ours to open
-	if (p->is_v6)
-		return NAT_MISS; // v6 VPC NAT: with the v6 pool work
-	if (p->proto != IPPROTO_TCP && p->proto != IPPROTO_UDP && p->proto != IPPROTO_ICMP)
-		return NAT_MISS;
-	if (!ns_egress_ok(skb, net, 0, p->proto, p->src, p->dst))
-		return TC_ACT_SHOT; // SG egress, the same gate the gateway path applies
-
-	void *data = (void *)(long)skb->data, *end = (void *)(long)skb->data_end;
-	struct iphdr *ip = data + ETH_HLEN;
-	if ((void *)(ip + 1) > end || ip->ihl != 5)
-		return NAT_MISS;
-	__u32 osrc = ip->saddr;
-	__u8 proto = ip->protocol;
-
-	// The link that can source this address, not a node-wide guess.
-	__u32 uplink;
-	__be32 xnh = 0, xbase = 0, xmask = 0;
-	struct ext_egress *xl = ext_link_of(&nat->ip);
-	if (xl) {
-		uplink = xl->ifindex;
-		xnh = xl->nh;
-		xbase = xl->base;
-		xmask = xl->mask; // copied: a packet store invalidates the map value
-	} else {
-		uplink = cfg(CFG_UPLINK_IFINDEX); // no link claims it: a routed pool
-	}
-	if (!uplink)
-		return NAT_MISS;
-
-	if (proto == IPPROTO_ICMP) {
-		__u8 type;
-		__u16 id;
-		if (icmp_echo(skb, &type, &id) < 0 || type != ICMP_ECHO_REQUEST)
-			return NAT_MISS;
-		struct ct_fwd_key fk = {
-			.proto = proto, .net = net,
-			.client_ip = p->src, .fabric_ip = p->dst,
-			.client_port = id,
-		};
-		__u16 gw_id;
-		__u16 *have = bpf_map_lookup_elem(&ct_fwd, &fk);
-		if (have) {
-			gw_id = *have;
-		} else {
-			gw_id = alloc_gw_port_in(proto, net, p->dst, 0, p->src, p->src, id,
-						 nat->port_base, nat->port_span);
-			if (!gw_id)
-				return NAT_MISS; // shard full: better unmasqueraded than dropped
-			bpf_map_update_elem(&ct_fwd, &fk, &gw_id, BPF_ANY);
-		}
-		nat_addr(skb, proto, IP_SADDR_OFF, osrc, v4_of_128(&nat->ip));
-		nat_icmp_id(skb, id, gw_id);
-		count_ns(net, skb->len, NS_GW, 0);
-		return ext_redirect(skb, uplink, xnh, xbase, xmask);
-	}
-
-	__u16 sport, dport;
-	if (l4_ports(skb, &sport, &dport) < 0)
-		return NAT_MISS;
-	struct ct_fwd_key fk = {
-		.proto = proto, .net = net,
-		.client_ip = p->src, .fabric_ip = p->dst,
-		.client_port = sport, .pod_port = dport,
-	};
-	__u16 gw_port;
-	__u16 *have = bpf_map_lookup_elem(&ct_fwd, &fk);
-	if (have) {
-		gw_port = *have;
-	} else {
-		gw_port = alloc_gw_port_in(proto, net, p->dst, dport, p->src, p->src, sport,
-					   nat->port_base, nat->port_span);
-		if (!gw_port)
-			return NAT_MISS;
-		bpf_map_update_elem(&ct_fwd, &fk, &gw_port, BPF_ANY);
-	}
-	nat_addr(skb, proto, IP_SADDR_OFF, osrc, v4_of_128(&nat->ip));
-	nat_port(skb, proto, L4_SPORT_OFF, sport, gw_port);
-	// The VPC's egress, through its own boundary, wearing its own address.
-	count_ns(net, skb->len, NS_GW, 0);
-	return ext_redirect(skb, uplink, xnh, xbase, xmask);
-}
-
-// vpc_nat_reverse: the reply half. A packet addressed to a VPC's NAT address
-// arrives at whichever node ATTRACTS that address — which is not necessarily the
-// node whose ct_rev holds the flow, because the SNAT happened at the pod's veth.
-// The port says who owns it: shard = (port - NAT_PORT_BASE) / NAT_SHARD_SPAN, and
-// nat_owner maps that to the owning node.
-//
-// Owned here  -> un-NAT from ct_rev and deliver straight into the pod's veth.
-// Owned there -> Geneve it to that node untouched, where from_overlay's probe
-//                does exactly the same thing with its own ct_rev.
-//
-// Returns NAT_MISS when the packet is not for a VPC NAT address at all.
-static __always_inline int vpc_nat_reverse(struct __sk_buff *skb, struct pkt *p)
-{
-	__u32 *netp = bpf_map_lookup_elem(&nat_of, &p->dst);
-	if (!netp)
-		return NAT_MISS;
-	__u32 net = *netp;
-
-	void *data = (void *)(long)skb->data, *end = (void *)(long)skb->data_end;
-	struct iphdr *ip = data + ETH_HLEN;
-	if ((void *)(ip + 1) > end || ip->ihl != 5)
-		return NAT_MISS;
-	__u8 proto = ip->protocol;
-	__u32 odst = ip->daddr;
-
-	__u16 gw_port = 0;
-	__u16 sport = 0, dport = 0;
-	__u8 type = 0;
-	if (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
-		if (l4_ports(skb, &sport, &dport) < 0)
-			return NAT_MISS;
-		gw_port = dport;
-	} else if (proto == IPPROTO_ICMP) {
-		if (icmp_echo(skb, &type, &gw_port) < 0 || type != ICMP_ECHO_REPLY)
-			return NAT_MISS;
-	} else {
-		return NAT_MISS;
-	}
-
-	// Whose shard is this port in?
-	__u16 h = bpf_ntohs(gw_port);
-	if (h < NAT_PORT_BASE)
-		return NAT_MISS;
-	struct nat_shard_key sk = { .ip = p->dst, .shard = (h - NAT_PORT_BASE) / NAT_SHARD_SPAN };
-	__u32 *owner = bpf_map_lookup_elem(&nat_owner, &sk);
-	if (!owner)
-		return NAT_MISS;
-	// nat_owner stores the node's Geneve endpoint the way `remotes` does — a
-	// HOST-order integer, which is what encap()/bpf_skb_set_tunnel_key want.
-	// CFG_NODE_IP holds the same address as raw network-order bytes (it is compared
-	// against packet fields elsewhere), so it has to be swapped to compare. Getting
-	// this wrong makes every reply "belong to someone else" and encapsulate into a
-	// loop.
-	if (*owner != bpf_ntohl(cfg(CFG_NODE_IP)))
-		return encap(skb, net, *owner, 0); // the state lives on that node
-
-	struct ct_rev_key rk = {
-		.proto = proto, .gw_port = gw_port, .net = net,
-		.vpc_ip = p->src, .pod_port = (proto == IPPROTO_ICMP) ? 0 : sport,
-	};
-	struct ct_rev_val *rv = bpf_map_lookup_elem(&ct_rev, &rk);
-	if (!rv)
-		return NAT_MISS; // no such flow: not a reply we masqueraded
-
-	struct endpoint *l = local_of(net, rv->fabric_ip);
-	if (!l)
-		return NAT_MISS; // the pod went away under the flow
-
-	nat_addr(skb, proto, IP_DADDR_OFF, odst, v4_of_128(&rv->fabric_ip));
-	if (proto == IPPROTO_ICMP)
-		nat_icmp_id(skb, gw_port, rv->client_port);
-	else
-		nat_port(skb, proto, L4_DPORT_OFF, gw_port, rv->client_port);
-	// This IS gateway-forwarded ingress — the VPC's gateway, now in eBPF — and it
-	// has to say so, or to_pod throws the reply away on the pod's own doorstep.
-	// Two gates there care: the isolation check refuses srcnet==0 -> dstnet!=0
-	// except for GW_MARK, and the SG ingress gate re-judges anything unmarked. The
-	// reply is neither unsolicited nor unjudged: the pod opened the flow, the SG
-	// EGRESS gate ran at the SNAT, and ct_rev proves it.
-	//
-	// ASSIGNED, not OR'd: the isolation escape tests `skb->mark == GW_MARK` for
-	// exact equality, so an extra bit is as good as no mark at all.
-	skb->mark = GW_MARK;
-	count_ns(net, skb->len, NS_GW, 1);
-	return deliver_local(skb, l);
-}
 
 #define MASQ_MISS -1
 
@@ -3692,152 +3728,6 @@ static __always_inline int masq_reverse6(struct __sk_buff *skb, struct pkt *p)
 	return TC_ACT_OK;
 }
 
-// vpc_nat_snat6 / vpc_nat_reverse6: the v6 twins of vpc_nat_snat / vpc_nat_reverse
-// (docs/north-south.md §6a). A dual-stack VPC wears a v4 identity for its v4 egress
-// and a v6 identity for its v6 egress — one boundary, one vpc_nat entry, two
-// addresses. The port shards, ct tables (addr128-keyed), nat_of and nat_owner are
-// all shared: a v4 and a v6 flow are disambiguated by the NAT address family in
-// nat_of/nat_owner and by the peer address in the ct keys, exactly as the v4/v6
-// cluster masquerade already shares MASQ_PORT_BASE and the ct tables.
-static __always_inline int vpc_nat_snat6(struct __sk_buff *skb, struct pkt *p, __u32 net)
-{
-	struct vpc_nat *nat = bpf_map_lookup_elem(&vpc_nat, &net);
-	if (!nat)
-		return NAT_MISS; // no gateway, or no NAT identity: a closed island
-	struct addr128 natip = nat->ip6, zero = {};
-	if (addr128_eq(&natip, &zero))
-		return NAT_MISS; // no v6 identity: this VPC's v6 egress still uses the pod
-	if (is_internal(p->dst))
-		return NAT_MISS; // the tenant->system boundary: not ours to open
-	if (v6_link_scoped(&p->dst))
-		return NAT_MISS; // NDP and friends are link-local, not egress
-	__u8 proto = p->proto;
-	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP && proto != IPPROTO_ICMPV6)
-		return NAT_MISS;
-	if (!ns_egress_ok(skb, net, 1, proto, p->src, p->dst))
-		return TC_ACT_SHOT; // SG egress, the same gate the gateway path applies
-	__u32 pb = nat->port_base, ps = nat->port_span;
-
-	// The link that can source this address. ext_links is v4-only today:
-	// EnsureFloatingUplink returns early for a v6 address, so nothing writes a
-	// v6 entry, which leaves the node-wide cell as the v6 answer until v6
-	// floating-uplink selection exists. Dropping straight to the default uplink
-	// here would move v6 egress off a secondary link that currently carries it.
-	// No v6 next-hop cell either: the FIB resolves the neighbour on that link.
-	struct ext_egress *xl = ext_link_of(&natip);
-	__u32 uplink = xl ? xl->ifindex : cfg(CFG_FLOAT_IFINDEX);
-	if (!uplink)
-		uplink = cfg(CFG_UPLINK_IFINDEX);
-	if (!uplink)
-		return NAT_MISS;
-
-	if (proto == IPPROTO_ICMPV6) {
-		__u8 type;
-		__u16 id;
-		if (icmp6_echo(skb, &type, &id) < 0 || type != ICMP6_ECHO_REQUEST)
-			return NAT_MISS;
-		struct ct_fwd_key fk = {
-			.proto = proto, .net = net,
-			.client_ip = p->src, .fabric_ip = p->dst,
-			.client_port = id,
-		};
-		__u16 gw_id;
-		__u16 *have = bpf_map_lookup_elem(&ct_fwd, &fk);
-		if (have) {
-			gw_id = *have;
-		} else {
-			gw_id = alloc_gw_port_in(proto, net, p->dst, 0, p->src, p->src, id, pb, ps);
-			if (!gw_id)
-				return NAT_MISS; // shard full: better unmasqueraded than dropped
-			bpf_map_update_elem(&ct_fwd, &fk, &gw_id, BPF_ANY);
-		}
-		nat_addr6(skb, proto, IP6_SADDR_OFF, &p->src, &natip);
-		nat_icmp6_id(skb, id, gw_id);
-		count_ns(net, skb->len, NS_GW, 0);
-		return bpf_redirect_neigh(uplink, NULL, 0, 0);
-	}
-
-	__u16 sport, dport;
-	if (l4_ports6(skb, &sport, &dport) < 0)
-		return NAT_MISS;
-	struct ct_fwd_key fk = {
-		.proto = proto, .net = net,
-		.client_ip = p->src, .fabric_ip = p->dst,
-		.client_port = sport, .pod_port = dport,
-	};
-	__u16 gw_port;
-	__u16 *have = bpf_map_lookup_elem(&ct_fwd, &fk);
-	if (have) {
-		gw_port = *have;
-	} else {
-		gw_port = alloc_gw_port_in(proto, net, p->dst, dport, p->src, p->src, sport, pb, ps);
-		if (!gw_port)
-			return NAT_MISS;
-		bpf_map_update_elem(&ct_fwd, &fk, &gw_port, BPF_ANY);
-	}
-	nat_addr6(skb, proto, IP6_SADDR_OFF, &p->src, &natip);
-	nat_port6(skb, proto, L4_SPORT_OFF6, sport, gw_port);
-	// The VPC's v6 egress, through its own boundary, wearing its own address.
-	count_ns(net, skb->len, NS_GW, 0);
-	return bpf_redirect_neigh(uplink, NULL, 0, 0);
-}
-
-static __always_inline int vpc_nat_reverse6(struct __sk_buff *skb, struct pkt *p)
-{
-	__u32 *netp = bpf_map_lookup_elem(&nat_of, &p->dst);
-	if (!netp)
-		return NAT_MISS;
-	__u32 net = *netp;
-	__u8 proto = p->proto;
-	struct addr128 odst = p->dst;
-
-	__u16 gw_port = 0, sport = 0, dport = 0;
-	__u8 type = 0;
-	if (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
-		if (l4_ports6(skb, &sport, &dport) < 0)
-			return NAT_MISS;
-		gw_port = dport;
-	} else if (proto == IPPROTO_ICMPV6) {
-		if (icmp6_echo(skb, &type, &gw_port) < 0 || type != ICMP6_ECHO_REPLY)
-			return NAT_MISS;
-	} else {
-		return NAT_MISS;
-	}
-
-	__u16 h = bpf_ntohs(gw_port);
-	if (h < NAT_PORT_BASE)
-		return NAT_MISS;
-	struct nat_shard_key sk = { .ip = p->dst, .shard = (h - NAT_PORT_BASE) / NAT_SHARD_SPAN };
-	__u32 *owner = bpf_map_lookup_elem(&nat_owner, &sk);
-	if (!owner)
-		return NAT_MISS;
-	if (*owner != bpf_ntohl(cfg(CFG_NODE_IP)))
-		return encap(skb, net, *owner, 0); // the state lives on that node
-
-	struct ct_rev_key rk = {
-		.proto = proto, .gw_port = gw_port, .net = net,
-		.vpc_ip = p->src, .pod_port = (proto == IPPROTO_ICMPV6) ? 0 : sport,
-	};
-	struct ct_rev_val *rv = bpf_map_lookup_elem(&ct_rev, &rk);
-	if (!rv)
-		return NAT_MISS;
-	struct endpoint *l = local_of(net, rv->fabric_ip);
-	if (!l)
-		return NAT_MISS;
-	struct addr128 pod = rv->fabric_ip;
-
-	nat_addr6(skb, proto, IP6_DADDR_OFF, &odst, &pod);
-	if (proto == IPPROTO_ICMPV6)
-		nat_icmp6_id(skb, gw_port, rv->client_port);
-	else
-		nat_port6(skb, proto, L4_DPORT_OFF6, gw_port, rv->client_port);
-	// Gateway-forwarded ingress: assigned, not OR'd (to_pod's isolation escape
-	// tests skb->mark == GW_MARK for exact equality). Same as the v4 twin.
-	skb->mark = GW_MARK;
-	count_ns(net, skb->len, NS_GW, 1);
-	return deliver_local(skb, l);
-}
-
 // cozyplane_from_pod: source-side hook (pod egress). Enforces isolation, then
 // delivers: same-node via redirect, cross-node via encap, off-VPC via gateway.
 // ---- ServiceVIP load balancing (services-in-vpc.md increment 2) -----------
@@ -4148,10 +4038,13 @@ struct {
 // else affected).
 struct {
 	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-	__uint(max_entries, 4); // 0: lb_ingress (from_uplink), 1: lb_dsr
+	__uint(max_entries, 7); // 0: lb_ingress (from_uplink), 1: lb_dsr
 	                        // (from_overlay), 2: hf_ingress (host firewall,
 	                        // every host-stack fall-through), 3: hf_egress
-	                        // (node -> remote pod, from_pod's remotes hit)
+	                        // (node -> remote pod, from_pod's remotes hit),
+	                        // 4: vpc_egress (from_pod's route decision),
+	                        // 5: from_pod (vpc_egress hands a packet back),
+	                        // 6: nat_reverse (from_uplink, from_overlay)
 	__type(key, __u32);
 	__type(value, __u32);
 } lb_prog SEC(".maps");
@@ -4777,6 +4670,567 @@ static __always_inline int dns_return(struct __sk_buff *skb, struct pkt *p)
 	return TC_ACT_OK;
 }
 
+// ---- VPC egress: NAT gateways and route tables (docs/vpc-egress.md) ------
+
+#define E2BIG 7 // vmlinux.h carries no errno macros
+
+// stat_inc adds one to a u64 counter, creating it on first use.
+static __always_inline void stat_inc(void *map, void *key)
+{
+	__u64 *v = bpf_map_lookup_elem(map, key);
+	if (v) {
+		__sync_fetch_and_add(v, 1);
+		return;
+	}
+	__u64 one = 1;
+	if (bpf_map_update_elem(map, key, &one, BPF_NOEXIST) != 0) {
+		v = bpf_map_lookup_elem(map, key); // another CPU created it first
+		if (v)
+			__sync_fetch_and_add(v, 1);
+	}
+}
+
+static __always_inline void nat_stat(__u32 natgw, __u32 counter)
+{
+	struct nat_stat_key k = { .natgw = natgw, .counter = counter };
+	stat_inc(&nat_stats, &k);
+}
+
+static __always_inline void route_drop(__u32 net, __u32 reason)
+{
+	struct route_drop_key k = { .net = net, .reason = reason };
+	stat_inc(&route_drops, &k);
+}
+
+// tcp_fin reports whether a TCP segment carries FIN or RST.
+static __always_inline __u8 tcp_fin(struct __sk_buff *skb, __u32 l4off)
+{
+	__u8 f = 0;
+	if (bpf_skb_load_bytes(skb, l4off + 13, &f, 1) < 0)
+		return 0;
+	return (f & 0x05) ? 1 : 0; // FIN 0x01, RST 0x04
+}
+
+// nat_flow returns the NAT gateway port of a flow (network order), allocating
+// one for a new flow, or 0 after counting why it could not (§4.2, §4.3).
+// nat_rev is the flow; a nat_fwd hit counts only if nat_rev still names this
+// pod and port under the NAT gateway the route now picks. The datapath only
+// inserts into nat_rev, never overwrites: the agent's sweep frees ports.
+static __always_inline __u16 nat_flow(__u8 proto, __u32 net, const struct addr128 *pod,
+				      const struct addr128 *remote, __u16 pod_port, __u16 remote_port,
+				      __u32 natgw, const __u16 *blocks, __u32 nb, __u32 bs, __u8 fin)
+{
+	__u64 now = bpf_ktime_get_ns();
+	struct nat_fwd_key fk = {
+		.proto = proto, .net = net,
+		.pod_ip = *pod, .remote_ip = *remote,
+		.pod_port = pod_port, .remote_port = remote_port,
+	};
+	struct nat_rev_key rk = {
+		.proto = proto, .natgw = natgw,
+		.remote_ip = *remote, .remote_port = remote_port,
+	};
+	struct nat_fwd_val *fv = bpf_map_lookup_elem(&nat_fwd, &fk);
+	if (fv && fv->natgw == natgw) {
+		rk.port = fv->port;
+		struct nat_rev_val *rv = bpf_map_lookup_elem(&nat_rev, &rk);
+		if (rv && rv->net == net && rv->pod_port == pod_port && addr128_eq(&rv->pod_ip, pod)) {
+			rv->last_seen = now;
+			if (fin)
+				rv->flags |= NAT_F_FIN;
+			return rk.port;
+		}
+	}
+
+	__u32 quota = cfg(CFG_NAT_VPC_QUOTA);
+	__u32 *flows = bpf_map_lookup_elem(&nat_flows, &net);
+	if (quota && flows && *flows >= quota) {
+		nat_stat(natgw, NATS_QUOTA);
+		return 0;
+	}
+
+	struct nat_rev_val nv = {
+		.last_seen = now, .net = net, .pod_ip = *pod,
+		.pod_port = pod_port, .flags = fin ? NAT_F_FIN : 0,
+	};
+	__u16 port = 0;
+	int full = 0, tries = 0;
+#pragma unroll
+	for (int i = 0; i < NAT_ATTEMPTS; i++) {
+		if (port || full)
+			break;
+		tries++;
+		__u32 r = bpf_get_prandom_u32();
+		__u32 bi = (r >> 16) % nb;
+		if (bi >= NATGW_BLOCKS)
+			continue;
+		__u32 hp = NAT_BASE_PORT + (__u32)blocks[bi] * bs + (r & 0xffff) % bs;
+		if (hp > 65535)
+			continue;
+		rk.port = bpf_htons(hp);
+		long err = bpf_map_update_elem(&nat_rev, &rk, &nv, BPF_NOEXIST);
+		if (err == 0)
+			port = rk.port;
+		else if (err == -E2BIG)
+			full = 1;
+	}
+	if (tries > NAT_DEEP)
+		nat_stat(natgw, NATS_DEEP);
+	if (!port) {
+		nat_stat(natgw, full ? NATS_TABLE_FULL : NATS_EXHAUSTED);
+		return 0;
+	}
+	struct nat_fwd_val nfv = { .natgw = natgw, .port = port };
+	if (bpf_map_update_elem(&nat_fwd, &fk, &nfv, BPF_ANY) != 0) {
+		bpf_map_delete_elem(&nat_rev, &rk);
+		nat_stat(natgw, NATS_TABLE_FULL);
+		return 0;
+	}
+	if (flows) {
+		__sync_fetch_and_add(flows, 1);
+	} else {
+		__u32 one = 1;
+		bpf_map_update_elem(&nat_flows, &net, &one, BPF_NOEXIST);
+	}
+	return port;
+}
+
+// nat_gw_of loads the NAT gateway's state this node needs to SNAT: the
+// address of the family, and the active blocks. Returns 0 after counting why
+// the node cannot NAT through it.
+static __always_inline int nat_gw_of(__u32 natgw, int is_v6, struct addr128 *ip,
+				     __u16 *blocks, __u32 *nb, __u32 *bs, __u32 *net)
+{
+	struct nat_gw *g = bpf_map_lookup_elem(&nat_gw, &natgw);
+	if (!g) {
+		nat_stat(natgw, NATS_NO_BLOCK);
+		return 0;
+	}
+	struct addr128 zero = {};
+	*ip = is_v6 ? g->ip6 : g->ip;
+	if (addr128_eq(ip, &zero)) {
+		nat_stat(natgw, NATS_NO_ADDRESS);
+		return 0;
+	}
+	*nb = g->nblocks;
+	*bs = g->block_size;
+	*net = g->net;
+	if (!*nb || *nb > NATGW_BLOCKS || !*bs) {
+		nat_stat(natgw, NATS_NO_BLOCK);
+		return 0;
+	}
+	__builtin_memcpy(blocks, g->blocks, sizeof(g->blocks));
+	return 1;
+}
+
+// nat_snat: SNAT a VPC Port's v4 packet to NAT gateway `natgw` and send it out
+// the link that carries the NAT gateway's address (§4.4).
+static __always_inline int nat_snat(struct __sk_buff *skb, struct pkt *p, __u32 net, __u32 natgw)
+{
+	struct addr128 natip;
+	__u16 blocks[NATGW_BLOCKS];
+	__u32 nb, bs, gnet;
+	if (!nat_gw_of(natgw, 0, &natip, blocks, &nb, &bs, &gnet))
+		return TC_ACT_SHOT;
+	if (gnet != net) {
+		nat_stat(natgw, NATS_NO_ADDRESS); // another VPC's NAT gateway
+		return TC_ACT_SHOT;
+	}
+
+	void *data = (void *)(long)skb->data, *end = (void *)(long)skb->data_end;
+	struct iphdr *ip = data + ETH_HLEN;
+	if ((void *)(ip + 1) > end || ip->ihl != 5) {
+		nat_stat(natgw, NATS_UNSUPPORTED);
+		return TC_ACT_SHOT;
+	}
+	__u32 osrc = ip->saddr;
+	__u8 proto = ip->protocol;
+	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP && proto != IPPROTO_ICMP) {
+		nat_stat(natgw, NATS_UNSUPPORTED);
+		return TC_ACT_SHOT;
+	}
+	if (!ns_egress_ok(skb, net, 0, proto, p->src, p->dst))
+		return TC_ACT_SHOT;
+
+	__u32 uplink;
+	__be32 xnh = 0, xbase = 0, xmask = 0;
+	struct ext_egress *xl = ext_link_of(&natip);
+	if (xl) {
+		uplink = xl->ifindex;
+		xnh = xl->nh;
+		xbase = xl->base;
+		xmask = xl->mask;
+	} else {
+		uplink = cfg(CFG_UPLINK_IFINDEX);
+	}
+	if (!uplink)
+		return TC_ACT_SHOT;
+
+	__u16 sport, dport = 0;
+	__u8 fin = 0;
+	if (proto == IPPROTO_ICMP) {
+		__u8 type;
+		if (icmp_echo(skb, &type, &sport) < 0 || type != ICMP_ECHO_REQUEST) {
+			nat_stat(natgw, NATS_UNSUPPORTED);
+			return TC_ACT_SHOT;
+		}
+	} else {
+		if (l4_ports(skb, &sport, &dport) < 0)
+			return TC_ACT_SHOT;
+		if (proto == IPPROTO_TCP)
+			fin = tcp_fin(skb, L4_OFF);
+	}
+	__u16 port = nat_flow(proto, net, &p->src, &p->dst, sport, dport, natgw, blocks, nb, bs, fin);
+	if (!port)
+		return TC_ACT_SHOT;
+
+	nat_addr(skb, proto, IP_SADDR_OFF, osrc, v4_of_128(&natip));
+	if (proto == IPPROTO_ICMP)
+		nat_icmp_id(skb, sport, port);
+	else
+		nat_port(skb, proto, L4_SPORT_OFF, sport, port);
+	count_ns(net, skb->len, NS_GW, 0);
+	return ext_redirect(skb, uplink, xnh, xbase, xmask);
+}
+
+// nat_snat6: the v6 twin of nat_snat.
+static __always_inline int nat_snat6(struct __sk_buff *skb, struct pkt *p, __u32 net, __u32 natgw)
+{
+	struct addr128 natip;
+	__u16 blocks[NATGW_BLOCKS];
+	__u32 nb, bs, gnet;
+	if (!nat_gw_of(natgw, 1, &natip, blocks, &nb, &bs, &gnet))
+		return TC_ACT_SHOT;
+	if (gnet != net) {
+		nat_stat(natgw, NATS_NO_ADDRESS);
+		return TC_ACT_SHOT;
+	}
+	__u8 proto = p->proto;
+	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP && proto != IPPROTO_ICMPV6) {
+		nat_stat(natgw, NATS_UNSUPPORTED);
+		return TC_ACT_SHOT;
+	}
+	if (!ns_egress_ok(skb, net, 1, proto, p->src, p->dst))
+		return TC_ACT_SHOT;
+	// ext_links holds no v6 entries yet (docs/lb-ingress.md); the node-wide
+	// floating cell stays the v6 answer, as for v6 FloatingIP egress.
+	struct ext_egress *xl = ext_link_of(&natip);
+	__u32 uplink = xl ? xl->ifindex : cfg(CFG_FLOAT_IFINDEX);
+	if (!uplink)
+		uplink = cfg(CFG_UPLINK_IFINDEX);
+	if (!uplink)
+		return TC_ACT_SHOT;
+
+	__u16 sport, dport = 0;
+	__u8 fin = 0;
+	if (proto == IPPROTO_ICMPV6) {
+		__u8 type;
+		if (icmp6_echo(skb, &type, &sport) < 0 || type != ICMP6_ECHO_REQUEST) {
+			nat_stat(natgw, NATS_UNSUPPORTED);
+			return TC_ACT_SHOT;
+		}
+	} else {
+		if (l4_ports6(skb, &sport, &dport) < 0)
+			return TC_ACT_SHOT;
+		if (proto == IPPROTO_TCP)
+			fin = tcp_fin(skb, L4_OFF6);
+	}
+	__u16 port = nat_flow(proto, net, &p->src, &p->dst, sport, dport, natgw, blocks, nb, bs, fin);
+	if (!port)
+		return TC_ACT_SHOT;
+
+	nat_addr6(skb, proto, IP6_SADDR_OFF, &p->src, &natip);
+	if (proto == IPPROTO_ICMPV6)
+		nat_icmp6_id(skb, sport, port);
+	else
+		nat_port6(skb, proto, L4_SPORT_OFF6, sport, port);
+	count_ns(net, skb->len, NS_GW, 0);
+	return bpf_redirect_neigh(uplink, NULL, 0, 0);
+}
+
+// nat_owner_or_encap: the block of `port` names the node holding the flow. Returns
+// 1 when that is this node, 0 when the packet is not ours to deliver; otherwise
+// it has already been encapsulated to the owner and *verdict holds the result.
+static __always_inline int nat_owner_or_encap(struct __sk_buff *skb, __u32 natgw, __u32 net,
+					      __u32 bs, __u16 port, int *verdict)
+{
+	__u16 hp = bpf_ntohs(port);
+	if (hp < NAT_BASE_PORT)
+		return 0;
+	struct nat_blk_key bk = { .natgw = natgw, .block = (hp - NAT_BASE_PORT) / bs };
+	__u32 *owner = bpf_map_lookup_elem(&nat_blk_owner, &bk);
+	if (!owner)
+		return 0;
+	if (*owner != bpf_ntohl(cfg(CFG_NODE_IP))) {
+		*verdict = encap(skb, net, *owner, 0);
+		return -1;
+	}
+	return 1;
+}
+
+// nat_reverse4: a v4 packet addressed to a NAT gateway — a reply, or an ICMP
+// error about a flow (§4.4, §4.5). Delivered to the pod if this node holds
+// the flow, forwarded to the owner if another node does, dropped otherwise.
+static __always_inline int nat_reverse4(struct __sk_buff *skb, struct pkt *p, __u32 natgw, __u32 net, __u32 bs)
+{
+	void *data = (void *)(long)skb->data, *end = (void *)(long)skb->data_end;
+	struct iphdr *ip = data + ETH_HLEN;
+	if ((void *)(ip + 1) > end || ip->ihl != 5)
+		return TC_ACT_SHOT;
+	__u8 proto = ip->protocol, lproto = proto;
+	__u32 odst = ip->daddr;
+	struct addr128 remote = p->src;
+	__u16 port, rport = 0;
+	__u8 fin = 0;
+	int err = 0;
+	struct emb e = {};
+	if (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
+		if (l4_ports(skb, &rport, &port) < 0)
+			return TC_ACT_SHOT;
+		if (proto == IPPROTO_TCP)
+			fin = tcp_fin(skb, L4_OFF);
+	} else if (proto == IPPROTO_ICMP) {
+		__u8 type;
+		__u16 id;
+		if (icmp_echo(skb, &type, &id) < 0)
+			return TC_ACT_SHOT;
+		if (type == ICMP_ECHO_REPLY) {
+			port = id;
+		} else if (icmp_v4_err(type)) {
+			// The embedded packet is the one the NAT gateway sent:
+			// NAT:port -> remote:rport.
+			if (emb_load(skb, &e) < 0 || e.saddr != odst)
+				return TC_ACT_SHOT;
+			if (e.proto != IPPROTO_TCP && e.proto != IPPROTO_UDP)
+				return TC_ACT_SHOT; // errors about echo flows are dropped
+			err = 1;
+			lproto = e.proto;
+			port = e.sport;
+			rport = e.dport;
+			v4_to_128(&remote, e.daddr);
+		} else {
+			return TC_ACT_SHOT;
+		}
+	} else {
+		return TC_ACT_SHOT;
+	}
+
+	int verdict = TC_ACT_SHOT;
+	int mine = nat_owner_or_encap(skb, natgw, net, bs, port, &verdict);
+	if (mine < 0)
+		return verdict;
+	if (!mine)
+		return TC_ACT_SHOT;
+
+	struct nat_rev_key rk = {
+		.proto = lproto, .port = port, .natgw = natgw,
+		.remote_ip = remote, .remote_port = rport,
+	};
+	struct nat_rev_val *rv = bpf_map_lookup_elem(&nat_rev, &rk);
+	if (!rv || rv->net != net)
+		return TC_ACT_SHOT; // no such flow: nothing unsolicited gets in
+	struct addr128 pod = rv->pod_ip;
+	__u16 pport = rv->pod_port;
+	if (!err) {
+		rv->last_seen = bpf_ktime_get_ns();
+		rv->flags |= NAT_F_REPLY;
+		if (fin)
+			rv->flags |= NAT_F_FIN;
+	}
+	struct endpoint *l = local_of(net, pod);
+	if (!l)
+		return TC_ACT_SHOT; // the pod went away under the flow
+
+	__u32 pod4 = v4_of_128(&pod);
+	if (err) {
+		nat_addr(skb, IPPROTO_ICMP, IP_DADDR_OFF, odst, pod4);
+		emb_rewrite(skb, &e, pod4, e.daddr, EMB_SPORT_OFF, e.sport, pport);
+	} else {
+		nat_addr(skb, proto, IP_DADDR_OFF, odst, pod4);
+		if (proto == IPPROTO_ICMP)
+			nat_icmp_id(skb, port, pport);
+		else
+			nat_port(skb, proto, L4_DPORT_OFF, port, pport);
+	}
+	// Gateway-forwarded ingress, assigned rather than OR'd: to_pod's isolation
+	// escape tests skb->mark == GW_MARK for equality.
+	skb->mark = GW_MARK;
+	count_ns(net, skb->len, NS_GW, 1);
+	return deliver_local(skb, l);
+}
+
+// nat_reverse6: the v6 twin of nat_reverse4.
+static __always_inline int nat_reverse6(struct __sk_buff *skb, struct pkt *p, __u32 natgw, __u32 net, __u32 bs)
+{
+	__u8 proto = p->proto, lproto = proto;
+	struct addr128 odst = p->dst, remote = p->src;
+	__u16 port, rport = 0;
+	__u8 fin = 0;
+	int err = 0;
+	struct emb6 e = {};
+	if (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
+		if (l4_ports6(skb, &rport, &port) < 0)
+			return TC_ACT_SHOT;
+		if (proto == IPPROTO_TCP)
+			fin = tcp_fin(skb, L4_OFF6);
+	} else if (proto == IPPROTO_ICMPV6) {
+		__u8 type;
+		__u16 id;
+		if (icmp6_echo(skb, &type, &id) < 0)
+			return TC_ACT_SHOT;
+		if (type == ICMP6_ECHO_REPLY) {
+			port = id;
+		} else if (icmp6_err(type)) {
+			if (emb6_load(skb, &e) < 0 || !addr128_eq(&e.saddr, &odst))
+				return TC_ACT_SHOT;
+			if (e.proto != IPPROTO_TCP && e.proto != IPPROTO_UDP)
+				return TC_ACT_SHOT;
+			err = 1;
+			lproto = e.proto;
+			port = e.sport;
+			rport = e.dport;
+			remote = e.daddr;
+		} else {
+			return TC_ACT_SHOT;
+		}
+	} else {
+		return TC_ACT_SHOT;
+	}
+
+	int verdict = TC_ACT_SHOT;
+	int mine = nat_owner_or_encap(skb, natgw, net, bs, port, &verdict);
+	if (mine < 0)
+		return verdict;
+	if (!mine)
+		return TC_ACT_SHOT;
+
+	struct nat_rev_key rk = {
+		.proto = lproto, .port = port, .natgw = natgw,
+		.remote_ip = remote, .remote_port = rport,
+	};
+	struct nat_rev_val *rv = bpf_map_lookup_elem(&nat_rev, &rk);
+	if (!rv || rv->net != net)
+		return TC_ACT_SHOT;
+	struct addr128 pod = rv->pod_ip;
+	__u16 pport = rv->pod_port;
+	if (!err) {
+		rv->last_seen = bpf_ktime_get_ns();
+		rv->flags |= NAT_F_REPLY;
+		if (fin)
+			rv->flags |= NAT_F_FIN;
+	}
+	struct endpoint *l = local_of(net, pod);
+	if (!l)
+		return TC_ACT_SHOT;
+
+	if (err) {
+		nat_addr6(skb, IPPROTO_ICMPV6, IP6_DADDR_OFF, &odst, &pod);
+		emb6_rewrite(skb, &e, &pod, &e.daddr, EMB6_SPORT_OFF, e.sport, pport);
+	} else {
+		nat_addr6(skb, proto, IP6_DADDR_OFF, &odst, &pod);
+		if (proto == IPPROTO_ICMPV6)
+			nat_icmp6_id(skb, port, pport);
+		else
+			nat_port6(skb, proto, L4_DPORT_OFF6, port, pport);
+	}
+	skb->mark = GW_MARK;
+	count_ns(net, skb->len, NS_GW, 1);
+	return deliver_local(skb, l);
+}
+
+// cozyplane_nat_reverse (lb_prog slot 6): from_uplink and from_overlay tail-call
+// it for a packet addressed to a NAT gateway (nat_addrs hit), so neither hook
+// carries the reverse path's frame.
+SEC("tc")
+int cozyplane_nat_reverse(struct __sk_buff *skb)
+{
+	struct pkt p;
+	if (parse_ip(skb, &p) < 0)
+		return TC_ACT_SHOT;
+	struct nat_addr_val *a = bpf_map_lookup_elem(&nat_addrs, &p.dst);
+	if (!a || !a->block_size)
+		return TC_ACT_SHOT;
+	__u32 natgw = a->natgw, net = a->net, bs = a->block_size;
+	if (p.is_v6)
+		return nat_reverse6(skb, &p, natgw, net, bs);
+	return nat_reverse4(skb, &p, natgw, net, bs);
+}
+
+// rt_back hands a packet vpc_egress does not decide back to from_pod (slot 5),
+// marked RT_DONE so from_pod carries on past its tail call.
+static __always_inline int rt_back(struct __sk_buff *skb)
+{
+	skb->mark |= RT_DONE;
+	bpf_tail_call(skb, &lb_prog, 5);
+	return TC_ACT_SHOT;
+}
+
+// cozyplane_vpc_egress (lb_prog slot 4): the route decision for a VPC Port's
+// off-VPC or peered packet (docs/vpc-egress.md §3, §5.2). It acts on nat,
+// internet, blackhole and unresolved routes; everything else goes back to
+// from_pod unchanged.
+SEC("tc")
+int cozyplane_vpc_egress(struct __sk_buff *skb)
+{
+	struct pkt p;
+	if (parse_ip(skb, &p) < 0)
+		return TC_ACT_SHOT;
+	__u32 ifindex = skb->ifindex;
+	__u32 *sp = bpf_map_lookup_elem(&ports, &ifindex);
+	if (!sp)
+		return rt_back(skb);
+	__u32 srcnet = PORT_NET(*sp);
+	if (!srcnet || (*sp & PORT_F_GATEWAY))
+		return rt_back(skb);
+	// Cluster-internal destinations are not routed (§3.1 step 2).
+	if (is_internal(p.dst))
+		return rt_back(skb);
+	struct local_key pk = { .net = srcnet, .ip = p.src };
+	__u32 *tbl = bpf_map_lookup_elem(&port_rt, &pk);
+	if (!tbl)
+		return rt_back(skb); // no table: local and peer routes only
+	struct lpm_key rk = { .prefixlen = LPM_FULL, .scope_net = *tbl, .addr = p.dst };
+	struct rt_val *r = bpf_map_lookup_elem(&vpc_routes, &rk);
+	if (!r) {
+		// Local and peer CIDRs are in every table; a miss on one of them
+		// is the agent catching up, so let from_pod deliver it.
+		if (net_of(&networks, srcnet, p.dst))
+			return rt_back(skb);
+		// The legacy gateway pod still takes unmatched traffic (§3.1 step 4).
+		if (bpf_map_lookup_elem(&gateways, &srcnet))
+			return rt_back(skb);
+		route_drop(srcnet, RTD_NO_ROUTE);
+		return TC_ACT_SHOT;
+	}
+	__u8 kind = r->kind;
+	__u32 natgw = r->natgw;
+	if (kind == RT_LOCAL || kind == RT_PEER)
+		return rt_back(skb);
+	if (kind == RT_NAT)
+		return p.is_v6 ? nat_snat6(skb, &p, srcnet, natgw) : nat_snat(skb, &p, srcnet, natgw);
+	if (kind == RT_INTERNET) {
+		int fr;
+		if (p.is_v6) {
+			fr = floating_egress_snat6(skb, &p, srcnet);
+		} else {
+			struct iphdr *ip;
+			if (parse_ipv4(skb, &ip) < 0)
+				return TC_ACT_SHOT;
+			fr = floating_egress_snat(skb, ip, srcnet);
+		}
+		if (fr != FLOAT_MISS)
+			return fr;
+		route_drop(srcnet, RTD_NO_FLOATING_IP);
+		return TC_ACT_SHOT;
+	}
+	if (kind == RT_BLACKHOLE) {
+		route_drop(srcnet, RTD_BLACKHOLE);
+		return TC_ACT_SHOT;
+	}
+	route_drop(srcnet, RTD_UNRESOLVED);
+	return TC_ACT_SHOT;
+}
+
 SEC("tc")
 int cozyplane_from_pod(struct __sk_buff *skb)
 {
@@ -4996,42 +5450,22 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 		// loopback: restore vip -> client and re-deliver into the pod.
 		if (ip->daddr == bpf_htonl(SVC_LOOPBACK))
 			return svc_hairpin_reverse(skb, &p, srcnet);
-		// Off-net traffic from a floating pod egresses from its public IP (both
-		// its replies and the connections it originates): SNAT VPC->public and
-		// redirect out the uplink, dropping cluster-internal destinations.
-		// Checked before isolation, which would otherwise send it to the gateway
-		// or drop it. On a hit floating_egress_snat returns the action; on a miss
-		// the packet is untouched, so p.src/p.dst (stack copies) stay valid.
-		if (srcnet && !dstnet) {
-			int fr = floating_egress_snat(skb, ip, srcnet);
-			if (fr != FLOAT_MISS)
-				return fr;
-		}
-	}
-	// The v6 twin: a floating v6 pod's internet-bound traffic egresses from
-	// its public address. Link-scoped v6 (NDP) was already bypassed above.
-	if (p.is_v6 && srcnet && !dstnet) {
-		int fr = floating_egress_snat6(skb, &p, srcnet);
-		if (fr != FLOAT_MISS)
-			return fr;
 	}
 
-	// The VPC's own NAT gateway (docs/north-south.md): off-VPC egress for a pod
-	// with no floating address of its own, SNATed to the VPC's identity and sent
-	// straight out the uplink — no gateway pod, no hairpin. Checked after the EIP
-	// path (a pod holding a public address egresses as that, 1:1) and before the
-	// isolation block, which would otherwise steer it to the gateway pod.
-	if (!p.is_v6 && srcnet && !dstnet && !is_gw) {
-		int nr = vpc_nat_snat(skb, &p, srcnet);
-		if (nr != NAT_MISS)
-			return nr;
-	}
-	// The v6 twin (docs/north-south.md §6a): a VPC with a v6 identity wears its own
-	// v6 address on the way out, instead of laundering through the gateway pod.
-	if (p.is_v6 && srcnet && !dstnet && !is_gw) {
-		int nr = vpc_nat_snat6(skb, &p, srcnet);
-		if (nr != NAT_MISS)
-			return nr;
+	// The route decision (docs/vpc-egress.md §3, §5.2): a VPC Port's off-VPC
+	// or peered packet goes to vpc_egress, which SNATs it through a NAT gateway,
+	// sends it out as the Port's FloatingIP, or drops it — or hands it back
+	// marked RT_DONE for the east-west, peered and gateway-pod paths below.
+	//
+	// A handed-back packet reaches this branch again — every test before it is
+	// a function of the packet alone — so this is where RT_DONE is cleared.
+	if (srcnet && !is_gw && dstnet != srcnet) {
+		__u32 m = skb->mark;
+		if (!(m & RT_DONE)) {
+			bpf_tail_call(skb, &lb_prog, 4);
+			return TC_ACT_SHOT; // slot unpopulated: no route decision is possible
+		}
+		skb->mark = m & ~RT_DONE;
 	}
 
 	// Isolation: same-network or explicitly peered traffic only (egress side) —
@@ -5495,17 +5929,15 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 		return deliver_local(skb, ep);
 	}
 
-	// A VPC NAT reply, forwarded here by the node that attracted the address
-	// because THIS node's ct_rev holds the flow (docs/north-south.md). Same
-	// un-NAT, same delivery; the shard demux already decided it is ours.
-	if (!p.is_v6) {
-		int nr = vpc_nat_reverse(skb, &p);
-		if (nr != NAT_MISS)
-			return nr;
-	} else {
-		int nr = vpc_nat_reverse6(skb, &p);
-		if (nr != NAT_MISS)
-			return nr;
+	// A NAT gateway reply (or an ICMP error about a NATed flow), forwarded
+	// here by the node that received it because this node holds the block
+	// (docs/vpc-egress.md §4.4). Same reverse path as from_uplink's.
+	{
+		struct nat_addr_val *na = bpf_map_lookup_elem(&nat_addrs, &p.dst);
+		if (na && na->net == vni) {
+			bpf_tail_call(skb, &lb_prog, 6);
+			return TC_ACT_SHOT;
+		}
 	}
 
 	// Inbound to a floating IP, forwarded here by the node that announced it
@@ -5568,6 +6000,12 @@ int cozyplane_from_overlay(struct __sk_buff *skb)
 SEC("tc")
 int cozyplane_from_uplink(struct __sk_buff *skb)
 {
+	// A frame addressed to another host's MAC is not ours. An L2 fabric that
+	// floods (an OCI VLAN does) hands every node the frames for an address
+	// another node attracts; handling them would deliver one copy per node.
+	if (skb->pkt_type == PACKET_OTHERHOST)
+		return TC_ACT_OK;
+
 	struct iphdr *ip;
 	if (parse_ipv4(skb, &ip) < 0) {
 		// v6 inbound to a floating address: deliver to the local pod like the
@@ -5577,11 +6015,11 @@ int cozyplane_from_uplink(struct __sk_buff *skb)
 			int m6 = masq_reverse6(skb, &p6);
 			if (m6 != MASQ_MISS)
 				return m6;
-			// A reply to a VPC's v6 NAT address: un-NAT if the flow is ours, or
-			// forward to the node whose ct_rev holds it (docs/north-south.md §6a).
-			int nr6 = vpc_nat_reverse6(skb, &p6);
-			if (nr6 != NAT_MISS)
-				return nr6;
+			// A packet to a v6 NAT gateway address (docs/vpc-egress.md §4.4).
+			if (bpf_map_lookup_elem(&nat_addrs, &p6.dst)) {
+				bpf_tail_call(skb, &lb_prog, 6);
+				return TC_ACT_SHOT;
+			}
 			struct bridge_ep *fe6 = float_of(p6.dst);
 			if (fe6) {
 				struct endpoint *l6 = local_of(fe6->net, fe6->vpc_ip);
@@ -5615,15 +6053,12 @@ int cozyplane_from_uplink(struct __sk_buff *skb)
 	struct addr128 d128;
 	v4_to_128(&d128, ip->daddr);
 
-	// A reply to a VPC's NAT address (docs/north-south.md): un-NAT it if the flow
-	// is ours, or hand it to the node whose ct_rev holds it.
-	{
-		struct pkt np;
-		if (parse_ip(skb, &np) == 0 && !np.is_v6) {
-			int nr = vpc_nat_reverse(skb, &np);
-			if (nr != NAT_MISS)
-				return nr;
-		}
+	// A packet to a NAT gateway address — a reply, or an ICMP error about a
+	// NATed flow (docs/vpc-egress.md §4.4, §4.5): reversed here or forwarded
+	// to the node holding the flow, in a tail-called program.
+	if (bpf_map_lookup_elem(&nat_addrs, &d128)) {
+		bpf_tail_call(skb, &lb_prog, 6);
+		return TC_ACT_SHOT;
 	}
 
 	struct bridge_ep *fe = float_of(d128);

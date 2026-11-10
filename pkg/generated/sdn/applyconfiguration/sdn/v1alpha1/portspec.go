@@ -45,6 +45,11 @@ type PortSpecApplyConfiguration struct {
 	// Gateway marks the VPC's gateway port (the .1 leg of the egress gateway
 	// pod); agents route off-VPC traffic to it.
 	Gateway *bool `json:"gateway,omitempty"`
+	// RouteTable is the name of the RouteTable (in the VPC's namespace) this
+	// Port's traffic is routed by, copied by the CNI from the pod's
+	// sdn.cozystack.io/route-table annotation. Empty means the VPC's default
+	// table (docs/vpc-egress.md §2.4).
+	RouteTable *string `json:"routeTable,omitempty"`
 }
 
 // PortSpecApplyConfiguration constructs a declarative configuration of the PortSpec type for use with
@@ -114,5 +119,13 @@ func (b *PortSpecApplyConfiguration) WithPodName(value string) *PortSpecApplyCon
 // If called multiple times, the Gateway field is set to the value of the last call.
 func (b *PortSpecApplyConfiguration) WithGateway(value bool) *PortSpecApplyConfiguration {
 	b.Gateway = &value
+	return b
+}
+
+// WithRouteTable sets the RouteTable field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the RouteTable field is set to the value of the last call.
+func (b *PortSpecApplyConfiguration) WithRouteTable(value string) *PortSpecApplyConfiguration {
+	b.RouteTable = &value
 	return b
 }

@@ -73,6 +73,9 @@ var quotableResources = []string{
 	"securitygroups",
 	"vpcpeerings",
 	"vpcbindings",
+	"natgateways", // each holds addresses (via owned LB Services)
+	"routetables", // and therefore table ids — a globally-shared keyspace
+	"routes",
 }
 
 // NewQuotaConfiguration returns the evaluators this server offers to the
@@ -124,6 +127,15 @@ func listerFor(client sdnclientset.Interface, resource string) generic.ListFuncB
 			return items(l.Items, err, func(i int) runtime.Object { return &l.Items[i] }, len(l.Items))
 		case "vpcbindings":
 			l, err := v1.VPCBindings(namespace).List(ctx, opts)
+			return items(l.Items, err, func(i int) runtime.Object { return &l.Items[i] }, len(l.Items))
+		case "natgateways":
+			l, err := v1.NATGateways(namespace).List(ctx, opts)
+			return items(l.Items, err, func(i int) runtime.Object { return &l.Items[i] }, len(l.Items))
+		case "routetables":
+			l, err := v1.RouteTables(namespace).List(ctx, opts)
+			return items(l.Items, err, func(i int) runtime.Object { return &l.Items[i] }, len(l.Items))
+		case "routes":
+			l, err := v1.Routes(namespace).List(ctx, opts)
 			return items(l.Items, err, func(i int) runtime.Object { return &l.Items[i] }, len(l.Items))
 		}
 		return nil, fmt.Errorf("no quota lister for %q", resource)

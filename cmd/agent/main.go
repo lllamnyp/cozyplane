@@ -117,6 +117,7 @@ func main() {
 		"listen address for the Prometheus /metrics endpoint; the agent is hostNetwork, so bind a specific node address to keep it off public interfaces; empty disables it")
 	flag.BoolVar(&metricsSecure, "metrics-secure", true,
 		"gate /metrics behind delegated authn/authz (TokenReview + SubjectAccessReview against the kube-apiserver); a scraper then needs a ServiceAccount token authorized for get on nonResourceURL /metrics")
+	bindEgressFlags()
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
@@ -446,7 +447,8 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 
 		register := func(context.Context) error {
 			watchVPCs(factory, mgr, log)
-			watchVPCGateways(ctx, factory, mgr, nodePools, nodeIPs, nodeName, state.NodeIP, log)
+			watchVPCGateways(ctx, factory, mgr, log)
+			watchEgress(ctx, factory, localFactory, lc, mgr, nodePools, nodeIPs, nodeName, state.NodeIP, log)
 			watchPorts(ctx, factory, localFactory, sdnClient, client, mgr, nodeName, state.NodeIP, log)
 			watchPeerings(ctx, factory, mgr, log)
 			watchGateways(ctx, factory, mgr, nodeName, log)
@@ -2078,6 +2080,9 @@ func serveMetrics(ctx context.Context, mgr *datapath.Manager, vpcs sdnv1alpha1in
 			fmt.Fprintf(&b, "# HELP cozyplane_bpf_map_memlock_bytes_total Kernel memory ALL eBPF maps charge to the agent's cgroup.\n# TYPE cozyplane_bpf_map_memlock_bytes_total gauge\n")
 			fmt.Fprintf(&b, "cozyplane_bpf_map_memlock_bytes_total{node=%q} %d\n", nodeName, total)
 		}
+
+		// VPC egress: NAT gateways and route tables (docs/vpc-egress.md §8).
+		writeEgressMetrics(&b, nodeName)
 
 		// Security-group policy drops (#7), same per-VPC labeling.
 		if drops, err := mgr.SGDrops(); err == nil {

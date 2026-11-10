@@ -123,6 +123,20 @@ func (m *Manager) Load(vni uint32) error {
 	if err := m.objs.LbProg.Put(uint32(3), uint32(m.objs.CozyplaneHfEgress.FD())); err != nil {
 		return fmt.Errorf("populate hf tail-call slot 3: %w", err)
 	}
+	// Slots 4-6 are VPC egress (docs/vpc-egress.md §5.2): from_pod tail-calls
+	// vpc_egress for the route decision, which hands undecided packets back to
+	// from_pod; from_uplink and from_overlay tail-call nat_reverse for packets
+	// to a NAT gateway address. from_pod drops what it cannot route, so these
+	// are filled before any veth is attached to the new program.
+	for slot, prog := range map[uint32]*ebpf.Program{
+		4: m.objs.CozyplaneVpcEgress,
+		5: m.objs.CozyplaneFromPod,
+		6: m.objs.CozyplaneNatReverse,
+	} {
+		if err := m.objs.LbProg.Put(slot, uint32(prog.FD())); err != nil {
+			return fmt.Errorf("populate vpc egress tail-call slot %d: %w", slot, err)
+		}
+	}
 
 	return nil
 }

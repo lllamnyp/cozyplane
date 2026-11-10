@@ -26,6 +26,11 @@ const (
 	// "<owner-ns>/<vpc>".
 	AnnotationVPC = "sdn.cozystack.io/vpc"
 
+	// AnnotationRouteTable on a pod names the RouteTable, in the VPC's
+	// namespace, that routes the pod's traffic. Absent means the VPC's default
+	// table (docs/vpc-egress.md §2.4).
+	AnnotationRouteTable = "sdn.cozystack.io/route-table"
+
 	// AnnotationGatewayFor on a (default-network, system-namespace) pod makes
 	// it the egress gateway of a VPC: it gets a second interface carrying the
 	// VPC's reserved .1 address. Same value syntax as AnnotationVPC. Honored

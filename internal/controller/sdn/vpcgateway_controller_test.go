@@ -22,14 +22,16 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
+	localsdnv1alpha1 "github.com/lllamnyp/cozyplane/api/localsdn/v1alpha1"
 	sdnv1alpha1 "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1"
 )
 
@@ -46,7 +48,8 @@ func gwClient(t *testing.T, objs ...client.Object) client.Client {
 	return fake.NewClientBuilder().
 		WithScheme(gatewayScheme(t)). // registers client-go (Services/EndpointSlices) + sdn
 		WithObjects(objs...).
-		WithStatusSubresource(&sdnv1alpha1.VPCGateway{}, &corev1.Service{}).
+		WithStatusSubresource(&sdnv1alpha1.VPCGateway{}, &corev1.Service{}, &sdnv1alpha1.NATGateway{},
+			&sdnv1alpha1.RouteTable{}, &sdnv1alpha1.Route{}).
 		Build()
 }
 
@@ -65,223 +68,164 @@ func reconcileGateway(t *testing.T, c client.Client, ns, name string) *sdnv1alph
 	return gw
 }
 
-// natServiceForFamily returns the gateway's owned NAT Service of a family
-// ("IPv4"/"IPv6"), or nil.
-func natServiceForFamily(t *testing.T, c client.Client, ns, gwName, family string) *corev1.Service {
+// egressScheme registers client-go, sdn and the local group.
+func egressScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
-	var list corev1.ServiceList
-	if err := c.List(context.Background(), &list, client.InNamespace(ns), client.MatchingLabels{
-		vpcGatewayLabel:    gwName,
-		addressFamilyLabel: family,
-	}); err != nil {
-		t.Fatalf("list NAT services: %v", err)
+	s := gatewayScheme(t)
+	if err := localsdnv1alpha1.AddToScheme(s); err != nil {
+		t.Fatalf("add local scheme: %v", err)
 	}
-	if len(list.Items) == 0 {
-		return nil
-	}
-	return &list.Items[0]
+	return s
 }
 
-func allNATServices(t *testing.T, c client.Client, ns, gwName string) []corev1.Service {
+func egressClient(t *testing.T, s *runtime.Scheme, objs ...client.Object) client.Client {
 	t.Helper()
-	var list corev1.ServiceList
-	if err := c.List(context.Background(), &list, client.InNamespace(ns),
-		client.MatchingLabels{vpcGatewayLabel: gwName}); err != nil {
-		t.Fatalf("list NAT services: %v", err)
-	}
-	return list.Items
+	return fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(objs...).
+		WithStatusSubresource(&sdnv1alpha1.VPCGateway{}, &corev1.Service{}, &sdnv1alpha1.NATGateway{},
+			&sdnv1alpha1.RouteTable{}, &sdnv1alpha1.Route{}, &localsdnv1alpha1.NATPortBlock{}).
+		Build()
 }
 
-// assignAndReconcile writes an LB ingress address onto the gateway's family Service
-// (simulating the LB implementation) and reconciles again.
-func assignAndReconcile(t *testing.T, c client.Client, ns, gwName, family, ip string) *sdnv1alpha1.VPCGateway {
-	t.Helper()
-	svc := natServiceForFamily(t, c, ns, gwName, family)
-	if svc == nil {
-		t.Fatalf("no %s NAT service to assign an address to", family)
-	}
-	assignServiceAddress(t, c, svc, ip)
-	return reconcileGateway(t, c, ns, gwName)
-}
-
-// A v4 VPC's gateway owns exactly one v4 LoadBalancer Service (delegated via
-// service-proxy-name), and its assigned address becomes the v4 NAT identity.
-func TestGatewayV4VPCDrawsV4Service(t *testing.T) {
-	c := gwClient(t,
-		vpcWithCIDRs("team-a", "vpc-a", 100, "10.10.0.0/24"),
-		natGateway("team-a", "door", "vpc-a"))
-	reconcileGateway(t, c, "team-a", "door") // creates the Service
-
-	svc := natServiceForFamily(t, c, "team-a", "door", "IPv4")
-	if svc == nil {
-		t.Fatal("no v4 NAT Service was created")
-	}
-	if svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
-		t.Errorf("Service type = %q, want LoadBalancer", svc.Spec.Type)
-	}
-	if svc.Labels[serviceProxyNameLabel] != serviceProxyNameValue {
-		t.Error("NAT Service must carry service-proxy-name (every proxy must skip its datapath)")
-	}
-	if len(svc.Spec.IPFamilies) != 1 || svc.Spec.IPFamilies[0] != corev1.IPv4Protocol {
-		t.Errorf("Service ipFamilies = %v, want [IPv4]", svc.Spec.IPFamilies)
-	}
-	if natServiceForFamily(t, c, "team-a", "door", "IPv6") != nil {
-		t.Error("a v4-only VPC must own no v6 NAT Service")
-	}
-
-	gw := assignAndReconcile(t, c, "team-a", "door", "IPv4", "203.0.113.5")
-	if gw.Status.NATAddress != "203.0.113.5" || gw.Status.NATAddress6 != "" {
-		t.Errorf("NAT identity = (%q, %q), want (203.0.113.5, \"\")", gw.Status.NATAddress, gw.Status.NATAddress6)
-	}
-}
-
-// A v6 VPC's gateway owns a v6 Service and wears the v6 address it is assigned.
-func TestGatewayV6VPCDrawsV6Service(t *testing.T) {
-	c := gwClient(t,
-		vpcWithCIDRs("team-a", "vpc-a", 100, "fd00:10::/64"),
-		natGateway("team-a", "door", "vpc-a"))
-	reconcileGateway(t, c, "team-a", "door")
-
-	svc := natServiceForFamily(t, c, "team-a", "door", "IPv6")
-	if svc == nil {
-		t.Fatal("no v6 NAT Service was created")
-	}
-	if len(svc.Spec.IPFamilies) != 1 || svc.Spec.IPFamilies[0] != corev1.IPv6Protocol {
-		t.Errorf("Service ipFamilies = %v, want [IPv6]", svc.Spec.IPFamilies)
-	}
-	gw := assignAndReconcile(t, c, "team-a", "door", "IPv6", "2001:db8::5")
-	if gw.Status.NATAddress != "" || gw.Status.NATAddress6 != "2001:db8::5" {
-		t.Errorf("NAT identity = (%q, %q), want (\"\", 2001:db8::5)", gw.Status.NATAddress, gw.Status.NATAddress6)
-	}
-}
-
-// A dual-stack VPC draws one Service of EACH family, each an independent identity.
-func TestGatewayDualStackDrawsBothServices(t *testing.T) {
-	c := gwClient(t,
-		vpcWithCIDRs("team-a", "vpc-a", 100, "10.10.0.0/24", "fd00:10::/64"),
-		natGateway("team-a", "door", "vpc-a"))
-	reconcileGateway(t, c, "team-a", "door")
-
-	if got := len(allNATServices(t, c, "team-a", "door")); got != 2 {
-		t.Fatalf("dual-stack gateway owns %d NAT Services, want 2", got)
-	}
-	assignAndReconcile(t, c, "team-a", "door", "IPv4", "203.0.113.5")
-	gw := assignAndReconcile(t, c, "team-a", "door", "IPv6", "2001:db8::5")
-	if gw.Status.NATAddress != "203.0.113.5" || gw.Status.NATAddress6 != "2001:db8::5" {
-		t.Errorf("dual-stack identity = (%q, %q), want (203.0.113.5, 2001:db8::5)", gw.Status.NATAddress, gw.Status.NATAddress6)
-	}
-}
-
-// A family whose Service gets no address yields no identity — the #15 pod fallback:
-// NATAddress6 stays empty, so gateway_controller.go keeps the gateway pod for v6.
-func TestGatewayV6ServiceUnassignedKeepsPodFallback(t *testing.T) {
-	c := gwClient(t,
-		vpcWithCIDRs("team-a", "vpc-a", 100, "10.10.0.0/24", "fd00:10::/64"),
-		natGateway("team-a", "door", "vpc-a"))
-	reconcileGateway(t, c, "team-a", "door")
-
-	// Only the v4 Service gets an address; the v6 Service stays unassigned.
-	gw := assignAndReconcile(t, c, "team-a", "door", "IPv4", "203.0.113.5")
-	if gw.Status.NATAddress != "203.0.113.5" {
-		t.Errorf("v4 identity = %q, want 203.0.113.5", gw.Status.NATAddress)
-	}
-	if gw.Status.NATAddress6 != "" {
-		t.Errorf("v6 identity = %q, want empty (no address assigned ⇒ gateway pod keeps v6)", gw.Status.NATAddress6)
-	}
-}
-
-// The synthesized EndpointSlice is a self-addressed, always-Ready advertisement
-// trigger (there is no target pod), so MetalLB advertises the NAT address.
-func TestGatewayNATServiceEndpointSliceReady(t *testing.T) {
-	c := gwClient(t,
-		vpcWithCIDRs("team-a", "vpc-a", 100, "10.10.0.0/24"),
-		natGateway("team-a", "door", "vpc-a"))
-	reconcileGateway(t, c, "team-a", "door")
-	assignAndReconcile(t, c, "team-a", "door", "IPv4", "203.0.113.5")
-
-	svc := natServiceForFamily(t, c, "team-a", "door", "IPv4")
-	eps := &discoveryv1.EndpointSlice{}
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: svc.Name}, eps); err != nil {
-		t.Fatalf("no EndpointSlice for the NAT Service: %v", err)
-	}
-	if len(eps.Endpoints) != 1 {
-		t.Fatalf("want one endpoint, got %d", len(eps.Endpoints))
-	}
-	ep := eps.Endpoints[0]
-	if ep.Conditions.Ready == nil || !*ep.Conditions.Ready {
-		t.Error("the NAT endpoint must be Ready (so MetalLB advertises even under etp: Cluster)")
-	}
-	if len(ep.Addresses) != 1 || ep.Addresses[0] != "203.0.113.5" {
-		t.Errorf("endpoint addresses = %v, want [203.0.113.5] (self-addressed, the NAT address)", ep.Addresses)
-	}
-}
-
-// A non-exclusive (loser) gateway owns no Service — it realizes nothing.
-func TestGatewayNonExclusiveLoserOwnsNoService(t *testing.T) {
-	c := gwClient(t,
-		vpcWithCIDRs("team-a", "vpc-a", 100, "10.10.0.0/24"),
-		natGateway("team-a", "door", "vpc-a"),
-		natGateway("team-a", "door2", "vpc-a"))
-	reconcileGateway(t, c, "team-a", "door")
-	loser := reconcileGateway(t, c, "team-a", "door2")
-
-	if len(allNATServices(t, c, "team-a", "door2")) != 0 {
-		t.Error("the losing gateway must own no NAT Service")
-	}
-	if len(allNATServices(t, c, "team-a", "door")) == 0 {
-		t.Error("the winning gateway must own its NAT Service")
-	}
-	_ = loser
-}
-
-// Reservation is per family (docs/external-addresses.md §7): each per-family
-// claim name lands as the association annotation on exactly that family's Service.
-func TestGatewayPerFamilyClaimAnnotations(t *testing.T) {
+// nat.enabled becomes a NATGateway the gateway owns, mirroring its claims, and a
+// default RouteTable for a VPC that has none (docs/vpc-egress.md §7).
+func TestGatewayNATEnabledCreatesEgressObjects(t *testing.T) {
 	gw := natGateway("team-a", "door", "vpc-a")
-	gw.Spec.NAT.AddressClaimName = "egress-v4"
-	gw.Spec.NAT.AddressClaimName6 = "egress-v6"
-	c := gwClient(t,
-		vpcWithCIDRs("team-a", "vpc-a", 100, "10.10.0.0/24", "fd00:10::/64"), gw)
-	reconcileGateway(t, c, "team-a", "door")
-
-	v4 := natServiceForFamily(t, c, "team-a", "door", "IPv4")
-	v6 := natServiceForFamily(t, c, "team-a", "door", "IPv6")
-	if v4 == nil || v6 == nil {
-		t.Fatal("expected one NAT Service per family")
-	}
-	if got := v4.Annotations[addressClaimAnnotation]; got != "egress-v4" {
-		t.Errorf("v4 Service annotation = %q, want egress-v4", got)
-	}
-	if got := v6.Annotations[addressClaimAnnotation]; got != "egress-v6" {
-		t.Errorf("v6 Service annotation = %q, want egress-v6", got)
-	}
-
-	// Clearing one family's claim removes only that family's annotation.
-	got := &sdnv1alpha1.VPCGateway{}
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: "door"}, got); err != nil {
-		t.Fatalf("get gateway: %v", err)
-	}
-	got.Spec.NAT.AddressClaimName6 = ""
-	if err := c.Update(context.Background(), got); err != nil {
-		t.Fatalf("update gateway: %v", err)
-	}
-	reconcileGateway(t, c, "team-a", "door")
-	if _, ok := natServiceForFamily(t, c, "team-a", "door", "IPv6").Annotations[addressClaimAnnotation]; ok {
-		t.Error("v6 annotation must be removed when its claim name is cleared")
-	}
-	if got := natServiceForFamily(t, c, "team-a", "door", "IPv4").Annotations[addressClaimAnnotation]; got != "egress-v4" {
-		t.Errorf("v4 annotation must survive the v6 clear, got %q", got)
-	}
-}
-
-// NAT disabled: no identity Service at all.
-func TestGatewayNATDisabledOwnsNoService(t *testing.T) {
-	gw := natGateway("team-a", "door", "vpc-a")
-	gw.Spec.NAT.Enabled = false
+	gw.Spec.NAT.AddressClaimName = "c4"
+	gw.Spec.LoadBalancerClass = "metallb"
 	c := gwClient(t, vpcWithCIDRs("team-a", "vpc-a", 100, "10.10.0.0/24"), gw)
+	got := reconcileGateway(t, c, "team-a", "door")
+
+	ngw := &sdnv1alpha1.NATGateway{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: "door"}, ngw); err != nil {
+		t.Fatalf("no NATGateway: %v", err)
+	}
+	if !metav1.IsControlledBy(ngw, got) {
+		t.Error("the NATGateway must be owned by the VPCGateway")
+	}
+	if ngw.Spec.VPCRef.Name != "vpc-a" || ngw.Spec.AddressClaimName != "c4" || ngw.Spec.LoadBalancerClass != "metallb" {
+		t.Errorf("NATGateway spec = %+v, want the gateway's VPC, claim and class", ngw.Spec)
+	}
+	rt := &sdnv1alpha1.RouteTable{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: "door"}, rt); err != nil {
+		t.Fatalf("no default RouteTable: %v", err)
+	}
+	if !rt.Spec.Default || rt.Spec.VPCRef.Name != "vpc-a" {
+		t.Errorf("RouteTable spec = %+v, want the VPC's default table", rt.Spec)
+	}
+	// No address yet: no route, so a family without one still reaches the pod.
+	var routes sdnv1alpha1.RouteList
+	if err := c.List(context.Background(), &routes, client.InNamespace("team-a")); err != nil {
+		t.Fatal(err)
+	}
+	if len(routes.Items) != 0 {
+		t.Errorf("routes before any address = %d, want 0", len(routes.Items))
+	}
+}
+
+// Once the NAT gateway holds an address, the family gets its default route, and
+// the gateway's status mirrors the address.
+func TestGatewayDefaultRouteFollowsNATGatewayAddress(t *testing.T) {
+	c := gwClient(t, vpcWithCIDRs("team-a", "vpc-a", 100, "10.10.0.0/24", "fd00:10::/64"), natGateway("team-a", "door", "vpc-a"))
 	reconcileGateway(t, c, "team-a", "door")
-	if len(allNATServices(t, c, "team-a", "door")) != 0 {
-		t.Error("a NAT-disabled gateway must own no NAT Service")
+	ngw := &sdnv1alpha1.NATGateway{}
+	key := types.NamespacedName{Namespace: "team-a", Name: "door"}
+	if err := c.Get(context.Background(), key, ngw); err != nil {
+		t.Fatal(err)
+	}
+	ngw.Status.Address = "203.0.113.5"
+	if err := c.Status().Update(context.Background(), ngw); err != nil {
+		t.Fatal(err)
+	}
+	got := reconcileGateway(t, c, "team-a", "door")
+	if got.Status.NATAddress != "203.0.113.5" || got.Status.NATAddress6 != "" {
+		t.Errorf("mirrored addresses = %q/%q, want 203.0.113.5/empty", got.Status.NATAddress, got.Status.NATAddress6)
+	}
+	r := &sdnv1alpha1.Route{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: "door-default-ipv4"}, r); err != nil {
+		t.Fatalf("no v4 default route: %v", err)
+	}
+	if r.Spec.Destination != "0.0.0.0/0" || r.Spec.RouteTableRef.Name != "door" ||
+		r.Spec.Target.NATGateway == nil || r.Spec.Target.NATGateway.Name != "door" {
+		t.Errorf("v4 default route = %+v", r.Spec)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: "door-default-ipv6"}, &sdnv1alpha1.Route{}); err == nil {
+		t.Error("the v6 family has no address and must have no route (it keeps the gateway pod)")
+	}
+}
+
+// A VPC that already has a default table gets the default routes in it; the
+// transition creates no second table.
+func TestGatewayUsesExistingDefaultTable(t *testing.T) {
+	user := &sdnv1alpha1.RouteTable{
+		ObjectMeta: metav1.ObjectMeta{Name: "main", Namespace: "team-a"},
+		Spec:       sdnv1alpha1.RouteTableSpec{VPCRef: sdnv1alpha1.LocalVPCRef{Name: "vpc-a"}, Default: true},
+	}
+	ngw := &sdnv1alpha1.NATGateway{}
+	c := gwClient(t, vpcWithCIDRs("team-a", "vpc-a", 100, "10.10.0.0/24"), natGateway("team-a", "door", "vpc-a"), user)
+	reconcileGateway(t, c, "team-a", "door")
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: "door"}, &sdnv1alpha1.RouteTable{}); err == nil {
+		t.Error("a VPC with a default table must not get a second one")
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: "door"}, ngw); err != nil {
+		t.Fatal(err)
+	}
+	ngw.Status.Address = "203.0.113.5"
+	if err := c.Status().Update(context.Background(), ngw); err != nil {
+		t.Fatal(err)
+	}
+	reconcileGateway(t, c, "team-a", "door")
+	r := &sdnv1alpha1.Route{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: "door-default-ipv4"}, r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Spec.RouteTableRef.Name != "main" {
+		t.Errorf("default route table = %q, want the VPC's default table main", r.Spec.RouteTableRef.Name)
+	}
+}
+
+// A losing (non-exclusive) gateway realizes nothing.
+func TestGatewayNonExclusiveLoserCreatesNothing(t *testing.T) {
+	winner := natGateway("team-a", "first", "vpc-a")
+	winner.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
+	loser := natGateway("team-a", "second", "vpc-a")
+	loser.CreationTimestamp = metav1.NewTime(time.Now())
+	c := gwClient(t, vpcWithCIDRs("team-a", "vpc-a", 100, "10.10.0.0/24"), winner, loser)
+	reconcileGateway(t, c, "team-a", "second")
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: "second"}, &sdnv1alpha1.NATGateway{}); err == nil {
+		t.Error("the losing gateway must create no NATGateway")
+	}
+}
+
+// Disabling NAT deletes what the gateway created, including a NAT Service a
+// VPCGateway owned before NAT gateways existed.
+func TestGatewayNATDisabledDeletesEgressObjects(t *testing.T) {
+	gw := natGateway("team-a", "door", "vpc-a")
+	c := gwClient(t, vpcWithCIDRs("team-a", "vpc-a", 100, "10.10.0.0/24"), gw)
+	got := reconcileGateway(t, c, "team-a", "door")
+	legacy := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "door-v4-x", Namespace: "team-a",
+			Labels: map[string]string{vpcGatewayLabel: "door", addressFamilyLabel: "IPv4"}},
+	}
+	if err := controllerutil.SetControllerReference(got, legacy, gatewayScheme(t)); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(context.Background(), legacy); err != nil {
+		t.Fatal(err)
+	}
+	got.Spec.NAT.Enabled = false
+	if err := c.Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	reconcileGateway(t, c, "team-a", "door")
+	for _, o := range []client.Object{&sdnv1alpha1.NATGateway{}, &sdnv1alpha1.RouteTable{}} {
+		if err := c.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: "door"}, o); err == nil {
+			t.Errorf("%T survived nat.enabled=false", o)
+		}
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(legacy), &corev1.Service{}); err == nil {
+		t.Error("the legacy NAT Service survived nat.enabled=false")
 	}
 }
 

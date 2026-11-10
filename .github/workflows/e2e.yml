@@ -17,7 +17,7 @@ permissions:
 jobs:
   e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -33,3 +33,9 @@ jobs:
 
       - name: run e2e
         run: IMAGE=ghcr.io/lllamnyp/cozyplane:e2e IMAGE_PREBUILT=1 bash test/e2e.sh
+
+      # VPC egress (docs/vpc-egress.md): NAT gateways, route tables, the
+      # internet target and the port-block leases, on a kind cluster of its own.
+      - name: run egress e2e
+        if: always()
+        run: IMAGE=ghcr.io/lllamnyp/cozyplane:e2e IMAGE_PREBUILT=1 bash test/egress-e2e.sh

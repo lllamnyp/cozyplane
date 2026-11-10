@@ -24,7 +24,10 @@ import (
 	"github.com/lllamnyp/cozyplane/pkg/registry/sdn/claim"
 	floatingipstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/floatingip"
 	hostfirewallstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/hostfirewall"
+	natgatewaystorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/natgateway"
 	portstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/port"
+	routestorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/route"
+	routetablestorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/routetable"
 	securitygroupstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/securitygroup"
 	servicevipstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/servicevip"
 	vpcstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/vpc"
@@ -98,6 +101,18 @@ func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOpt
 	if err != nil {
 		panic(err)
 	}
+	natGatewayREST, natGatewayStatusREST, err := natgatewaystorage.NewREST(scheme, restOptionsGetter)
+	if err != nil {
+		panic(err)
+	}
+	routeTableREST, routeTableStatusREST, err := routetablestorage.NewREST(scheme, restOptionsGetter)
+	if err != nil {
+		panic(err)
+	}
+	routeREST, routeStatusREST, err := routestorage.NewREST(scheme, restOptionsGetter)
+	if err != nil {
+		panic(err)
+	}
 
 	v1alpha1storage := map[string]rest.Storage{}
 	v1alpha1storage["vpcs"] = vpcREST
@@ -117,6 +132,12 @@ func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOpt
 	v1alpha1storage["securitygroups/status"] = securityGroupStatusREST
 	v1alpha1storage["hostfirewalls"] = hostFirewallREST
 	v1alpha1storage["hostfirewalls/status"] = hostFirewallStatusREST
+	v1alpha1storage["natgateways"] = natGatewayREST
+	v1alpha1storage["natgateways/status"] = natGatewayStatusREST
+	v1alpha1storage["routetables"] = routeTableREST
+	v1alpha1storage["routetables/status"] = routeTableStatusREST
+	v1alpha1storage["routes"] = routeREST
+	v1alpha1storage["routes/status"] = routeStatusREST
 	apiGroupInfo.VersionedResourcesStorageMap["v1alpha1"] = v1alpha1storage
 
 	return &apiGroupInfo

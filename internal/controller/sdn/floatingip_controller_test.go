@@ -362,3 +362,89 @@ func TestFloatingIPUnrelatedConditionKeepsTransitionTimeOnPartialChange(t *testi
 			serviceReady.LastTransitionTime, past)
 	}
 }
+
+// A FloatingIP naming a claim takes only the claim's address. Any other address
+// the Service holds (the LB implementation assigned it from its pools because
+// the claim is missing, unbound or attached elsewhere) is not published, and the
+// endpoint stays not-ready so the address is not announced.
+func TestFloatingIPClaimNotAttached(t *testing.T) {
+	s := claimScheme(t)
+	fip := floatingIP("team-a", "web", "vpc-a", "10.0.0.5")
+	fip.Spec.AddressClaimName = "my-eip"
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(livePort("team-a", "vpc-a", "10.0.0.5", "node-1"), fip, ipClaim("team-a", "my-eip", "Bound", "203.0.113.9")).
+		WithStatusSubresource(&sdnv1alpha1.FloatingIP{}, &corev1.Service{}).Build()
+	reconcile := func() *sdnv1alpha1.FloatingIP {
+		t.Helper()
+		r := &FloatingIPReconciler{Client: c, Scheme: s}
+		key := types.NamespacedName{Namespace: "team-a", Name: "web"}
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+		got := &sdnv1alpha1.FloatingIP{}
+		if err := c.Get(context.Background(), key, got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	reconcile()
+	assignServiceAddress(t, c, ownedFloatingService(t, c, "team-a", "web"), "203.0.113.50")
+	got := reconcile()
+	cond := meta.FindStatusCondition(got.Status.Conditions, sdnv1alpha1.FloatingIPConditionAddressAssigned)
+	if got.Status.Address != "" || got.Status.Phase == sdnv1alpha1.FloatingIPPhaseReady || cond == nil || cond.Reason != "ClaimNotAttached" {
+		t.Errorf("address %q phase %s AddressAssigned %+v, want none, Pending, ClaimNotAttached", got.Status.Address, got.Status.Phase, cond)
+	}
+	if eps := ownedEndpointSlice(t, c, "team-a", "web"); eps == nil || *eps.Endpoints[0].Conditions.Ready {
+		t.Errorf("endpoint slice %+v, want a not-ready endpoint", eps)
+	}
+
+	assignServiceAddress(t, c, ownedFloatingService(t, c, "team-a", "web"), "203.0.113.9")
+	if got = reconcile(); got.Status.Address != "203.0.113.9" || got.Status.Phase != sdnv1alpha1.FloatingIPPhaseReady {
+		t.Errorf("address %q phase %s, want the claim's address and Ready", got.Status.Address, got.Status.Phase)
+	}
+	if eps := ownedEndpointSlice(t, c, "team-a", "web"); eps == nil || !*eps.Endpoints[0].Conditions.Ready {
+		t.Errorf("endpoint slice %+v, want a ready endpoint", eps)
+	}
+}
+
+// A FloatingIP leaves a claim annotation another field manager set while it names
+// no claim; naming one then replaces the Service, since only a new Service can
+// carry it without touching the other manager's field.
+func TestFloatingIPClaimAnnotationOwnership(t *testing.T) {
+	s := gatewayScheme(t)
+	base := fake.NewClientBuilder().WithScheme(s).WithReturnManagedFields().
+		WithObjects(livePort("team-a", "vpc-a", "10.0.0.5", "node-1"), floatingIP("team-a", "web", "vpc-a", "10.0.0.5")).
+		WithStatusSubresource(&sdnv1alpha1.FloatingIP{}, &corev1.Service{}).Build()
+	ours := client.WithFieldOwner(base, FieldOwner)
+	reconcile := func() {
+		t.Helper()
+		r := &FloatingIPReconciler{Client: ours, Scheme: s}
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "team-a", Name: "web"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reconcile()
+	svc := ownedFloatingService(t, base, "team-a", "web")
+	svc.Annotations = map[string]string{addressClaimAnnotation: "auto"}
+	if err := client.WithFieldOwner(base, "address-controller").Update(context.Background(), svc); err != nil {
+		t.Fatal(err)
+	}
+	reconcile()
+	if got := ownedFloatingService(t, base, "team-a", "web"); got.Name != svc.Name || got.Annotations[addressClaimAnnotation] != "auto" {
+		t.Errorf("service %s annotation %q, want the same Service with auto left in place", got.Name, got.Annotations[addressClaimAnnotation])
+	}
+
+	fip := &sdnv1alpha1.FloatingIP{}
+	if err := base.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: "web"}, fip); err != nil {
+		t.Fatal(err)
+	}
+	fip.Spec.AddressClaimName = "my-eip"
+	if err := base.Update(context.Background(), fip); err != nil {
+		t.Fatal(err)
+	}
+	reconcile() // deletes the Service carrying the other claim
+	reconcile() // creates its replacement
+	if got := ownedFloatingService(t, base, "team-a", "web"); got == nil || got.Name == svc.Name || got.Annotations[addressClaimAnnotation] != "my-eip" {
+		t.Errorf("service %v, want a new Service annotated my-eip", got)
+	}
+}

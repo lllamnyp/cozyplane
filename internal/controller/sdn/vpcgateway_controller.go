@@ -19,10 +19,9 @@ package sdn
 import (
 	"context"
 	"fmt"
-	"net/netip"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
-	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -85,14 +84,18 @@ func (r *VPCGatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// node's address and the tenant is indistinguishable from the platform on the
 	// wire (docs/north-south.md, tenet 8; docs/external-addresses.md §5). A losing
 	// (non-exclusive) gateway owns no Service — it realizes nothing.
-	natAddr, natAddr6 := "", ""
+	// nat.enabled is realized as a NATGateway, a default RouteTable and default
+	// Routes the gateway owns (docs/vpc-egress.md §7); the NAT addresses are the
+	// NAT gateway's, mirrored here. A losing (non-exclusive) gateway realizes
+	// nothing.
+	natAddr, natAddr6, problem := "", "", ""
 	if exclusive && gw.Spec.NAT.Enabled && vpcOK {
-		v4, v6, err := r.ensureNATServices(ctx, gw, vpc)
+		v4, v6, p, err := r.ensureEgress(ctx, gw)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		natAddr, natAddr6 = v4, v6
-	} else if err := r.deleteNATServices(ctx, gw); err != nil {
+		natAddr, natAddr6, problem = v4, v6, p
+	} else if err := r.deleteEgress(ctx, gw); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -105,7 +108,9 @@ func (r *VPCGatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	setGWCondition(&status, sdnv1alpha1.VPCGatewayConditionVPCResolved, vpcOK,
 		"VPCResolved", "spec.vpcRef names a VPC in this namespace")
 	natReady := !gw.Spec.NAT.Enabled || natAddr != "" || natAddr6 != ""
-	if natReady {
+	if problem != "" {
+		setGWCondition(&status, sdnv1alpha1.VPCGatewayConditionNATReady, false, "NameTaken", problem)
+	} else if natReady {
 		setGWCondition(&status, sdnv1alpha1.VPCGatewayConditionNATReady, true,
 			"NATReady", "NAT egress has an eBPF identity (or is disabled)")
 	} else {
@@ -175,58 +180,11 @@ const (
 	addressFamilyLabel = "sdn.cozystack.io/address-family"
 )
 
-// ensureNATServices reconciles the VPC's eBPF egress identities: one delegated
-// LoadBalancer Service per address family the VPC has, whose assigned address the
-// datapath SNATs the VPC's egress to. A family the VPC lacks (or the cluster cannot
-// serve a LoadBalancer for) gets no address here, and — per the unchanged pod
-// reconciler (gateway_controller.go) — keeps the gateway pod (docs/north-south.md
-// §6a, #15). cozyplane allocates nothing; the LB implementation does.
-func (r *VPCGatewayReconciler) ensureNATServices(ctx context.Context, gw *sdnv1alpha1.VPCGateway, vpc *sdnv1alpha1.VPC) (v4, v6 string, err error) {
-	haveV4, haveV6 := cidrsHaveV4(vpc.Spec.CIDRs), cidrsHaveV6(vpc.Spec.CIDRs)
-
-	if haveV4 {
-		if v4, err = r.ensureNATFamilyService(ctx, gw, corev1.IPv4Protocol); err != nil {
-			return "", "", err
-		}
-	} else if err = r.deleteNATFamilyService(ctx, gw, corev1.IPv4Protocol); err != nil {
-		return "", "", err
-	}
-
-	if haveV6 {
-		if v6, err = r.ensureNATFamilyService(ctx, gw, corev1.IPv6Protocol); err != nil {
-			return "", "", err
-		}
-	} else if err = r.deleteNATFamilyService(ctx, gw, corev1.IPv6Protocol); err != nil {
-		return "", "", err
-	}
-	return v4, v6, nil
-}
-
-// deleteNATServices removes every NAT-identity Service this gateway owns (both
-// families) — used when the gateway is non-exclusive or NAT is disabled.
-func (r *VPCGatewayReconciler) deleteNATServices(ctx context.Context, gw *sdnv1alpha1.VPCGateway) error {
-	for _, f := range []corev1.IPFamily{corev1.IPv4Protocol, corev1.IPv6Protocol} {
-		if err := r.deleteNATFamilyService(ctx, gw, f); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func familyLabelValue(f corev1.IPFamily) string {
 	if f == corev1.IPv6Protocol {
 		return "IPv6"
 	}
 	return "IPv4"
-}
-
-// natClaimFor returns the per-family IPAddressClaim name the gateway's spec
-// reserves for this family's NAT identity ("" = dynamic; external-addresses.md §7).
-func natClaimFor(gw *sdnv1alpha1.VPCGateway, f corev1.IPFamily) string {
-	if f == corev1.IPv6Protocol {
-		return gw.Spec.NAT.AddressClaimName6
-	}
-	return gw.Spec.NAT.AddressClaimName
 }
 
 func familyShort(f corev1.IPFamily) string {
@@ -236,169 +194,178 @@ func familyShort(f corev1.IPFamily) string {
 	return "v4"
 }
 
-// ownedNATService returns the Service this gateway owns for the given family, or nil.
-func (r *VPCGatewayReconciler) ownedNATService(ctx context.Context, gw *sdnv1alpha1.VPCGateway, f corev1.IPFamily) (*corev1.Service, error) {
-	var list corev1.ServiceList
-	if err := r.List(ctx, &list, client.InNamespace(gw.Namespace), client.MatchingLabels{
-		vpcGatewayLabel:    gw.Name,
-		addressFamilyLabel: familyLabelValue(f),
-	}); err != nil {
-		return nil, fmt.Errorf("list NAT services: %w", err)
-	}
-	for i := range list.Items {
-		if metav1.IsControlledBy(&list.Items[i], gw) {
-			return &list.Items[i], nil
-		}
-	}
-	return nil, nil
+// egressRouteName is the name of the default route the transition creates for
+// a family (docs/vpc-egress.md §7).
+func egressRouteName(gw *sdnv1alpha1.VPCGateway, f corev1.IPFamily) string {
+	return gw.Name + "-default-" + strings.ToLower(familyLabelValue(f))
 }
 
-// ensureNATFamilyService returns the assigned NAT address for a family, creating the
-// gateway's owned single-family LoadBalancer Service if absent and synthesizing its
-// advertisement-trigger EndpointSlice once an address is assigned. A cluster that
-// cannot serve a LoadBalancer of this family (an IPv6 VPC on a v4-only cluster) yields
-// "" — that family keeps the gateway pod (#15).
-func (r *VPCGatewayReconciler) ensureNATFamilyService(ctx context.Context, gw *sdnv1alpha1.VPCGateway, f corev1.IPFamily) (string, error) {
-	svc, err := r.ownedNATService(ctx, gw, f)
-	if err != nil {
-		return "", err
-	}
-	if svc != nil {
-		// Reservation (docs/external-addresses.md §7): keep the association
-		// annotation in step with the per-family claim name; the claim's driver
-		// does the pinning.
-		if reconcileClaimAnnotation(svc, natClaimFor(gw, f)) {
-			if err := r.Update(ctx, svc); err != nil {
-				return "", fmt.Errorf("update NAT service annotations: %w", err)
-			}
-		}
-	}
-	if svc == nil {
-		svc = &corev1.Service{
-			ObjectMeta: metav1.ObjectMeta{
-				GenerateName: gw.Name + "-" + familyShort(f) + "-",
-				Namespace:    gw.Namespace,
-				Labels: map[string]string{
-					serviceProxyNameLabel: serviceProxyNameValue,
-					vpcGatewayLabel:       gw.Name,
-					addressFamilyLabel:    familyLabelValue(f),
-				},
-			},
-			Spec: corev1.ServiceSpec{
-				Type:                          corev1.ServiceTypeLoadBalancer,
-				ExternalTrafficPolicy:         corev1.ServiceExternalTrafficPolicyCluster,
-				AllocateLoadBalancerNodePorts: new(false),
-				IPFamilyPolicy:                new(corev1.IPFamilyPolicySingleStack),
-				IPFamilies:                    []corev1.IPFamily{f},
-				Ports:                         []corev1.ServicePort{{Name: "placeholder", Port: 1, Protocol: corev1.ProtocolTCP}},
-			},
-		}
-		if gw.Spec.LoadBalancerClass != "" {
-			svc.Spec.LoadBalancerClass = new(gw.Spec.LoadBalancerClass)
-		}
-		reconcileClaimAnnotation(svc, natClaimFor(gw, f))
-		if err := controllerutil.SetControllerReference(gw, svc, r.Scheme); err != nil {
-			return "", err
-		}
-		if err := r.Create(ctx, svc); err != nil {
-			// A cluster that cannot serve a LoadBalancer of this family rejects the
-			// Service as Invalid; treat that as "no identity" so the family keeps the
-			// gateway pod (#15), rather than failing the whole reconcile.
-			if apierrors.IsInvalid(err) {
-				log.FromContext(ctx).Info("cluster cannot serve a LoadBalancer of this family; NAT identity falls back to the gateway pod",
-					"vpcgateway", client.ObjectKeyFromObject(gw).String(), "family", familyLabelValue(f))
-				return "", nil
-			}
-			return "", fmt.Errorf("create NAT service: %w", err)
-		}
-	}
-
-	addr := ingressAddress(svc)
-	if addr != "" {
-		if err := r.ensureNATEndpointSlice(ctx, svc, gw, f, addr); err != nil {
-			return "", err
-		}
-	}
-	return addr, nil
-}
-
-// ensureNATEndpointSlice reconciles the self-addressed, always-Ready EndpointSlice
-// that makes the LB implementation advertise the NAT address. There is no target
-// pod — the endpoint is a pure advertisement trigger (MetalLB advertises only a
-// Service with a ready endpoint, even under etp: Cluster; docs/external-addresses.md
-// §5). Nothing dials it (every proxy skips the Service via service-proxy-name); the
-// real reverse path is vpc_nat_reverse on whichever node attracts the address.
-func (r *VPCGatewayReconciler) ensureNATEndpointSlice(ctx context.Context, svc *corev1.Service, gw *sdnv1alpha1.VPCGateway, f corev1.IPFamily, addr string) error {
-	addrType := discoveryv1.AddressTypeIPv4
-	if f == corev1.IPv6Protocol {
-		addrType = discoveryv1.AddressTypeIPv6
-	}
-	if a, err := netip.ParseAddr(addr); err != nil ||
-		(a.Is6() && !a.Is4In6()) != (f == corev1.IPv6Protocol) {
-		// The assigned address must parse and match the Service's family.
-		return nil
-	}
-	ep := discoveryv1.Endpoint{
-		Addresses:  []string{addr},
-		Conditions: discoveryv1.EndpointConditions{Ready: new(true)},
-	}
-	ports := []discoveryv1.EndpointPort{{
-		Name:     new("placeholder"),
-		Port:     new(int32(1)),
-		Protocol: new(corev1.ProtocolTCP),
-	}}
-
-	key := client.ObjectKey{Namespace: svc.Namespace, Name: svc.Name}
-	existing := &discoveryv1.EndpointSlice{}
-	switch err := r.Get(ctx, key, existing); {
+// ensureEgress realizes nat.enabled as the objects of docs/vpc-egress.md §7: a
+// NATGateway named after the VPCGateway, a default RouteTable if the VPC has
+// none, and a default route per family the NAT gateway holds an address for.
+// It returns the NAT gateway's addresses, which VPCGateway status mirrors, and
+// a non-empty problem when an object it needs is taken by someone else.
+func (r *VPCGatewayReconciler) ensureEgress(ctx context.Context, gw *sdnv1alpha1.VPCGateway) (v4, v6, problem string, err error) {
+	ngw := &sdnv1alpha1.NATGateway{}
+	key := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+	switch err := r.Get(ctx, key, ngw); {
 	case apierrors.IsNotFound(err):
-		slice := &discoveryv1.EndpointSlice{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      svc.Name,
-				Namespace: svc.Namespace,
-				Labels: map[string]string{
-					discoveryv1.LabelServiceName: svc.Name,
-					discoveryv1.LabelManagedBy:   serviceProxyNameValue,
-					vpcGatewayLabel:              gw.Name,
-				},
+		ngw = &sdnv1alpha1.NATGateway{
+			ObjectMeta: metav1.ObjectMeta{Name: gw.Name, Namespace: gw.Namespace},
+			Spec: sdnv1alpha1.NATGatewaySpec{
+				VPCRef:            gw.Spec.VPCRef,
+				LoadBalancerClass: gw.Spec.LoadBalancerClass,
+				AddressClaimName:  gw.Spec.NAT.AddressClaimName,
+				AddressClaimName6: gw.Spec.NAT.AddressClaimName6,
 			},
-			AddressType: addrType,
-			Endpoints:   []discoveryv1.Endpoint{ep},
-			Ports:       ports,
 		}
-		if err := controllerutil.SetControllerReference(svc, slice, r.Scheme); err != nil {
-			return err
+		if err := controllerutil.SetControllerReference(gw, ngw, r.Scheme); err != nil {
+			return "", "", "", err
 		}
-		if err := r.Create(ctx, slice); err != nil {
-			return fmt.Errorf("create NAT endpointslice: %w", err)
+		if err := r.Create(ctx, ngw); err != nil {
+			return "", "", "", fmt.Errorf("create NATGateway: %w", err)
 		}
-		return nil
 	case err != nil:
-		return fmt.Errorf("get NAT endpointslice: %w", err)
-	}
-	if existing.AddressType != addrType {
-		if err := r.Delete(ctx, existing); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("delete NAT endpointslice for family change: %w", err)
+		return "", "", "", fmt.Errorf("fetch NATGateway: %w", err)
+	case !metav1.IsControlledBy(ngw, gw):
+		return "", "", fmt.Sprintf("NATGateway %q exists and is not this VPCGateway's", gw.Name), nil
+	case ngw.Spec.VPCRef != gw.Spec.VPCRef:
+		// vpcRef is immutable: a VPCGateway re-pointed at another VPC gets a
+		// new NAT gateway.
+		if err := r.Delete(ctx, ngw); err != nil && !apierrors.IsNotFound(err) {
+			return "", "", "", fmt.Errorf("delete NATGateway of the previous VPC: %w", err)
 		}
-		return r.ensureNATEndpointSlice(ctx, svc, gw, f, addr)
+		return "", "", "", nil
+	default:
+		want := sdnv1alpha1.NATGatewaySpec{
+			VPCRef:            gw.Spec.VPCRef,
+			LoadBalancerClass: gw.Spec.LoadBalancerClass,
+			AddressClaimName:  gw.Spec.NAT.AddressClaimName,
+			AddressClaimName6: gw.Spec.NAT.AddressClaimName6,
+		}
+		if ngw.Spec != want {
+			ngw.Spec = want
+			if err := r.Update(ctx, ngw); err != nil {
+				return "", "", "", fmt.Errorf("update NATGateway: %w", err)
+			}
+		}
 	}
-	existing.Endpoints = []discoveryv1.Endpoint{ep}
-	existing.Ports = ports
-	if err := r.Update(ctx, existing); err != nil {
-		return fmt.Errorf("update NAT endpointslice: %w", err)
+
+	var tables sdnv1alpha1.RouteTableList
+	if err := r.List(ctx, &tables, client.InNamespace(gw.Namespace)); err != nil {
+		return "", "", "", fmt.Errorf("list RouteTables: %w", err)
+	}
+	tableName := ""
+	if eff := effectiveDefaultTable(tables.Items, gw.Spec.VPCRef.Name); eff != nil {
+		tableName = eff.Name
+	} else {
+		rt := &sdnv1alpha1.RouteTable{}
+		switch err := r.Get(ctx, key, rt); {
+		case apierrors.IsNotFound(err):
+			rt = &sdnv1alpha1.RouteTable{
+				ObjectMeta: metav1.ObjectMeta{Name: gw.Name, Namespace: gw.Namespace},
+				Spec:       sdnv1alpha1.RouteTableSpec{VPCRef: gw.Spec.VPCRef, Default: true},
+			}
+			if err := controllerutil.SetControllerReference(gw, rt, r.Scheme); err != nil {
+				return "", "", "", err
+			}
+			if err := r.Create(ctx, rt); err != nil {
+				return "", "", "", fmt.Errorf("create default RouteTable: %w", err)
+			}
+		case err != nil:
+			return "", "", "", fmt.Errorf("fetch RouteTable: %w", err)
+		case !metav1.IsControlledBy(rt, gw):
+			return "", "", fmt.Sprintf("the VPC has no default RouteTable and RouteTable %q is not this VPCGateway's", gw.Name), nil
+		}
+		tableName = gw.Name
+	}
+
+	addrs := map[corev1.IPFamily]string{corev1.IPv4Protocol: ngw.Status.Address, corev1.IPv6Protocol: ngw.Status.Address6}
+	dests := map[corev1.IPFamily]string{corev1.IPv4Protocol: "0.0.0.0/0", corev1.IPv6Protocol: "::/0"}
+	for _, f := range []corev1.IPFamily{corev1.IPv4Protocol, corev1.IPv6Protocol} {
+		if err := r.ensureDefaultRoute(ctx, gw, f, tableName, dests[f], addrs[f] != ""); err != nil {
+			return "", "", "", err
+		}
+	}
+	return ngw.Status.Address, ngw.Status.Address6, "", nil
+}
+
+// ensureDefaultRoute makes the transition's default route of one family exist
+// (in the VPC's default table) when the NAT gateway has an address of that
+// family, and not exist otherwise — so a family without an address still
+// reaches the gateway pod (docs/vpc-egress.md §3.1 step 4).
+func (r *VPCGatewayReconciler) ensureDefaultRoute(ctx context.Context, gw *sdnv1alpha1.VPCGateway, f corev1.IPFamily, table, dest string, want bool) error {
+	route := &sdnv1alpha1.Route{}
+	key := types.NamespacedName{Namespace: gw.Namespace, Name: egressRouteName(gw, f)}
+	err := r.Get(ctx, key, route)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("fetch default Route: %w", err)
+	}
+	exists := err == nil
+	if exists && !metav1.IsControlledBy(route, gw) {
+		return nil // someone else's route of that name: leave it
+	}
+	if exists && (!want || route.Spec.RouteTableRef.Name != table) {
+		// routeTableRef is immutable: a moved default table means a new route.
+		if err := r.Delete(ctx, route); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete default Route: %w", err)
+		}
+		exists = false
+	}
+	if !want || exists {
+		return nil
+	}
+	route = &sdnv1alpha1.Route{
+		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: gw.Namespace},
+		Spec: sdnv1alpha1.RouteSpec{
+			RouteTableRef: sdnv1alpha1.LocalRouteTableRef{Name: table},
+			Destination:   dest,
+			Target:        sdnv1alpha1.RouteTarget{NATGateway: &sdnv1alpha1.LocalNATGatewayRef{Name: gw.Name}},
+		},
+	}
+	if err := controllerutil.SetControllerReference(gw, route, r.Scheme); err != nil {
+		return err
+	}
+	if err := r.Create(ctx, route); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create default Route: %w", err)
 	}
 	return nil
 }
 
-// deleteNATFamilyService removes the gateway's owned Service for a family (its
-// EndpointSlice cascades with it) — used when the VPC drops that family.
-func (r *VPCGatewayReconciler) deleteNATFamilyService(ctx context.Context, gw *sdnv1alpha1.VPCGateway, f corev1.IPFamily) error {
-	svc, err := r.ownedNATService(ctx, gw, f)
-	if err != nil || svc == nil {
-		return err
+// deleteEgress removes what ensureEgress created, and any NAT Service a
+// VPCGateway owned before NAT gateways existed.
+func (r *VPCGatewayReconciler) deleteEgress(ctx context.Context, gw *sdnv1alpha1.VPCGateway) error {
+	key := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+	objs := []client.Object{&sdnv1alpha1.NATGateway{}, &sdnv1alpha1.RouteTable{}}
+	keys := []types.NamespacedName{key, key}
+	for _, f := range []corev1.IPFamily{corev1.IPv4Protocol, corev1.IPv6Protocol} {
+		objs = append(objs, &sdnv1alpha1.Route{})
+		keys = append(keys, types.NamespacedName{Namespace: gw.Namespace, Name: egressRouteName(gw, f)})
 	}
-	if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("delete NAT service: %w", err)
+	for i, o := range objs {
+		if err := r.Get(ctx, keys[i], o); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("fetch %T: %w", o, err)
+		}
+		if !metav1.IsControlledBy(o, gw) {
+			continue
+		}
+		if err := r.Delete(ctx, o); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete %T: %w", o, err)
+		}
+	}
+	var list corev1.ServiceList
+	if err := r.List(ctx, &list, client.InNamespace(gw.Namespace), client.MatchingLabels{vpcGatewayLabel: gw.Name}); err != nil {
+		return fmt.Errorf("list NAT services: %w", err)
+	}
+	for i := range list.Items {
+		if metav1.IsControlledBy(&list.Items[i], gw) {
+			if err := r.Delete(ctx, &list.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("delete NAT service: %w", err)
+			}
+		}
 	}
 	return nil
 }
@@ -444,7 +411,10 @@ func gwStatusEqual(a, b sdnv1alpha1.VPCGatewayStatus) bool {
 func (r *VPCGatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&sdnv1alpha1.VPCGateway{}).
-		Owns(&corev1.Service{}). // re-reconcile when an owned NAT Service's LB ingress fills
+		Owns(&sdnv1alpha1.NATGateway{}). // re-reconcile when its NAT gateway's addresses fill
+		Owns(&sdnv1alpha1.RouteTable{}).
+		Owns(&sdnv1alpha1.Route{}).
+		Watches(&sdnv1alpha1.RouteTable{}, handler.EnqueueRequestsFromMapFunc(r.mapNamespaceGateways)).
 		Watches(&sdnv1alpha1.VPC{}, handler.EnqueueRequestsFromMapFunc(r.mapVPCToGateways)).
 		Named("vpcgateway").
 		Complete(r)
@@ -460,6 +430,20 @@ func (r *VPCGatewayReconciler) mapVPCToGateways(ctx context.Context, obj client.
 		if list.Items[i].Spec.VPCRef.Name == obj.GetName() {
 			out = append(out, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(&list.Items[i])})
 		}
+	}
+	return out
+}
+
+// mapNamespaceGateways re-reconciles a namespace's gateways when its route
+// tables change: the default table decides where the default routes go.
+func (r *VPCGatewayReconciler) mapNamespaceGateways(ctx context.Context, obj client.Object) []ctrl.Request {
+	var list sdnv1alpha1.VPCGatewayList
+	if err := r.List(ctx, &list, client.InNamespace(obj.GetNamespace())); err != nil {
+		return nil
+	}
+	out := make([]ctrl.Request, 0, len(list.Items))
+	for i := range list.Items {
+		out = append(out, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(&list.Items[i])})
 	}
 	return out
 }

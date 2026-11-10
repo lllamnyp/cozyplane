@@ -22,7 +22,13 @@ type FloatingIPExpansion interface{}
 
 type HostFirewallExpansion interface{}
 
+type NATGatewayExpansion interface{}
+
 type PortExpansion interface{}
+
+type RouteExpansion interface{}
+
+type RouteTableExpansion interface{}
 
 type SecurityGroupExpansion interface{}
 

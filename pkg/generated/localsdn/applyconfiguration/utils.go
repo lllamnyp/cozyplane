@@ -36,6 +36,16 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &localsdnv1alpha1.FabricIPApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("FabricIPSpec"):
 		return &localsdnv1alpha1.FabricIPSpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("NATGatewayReference"):
+		return &localsdnv1alpha1.NATGatewayReferenceApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("NATPortBlock"):
+		return &localsdnv1alpha1.NATPortBlockApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("NATPortBlockAck"):
+		return &localsdnv1alpha1.NATPortBlockAckApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("NATPortBlockSpec"):
+		return &localsdnv1alpha1.NATPortBlockSpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("NATPortBlockStatus"):
+		return &localsdnv1alpha1.NATPortBlockStatusApplyConfiguration{}
 
 	}
 	return nil

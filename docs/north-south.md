@@ -8,6 +8,12 @@ cloud actually needs.
 It supersedes the north-south halves of [floating-ha.md](floating-ha.md) and
 [lb-ingress.md](lb-ingress.md), and it re-parents `FloatingIP`.
 
+> **Egress is superseded by [vpc-egress.md](vpc-egress.md) (design, 2026-11-06):**
+> `NATGateway` objects, per-pod route tables of `Route` objects, an explicit
+> `internet` route for FloatingIP egress, and leased port blocks in place of
+> increment 2's shards. `VPCGateway.spec.nat` remains only for the transition.
+> Increment 2 and §6a record how the current mechanism was built.
+
 ---
 
 ## 1. The problem: three doors, no doorway
@@ -231,9 +237,9 @@ pool that covers every family a VPC uses.
   because we only half-applied tenet 3. The answer is that cozyplane must stop
   *allocating* external addresses too, and `ExternalPool` is retired — **done**,
   the kind is deleted ([external-addresses.md](external-addresses.md) §9).
-- **Per-VPC NAT port-pool sizing and exhaustion** — the node masquerade's pool is
-  shared; a per-VPC pool needs its own accounting and a story for what happens when
-  a tenant exhausts it.
+- ~~**Per-VPC NAT port-pool sizing and exhaustion**~~ — **answered by
+  [vpc-egress.md](vpc-egress.md) §4**: expiring connection state in NAT-only maps,
+  a per-VPC flow quota, leased port blocks, and counted refusals.
 - ~~**Metering shape**~~ — **answered by increment 0**: per-VPC byte/packet counters
   at the boundary, split by direction and by door (gateway / eip / loadbalancer),
   with refusals counted separately from crossings. Closed [#2](../../issues/2)'s
@@ -404,7 +410,10 @@ Not a commitment; the order the pieces actually depend on each other.
    claims it first).
 
    **A FloatingIP is now an EIP under the gateway**: it draws from its VPC's
-   gateway's pool, so a VPC with no boundary gets no external address at all. The
+   gateway's pool, so a VPC with no boundary gets no external address at all.
+   *(No longer true: the gate went with the pool (§9) and nothing replaced it, so a
+   FloatingIP egresses as if through an implicit internet gateway.
+   [vpc-egress.md](vpc-egress.md) makes that an explicit `internet` route.)* The
    `attach` verb on the pool therefore governs *every* address a tenant can wear,
    not just its NAT identity — and every external address a VPC uses crosses, and is
    counted at, one boundary. Tenet 2, finally true.

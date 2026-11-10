@@ -31,6 +31,7 @@ import (
 	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -72,6 +73,8 @@ func main() {
 		gatewayNamespace     string
 		internalCIDRs        string
 		clusterDNS           string
+		natBlockSize         int
+		natNodeGoneGrace     time.Duration
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
@@ -92,6 +95,10 @@ func main() {
 		"comma-separated cluster-internal CIDRs gateways must not forward tenant traffic to (pod, service, node networks)")
 	flag.StringVar(&clusterDNS, "cluster-dns", "",
 		"cluster DNS ClusterIP gateways allow on :53")
+	flag.IntVar(&natBlockSize, "nat-block-size", sdncontroller.DefaultNATBlockSize,
+		"ports per NAT gateway port block (docs/vpc-egress.md §4.3); at most 64512/size nodes can NAT through one NAT gateway at once")
+	flag.DurationVar(&natNodeGoneGrace, "nat-node-gone-grace", sdncontroller.DefaultNATNodeGoneGrace,
+		"how long a deleted node's NAT port blocks stay leased (one TCP-established timeout)")
 
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
@@ -152,11 +159,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Every controller writes as one field manager, which the controllers check
+	// to tell the labels and annotations they wrote from other managers'.
+	c := client.WithFieldOwner(mgr.GetClient(), sdncontroller.FieldOwner)
+
 	// The local layer's GC: reclaim underlay addresses whose pod is gone
 	// (docs/api-groups.md). It reconciles a CRD-served kind, so it works on a
 	// cluster with no aggregated apiserver at all.
 	if err := (&localsdnctrl.FabricIPReconciler{
-		Client: mgr.GetClient(),
+		Client: c,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "FabricIP")
 		os.Exit(1)
@@ -178,6 +189,8 @@ func main() {
 		gatewayNamespace: gatewayNamespace,
 		internalCIDRs:    internalCIDRs,
 		clusterDNS:       clusterDNS,
+		natBlockSize:     natBlockSize,
+		natNodeGoneGrace: natNodeGoneGrace,
 	}
 	gate := &apigate.Gate{
 		Name: sdnv1alpha1.SchemeGroupVersion.String(),
@@ -188,7 +201,8 @@ func main() {
 			// than just the group) keeps a half-registered apiserver — group
 			// advertised, registries not installed — from opening the gate.
 			Resources: []string{"vpcs", "vpcbindings", "vpcpeerings", "vpcgateways",
-				"ports", "securitygroups", "servicevips", "floatingips"},
+				"ports", "securitygroups", "servicevips", "floatingips",
+				"natgateways", "routetables", "routes"},
 		},
 		Interval: apiGroupPollInterval,
 		Register: func(context.Context) error { return setupSDNControllers(mgr, gateCfg) },
@@ -214,6 +228,8 @@ type sdnControllerConfig struct {
 	gatewayNamespace string
 	internalCIDRs    string
 	clusterDNS       string
+	natBlockSize     int
+	natNodeGoneGrace time.Duration
 }
 
 // setupSDNControllers registers every controller that watches a
@@ -226,8 +242,9 @@ type sdnControllerConfig struct {
 // the runnable group starts them on the spot — so this needs no second manager
 // and no restart.
 func setupSDNControllers(mgr manager.Manager, cfg sdnControllerConfig) error {
+	c := client.WithFieldOwner(mgr.GetClient(), sdncontroller.FieldOwner)
 	if err := (&sdncontroller.VPCReconciler{
-		Client: mgr.GetClient(),
+		Client: c,
 		Scheme: mgr.GetScheme(),
 		// VNI allocation must read live, never the lagging informer cache —
 		// a stale read hands two VPCs the same network id (isolation break).
@@ -237,21 +254,21 @@ func setupSDNControllers(mgr manager.Manager, cfg sdnControllerConfig) error {
 	}
 
 	if err := (&sdncontroller.VPCBindingReconciler{
-		Client: mgr.GetClient(),
+		Client: c,
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("unable to create controller %s: %w", "VPCBinding", err)
 	}
 
 	if err := (&sdncontroller.VPCPeeringReconciler{
-		Client: mgr.GetClient(),
+		Client: c,
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("unable to create controller %s: %w", "VPCPeering", err)
 	}
 
 	if err := (&sdncontroller.PortGCReconciler{
-		Client: mgr.GetClient(),
+		Client: c,
 		Scheme: mgr.GetScheme(),
 		// Claimant-gone checks confirm against the API server directly — a
 		// stale cache read must not GC a just-created pod's newborn Port.
@@ -261,21 +278,22 @@ func setupSDNControllers(mgr manager.Manager, cfg sdnControllerConfig) error {
 	}
 
 	if err := (&sdncontroller.FloatingIPReconciler{
-		Client: mgr.GetClient(),
+		Client: c,
 		Scheme: mgr.GetScheme(),
+		Reader: mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("unable to create controller %s: %w", "FloatingIP", err)
 	}
 
 	if err := (&sdncontroller.PersistentPortReconciler{
-		Client: mgr.GetClient(),
+		Client: c,
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("unable to create controller %s: %w", "PersistentPort", err)
 	}
 
 	if err := (&sdncontroller.ServiceVIPReconciler{
-		Client: mgr.GetClient(),
+		Client: c,
 		Scheme: mgr.GetScheme(),
 		Reader: mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
@@ -283,28 +301,57 @@ func setupSDNControllers(mgr manager.Manager, cfg sdnControllerConfig) error {
 	}
 
 	if err := (&sdncontroller.SecurityGroupReconciler{
-		Client: mgr.GetClient(),
+		Client: c,
 		Reader: mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("unable to create controller %s: %w", "SecurityGroup", err)
 	}
 
 	if err := (&sdncontroller.PortMembershipReconciler{
-		Client: mgr.GetClient(),
+		Client: c,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("unable to create controller %s: %w", "PortMembership", err)
 	}
 
 	if err := (&sdncontroller.VPCGatewayReconciler{
-		Client: mgr.GetClient(),
+		Client: c,
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("unable to create controller %s: %w", "VPCGateway", err)
 	}
 
+	if err := (&sdncontroller.NATGatewayReconciler{
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Reader:    mgr.GetAPIReader(),
+		BlockSize: cfg.natBlockSize,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create controller %s: %w", "NATGateway", err)
+	}
+
+	if err := (&sdncontroller.RouteTableReconciler{
+		Client: c,
+		Reader: mgr.GetAPIReader(),
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create controller %s: %w", "RouteTable", err)
+	}
+
+	if err := (&sdncontroller.RouteReconciler{
+		Client: c,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create controller %s: %w", "Route", err)
+	}
+
+	if err := (&sdncontroller.NATPortBlockGCReconciler{
+		Client:        mgr.GetClient(),
+		NodeGoneGrace: cfg.natNodeGoneGrace,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create controller %s: %w", "NATPortBlockGC", err)
+	}
+
 	if cfg.gatewayImage != "" {
 		if err := (&sdncontroller.GatewayReconciler{
-			Client: mgr.GetClient(),
+			Client: c,
 			Scheme: mgr.GetScheme(),
 			Config: sdncontroller.GatewayConfig{
 				Image:         cfg.gatewayImage,

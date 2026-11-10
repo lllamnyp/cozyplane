@@ -52,14 +52,40 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &sdnv1alpha1.HostFirewallSpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("HostFirewallStatus"):
 		return &sdnv1alpha1.HostFirewallStatusApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("LocalNATGatewayRef"):
+		return &sdnv1alpha1.LocalNATGatewayRefApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("LocalRouteTableRef"):
+		return &sdnv1alpha1.LocalRouteTableRefApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("LocalVPCRef"):
 		return &sdnv1alpha1.LocalVPCRefApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("NATGateway"):
+		return &sdnv1alpha1.NATGatewayApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("NATGatewayBlocks"):
+		return &sdnv1alpha1.NATGatewayBlocksApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("NATGatewaySpec"):
+		return &sdnv1alpha1.NATGatewaySpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("NATGatewayStatus"):
+		return &sdnv1alpha1.NATGatewayStatusApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("Port"):
 		return &sdnv1alpha1.PortApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("PortSpec"):
 		return &sdnv1alpha1.PortSpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("PortStatus"):
 		return &sdnv1alpha1.PortStatusApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("Route"):
+		return &sdnv1alpha1.RouteApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("RouteSpec"):
+		return &sdnv1alpha1.RouteSpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("RouteStatus"):
+		return &sdnv1alpha1.RouteStatusApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("RouteTable"):
+		return &sdnv1alpha1.RouteTableApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("RouteTableSpec"):
+		return &sdnv1alpha1.RouteTableSpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("RouteTableStatus"):
+		return &sdnv1alpha1.RouteTableStatusApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("RouteTarget"):
+		return &sdnv1alpha1.RouteTargetApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("SecurityGroup"):
 		return &sdnv1alpha1.SecurityGroupApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("SecurityGroupEgressRule"):

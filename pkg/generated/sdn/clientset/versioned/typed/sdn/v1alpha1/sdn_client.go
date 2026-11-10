@@ -30,7 +30,10 @@ type SdnV1alpha1Interface interface {
 	RESTClient() rest.Interface
 	FloatingIPsGetter
 	HostFirewallsGetter
+	NATGatewaysGetter
 	PortsGetter
+	RoutesGetter
+	RouteTablesGetter
 	SecurityGroupsGetter
 	ServiceVIPsGetter
 	VPCsGetter
@@ -52,8 +55,20 @@ func (c *SdnV1alpha1Client) HostFirewalls() HostFirewallInterface {
 	return newHostFirewalls(c)
 }
 
+func (c *SdnV1alpha1Client) NATGateways(namespace string) NATGatewayInterface {
+	return newNATGateways(c, namespace)
+}
+
 func (c *SdnV1alpha1Client) Ports() PortInterface {
 	return newPorts(c)
+}
+
+func (c *SdnV1alpha1Client) Routes(namespace string) RouteInterface {
+	return newRoutes(c, namespace)
+}
+
+func (c *SdnV1alpha1Client) RouteTables(namespace string) RouteTableInterface {
+	return newRouteTables(c, namespace)
 }
 
 func (c *SdnV1alpha1Client) SecurityGroups(namespace string) SecurityGroupInterface {

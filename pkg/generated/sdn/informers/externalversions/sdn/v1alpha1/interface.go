@@ -28,8 +28,14 @@ type Interface interface {
 	FloatingIPs() FloatingIPInformer
 	// HostFirewalls returns a HostFirewallInformer.
 	HostFirewalls() HostFirewallInformer
+	// NATGateways returns a NATGatewayInformer.
+	NATGateways() NATGatewayInformer
 	// Ports returns a PortInformer.
 	Ports() PortInformer
+	// Routes returns a RouteInformer.
+	Routes() RouteInformer
+	// RouteTables returns a RouteTableInformer.
+	RouteTables() RouteTableInformer
 	// SecurityGroups returns a SecurityGroupInformer.
 	SecurityGroups() SecurityGroupInformer
 	// ServiceVIPs returns a ServiceVIPInformer.
@@ -65,9 +71,24 @@ func (v *version) HostFirewalls() HostFirewallInformer {
 	return &hostFirewallInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
 }
 
+// NATGateways returns a NATGatewayInformer.
+func (v *version) NATGateways() NATGatewayInformer {
+	return &nATGatewayInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
 // Ports returns a PortInformer.
 func (v *version) Ports() PortInformer {
 	return &portInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
+}
+
+// Routes returns a RouteInformer.
+func (v *version) Routes() RouteInformer {
+	return &routeInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// RouteTables returns a RouteTableInformer.
+func (v *version) RouteTables() RouteTableInformer {
+	return &routeTableInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
 // SecurityGroups returns a SecurityGroupInformer.

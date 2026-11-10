@@ -135,22 +135,16 @@ comes back *addressed to it*, and that reply must be attracted to a node for
 attraction as a FloatingIP — it rides a Service too. It differs in two ways, neither
 being "no Service":
 
-1. **`etp: Cluster`, with a self-addressed endpoint.** There is no single target pod to
-   hang an EndpointSlice on — the replies fan out by port shard across nodes — so the
-   Service is `etp: Cluster` and cozyplane demuxes: the reply lands on whichever node
-   attracts the address, `from_uplink` there runs `vpc_nat_reverse`, the port's shard
-   names the owning node, and the packet is forwarded over the overlay to it. This is
-   exactly what `vpc_nat_reverse` already does — "the reply arrives at whichever node
-   attracts the address; the port says who owns the flow."
-   The one thing this Service still needs is a **ready endpoint**: MetalLB (verified at
-   increment 1) advertises a LoadBalancer address only while its Service has one —
-   `etp: Cluster` does **not** exempt it (the earlier "announces unconditionally"
-   assumption was wrong). Since there is no target, cozyplane synthesizes a single
-   endpoint that is a pure **advertisement trigger**, not a delivery target: its address
-   is the assigned NAT address itself and it is `Ready` whenever the gateway is the VPC's
-   legitimate (exclusive) boundary. Nothing dials it — every proxy skips the Service via
-   `service-proxy-name`, and the real reverse path is `vpc_nat_reverse`. The endpoint
-   exists only to flip MetalLB's advertise gate; the reply path is unchanged.
+1. **`etp: Local`, with one endpoint per NAT-ready node.** There is no target pod:
+   a reply lands on whichever node attracts the address, `from_uplink` there finds
+   the port's block owner, and forwards the packet over the overlay to it. A node
+   can do that only once its agent has programmed the owner of every leased block,
+   so the controller lists those nodes as the Service's endpoints, each with its
+   `nodeName`, and the Service is `etp: Local`: the LB implementation announces the
+   address only from them ([vpc-egress.md](vpc-egress.md) §4.3). MetalLB advertises a
+   LoadBalancer address only while its Service has a ready endpoint (verified at
+   increment 1), so the endpoints are also the advertisement trigger. Nothing dials
+   them: every proxy skips the Service via `service-proxy-name`.
 2. **Prefers reservation.** A VPC's egress identity churning under live flows is bad,
    so the NAT identity is the strong candidate for a **claim** (§7) rather than a
    dynamic address. That is a preference for stability, satisfied by the claim layer —
@@ -210,12 +204,21 @@ never a Service**, so there is no IP to share, and the earlier claim-owns-the-Se
 
 - **Dynamic (no `addressClaimName`):** the FloatingIP/VPCGateway owns its one
   Service; the LB implementation auto-assigns; the address lives for the object's
-  lifetime.
+  lifetime. cozyplane changes or removes the claim annotation only if no other
+  field manager owns it, so an annotation the address-controller's auto-claim wrote
+  stays, and the auto-claim class supplies the address. Naming a claim then
+  replaces the Service: only a new one can carry it without touching the other
+  manager's field.
 - **Reserved (`addressClaimName` set):** the **same** owned Service, plus the one
   annotation. The driver pins the claim's address onto it, and cozyplane consumes
   `status.loadBalancer.ingress` exactly as in the dynamic case — reserved and
   dynamic are one code path. The address lives for the **claim's** lifetime and
-  survives the FloatingIP — the AWS-EIP semantics.
+  survives the FloatingIP — the AWS-EIP semantics. cozyplane takes the Service's
+  address only if it is one of the claim's: when the driver did not pin (the claim is
+  missing, unbound, or attached to another Service), the LB implementation may
+  assign one from its pools. That address is not published, the endpoint stays
+  not-ready so it is not announced, and `AddressAssigned` is `False` with reason
+  `ClaimNotAttached`.
 - **Per family:** association is one-claim-one-Service and the gateway's Services
   are single-family, so the NAT identity takes one single-family claim per family
   (`nat.addressClaimName` / `nat.addressClaimName6`).
@@ -224,9 +227,12 @@ Two independent gates, each in its right place: the **claim** governs reservatio
 the **EndpointSlice readiness** governs announcement (held-but-dark when the target
 dies). Neither knows about the other.
 
-cozyplane's entire claim surface is that annotation, written as an opaque string —
-no dependency on the claim CRDs, no informer, no module import (the repos are
-private and the API alpha; a Go import would couple builds). The annotation key
+cozyplane's claim surface is that annotation, written as an opaque string — no
+informer, no module import (the repos are private and the API alpha; a Go import
+would couple builds). The reads are GETs of a claim: a named claim's
+`status.addresses`, which decides the families of the Service the `NATGateway`
+controller creates ([vpc-egress.md](vpc-egress.md) §2.1) and which address a
+FloatingIP or NAT gateway accepts. The annotation key
 mirrors the address-controller's `well_known.go` constant, with the authority named
 at the mirror.
 
