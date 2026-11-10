@@ -147,11 +147,11 @@ func ownerFromAddrs(addrs []netlink.Addr, links map[int]linkInfo, ip net.IP) (id
 // the address is not the node's own. Two dumps, not one per link: AddrList
 // always dumps the whole table and filters client-side.
 func addrOwnerLink(ip net.IP) (int, bool, error) {
-	addrs, err := netlink.AddrList(nil, netlink.FAMILY_V4)
+	addrs, err := addrList(nil, netlink.FAMILY_V4)
 	if err != nil {
 		return 0, false, fmt.Errorf("list addresses: %w", err)
 	}
-	links, err := netlink.LinkList()
+	links, err := linkList()
 	if err != nil {
 		return 0, false, fmt.Errorf("list links: %w", err)
 	}
@@ -256,7 +256,7 @@ func (m *Manager) bindFloatUplink(link netlink.Link, ip, gw net.IP) error {
 	if gw != nil {
 		anchor = gw
 	}
-	addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+	addrs, err := addrList(link, netlink.FAMILY_V4)
 	if err != nil {
 		return fmt.Errorf("floating uplink %s addrs: %w", link.Attrs().Name, err)
 	}
