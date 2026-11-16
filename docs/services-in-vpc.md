@@ -113,12 +113,43 @@ Two kinds now draw from one per-net IP keyspace, and a Port and a
    lag, CRD mode), **the Port always wins**: Port IPs are workload- and
    VM-pinned identity and immovable, while a VIP is movable *by construction*
    — nothing addresses it except through a DNS answer, so the loser VIP
-   re-allocates and the resolver's next answer carries the new address.
+   re-allocates and the resolver's next answer carries the new address. (The
+   VIP is also reported on the Service, which follows the move; see below.)
 
 Rejected simplification: a tenant-declared `serviceCIDR` sub-range (disjoint
 pools, no race by partitioning) — it adds required per-VPC configuration to
 dodge a problem the layers above close; kept only as an escape hatch if the
 shared pool proves fragile in practice.
+
+### Reporting the VIP on the Service
+
+The ServiceVIP is cluster-scoped, so a tenant cannot read it (R2). The
+controller therefore writes the VIP onto the attached Service, as the CNI does
+for a pod's VPC address:
+
+```yaml
+metadata:
+  annotations:
+    sdn.cozystack.io/vpc: tenant-a        # the tenant's
+    sdn.cozystack.io/vpc-ip: 10.10.0.254  # the controller's
+```
+
+- **Written** once the VIP is allocated, and rewritten when it changes: after a
+  retarget to another VPC, or when the VIP yields to a Port (layer 3) and is
+  reallocated.
+- **Removed** while the Service has no VIP: when it is detached (the `vpc`
+  annotation removed, the VPCBinding gone, or the Service made headless), and
+  between a yield and the reallocation.
+- **One address.** The VIP comes from the VPC's first CIDR, so the value is a
+  single address.
+- **Not a security boundary.** The controller is the key's only writer on
+  Services and overwrites any other value on the next reconcile; an edit to the
+  annotation triggers one. A tenant can still write a value that holds until
+  then, so a consumer treats it as information about its own Service.
+- **The address can move.** A VIP yields to a Port that comes to hold its
+  address. A consumer that copies the value into configuration (an advertise
+  address, a certificate) must follow the annotation, or it keeps the old
+  address after a reallocation.
 
 ### DNS — split-horizon resolver
 

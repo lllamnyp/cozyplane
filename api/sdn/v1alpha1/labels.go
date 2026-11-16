@@ -38,22 +38,30 @@ const (
 	// VPC has spec.egress.natGateway enabled.
 	AnnotationGatewayFor = "sdn.cozystack.io/gateway-for"
 
-	// AnnotationVPCIP and AnnotationVPCMAC are stamped BY the CNI ONTO the pod: the
-	// VPC address and MAC it just allocated. They are how a tenant learns its own
-	// network identity (docs/multitenancy.md R1).
+	// AnnotationVPCIP is an object's own address inside its VPC; AnnotationVPCMAC
+	// is a pod's MAC there. They are how a tenant learns the network identity of
+	// what it runs (docs/multitenancy.md R1), and cozyplane is their only writer:
 	//
-	// Without them a tenant cannot discover its own address at all. `status.podIP`
-	// is the FABRIC IP — the underlay handle the platform routes and kubelet probes
-	// — not the address the pod's own interface carries and not the address anything
-	// inside the VPC uses. The real identity lives on the cluster-scoped Port, which
-	// a tenant may never read (R2), so it would be invisible.
+	//   - on a pod, the CNI stamps both when it allocates the Port (once, at ADD);
+	//   - on a Service attached to a VPC, the ServiceVIP controller writes
+	//     AnnotationVPCIP with the VIP it allocated, rewrites it when the VIP
+	//     changes, overwrites any other value, and removes it when the Service
+	//     is detached (docs/services-in-vpc.md).
 	//
-	// They are a CACHE, never a source of truth: the Port is authoritative, nothing
-	// reads these back, and their lifetime is exactly the claim's — the pod dies and
-	// they die with it. That is deliberate. A namespaced object COPYING the address
-	// would be the stale-copy bug rebuilt (we deleted Port.spec.fabricIP for exactly
-	// that reason); an annotation on the object the address belongs to cannot drift
-	// away from its owner.
+	// Without them a tenant cannot discover these addresses at all. A pod's
+	// `status.podIP` is the FABRIC IP — the underlay handle the platform routes and
+	// kubelet probes — not the address its own interface carries and not the
+	// address anything inside the VPC uses. The real identities live on the
+	// cluster-scoped Port and ServiceVIP, which a tenant may never read (R2).
+	//
+	// They are a CACHE, never a source of truth: the Port and the ServiceVIP are
+	// authoritative, and cozyplane never reads these back. Consumers may, but a
+	// tenant can edit annotations on its own objects, so a value is informational,
+	// not a security boundary. Their lifetime is the object's: the pod or Service
+	// goes and they go with it. A namespaced object COPYING the address would be
+	// the stale-copy bug rebuilt (we deleted Port.spec.fabricIP for exactly that
+	// reason); an annotation on the object the address belongs to cannot drift away
+	// from its owner.
 	AnnotationVPCIP  = "sdn.cozystack.io/vpc-ip"
 	AnnotationVPCMAC = "sdn.cozystack.io/vpc-mac"
 

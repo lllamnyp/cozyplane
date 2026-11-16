@@ -54,7 +54,7 @@ type ServiceVIPReconciler struct {
 	Reader client.Reader
 }
 
-// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=servicevips,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups=sdn.cozystack.io,resources=servicevips/status,verbs=get;update;patch
@@ -80,17 +80,20 @@ func (r *ServiceVIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	vpcNS, vpcName, attached := serviceVPCRef(svc)
-	if !attached || svc.Spec.ClusterIP == corev1.ClusterIPNone || svc.DeletionTimestamp != nil {
-		// Not attached (or headless — served by the resolver directly, no VIP,
-		// or being deleted): reap whatever VIP the service may have had.
+	if svc.DeletionTimestamp != nil {
 		return ctrl.Result{}, r.reapVIPs(ctx, svc.Namespace, svc.Name, "")
+	}
+	if !attached || svc.Spec.ClusterIP == corev1.ClusterIPNone {
+		// Not attached (or headless — served by the resolver directly, no
+		// VIP): reap whatever VIP the service may have had.
+		return ctrl.Result{}, r.detach(ctx, svc)
 	}
 
 	// Authorization: the same gate pods pass at CNI ADD — a VPCBinding in the
 	// consumer namespace referencing the VPC. No binding, no attachment.
 	if !r.bindingExists(ctx, svc.Namespace, vpcNS, vpcName) {
 		logger.Info("service annotated into a VPC without a VPCBinding; ignoring", "service", req.NamespacedName, "vpc", vpcNS+"/"+vpcName)
-		return ctrl.Result{}, r.reapVIPs(ctx, svc.Namespace, svc.Name, "")
+		return ctrl.Result{}, r.detach(ctx, svc)
 	}
 
 	vpc := &sdnv1alpha1.VPC{}
@@ -112,7 +115,9 @@ func (r *ServiceVIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 	if svip == nil {
-		return ctrl.Result{Requeue: true}, nil
+		// No VIP yet; an address left from a VPC this Service was retargeted
+		// away from is no longer its own.
+		return ctrl.Result{Requeue: true}, r.reportVIP(ctx, svc, "")
 	}
 
 	// Port always wins an IP conflict: a Port's address is pinned workload
@@ -125,7 +130,10 @@ func (r *ServiceVIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if err := r.Delete(ctx, svip); err != nil && !apierrors.IsNotFound(err) {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{Requeue: true}, r.reportVIP(ctx, svc, "")
+	}
+	if err := r.reportVIP(ctx, svc, svip.Spec.IP); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	backends, err := r.resolveBackends(ctx, svc, vpc)
@@ -149,6 +157,38 @@ func (r *ServiceVIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		logger.Info("ServiceVIP reconciled", "vip", svip.Name, "ip", svip.Spec.IP, "backends", len(backends), "phase", phase)
 	}
 	return ctrl.Result{}, nil
+}
+
+// detach reaps the Service's VIPs and withdraws the address it reported.
+func (r *ServiceVIPReconciler) detach(ctx context.Context, svc *corev1.Service) error {
+	if err := r.reapVIPs(ctx, svc.Namespace, svc.Name, ""); err != nil {
+		return err
+	}
+	return r.reportVIP(ctx, svc, "")
+}
+
+// reportVIP makes the Service's sdn.cozystack.io/vpc-ip annotation ip, or
+// removes it when ip is empty (docs/services-in-vpc.md). This controller is the
+// key's only writer on Services, so a differing value, a tenant's edit
+// included, is overwritten.
+func (r *ServiceVIPReconciler) reportVIP(ctx context.Context, svc *corev1.Service, ip string) error {
+	cur, has := svc.Annotations[sdnv1alpha1.AnnotationVPCIP]
+	if (ip == "" && !has) || (ip != "" && cur == ip) {
+		return nil
+	}
+	patch := client.MergeFrom(svc.DeepCopy())
+	if ip == "" {
+		delete(svc.Annotations, sdnv1alpha1.AnnotationVPCIP)
+	} else {
+		if svc.Annotations == nil {
+			svc.Annotations = map[string]string{}
+		}
+		svc.Annotations[sdnv1alpha1.AnnotationVPCIP] = ip
+	}
+	if err := r.Patch(ctx, svc, patch); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("report VPC VIP on the Service: %w", err)
+	}
+	return nil
 }
 
 func backendEqual(a, b sdnv1alpha1.VIPBackend) bool {
