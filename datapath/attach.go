@@ -22,10 +22,21 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 )
+
+// tcxMu serialises the writers of a hook's cozyplane link INSIDE the agent:
+// ensureTCX (program reload) and the order reconciler. Without it the
+// reconciler can detach a link that ensureTCX is adopting, which is the
+// two-generations state both are written to avoid.
+//
+// It does not — and cannot — serialise against the CNI plugin: that is a
+// separate process. What makes the pair safe across processes is that both
+// paths converge on the same end state and re-run.
+var tcxMu sync.Mutex
 
 // We attach with tcx (BPF links), not classic clsact filters: tcx links are
 // independent kernel objects that coexist with other tcx users (notably Cilium,
@@ -121,6 +132,110 @@ func DetachVeth(ifindex int) error {
 	return nil
 }
 
+// ReconcilePodTCXOrder puts our classifiers back at the position each local pod
+// veth requires, and reports how many hooks it had to move.
+//
+// **Why a loop and not just an anchor at attach time.** A peer CNI sharing the
+// interface programs its endpoint asynchronously, after CNI ADD has returned.
+// Whatever order we established at attach time is therefore not the order that
+// survives: the peer appends (or prepends) later, silently, and nothing fails.
+// An anchor decides where we land; only a loop keeps us there.
+//
+// **Why it repairs by detaching, not by dropping the pin.** tcx offers no "move"
+// operation: a link's position is fixed when it is created, so the repair is
+// detach-then-attach-anchored. Doing that by removing the pin is what produced
+// the dev4 split datapath — pin removal does NOT reliably detach, both
+// generations stayed attached, and the older one ran first against maps nothing
+// updated any more. detachLink asks the kernel, which is the difference.
+//
+// The window this opens is real and bounded: between detach and re-attach the
+// veth carries no classifier of ours. It is the price of a wrong order, which is
+// worse — a wrong order is a policy bypass, not a gap.
+//
+// Foreign links are only ever counted, never touched: ourTCXLinks selects ours,
+// and the peer's programs decide our target index without us moving them.
+func (m *Manager) ReconcilePodTCXOrder() (int, error) {
+	veths, err := ListLocalPortVeths()
+	if err != nil {
+		return 0, err
+	}
+
+	hooks := []struct {
+		name    string
+		program *ebpf.Program
+		attach  ebpf.AttachType
+		ingress bool
+		wantID  ebpf.ProgramID
+	}{
+		{name: "from_pod", program: m.objs.CozyplaneFromPod, attach: ebpf.AttachTCXIngress, ingress: true},
+		{name: "to_pod", program: m.objs.CozyplaneToPod, attach: ebpf.AttachTCXEgress, ingress: false},
+	}
+	for i := range hooks {
+		id, err := programID(hooks[i].program)
+		if err != nil {
+			return 0, fmt.Errorf("inspect %s program: %w", hooks[i].name, err)
+		}
+		hooks[i].wantID = id
+	}
+
+	moved := 0
+	var errs []error
+	for _, veth := range veths {
+		// A non-zero network is a VPC leg, where our verdicts must land first.
+		// Net zero is the fabric interface a peer CNI also serves, where it goes
+		// first and we follow.
+		wantFirst := veth.Net != 0
+		for _, hook := range hooks {
+			q, err := link.QueryPrograms(link.QueryOptions{Target: veth.Ifindex, Attach: hook.attach})
+			if err != nil {
+				// A kernel without tcx query, or an interface that just went
+				// away. Neither is ours to fix, and neither is worth a restart.
+				errs = append(errs, fmt.Errorf("query %s on ifindex %d: %w", hook.name, veth.Ifindex, err))
+				continue
+			}
+			ours := -1
+			for i, ap := range q.Programs {
+				if ap.ID == hook.wantID {
+					ours = i
+					break
+				}
+			}
+			if tcxOrderOK(ours, len(q.Programs), wantFirst) {
+				continue
+			}
+			if err := m.reanchorTCX(veth.Ifindex, hook.program, hook.attach, hook.ingress, wantFirst); err != nil {
+				errs = append(errs, fmt.Errorf("reanchor %s on ifindex %d: %w", hook.name, veth.Ifindex, err))
+				continue
+			}
+			moved++
+		}
+	}
+	return moved, errors.Join(errs...)
+}
+
+// reanchorTCX detaches every cozyplane link at a hook and attaches prog at the
+// end the interface requires. Held under tcxMu so a concurrent program reload
+// cannot adopt a link this is detaching.
+func (m *Manager) reanchorTCX(ifindex int, prog *ebpf.Program, attach ebpf.AttachType, ingress, wantFirst bool) error {
+	tcxMu.Lock()
+	defer tcxMu.Unlock()
+
+	links, _, err := ourTCXLinks(ifindex, attach)
+	if err != nil {
+		return err
+	}
+	for _, l := range links {
+		if derr := detachLink(l); derr != nil && !errors.Is(derr, os.ErrNotExist) {
+			return derr
+		}
+	}
+	anchor := link.Tail()
+	if wantFirst {
+		anchor = link.Head()
+	}
+	return freshAttachTCX(ifindex, prog, attach, linkPinPath(ifindex, ingress), anchor)
+}
+
 // cozyplaneProgPrefix identifies our own classifiers among the tcx programs
 // attached at a hook. The kernel truncates `bpf_prog_info.name` to 15 chars, so
 // `cozyplane_from_pod` comes back as `cozyplane_from_`; match on the prefix, and
@@ -164,6 +279,42 @@ func planTCX(progIDs []ebpf.ProgramID, wantID ebpf.ProgramID) tcxState {
 		}
 	}
 	return st
+}
+
+// tcxOrderOK reports whether our program already runs at the position the
+// interface requires, given its index among ALL programs at the hook (ours < 0
+// when we are not attached) and how many there are.
+//
+// Kept a plain function, like planTCX: the rule is the whole point, and it must
+// be readable and testable without a kernel, a veth or a peer CNI.
+//
+// wantFirst is a property of the interface, not a preference:
+//
+//   - A VPC leg needs us FIRST. Our verdicts are terminal, and they are what
+//     stops a peer CNI from reading an overlapping tenant address as a fabric
+//     identity; DNS answers are also rewritten before anyone can deliver them
+//     to the hidden fabric address.
+//   - The default network needs us LAST, so the peer's service load-balancing,
+//     policy and connection tracking keep their ordinary semantics and see the
+//     packet the way they expect.
+//
+// Alone at the hook, order is whatever we are — there is nothing to be before
+// or after, so nothing to repair.
+func tcxOrderOK(ours, n int, wantFirst bool) bool {
+	if ours < 0 {
+		// Not attached at all. Not an ordering question, but the reconciler is
+		// the only loop that revisits a live veth, and Cilium has been seen to
+		// leave a stale pin behind while it replaces a hook's program list. Say
+		// "not OK" so that state gets repaired too.
+		return false
+	}
+	if n <= 1 {
+		return true
+	}
+	if wantFirst {
+		return ours == 0
+	}
+	return ours == n-1
 }
 
 // ourTCXLinks returns the cozyplane links attached at (ifindex, attach), in
@@ -263,6 +414,9 @@ func detachLink(l link.Link) error {
 // cozyplane links at the same hook are detached, and only a hook with none of
 // ours gets a fresh attach. Foreign tcx links are never touched.
 func ensureTCX(ifindex int, prog *ebpf.Program, attach ebpf.AttachType, ingress bool) error {
+	tcxMu.Lock()
+	defer tcxMu.Unlock()
+
 	if err := os.MkdirAll(filepath.Join(PinRoot, "links"), 0o755); err != nil {
 		return err
 	}
@@ -291,7 +445,7 @@ func ensureTCX(ifindex int, prog *ebpf.Program, attach ebpf.AttachType, ingress 
 					_ = detachLink(l)
 				}
 				links = nil
-				return freshAttachTCX(ifindex, prog, attach, pin)
+				return freshAttachTCX(ifindex, prog, attach, pin, nil)
 			}
 		}
 		for _, i := range plan.stale {
@@ -302,11 +456,17 @@ func ensureTCX(ifindex int, prog *ebpf.Program, attach ebpf.AttachType, ingress 
 		return pinLink(keep, pin)
 	}
 
-	return freshAttachTCX(ifindex, prog, attach, pin)
+	return freshAttachTCX(ifindex, prog, attach, pin, nil)
 }
 
 // freshAttachTCX attaches prog at a hook that carries none of our links.
-func freshAttachTCX(ifindex int, prog *ebpf.Program, attach ebpf.AttachType, pin string) error {
+//
+// anchor says WHERE in the hook's run order to land: link.Head() to run before
+// everything already there, link.Tail() to run after, nil to take the kernel's
+// default. Position matters only where another tcx user shares the interface —
+// see ReconcilePodTCXOrder — so every ordinary caller passes nil and keeps the
+// behaviour it had.
+func freshAttachTCX(ifindex int, prog *ebpf.Program, attach ebpf.AttachType, pin string, anchor link.Anchor) error {
 	// No link of ours here, so a leftover pin is a dangling reference to a link
 	// that is already gone; it must not shadow the one we are about to make.
 	_ = os.Remove(pin)
@@ -315,6 +475,7 @@ func freshAttachTCX(ifindex int, prog *ebpf.Program, attach ebpf.AttachType, pin
 		Interface: ifindex,
 		Program:   prog,
 		Attach:    attach,
+		Anchor:    anchor,
 	})
 	if isExist(err) {
 		// This exact program is already attached here — a pod ADDed after the
