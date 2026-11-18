@@ -84,8 +84,7 @@ func (r *ServiceVIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, r.reapVIPs(ctx, svc.Namespace, svc.Name, "")
 	}
 	if !attached || svc.Spec.ClusterIP == corev1.ClusterIPNone {
-		// Not attached (or headless — served by the resolver directly, no
-		// VIP): reap whatever VIP the service may have had.
+		// Not attached, or headless: no VIP.
 		return ctrl.Result{}, r.detach(ctx, svc)
 	}
 
@@ -115,8 +114,6 @@ func (r *ServiceVIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 	if svip == nil {
-		// No VIP yet; an address left from a VPC this Service was retargeted
-		// away from is no longer its own.
 		return ctrl.Result{Requeue: true}, r.reportVIP(ctx, svc, "")
 	}
 
@@ -159,7 +156,7 @@ func (r *ServiceVIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	return ctrl.Result{}, nil
 }
 
-// detach reaps the Service's VIPs and withdraws the address it reported.
+// detach reaps the Service's VIPs and removes its vpc-ip annotation.
 func (r *ServiceVIPReconciler) detach(ctx context.Context, svc *corev1.Service) error {
 	if err := r.reapVIPs(ctx, svc.Namespace, svc.Name, ""); err != nil {
 		return err
@@ -167,10 +164,7 @@ func (r *ServiceVIPReconciler) detach(ctx context.Context, svc *corev1.Service) 
 	return r.reportVIP(ctx, svc, "")
 }
 
-// reportVIP makes the Service's sdn.cozystack.io/vpc-ip annotation ip, or
-// removes it when ip is empty (docs/services-in-vpc.md). This controller is the
-// key's only writer on Services, so a differing value, a tenant's edit
-// included, is overwritten.
+// reportVIP sets the Service's vpc-ip annotation to ip, or removes it if ip is empty.
 func (r *ServiceVIPReconciler) reportVIP(ctx context.Context, svc *corev1.Service, ip string) error {
 	cur, has := svc.Annotations[sdnv1alpha1.AnnotationVPCIP]
 	if (ip == "" && !has) || (ip != "" && cur == ip) {
@@ -478,9 +472,6 @@ func (r *ServiceVIPReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&discoveryv1.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
 			return toService(obj.GetNamespace(), obj.GetLabels()[discoveryv1.LabelServiceName])
 		})).
-		// Attachment depends on the VPCBinding and the VPC as well as the
-		// Service: a binding created after its Service, or a VPC that becomes
-		// ready, must attach the Service without anything touching it.
 		Watches(&sdnv1alpha1.VPCBinding{}, handler.EnqueueRequestsFromMapFunc(r.mapBinding)).
 		Watches(&sdnv1alpha1.VPC{}, handler.EnqueueRequestsFromMapFunc(r.mapVPC)).
 		Watches(&sdnv1alpha1.ServiceVIP{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
@@ -529,8 +520,7 @@ func (r *ServiceVIPReconciler) mapVPC(ctx context.Context, obj client.Object) []
 	return r.servicesNaming(ctx, obj.GetNamespace(), obj.GetName())
 }
 
-// servicesNaming lists the Services whose sdn.cozystack.io/vpc annotation
-// resolves to the VPC vpcNS/vpcName.
+// servicesNaming lists the Services whose vpc annotation names vpcNS/vpcName.
 func (r *ServiceVIPReconciler) servicesNaming(ctx context.Context, vpcNS, vpcName string, opts ...client.ListOption) []ctrl.Request {
 	svcs := &corev1.ServiceList{}
 	if err := r.List(ctx, svcs, opts...); err != nil {

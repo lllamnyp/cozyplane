@@ -235,8 +235,7 @@ func editService(t *testing.T, c client.Client, ns, name string, edit func(*core
 	}
 }
 
-// The attached Service reports its VIP as sdn.cozystack.io/vpc-ip; a value a
-// tenant wrote, empty or not, is overwritten on the next reconcile.
+// The VIP is reported on the Service, and a forged value is overwritten.
 func TestServiceVIPReportedOnService(t *testing.T) {
 	c := svcClient(t,
 		readyVPC("team-a", "vpc-a", "10.0.0.0/24", 101),
@@ -256,8 +255,7 @@ func TestServiceVIPReportedOnService(t *testing.T) {
 	}
 }
 
-// The report follows the VIP: rewritten when the VIP yields to a Port and is
-// reallocated, and when the Service is retargeted to another VPC.
+// The report follows the VIP across a yield and a retarget.
 func TestServiceVIPReportFollowsVIP(t *testing.T) {
 	c := svcClient(t,
 		readyVPC("team-a", "vpc-a", "10.0.0.0/24", 101),
@@ -290,8 +288,7 @@ func TestServiceVIPReportFollowsVIP(t *testing.T) {
 	}
 }
 
-// Detaching the Service (annotation removed, binding gone, or headless) reaps
-// its VIP and withdraws the report.
+// Detaching the Service reaps its VIP and removes the report.
 func TestServiceVIPReportWithdrawnOnDetach(t *testing.T) {
 	for name, detach := range map[string]func(c client.Client){
 		"annotation removed": func(c client.Client) {
@@ -303,8 +300,7 @@ func TestServiceVIPReportWithdrawnOnDetach(t *testing.T) {
 			}
 		},
 		"made headless": func(c client.Client) {
-			// clusterIP is immutable; recreate the Service headless under the
-			// same name, keeping the reported annotation.
+			// clusterIP is immutable, so recreate the Service headless.
 			svc := &corev1.Service{}
 			if err := c.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: "db"}, svc); err != nil {
 				t.Fatal(err)
@@ -342,9 +338,7 @@ func TestServiceVIPReportWithdrawnOnDetach(t *testing.T) {
 	}
 }
 
-// A VPCBinding or a VPC event enqueues exactly the Services that name that VPC
-// (and, for a binding, only those in the binding's namespace), so a binding
-// created after its Service attaches the Service.
+// VPCBinding and VPC events enqueue the Services that name the VPC.
 func TestServiceVIPWatchesBindingAndVPC(t *testing.T) {
 	other := clusterIPService("team-b", "db", "team-a/vpc-a") // consumer namespace
 	c := svcClient(t,
@@ -369,8 +363,7 @@ func TestServiceVIPWatchesBindingAndVPC(t *testing.T) {
 		t.Errorf("VPC team-a/vpc-a enqueued %v, want team-a/db and team-b/db", got)
 	}
 
-	// The case found live: the Service was detached for want of a binding,
-	// and the binding's arrival alone reattaches it.
+	// A binding created after its Service attaches it.
 	c = svcClient(t, readyVPC("team-a", "vpc-a", "10.0.0.0/24", 101), clusterIPService("team-a", "db", "vpc-a"))
 	reconcileSVC(t, c, "team-a", "db")
 	if _, ok := reportedVIP(t, c, "team-a", "db"); ok {
