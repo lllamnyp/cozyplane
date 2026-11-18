@@ -51,8 +51,8 @@ egress:
   # Cluster DNS ClusterIP; the one cluster-internal door a VPC gateway opens
   # (:53 only), so tenant pods resolve with a stock resolv.conf.
   clusterDNS: "10.96.0.10"
-  # Additional cluster-internal networks VPC tenants must not reach through
-  # their gateways (e.g. the node/management network).
+  # Additional cluster-internal networks VPC tenants must not reach (e.g. a
+  # management network). Every node's own addresses are refused without listing.
   internalCIDRs: []
 
 agent:

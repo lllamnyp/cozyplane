@@ -57,8 +57,9 @@ most likely to set:
   which has no CRDs.
 - `egress.*` — cluster networking facts (pod/service CIDRs, cluster DNS) that
   drive node masquerade and the pool-less per-VPC egress gateway pod (a
-  `VPCGateway` *with* a pool needs none -- its NAT is eBPF); add node/management networks to
-  `egress.internalCIDRs`.
+  `VPCGateway` *with* a pool needs none -- its NAT is eBPF); add management networks to
+  `egress.internalCIDRs`. Every node's own addresses are kept out of VPC egress
+  from the Node objects, so node networks need no entry.
 
 ## What gets installed
 

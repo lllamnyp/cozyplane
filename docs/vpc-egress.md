@@ -223,9 +223,52 @@ For a packet from a VPC Port:
 
 1. **DNS and LoadBalancer replies first,** as today: DNS steering to the
    split-horizon resolver, and a VPC backend's reply to a LoadBalancer client.
-2. **Cluster-internal destinations are not routed.** A destination in the
-   cluster's pod, service or node CIDRs (the `internal` map) goes to the gateway pod
-   if the VPC has one, and is dropped otherwise.
+2. **Cluster-internal destinations are not routed.** A destination in a static
+   internal range (the `internal` map: `--internal-cidrs`, the pod and service CIDRs
+   and any management ranges the operator lists) goes to the gateway pod if the VPC
+   has one, and is dropped otherwise.
+
+   **A node's own address is dropped,** with or without a gateway pod, whose filter
+   knows only the static ranges. The node addresses are every Node's InternalIPs and
+   ExternalIPs, both families, plus the host-source addresses the agent advertises in
+   the `cozyplane.io/node-addresses` annotation, as exact addresses in the
+   `internal_nodes` map. The agent maintains them from its Node informer: added on
+   Add, rewritten on Update, removed on Delete, and the whole map rewritten once the
+   informer has synced, which prunes nodes deleted while the agent was down. They
+   are live data, so no CIDR or chart value describes them and none can drift from
+   the cluster. The static entries sit in their own map, so a node's removal never
+   removes a static range that covers the same address. Two exceptions:
+   - A destination inside one of the Port's peered VPCs is the peer's, not the
+     node's. VPC CIDRs may overlap the node network (design tenet 3).
+   - An unfragmented packet shaped like a reply to a flow the node side opened
+     passes and is routed as usual: TCP other than a bare SYN, an ICMP echo reply,
+     an ICMP error.
+     This is a node or a masqueraded default-network pod reaching a Port on its
+     FloatingIP, whose answers go to the node's address. It cannot open anything: a
+     node answers a stray TCP segment with a reset. UDP and every other protocol are
+     refused whole, the node's Geneve port included. A UDP flow from a node to a
+     FloatingIP therefore gets no answer.
+
+   `route_drops` counts the refusals as `node_address` (§4.6).
+
+   Only `vpc_egress` reads `internal_nodes`. The other tests of the static map keep
+   their meaning:
+   - **The cluster-egress masquerade** leaves a default-network pod's packet to an
+     internal destination unmasqueraded. A packet to another node's address normally
+     crosses the overlay through `node_remotes` and never reaches the masquerade. If
+     node addresses counted there, one that did reach it, such as a packet to a node
+     that reports no InternalIP, would leave the uplink with the pod's source. A
+     spoof-guarding underlay drops that, and the HostFirewall and the node-origin
+     exemption would see a pod where they see a node today
+     ([policy-layers.md](policy-layers.md)).
+   - **The FloatingIP egress test** is reached only from `vpc_egress`'s `internet`
+     route, after the node check, so a node address reaching it is a reply.
+   - **DNS steering** sends a `:53` query to an internal destination to the
+     split-horizon resolver, because under a socket-LB kube-proxy replacement that
+     destination is a cluster DNS backend. Backends are pod addresses, so a query to
+     a node address is not one and the node check drops it. The exception is a
+     cluster DNS served by hostNetwork pods: its VPC clients then lose DNS under a
+     socket-LB replacement.
 3. **Longest prefix match** in the Port's table, over:
    - the **local** route: each of the VPC's CIDRs, implicit;
    - **peer** routes: each peered VPC's CIDRs, implicit, so a peering needs no
@@ -447,8 +490,8 @@ the fabric bridge.
 | `unsupported` | not TCP, UDP or an ICMP echo request |
 
 `route_drops[{net, reason}]` counts routing refusals per VPC: `blackhole`,
-`unresolved`, `no_floating_ip` (an `internet` route from a Port without one), and
-`no_route`. A refused packet is dropped; it never falls through to another egress
+`unresolved`, `no_floating_ip` (an `internet` route from a Port without one),
+`no_route`, and `node_address` (a node's own address, §3.1 step 2). A refused packet is dropped; it never falls through to another egress
 path.
 
 ## 5. Datapath
@@ -466,6 +509,7 @@ path.
 | `nat_flows` | HASH | net → live flows on this node | datapath; the sweep recomputes |
 | `nat_stats` | HASH | `{natgateway id, counter}` → count: refusals by reason (§4.6) and deep allocations (§4.3) | datapath |
 | `route_drops` | HASH | `{net, reason}` → count | datapath |
+| `internal_nodes` | HASH | node address → 1 | agent, every node's addresses, this node's included |
 
 Nothing reads or writes `vpc_nat`, `nat_of` or the shard-keyed `nat_owner` any
 more. Their definitions stay, because removing or reshaping a pinned map strands or
@@ -482,8 +526,9 @@ own stack and instruction budget.
 1. `from_pod` runs as today through DNS steering and the LoadBalancer reply. Then,
    for a VPC Port that is not a gateway leg, with a destination outside its own VPC,
    it tail-calls `vpc_egress`, unless the packet carries the `RT_DONE` mark.
-2. `vpc_egress` sends cluster-internal destinations back (step 3 below). Otherwise
-   it looks up the Port's table and the longest match:
+2. `vpc_egress` sends destinations in the static internal ranges back (step 3
+   below) and drops a node's own address, except toward a peer and for a reply
+   (§3.1 step 2). Otherwise it looks up the Port's table and the longest match:
    - **nat, internet, blackhole, unresolved** — handled here: SNAT and send (§4),
      FloatingIP rewrite and send, or drop and count.
    - **local, peer, no table, no match** — it sets `RT_DONE` (mark bit 18) and
