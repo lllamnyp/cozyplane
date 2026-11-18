@@ -236,7 +236,9 @@ For a packet from a VPC Port:
    Add, rewritten on Update, removed on Delete, and the whole map rewritten once the
    informer has synced, which prunes nodes deleted while the agent was down. They
    are live data, so no CIDR or chart value describes them and none can drift from
-   the cluster. The static entries sit in their own map, so a node's removal never
+   the cluster. An address no Node reports is not covered: a cloud's 1:1 public
+   address for a node, absent a cloud controller that sets it as the ExternalIP,
+   stays reachable through the internet. The static entries sit in their own map, so a node's removal never
    removes a static range that covers the same address. Two exceptions:
    - A destination inside one of the Port's peered VPCs is the peer's, not the
      node's. VPC CIDRs may overlap the node network (design tenet 3).
