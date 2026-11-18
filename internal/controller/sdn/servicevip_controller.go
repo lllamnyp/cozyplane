@@ -478,6 +478,11 @@ func (r *ServiceVIPReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&discoveryv1.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
 			return toService(obj.GetNamespace(), obj.GetLabels()[discoveryv1.LabelServiceName])
 		})).
+		// Attachment depends on the VPCBinding and the VPC as well as the
+		// Service: a binding created after its Service, or a VPC that becomes
+		// ready, must attach the Service without anything touching it.
+		Watches(&sdnv1alpha1.VPCBinding{}, handler.EnqueueRequestsFromMapFunc(r.mapBinding)).
+		Watches(&sdnv1alpha1.VPC{}, handler.EnqueueRequestsFromMapFunc(r.mapVPC)).
 		Watches(&sdnv1alpha1.ServiceVIP{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
 			return toService(obj.GetLabels()[sdnv1alpha1.LabelServiceNamespace], obj.GetLabels()[sdnv1alpha1.LabelServiceName])
 		})).
@@ -508,6 +513,36 @@ func (r *ServiceVIPReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		})).
 		Named("servicevip").
 		Complete(r)
+}
+
+// mapBinding enqueues the Services in the binding's namespace that name its VPC.
+func (r *ServiceVIPReconciler) mapBinding(ctx context.Context, obj client.Object) []ctrl.Request {
+	b, ok := obj.(*sdnv1alpha1.VPCBinding)
+	if !ok {
+		return nil
+	}
+	return r.servicesNaming(ctx, b.Spec.VPCRef.Namespace, b.Spec.VPCRef.Name, client.InNamespace(b.Namespace))
+}
+
+// mapVPC enqueues the Services, in any namespace, that name the VPC.
+func (r *ServiceVIPReconciler) mapVPC(ctx context.Context, obj client.Object) []ctrl.Request {
+	return r.servicesNaming(ctx, obj.GetNamespace(), obj.GetName())
+}
+
+// servicesNaming lists the Services whose sdn.cozystack.io/vpc annotation
+// resolves to the VPC vpcNS/vpcName.
+func (r *ServiceVIPReconciler) servicesNaming(ctx context.Context, vpcNS, vpcName string, opts ...client.ListOption) []ctrl.Request {
+	svcs := &corev1.ServiceList{}
+	if err := r.List(ctx, svcs, opts...); err != nil {
+		return nil
+	}
+	var out []ctrl.Request
+	for i := range svcs.Items {
+		if ns, name, ok := serviceVPCRef(&svcs.Items[i]); ok && ns == vpcNS && name == vpcName {
+			out = append(out, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(&svcs.Items[i])})
+		}
+	}
+	return out
 }
 
 // incIP returns the IP after ip (the CNI plugin has its own twin, nextIP).

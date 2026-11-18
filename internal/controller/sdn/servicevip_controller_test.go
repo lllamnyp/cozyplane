@@ -341,3 +341,52 @@ func TestServiceVIPReportWithdrawnOnDetach(t *testing.T) {
 		})
 	}
 }
+
+// A VPCBinding or a VPC event enqueues exactly the Services that name that VPC
+// (and, for a binding, only those in the binding's namespace), so a binding
+// created after its Service attaches the Service.
+func TestServiceVIPWatchesBindingAndVPC(t *testing.T) {
+	other := clusterIPService("team-b", "db", "team-a/vpc-a") // consumer namespace
+	c := svcClient(t,
+		clusterIPService("team-a", "db", "vpc-a"),
+		clusterIPService("team-a", "web", "vpc-b"),
+		other,
+	)
+	r := &ServiceVIPReconciler{Client: c}
+	names := func(reqs []ctrl.Request) map[string]bool {
+		out := map[string]bool{}
+		for _, q := range reqs {
+			out[q.String()] = true
+		}
+		return out
+	}
+	got := names(r.mapBinding(context.Background(), binding("team-b", "team-a", "vpc-a")))
+	if len(got) != 1 || !got["team-b/db"] {
+		t.Errorf("binding in team-b enqueued %v, want only team-b/db", got)
+	}
+	got = names(r.mapVPC(context.Background(), readyVPC("team-a", "vpc-a", "10.0.0.0/24", 101)))
+	if len(got) != 2 || !got["team-a/db"] || !got["team-b/db"] {
+		t.Errorf("VPC team-a/vpc-a enqueued %v, want team-a/db and team-b/db", got)
+	}
+
+	// The case found live: the Service was detached for want of a binding,
+	// and the binding's arrival alone reattaches it.
+	c = svcClient(t, readyVPC("team-a", "vpc-a", "10.0.0.0/24", 101), clusterIPService("team-a", "db", "vpc-a"))
+	reconcileSVC(t, c, "team-a", "db")
+	if _, ok := reportedVIP(t, c, "team-a", "db"); ok {
+		t.Fatal("reported a VIP without a binding")
+	}
+	b := binding("team-a", "team-a", "vpc-a")
+	if err := c.Create(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	r = &ServiceVIPReconciler{Client: c}
+	for _, q := range r.mapBinding(context.Background(), b) {
+		if _, err := r.Reconcile(context.Background(), q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if ip, _ := reportedVIP(t, c, "team-a", "db"); ip != "10.0.0.254" {
+		t.Errorf("after the binding arrived: reported %q, want 10.0.0.254", ip)
+	}
+}
