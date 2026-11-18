@@ -212,3 +212,174 @@ func TestServiceVIPCarriesAffinity(t *testing.T) {
 		t.Fatalf("affinity not propagated: %+v", vips)
 	}
 }
+
+func reportedVIP(t *testing.T, c client.Client, ns, name string) (string, bool) {
+	t.Helper()
+	svc := &corev1.Service{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: name}, svc); err != nil {
+		t.Fatalf("get service: %v", err)
+	}
+	ip, ok := svc.Annotations[sdnv1alpha1.AnnotationVPCIP]
+	return ip, ok
+}
+
+func editService(t *testing.T, c client.Client, ns, name string, edit func(*corev1.Service)) {
+	t.Helper()
+	svc := &corev1.Service{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: name}, svc); err != nil {
+		t.Fatalf("get service: %v", err)
+	}
+	edit(svc)
+	if err := c.Update(context.Background(), svc); err != nil {
+		t.Fatalf("update service: %v", err)
+	}
+}
+
+// The VIP is reported on the Service, and a forged value is overwritten.
+func TestServiceVIPReportedOnService(t *testing.T) {
+	c := svcClient(t,
+		readyVPC("team-a", "vpc-a", "10.0.0.0/24", 101),
+		binding("team-a", "team-a", "vpc-a"),
+		clusterIPService("team-a", "db", "vpc-a"),
+	)
+	reconcileSVC(t, c, "team-a", "db")
+	if ip, _ := reportedVIP(t, c, "team-a", "db"); ip != "10.0.0.254" {
+		t.Fatalf("reported %q, want the VIP 10.0.0.254", ip)
+	}
+	for _, forged := range []string{"10.0.0.9", ""} {
+		editService(t, c, "team-a", "db", func(s *corev1.Service) { s.Annotations[sdnv1alpha1.AnnotationVPCIP] = forged })
+		reconcileSVC(t, c, "team-a", "db")
+		if ip, _ := reportedVIP(t, c, "team-a", "db"); ip != "10.0.0.254" {
+			t.Errorf("after forging %q: reported %q, want 10.0.0.254", forged, ip)
+		}
+	}
+}
+
+// The report follows the VIP across a yield and a retarget.
+func TestServiceVIPReportFollowsVIP(t *testing.T) {
+	c := svcClient(t,
+		readyVPC("team-a", "vpc-a", "10.0.0.0/24", 101),
+		readyVPC("team-a", "vpc-b", "10.1.0.0/24", 102),
+		binding("team-a", "team-a", "vpc-a"),
+		binding("team-a", "team-a", "vpc-b"),
+		clusterIPService("team-a", "db", "vpc-a"),
+	)
+	reconcileSVC(t, c, "team-a", "db")
+	port := &sdnv1alpha1.Port{
+		ObjectMeta: metav1.ObjectMeta{Name: "v101.conflict"},
+		Spec:       sdnv1alpha1.PortSpec{VPCRef: sdnv1alpha1.VPCRef{Namespace: "team-a", Name: "vpc-a"}, IP: "10.0.0.254"},
+	}
+	if err := c.Create(context.Background(), port); err != nil {
+		t.Fatal(err)
+	}
+	reconcileSVC(t, c, "team-a", "db") // yields
+	if ip, ok := reportedVIP(t, c, "team-a", "db"); ok {
+		t.Errorf("reported %q while the Service has no VIP, want none", ip)
+	}
+	reconcileSVC(t, c, "team-a", "db") // reallocates
+	if ip, _ := reportedVIP(t, c, "team-a", "db"); ip != "10.0.0.253" {
+		t.Errorf("reported %q after the yield, want the new VIP 10.0.0.253", ip)
+	}
+
+	editService(t, c, "team-a", "db", func(s *corev1.Service) { s.Annotations[sdnv1alpha1.AnnotationVPC] = "vpc-b" })
+	reconcileSVC(t, c, "team-a", "db")
+	if ip, _ := reportedVIP(t, c, "team-a", "db"); ip != "10.1.0.254" {
+		t.Errorf("reported %q after the retarget, want vpc-b's VIP 10.1.0.254", ip)
+	}
+}
+
+// Detaching the Service reaps its VIP and removes the report.
+func TestServiceVIPReportWithdrawnOnDetach(t *testing.T) {
+	for name, detach := range map[string]func(c client.Client){
+		"annotation removed": func(c client.Client) {
+			editService(t, c, "team-a", "db", func(s *corev1.Service) { delete(s.Annotations, sdnv1alpha1.AnnotationVPC) })
+		},
+		"binding deleted": func(c client.Client) {
+			if err := c.Delete(context.Background(), binding("team-a", "team-a", "vpc-a")); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"made headless": func(c client.Client) {
+			// clusterIP is immutable, so recreate the Service headless.
+			svc := &corev1.Service{}
+			if err := c.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: "db"}, svc); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Delete(context.Background(), svc); err != nil {
+				t.Fatal(err)
+			}
+			headless := clusterIPService("team-a", "db", "vpc-a")
+			headless.Spec.ClusterIP = corev1.ClusterIPNone
+			headless.Annotations[sdnv1alpha1.AnnotationVPCIP] = svc.Annotations[sdnv1alpha1.AnnotationVPCIP]
+			if err := c.Create(context.Background(), headless); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := svcClient(t,
+				readyVPC("team-a", "vpc-a", "10.0.0.0/24", 101),
+				binding("team-a", "team-a", "vpc-a"),
+				clusterIPService("team-a", "db", "vpc-a"),
+			)
+			reconcileSVC(t, c, "team-a", "db")
+			if _, ok := reportedVIP(t, c, "team-a", "db"); !ok {
+				t.Fatal("no report before the detach")
+			}
+			detach(c)
+			reconcileSVC(t, c, "team-a", "db")
+			if ip, ok := reportedVIP(t, c, "team-a", "db"); ok {
+				t.Errorf("reported %q after the detach, want none", ip)
+			}
+			if vips := vipsInVPC(t, c, "team-a", "vpc-a"); len(vips) != 0 {
+				t.Errorf("%d VIPs after the detach, want none", len(vips))
+			}
+		})
+	}
+}
+
+// VPCBinding and VPC events enqueue the Services that name the VPC.
+func TestServiceVIPWatchesBindingAndVPC(t *testing.T) {
+	other := clusterIPService("team-b", "db", "team-a/vpc-a") // consumer namespace
+	c := svcClient(t,
+		clusterIPService("team-a", "db", "vpc-a"),
+		clusterIPService("team-a", "web", "vpc-b"),
+		other,
+	)
+	r := &ServiceVIPReconciler{Client: c}
+	names := func(reqs []ctrl.Request) map[string]bool {
+		out := map[string]bool{}
+		for _, q := range reqs {
+			out[q.String()] = true
+		}
+		return out
+	}
+	got := names(r.mapBinding(context.Background(), binding("team-b", "team-a", "vpc-a")))
+	if len(got) != 1 || !got["team-b/db"] {
+		t.Errorf("binding in team-b enqueued %v, want only team-b/db", got)
+	}
+	got = names(r.mapVPC(context.Background(), readyVPC("team-a", "vpc-a", "10.0.0.0/24", 101)))
+	if len(got) != 2 || !got["team-a/db"] || !got["team-b/db"] {
+		t.Errorf("VPC team-a/vpc-a enqueued %v, want team-a/db and team-b/db", got)
+	}
+
+	// A binding created after its Service attaches it.
+	c = svcClient(t, readyVPC("team-a", "vpc-a", "10.0.0.0/24", 101), clusterIPService("team-a", "db", "vpc-a"))
+	reconcileSVC(t, c, "team-a", "db")
+	if _, ok := reportedVIP(t, c, "team-a", "db"); ok {
+		t.Fatal("reported a VIP without a binding")
+	}
+	b := binding("team-a", "team-a", "vpc-a")
+	if err := c.Create(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	r = &ServiceVIPReconciler{Client: c}
+	for _, q := range r.mapBinding(context.Background(), b) {
+		if _, err := r.Reconcile(context.Background(), q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if ip, _ := reportedVIP(t, c, "team-a", "db"); ip != "10.0.0.254" {
+		t.Errorf("after the binding arrived: reported %q, want 10.0.0.254", ip)
+	}
+}
