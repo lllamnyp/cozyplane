@@ -939,6 +939,30 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } node_ip6 SEC(".maps");
 
+struct masq_link {
+	__u32 v4; // network order
+	__u32 pad[3];
+	struct addr128 v6;
+};
+
+// masq_links holds, per link other than the default uplink, the addresses the cluster-egress masquerade sources from there.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u32); // ifindex
+	__type(value, struct masq_link);
+	__uint(max_entries, 64);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} masq_links SEC(".maps");
+
+// masq_addrs holds every address the cluster-egress masquerade sources from on this node.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct addr128);
+	__type(value, __u8);
+	__uint(max_entries, 256);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} masq_addrs SEC(".maps");
+
 // migrate_fwd forwards a migrated VM's traffic from its OLD node to its new
 // one during the cutover propagation window (live migration, stage 2). When a
 // VM moves, remote nodes keep delivering to the stale source location until
@@ -3327,21 +3351,11 @@ static __always_inline int encap_lb(struct __sk_buff *skb, __u32 node_ip,
 
 #define MASQ_MISS -1
 
-// masq_snat is the cluster-egress bpf masquerade (#10), run in from_pod at the
-// uplink-egress attachment only: a packet whose source is a (default-network)
-// pod address and whose destination is off-cluster gets its source rewritten
-// to the node IP and its port/id to an allocated masquerade port — the same
-// ct_fwd/ct_rev machinery as the north-south bridge, reused with net=0 and
-// inverted roles (vpc_ip:=remote, fabric_ip/client_ip:=pod). Ports come from
-// MASQ_PORT_BASE..+SPAN: disjoint from the host ephemeral range so reverse
-// lookups can't capture the node's own connections, and below the NodePort
-// range so an allocation never collides with one. v4-only, TCP/UDP/ICMP-echo —
-// the same practical envelope as the kernel MASQUERADE rule it replaces.
-static __always_inline int masq_snat(struct __sk_buff *skb, struct pkt *p)
+// masq_snat masquerades a default-network pod's off-cluster packet to node_ip, the address of the link it leaves by.
+static __always_inline int masq_snat(struct __sk_buff *skb, struct pkt *p, __u32 node_ip)
 {
 	if (!is_masq_src(p->src) || is_internal(p->dst))
 		return MASQ_MISS;
-	__u32 node_ip = cfg(CFG_MASQ_IP);
 	if (!node_ip)
 		return MASQ_MISS;
 
@@ -3403,19 +3417,10 @@ static __always_inline int masq_snat(struct __sk_buff *skb, struct pkt *p)
 	return TC_ACT_OK;
 }
 
-// masq_reverse un-SNATs a reply to a bpf-masqueraded connection, run in
-// from_uplink at the uplink ingress — BEFORE netfilter, so the kernel's
-// conntrack (which watched the original pod-sourced flow leave through
-// FORWARD) sees a reply that matches ESTABLISHED; no INVALID drop can fire.
-// Only packets to the node IP whose port/id sits in the masquerade range and
-// hits ct_rev are touched, so the node's own traffic (host ephemeral ports
-// and NodePorts are outside the range) passes untouched. Inbound ICMP errors
-// about masqueraded flows (frag-needed: the pod's PMTU signal) are translated
-// with the same embedded-header rewrite as the bridge.
+// masq_reverse un-SNATs a reply to any of the node's masquerade addresses, before netfilter sees it.
 static __always_inline int masq_reverse(struct __sk_buff *skb, struct pkt *p)
 {
-	__u32 node_ip = cfg(CFG_MASQ_IP);
-	if (!node_ip || v4_of_128(&p->dst) != node_ip)
+	if (!bpf_map_lookup_elem(&masq_addrs, &p->dst))
 		return MASQ_MISS;
 
 	void *data = (void *)(long)skb->data, *end = (void *)(long)skb->data_end;
@@ -3588,19 +3593,15 @@ static __always_inline struct addr128 *masq_node6(void)
 	return n;
 }
 
-// masq_snat6 / masq_reverse6: the v6 cluster-egress masquerade, mirroring the
-// v4 pair. Same ct tables (addr128-keyed, families coexist), same port range.
-// This is what gives the gateway pod's forwarded tenant-v6 traffic (and any
-// default-network pod's v6 egress) a routable return path — pod ULAs are not
-// routable outside the cluster, exactly like the v4 pod CIDRs.
-static __always_inline int masq_snat6(struct __sk_buff *skb, struct pkt *p)
+// masq_snat6 / masq_reverse6 are the v6 twins of masq_snat and masq_reverse.
+static __always_inline int masq_snat6(struct __sk_buff *skb, struct pkt *p, struct addr128 *node6)
 {
 	if (!is_masq_src(p->src) || is_internal(p->dst))
 		return MASQ_MISS;
 	if (v6_link_scoped(&p->dst))
 		return MASQ_MISS; // NDP and friends are the node's own business
-	struct addr128 *node6 = masq_node6();
-	if (!node6)
+	struct addr128 z = {};
+	if (!node6 || addr128_eq(node6, &z))
 		return MASQ_MISS;
 	struct addr128 node = *node6, src = p->src;
 	__u8 proto = p->proto;
@@ -3658,10 +3659,9 @@ static __always_inline int masq_snat6(struct __sk_buff *skb, struct pkt *p)
 
 static __always_inline int masq_reverse6(struct __sk_buff *skb, struct pkt *p)
 {
-	struct addr128 *node6 = masq_node6();
-	if (!node6 || !addr128_eq(&p->dst, node6))
+	if (!bpf_map_lookup_elem(&masq_addrs, &p->dst))
 		return MASQ_MISS;
-	struct addr128 node = *node6;
+	struct addr128 node = p->dst;
 	__u8 proto = p->proto;
 
 	if (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
@@ -5231,6 +5231,24 @@ int cozyplane_vpc_egress(struct __sk_buff *skb)
 	return TC_ACT_SHOT;
 }
 
+// cozyplane_link_egress is the cluster-egress masquerade at the egress of a link other than the default uplink.
+SEC("tc")
+int cozyplane_link_egress(struct __sk_buff *skb)
+{
+	struct pkt p;
+	if (parse_ip(skb, &p) < 0)
+		return TC_ACT_OK;
+	__u32 ifindex = skb->ifindex;
+	struct masq_link *ml = bpf_map_lookup_elem(&masq_links, &ifindex);
+	if (!ml)
+		return TC_ACT_OK;
+	if (p.is_v6)
+		masq_snat6(skb, &p, &ml->v6);
+	else
+		masq_snat(skb, &p, ml->v4);
+	return TC_ACT_OK;
+}
+
 SEC("tc")
 int cozyplane_from_pod(struct __sk_buff *skb)
 {
@@ -5251,7 +5269,7 @@ int cozyplane_from_pod(struct __sk_buff *skb)
 	// here instead of by an iptables MASQUERADE rule. Everything else (node
 	// traffic, geneve encap, floated egress with its public source) misses.
 	if (ifindex == cfg(CFG_UPLINK_IFINDEX)) {
-		int m = p.is_v6 ? masq_snat6(skb, &p) : masq_snat(skb, &p);
+		int m = p.is_v6 ? masq_snat6(skb, &p, masq_node6()) : masq_snat(skb, &p, cfg(CFG_MASQ_IP));
 		if (m != MASQ_MISS)
 			return m;
 	}
