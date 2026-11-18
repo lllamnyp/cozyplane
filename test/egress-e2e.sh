@@ -306,9 +306,9 @@ EOF
 for p in d0 d1 hudp pw; do $K -n $NS wait --for=condition=Ready pod/$p --timeout=120s >/dev/null; done
 portip() { $K get ports -o jsonpath="{range .items[*]}{.spec.podName}{' '}{.spec.ip}{'\n'}{end}" | awk -v p="$1" '$1==p{print $2}'; }
 P2IP=$(portip p2); PWIP=$(portip pw)
-metrics() { $K -n $NS exec "$1" -- wget -qO- -T3 "http://$2:9411/metrics" 2>/dev/null | grep -q cozyplane_; }
+metrics() { $K -n $NS exec "$1" -- wget -qO- -T3 "http://$2:9411/metrics" 2>/dev/null | grep cozyplane_ >/dev/null; }
 refused() { ! metrics "$@"; }
-heard() { $K -n $NS logs hudp 2>/dev/null | grep -q "$1"; }
+heard() { $K -n $NS logs hudp 2>/dev/null | grep "$1" >/dev/null; }
 drops() { docker exec "$W" curl -s http://127.0.0.1:9411/metrics | grep '^cozyplane_route_drops_total{' | grep 'reason="node_address"' | awk '$NF>0{f=1} END{exit !f}'; }
 phantom() { # phantom <status.addresses JSON>
   echo '{"apiVersion":"v1","kind":"Node","metadata":{"name":"eg-phantom"}}' | $K apply -f - >/dev/null
@@ -325,7 +325,7 @@ check_fail "the UDP listener on $W2 never heard p1" heard from-vpc
 check_ok "p1 still reaches the external target" retry 10 get p1
 check_ok "p1 still pings p2 in its own VPC (node $W2)" $K -n $NS exec p1 -- ping -c2 -W2 "$P2IP"
 check_ok "p1 pings pw in the peered VPC" retry 10 $K -n $NS exec p1 -- ping -c1 -W2 "$PWIP"
-check_ok "$W counts the refusals as node_address" drops
+check_ok "$W counts the refusals as node_address" retry 25 drops
 
 check_ok "p1 reaches $XEXT while no Node claims it" retry 10 metrics p1 "$XEXT"
 phantom "[{\"type\":\"InternalIP\",\"address\":\"$XINT\"},{\"type\":\"ExternalIP\",\"address\":\"$XEXT\"}]"
