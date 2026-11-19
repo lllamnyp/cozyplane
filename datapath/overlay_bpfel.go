@@ -431,6 +431,7 @@ const (
 	overlayMapHfEallow              = "hf_eallow"
 	overlayMapHfSelf                = "hf_self"
 	overlayMapInternal              = "internal"
+	overlayMapInternalNodes         = "internal_nodes"
 	overlayMapLbProg                = "lb_prog"
 	overlayMapLbScratch             = "lb_scratch"
 	overlayMapLbSrc                 = "lb_src"
@@ -564,6 +565,7 @@ type overlayMapSpecs struct {
 	HfEallow       *ebpf.MapSpec `ebpf:"hf_eallow"`
 	HfSelf         *ebpf.MapSpec `ebpf:"hf_self"`
 	Internal       *ebpf.MapSpec `ebpf:"internal"`
+	InternalNodes  *ebpf.MapSpec `ebpf:"internal_nodes"`
 	LbProg         *ebpf.MapSpec `ebpf:"lb_prog"`
 	LbScratch      *ebpf.MapSpec `ebpf:"lb_scratch"`
 	LbSrc          *ebpf.MapSpec `ebpf:"lb_src"`
@@ -655,6 +657,7 @@ type overlayMaps struct {
 	HfEallow       *ebpf.Map `ebpf:"hf_eallow"`
 	HfSelf         *ebpf.Map `ebpf:"hf_self"`
 	Internal       *ebpf.Map `ebpf:"internal"`
+	InternalNodes  *ebpf.Map `ebpf:"internal_nodes"`
 	LbProg         *ebpf.Map `ebpf:"lb_prog"`
 	LbScratch      *ebpf.Map `ebpf:"lb_scratch"`
 	LbSrc          *ebpf.Map `ebpf:"lb_src"`
@@ -722,6 +725,7 @@ func (m *overlayMaps) Close() error {
 		m.HfEallow,
 		m.HfSelf,
 		m.Internal,
+		m.InternalNodes,
 		m.LbProg,
 		m.LbScratch,
 		m.LbSrc,

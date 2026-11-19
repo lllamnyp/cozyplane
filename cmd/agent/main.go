@@ -108,7 +108,7 @@ func main() {
 	flag.StringVar(&masqMode, "masquerade", "bpf",
 		"cluster-egress masquerade implementation: bpf (eBPF SNAT at the uplink, no netfilter), iptables (kernel MASQUERADE rule), off (the environment masquerades elsewhere)")
 	flag.StringVar(&internalCIDRs, "internal-cidrs", "",
-		"comma-separated cluster-internal CIDRs (pod, service, node networks) a floating pod's public-IP egress must not reach")
+		"comma-separated cluster-internal CIDRs (pod and service networks, management ranges) a VPC Port's egress must not reach; every node's own addresses are added from the Node objects")
 	flag.BoolVar(&vpcDNS, "vpc-dns", true,
 		"steer VPC pods' cluster-DNS queries to the node-local split-horizon resolver (docs/services-in-vpc.md)")
 	flag.StringVar(&clusterDNSIPs, "cluster-dns", "",
@@ -518,10 +518,7 @@ func advertiseNodeAddrs(ctx context.Context, client kubernetes.Interface, nodeNa
 // the overlay the true source survives and the destination node gates it.
 func nodeAddresses(node *corev1.Node) []net.IP { return npNodeAddresses(node) }
 
-// watchNodes starts a Node informer that indexes every other node's tunnel
-// endpoint and mirrors their addresses into node_remotes. It blocks until the
-// cache is synced. (Pod delivery is keyed per address by watchFabricIPs; nothing
-// here reads `spec.podCIDR` any more — see docs/api-groups.md.)
+// watchNodes mirrors Node objects into the node indexes, node_remotes, np_nodes and internal_nodes, blocking until synced.
 func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.Manager, selfName string,
 	nodeIPs *nodeIPIndex, nodePools *nodePoolIndex, fabricResync func(), log *slog.Logger) error {
 	factory := informers.NewSharedInformerFactory(client, 0)
@@ -642,9 +639,44 @@ func watchNodes(ctx context.Context, client kubernetes.Interface, mgr *datapath.
 		return fmt.Errorf("add np node handler: %w", err)
 	}
 
+	// internal_nodes: every node's addresses, this node's included.
+	internal := newInternalNodes(mgr)
+	internalApply := func(obj any) {
+		if node, ok := obj.(*corev1.Node); ok {
+			if err := internal.set(node); err != nil {
+				log.Error("set internal node addresses", "node", node.Name, "err", err)
+			}
+		}
+	}
+	internalReg, err := nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    internalApply,
+		UpdateFunc: func(_, newObj any) { internalApply(newObj) },
+		DeleteFunc: func(obj any) {
+			name := ""
+			switch o := obj.(type) {
+			case *corev1.Node:
+				name = o.Name
+			case cache.DeletedFinalStateUnknown:
+				name = o.Key // cluster-scoped: the key is the name
+			}
+			if name == "" {
+				return
+			}
+			if err := internal.del(name); err != nil {
+				log.Error("del internal node addresses", "node", name, "err", err)
+			}
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("add internal node handler: %w", err)
+	}
+
 	factory.Start(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(), nodeInformer.HasSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), nodeInformer.HasSynced, internalReg.HasSynced) {
 		return fmt.Errorf("node cache failed to sync")
+	}
+	if err := internal.resync(); err != nil {
+		log.Error("sync internal node addresses", "err", err)
 	}
 	return nil
 }

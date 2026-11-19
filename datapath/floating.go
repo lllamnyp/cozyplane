@@ -456,6 +456,41 @@ func (m *Manager) SetInternal(cidrs []string) error {
 	return nil
 }
 
+// SetInternalNode adds a node address to internal_nodes.
+func (m *Manager) SetInternalNode(ip net.IP) error {
+	a, err := addr128(ip)
+	if err != nil {
+		return fmt.Errorf("internal node IP: %w", err)
+	}
+	var one uint8 = 1
+	return m.objs.InternalNodes.Put(&a, &one)
+}
+
+// DelInternalNode removes a node address from internal_nodes.
+func (m *Manager) DelInternalNode(ip net.IP) error {
+	a, err := addr128(ip)
+	if err != nil {
+		return fmt.Errorf("internal node IP: %w", err)
+	}
+	if err := m.objs.InternalNodes.Delete(&a); err != nil && !isNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// SyncInternalNodes makes internal_nodes exactly ips.
+func (m *Manager) SyncInternalNodes(ips []net.IP) error {
+	want := make(map[overlayAddr128]uint8, len(ips))
+	for _, ip := range ips {
+		a, err := addr128(ip)
+		if err != nil {
+			return fmt.Errorf("internal node IP: %w", err)
+		}
+		want[a] = 1
+	}
+	return syncMap(m.objs.InternalNodes, want)
+}
+
 // Floatings returns the public IPs currently programmed in the floating map, so
 // a restarted agent can prune entries whose FloatingIPs or target Ports vanished
 // while it was down.

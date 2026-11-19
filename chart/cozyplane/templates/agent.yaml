@@ -14,8 +14,9 @@ metadata:
   labels:
     {{- include "cozyplane.labels" . | nindent 4 }}
 rules:
-  # The agent learns remote pod CIDRs + addresses from Node objects, and patches
-  # its own Node to advertise the address host traffic sources from (node_remotes).
+  # Node reads feed the tunnel endpoints (node_remotes), the NAT shard partition,
+  # the HostFirewall and NetworkPolicy node addresses, and internal_nodes; the
+  # patch advertises the agent's own host-source address.
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch", "patch"]
@@ -196,8 +197,7 @@ spec:
             {{- end }}
             {{- $internal := concat (list .Values.egress.clusterCIDR .Values.egress.serviceCIDR) .Values.egress.internalCIDRs | compact }}
             {{- if $internal }}
-            # Cluster-internal CIDRs a floating pod's public-IP egress skips
-            # (routed to the gateway instead, which proxies DNS / denies the rest).
+            # Static cluster-internal ranges VPC egress refuses; node addresses come from the Nodes.
             - "--internal-cidrs={{ join "," $internal }}"
             {{- end }}
             # The kubelet expands $(HOST_IP) from the env below (values.yaml,

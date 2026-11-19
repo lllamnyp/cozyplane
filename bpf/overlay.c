@@ -686,6 +686,7 @@ struct {
 #define RTD_UNRESOLVED     1
 #define RTD_NO_FLOATING_IP 2
 #define RTD_NO_ROUTE       3
+#define RTD_NODE_ADDRESS   4
 
 struct route_drop_key {
 	__u32 net;
@@ -732,6 +733,16 @@ struct {
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } internal SEC(".maps");
+
+// internal_nodes holds every node's own addresses, which vpc_egress refuses to route.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct addr128);
+	__type(value, __u8);
+	__uint(max_entries, 4096);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} internal_nodes SEC(".maps");
 
 // masq_srcs holds the source CIDRs (the cluster pod supernet) whose
 // off-cluster egress the datapath masquerades to the node address at the
@@ -4702,6 +4713,31 @@ static __always_inline void route_drop(__u32 net, __u32 reason)
 	stat_inc(&route_drops, &k);
 }
 
+// node_reply reports whether an unfragmented packet to a node address is TCP other than a bare SYN, or an ICMP echo reply or error.
+static __always_inline int node_reply(struct __sk_buff *skb, struct pkt *p)
+{
+	__u32 l4off = ETH_HLEN + 40;
+	__u8 b;
+	if (!p->is_v6) {
+		__u8 h[8];
+		if (bpf_skb_load_bytes(skb, ETH_HLEN, h, 8) < 0 || (h[0] & 0x0f) != 5 || (h[6] & 0x3f) || h[7])
+			return 0; // options or a fragment
+		l4off = ETH_HLEN + 20;
+	}
+	if (p->proto == IPPROTO_TCP) {
+		if (bpf_skb_load_bytes(skb, l4off + 13, &b, 1) < 0)
+			return 0;
+		return !((b & 0x02) && !(b & 0x10)); // anything but a bare SYN
+	}
+	if (p->proto != IPPROTO_ICMP && p->proto != IPPROTO_ICMPV6)
+		return 0;
+	if (bpf_skb_load_bytes(skb, l4off, &b, 1) < 0)
+		return 0;
+	if (p->proto == IPPROTO_ICMP)
+		return b == 0 || b == 3 || b == 11 || b == 12; // echo reply, the errors
+	return (b >= 1 && b <= 4) || b == 129; // the ICMPv6 errors, echo reply
+}
+
 // tcp_fin reports whether a TCP segment carries FIN or RST.
 static __always_inline __u8 tcp_fin(struct __sk_buff *skb, __u32 l4off)
 {
@@ -5185,6 +5221,12 @@ int cozyplane_vpc_egress(struct __sk_buff *skb)
 	// Cluster-internal destinations are not routed (§3.1 step 2).
 	if (is_internal(p.dst))
 		return rt_back(skb);
+	// Nor is a node's own address, unless a peer's or a reply (§3.1 step 2).
+	if (bpf_map_lookup_elem(&internal_nodes, &p.dst) &&
+	    !net_of(&networks, srcnet, p.dst) && !node_reply(skb, &p)) {
+		route_drop(srcnet, RTD_NODE_ADDRESS);
+		return TC_ACT_SHOT;
+	}
 	struct local_key pk = { .net = srcnet, .ip = p.src };
 	__u32 *tbl = bpf_map_lookup_elem(&port_rt, &pk);
 	if (!tbl)

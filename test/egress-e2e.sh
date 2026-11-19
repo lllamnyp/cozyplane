@@ -29,6 +29,7 @@ retry() { local n="$1"; shift; for _ in $(seq 1 "$n"); do "$@" >/dev/null 2>&1 &
 
 cleanup() {
   docker rm -f egtgt egcap >/dev/null 2>&1
+  $K delete node eg-phantom --ignore-not-found >/dev/null 2>&1
   [ "${KEEP:-0}" = "1" ] || kind delete cluster --name "$CLUSTER" >/dev/null 2>&1
 }
 
@@ -100,7 +101,7 @@ docker run -d --rm --name egcap --net container:egtgt nicolaka/netshoot \
 TGT=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' egtgt)
 sleep 3
 get() { $K -n $NS exec "$1" -- wget -qO- -T3 "http://$TGT/" 2>/dev/null | grep -q tgt; }
-seen() { docker exec egcap grep -q "IP $1\." /tmp/cap.txt; }
+seen() { retry 5 docker exec egcap grep -q "IP $1\." /tmp/cap.txt; }
 
 phase "no route table: no internet"
 check_fail "p1 (no table) cannot reach the external target" get p1
@@ -245,6 +246,102 @@ check_ok "VPCGateway status mirrors $NATIP2" retry 15 bash -c "[ \"\$($K -n $NS 
 docker exec egcap sh -c ': > /tmp/cap.txt'
 check_ok "pl (VPCGateway VPC) reaches the target" retry 20 get pl
 check_ok "pl's source is the transition's NAT gateway $NATIP2" seen "$NATIP2"
+
+phase "node addresses"
+# Targets on $W2: the agent's :9411, a hostNetwork UDP listener, and eg-phantom, a Node no kubelet rewrites.
+W2IP=$($K get node "$W2" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' | tr ' ' '\n' | grep -v : | head -1)
+XINT="$P4.250.40"; XEXT="$P4.250.41"
+docker exec "$W2" ip addr add "$XINT/32" dev eth0 2>/dev/null
+docker exec "$W2" ip addr add "$XEXT/32" dev eth0 2>/dev/null
+$K apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: d0, namespace: $NS}
+spec:
+  nodeName: $W
+  containers: [{name: c, image: busybox:1.36, command: ["sleep", "3600"]}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: d1, namespace: $NS}
+spec:
+  nodeName: $W2
+  containers: [{name: c, image: busybox:1.36, command: ["sleep", "3600"]}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: hudp, namespace: $NS}
+spec:
+  nodeName: $W2
+  hostNetwork: true
+  containers: [{name: c, image: busybox:1.36, stdin: true, command: ["nc", "-lu", "-p", "18081"]}]
+---
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: VPC
+metadata: {name: w, namespace: $NS}
+spec: {cidrs: ["10.32.0.0/24"]}
+---
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: VPCBinding
+metadata: {name: w, namespace: $NS}
+spec: {vpcRef: {namespace: $NS, name: w}}
+---
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: VPCPeering
+metadata: {name: v-w, namespace: $NS}
+spec: {vpcRef: {name: v}, peerRef: {namespace: $NS, name: w}}
+---
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: VPCPeering
+metadata: {name: w-v, namespace: $NS}
+spec: {vpcRef: {name: w}, peerRef: {namespace: $NS, name: v}}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: pw, namespace: $NS, annotations: {sdn.cozystack.io/vpc: w}}
+spec:
+  nodeName: $W2
+  containers: [{name: c, image: busybox:1.36, command: ["sleep", "3600"]}]
+EOF
+for p in d0 d1 hudp pw; do $K -n $NS wait --for=condition=Ready pod/$p --timeout=120s >/dev/null; done
+portip() { $K get ports -o jsonpath="{range .items[*]}{.spec.podName}{' '}{.spec.ip}{'\n'}{end}" | awk -v p="$1" '$1==p{print $2}'; }
+P2IP=$(portip p2); PWIP=$(portip pw)
+metrics() { $K -n $NS exec "$1" -- wget -qO- -T3 "http://$2:9411/metrics" 2>/dev/null | grep cozyplane_ >/dev/null; }
+refused() { ! metrics "$@"; }
+heard() { $K -n $NS logs hudp 2>/dev/null | grep "$1" >/dev/null; }
+drops() { docker exec "$W" curl -s http://127.0.0.1:9411/metrics | grep '^cozyplane_route_drops_total{' | grep 'reason="node_address"' | awk '$NF>0{f=1} END{exit !f}'; }
+phantom() { # phantom <status.addresses JSON>
+  echo '{"apiVersion":"v1","kind":"Node","metadata":{"name":"eg-phantom"}}' | $K apply -f - >/dev/null
+  $K patch node eg-phantom --subresource=status --type=merge -p "{\"status\":{\"addresses\":$1}}" >/dev/null
+}
+
+check_ok "d0 (default network, node $W) reaches $W2's InternalIP" metrics d0 "$W2IP"
+check_fail "p1 (VPC, NAT gateway, node $W) cannot reach $W2's InternalIP over TCP" metrics p1 "$W2IP"
+check_fail "p1 cannot ping $W2's InternalIP" $K -n $NS exec p1 -- ping -c2 -W2 "$W2IP"
+$K -n $NS exec p1 -- sh -c "echo from-vpc | nc -u -w1 $W2IP 18081" >/dev/null 2>&1
+$K -n $NS exec d0 -- sh -c "echo from-default | nc -u -w1 $W2IP 18081" >/dev/null 2>&1
+check_ok "the UDP listener on $W2 heard d0" retry 5 heard from-default
+check_fail "the UDP listener on $W2 never heard p1" heard from-vpc
+check_ok "p1 still reaches the external target" retry 10 get p1
+check_ok "p1 still pings p2 in its own VPC (node $W2)" $K -n $NS exec p1 -- ping -c2 -W2 "$P2IP"
+check_ok "p1 pings pw in the peered VPC" retry 10 $K -n $NS exec p1 -- ping -c1 -W2 "$PWIP"
+check_ok "$W counts the refusals as node_address" retry 25 drops
+
+check_ok "p1 reaches $XEXT while no Node claims it" retry 10 metrics p1 "$XEXT"
+phantom "[{\"type\":\"InternalIP\",\"address\":\"$XINT\"},{\"type\":\"ExternalIP\",\"address\":\"$XEXT\"}]"
+check_ok "a Node's ExternalIP is refused once the Node is added" retry 10 refused p1 "$XEXT"
+check_fail "the Node's InternalIP is refused" metrics p1 "$XINT"
+phantom "[{\"type\":\"InternalIP\",\"address\":\"$XINT\"}]"
+check_ok "dropping the ExternalIP from the Node reopens it" retry 10 metrics p1 "$XEXT"
+check_fail "the InternalIP the Node kept stays refused" metrics p1 "$XINT"
+$K delete node eg-phantom >/dev/null
+check_ok "deleting the Node reopens its InternalIP" retry 10 metrics p1 "$XINT"
+
+# pf's replies to d1's flow go to $W2's address, which d1's masquerade put there.
+$K -n $NS exec pf -- sh -c 'mkdir -p /w && echo pf > /w/index.html && httpd -p 8080 -h /w' >/dev/null 2>&1
+check_ok "d1 (default network) reaches pf's FloatingIP over TCP" retry 10 \
+  bash -c "$K -n $NS exec d1 -- wget -qO- -T3 http://$FIP:8080/ | grep -q pf"
+check_ok "d1 pings pf's FloatingIP" $K -n $NS exec d1 -- ping -c2 -W2 "$FIP"
 
 echo
 if [ "$FAILED" = 0 ]; then echo "ALL ${CHECKS} CHECKS PASSED"; else echo "SOME CHECKS FAILED"; fi

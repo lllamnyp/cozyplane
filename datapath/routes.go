@@ -83,6 +83,7 @@ var routeDropNames = map[uint32]string{
 	1: "unresolved",
 	2: "no_floating_ip",
 	3: "no_route",
+	4: "node_address",
 }
 
 // RouteDrops returns route_drops as {net: {reason: count}}.

@@ -38,9 +38,14 @@ The layers map onto three trust zones, in descending privilege:
   pods directly; it is infrastructure land, not tenant land. The
   HostFirewall exists largely because this zone is only *somewhat* trusted.
 - **VPCs** — tenant land. A VPC workload cannot address a node or a net-0
-  pod at all (the datapath has no sanctioned path for it; gateway and
-  floating egress surface as pod-sourced or refuse cluster-internal
-  destinations). True tenant isolation is the VPC boundary itself; the
+  pod at all. The datapath has no sanctioned path for it: NAT gateway,
+  FloatingIP and gateway-pod egress refuse the static cluster-internal
+  ranges, and `vpc_egress` drops every node's own address, which the agent
+  tracks from the Node objects
+  ([vpc-egress.md](vpc-egress.md) §3.1 step 2). The one exception is a
+  reply-shaped packet (TCP other than a bare SYN, ICMP echo reply or error)
+  to a node or masqueraded net-0 pod that reached the workload's
+  FloatingIP. True tenant isolation is the VPC boundary itself; the
   policy layers refine what crosses it, they don't create it.
 
 ## Flow ownership
