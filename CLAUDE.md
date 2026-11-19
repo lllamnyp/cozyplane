@@ -43,7 +43,10 @@ change is — resolve that first, in writing.
 
 2. **Addresses are 128-bit everywhere; a v4 address is stored in RFC 6052 NAT64
    form `64:ff9b::a.b.c.d`, never `::ffff:a.b.c.d`.** One map set, not parallel
-   v4/v6 sets. The NAT64 form is a real routable v6 address a future cross-family
+   v4/v6 sets. "Everywhere" includes map values and the underlay: node
+   addresses and tunnel endpoints too. Today the underlay is still IPv4-only,
+   a known violation tracked in #78; don't add new 32-bit node addresses.
+   The NAT64 form is a real routable v6 address a future cross-family
    translator can act on; `::ffff:` is non-routable and would preclude it. Use the
    `addr128`/`v4_to_128` helpers, never hand-roll the encoding. (internals.md §3)
 

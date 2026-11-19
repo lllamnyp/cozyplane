@@ -64,3 +64,32 @@ func TestDefaultRouteIn(t *testing.T) {
 		}
 	}
 }
+
+// TestHasGlobalIPv4 checks only a global-scope IPv4 address counts.
+func TestHasGlobalIPv4(t *testing.T) {
+	addr := func(cidr string, scope netlink.Scope) netlink.Addr {
+		ip, n, err := net.ParseCIDR(cidr)
+		if err != nil {
+			panic(err)
+		}
+		n.IP = ip
+		return netlink.Addr{IPNet: n, Scope: int(scope)}
+	}
+	cases := []struct {
+		name  string
+		addrs []netlink.Addr
+		want  bool
+	}{
+		{"none", nil, false},
+		{"loopback only", []netlink.Addr{addr("127.0.0.1/8", netlink.SCOPE_HOST)}, false},
+		{"link-local only", []netlink.Addr{addr("169.254.1.1/16", netlink.SCOPE_LINK)}, false},
+		{"IPv6 only", []netlink.Addr{addr("2001:db8::5/64", netlink.SCOPE_UNIVERSE)}, false},
+		{"a private IPv4", []netlink.Addr{addr("127.0.0.1/8", netlink.SCOPE_HOST), addr("10.20.0.5/24", netlink.SCOPE_UNIVERSE)}, true},
+		{"a public IPv4", []netlink.Addr{addr("203.0.113.7/24", netlink.SCOPE_UNIVERSE)}, true},
+	}
+	for _, c := range cases {
+		if got := hasGlobalIPv4(c.addrs); got != c.want {
+			t.Errorf("%s: hasGlobalIPv4 = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

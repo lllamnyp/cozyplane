@@ -242,6 +242,31 @@ func (m *Manager) setUplinkMAC(mac net.HardwareAddr) error {
 // ErrNoDefaultRoute means the node has no IPv4 default route with a gateway, which the datapath requires for now.
 var ErrNoDefaultRoute = errors.New("no IPv4 default route (0.0.0.0/0 with a gateway)")
 
+// ErrNoIPv4 means the node has no global IPv4 address, which the overlay between nodes requires for now.
+var ErrNoIPv4 = errors.New("no global IPv4 address on any link")
+
+// RequireIPv4 returns ErrNoIPv4 if no link on the node has a global IPv4 address.
+func RequireIPv4() error {
+	addrs, err := addrList(nil, netlink.FAMILY_V4)
+	if err != nil {
+		return fmt.Errorf("list addrs: %w", err)
+	}
+	if !hasGlobalIPv4(addrs) {
+		return ErrNoIPv4
+	}
+	return nil
+}
+
+// hasGlobalIPv4 reports whether addrs holds a global-scope IPv4 address.
+func hasGlobalIPv4(addrs []netlink.Addr) bool {
+	for _, a := range addrs {
+		if a.IPNet != nil && a.IP.To4() != nil && a.IP.IsGlobalUnicast() && a.Scope == int(netlink.SCOPE_UNIVERSE) {
+			return true
+		}
+	}
+	return false
+}
+
 // RequireDefaultRoute returns ErrNoDefaultRoute if the node has no IPv4 default route with a gateway.
 func RequireDefaultRoute() error {
 	_, _, err := defaultRouteLink()

@@ -131,6 +131,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := datapath.RequireIPv4(); errors.Is(err, datapath.ErrNoIPv4) {
+		log.Error("this node has no IPv4 address; the overlay between nodes is IPv4-only for now, so IPv6-only nodes are unsupported", "issue", ipv6UnderlayIssue)
+		os.Exit(1)
+	}
 	if err := datapath.RequireDefaultRoute(); errors.Is(err, datapath.ErrNoDefaultRoute) {
 		log.Error("this node has no IPv4 default route with a gateway; cozyplane requires one for now", "issue", noDefaultRouteIssue)
 		os.Exit(1)
@@ -496,6 +500,9 @@ const nodeAddrsAnnotation = "cozyplane.io/node-addresses"
 
 // noDefaultRouteIssue tracks running on a node without an IPv4 default route.
 const noDefaultRouteIssue = "https://github.com/lllamnyp/cozyplane/issues/75"
+
+// ipv6UnderlayIssue tracks running the overlay between nodes over IPv6.
+const ipv6UnderlayIssue = "https://github.com/lllamnyp/cozyplane/issues/78"
 
 // advertiseNodeAddrs publishes this node's default-route source address in the
 // node annotation, so peers can encapsulate their pods' replies to this node.
