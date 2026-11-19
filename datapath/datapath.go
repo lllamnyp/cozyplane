@@ -239,23 +239,45 @@ func (m *Manager) setUplinkMAC(mac net.HardwareAddr) error {
 	return nil
 }
 
+// ErrNoDefaultRoute means the node has no IPv4 default route with a gateway, which the datapath requires for now.
+var ErrNoDefaultRoute = errors.New("no IPv4 default route (0.0.0.0/0 with a gateway)")
+
+// RequireDefaultRoute returns ErrNoDefaultRoute if the node has no IPv4 default route with a gateway.
+func RequireDefaultRoute() error {
+	_, _, err := defaultRouteLink()
+	return err
+}
+
 // defaultRouteLink returns the ifindex and name of the IPv4 default-route link.
 func defaultRouteLink() (int, string, error) {
 	routes, err := routeList(nil, netlink.FAMILY_V4)
 	if err != nil {
 		return 0, "", fmt.Errorf("list routes: %w", err)
 	}
+	idx, ok := defaultRouteIn(routes)
+	if !ok {
+		return 0, "", ErrNoDefaultRoute
+	}
+	link, err := netlink.LinkByIndex(idx)
+	if err != nil {
+		return 0, "", err
+	}
+	return idx, link.Attrs().Name, nil
+}
+
+// defaultRouteIn returns the link of the first 0.0.0.0/0 route with a gateway.
+func defaultRouteIn(routes []netlink.Route) (int, bool) {
 	for _, r := range routes {
-		isDefault := r.Dst == nil || r.Dst.IP.IsUnspecified()
+		isDefault := r.Dst == nil
+		if r.Dst != nil {
+			ones, _ := r.Dst.Mask.Size()
+			isDefault = r.Dst.IP.IsUnspecified() && ones == 0
+		}
 		if isDefault && r.Gw != nil && r.LinkIndex > 0 {
-			link, err := netlink.LinkByIndex(r.LinkIndex)
-			if err != nil {
-				return 0, "", err
-			}
-			return r.LinkIndex, link.Attrs().Name, nil
+			return r.LinkIndex, true
 		}
 	}
-	return 0, "", fmt.Errorf("no default route found")
+	return 0, false
 }
 
 // DefaultRouteSrcIP returns the IPv4 address host-originated traffic to off-link
