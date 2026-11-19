@@ -92,6 +92,11 @@ replaces kube-ovn for VPC networking, and it can own Services too: `cozyplane-kp
 See the [roadmap](docs/roadmap.md) and the [open issues](../../issues) for what's
 outstanding.
 
+## Known limitations
+
+- A node needs an IPv4 default route (`0.0.0.0/0` with a gateway); the agent exits at startup without one. On a node with several links, the others get only part of the datapath: notably, a default-network pod's traffic routed out another link is not masqueraded. Tracked in [#75](https://github.com/lllamnyp/cozyplane/issues/75).
+- The overlay between nodes runs only over IPv4, so every node needs an IPv4 address and IPv6-only nodes are unsupported; the agent exits at startup on one. Pods, VPCs and fabric IPs can be IPv6. Tracked in [#78](https://github.com/lllamnyp/cozyplane/issues/78).
+
 ## Documentation
 
 Start with [design.md](docs/design.md) (the vision and the **design tenets**), then
