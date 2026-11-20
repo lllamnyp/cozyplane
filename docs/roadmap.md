@@ -15,6 +15,11 @@ they're discovered rather than leaving them only in issues.
 
 ## Immediate roadmap — what's genuinely open
 
+- [ ] SecurityGroup admission and legacy-input hardening: bounded reference and
+  diagnostic sizes, selector/port validation, guarded allocation and agent
+  lookups. Regression tests cover the API strategies and controller/compiler
+  behavior; merge and real-cluster validation remain outstanding.
+
 The sections below are the full ledger, and most of it is ticked. This is the
 short list: what is actually left, in rough priority order. Revised **2026-07-14**,
 once the north-south arc closed (one declared boundary, metered, with the tenant's

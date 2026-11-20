@@ -12,6 +12,24 @@ FQDN and specific-CIDR sources, the Geneve identity TLV) is v2 — the v1 shape 
 chosen so those are additive, never a reshape. What is not built yet is called
 out inline. **Label-follows membership is built** (see "Membership").
 
+## Admission and reference limits
+
+SecurityGroup VPC and group references must be DNS subdomain names of at most
+253 bytes. Explicit peer namespaces must be DNS label names of at most 63 bytes.
+Admission checks lengths before parsing and reports the first invalid rule with
+bounded diagnostics that do not repeat untrusted input. Selectors must be valid;
+listed ports use TCP or UDP and the range 0..65535 (zero means any port).
+
+An unchanged legacy reference may remain during a metadata-only update so that
+cleanup is possible; changing the spec requires valid references. Controllers
+clear the allocated ID of an unusable legacy VPC anchor, leave the group Pending,
+and avoid allocation scans and repeated unchanged status writes. Agents reject
+unusable references before constructing lookup keys, bound legacy CIDR parsing,
+and discard out-of-range ports before converting them to datapath identifiers.
+
+These checks bound work caused by individual malformed fields. Whole-snapshot
+budgets, membership identity proofs and rollout protection are separate work.
+
 ## What §7 commits us to
 
 - A **security identity** per port, derived from workload metadata, **scoped to
