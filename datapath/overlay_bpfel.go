@@ -138,6 +138,13 @@ type overlayLpmKey struct {
 	Addr      overlayAddr128
 }
 
+type overlayMasqLink struct {
+	_   structs.HostLayout
+	V4  uint32
+	Pad [3]uint32
+	V6  overlayAddr128
+}
+
 type overlayNatAddrVal struct {
 	_         structs.HostLayout
 	Natgw     uint32
@@ -435,6 +442,8 @@ const (
 	overlayMapLbScratch             = "lb_scratch"
 	overlayMapLbSrc                 = "lb_src"
 	overlayMapLocals                = "locals"
+	overlayMapMasqAddrs             = "masq_addrs"
+	overlayMapMasqLinks             = "masq_links"
 	overlayMapMasqSrcs              = "masq_srcs"
 	overlayMapMigrateFwd            = "migrate_fwd"
 	overlayMapNatAddrs              = "nat_addrs"
@@ -483,6 +492,7 @@ const (
 	overlayProgCozyplaneHfIngress   = "cozyplane_hf_ingress"
 	overlayProgCozyplaneLbDsr       = "cozyplane_lb_dsr"
 	overlayProgCozyplaneLbIngress   = "cozyplane_lb_ingress"
+	overlayProgCozyplaneLinkEgress  = "cozyplane_link_egress"
 	overlayProgCozyplaneNatReverse  = "cozyplane_nat_reverse"
 	overlayProgCozyplaneToPod       = "cozyplane_to_pod"
 	overlayProgCozyplaneVpcEgress   = "cozyplane_vpc_egress"
@@ -537,6 +547,7 @@ type overlayProgramSpecs struct {
 	CozyplaneHfIngress   *ebpf.ProgramSpec `ebpf:"cozyplane_hf_ingress"`
 	CozyplaneLbDsr       *ebpf.ProgramSpec `ebpf:"cozyplane_lb_dsr"`
 	CozyplaneLbIngress   *ebpf.ProgramSpec `ebpf:"cozyplane_lb_ingress"`
+	CozyplaneLinkEgress  *ebpf.ProgramSpec `ebpf:"cozyplane_link_egress"`
 	CozyplaneNatReverse  *ebpf.ProgramSpec `ebpf:"cozyplane_nat_reverse"`
 	CozyplaneToPod       *ebpf.ProgramSpec `ebpf:"cozyplane_to_pod"`
 	CozyplaneVpcEgress   *ebpf.ProgramSpec `ebpf:"cozyplane_vpc_egress"`
@@ -568,6 +579,8 @@ type overlayMapSpecs struct {
 	LbScratch      *ebpf.MapSpec `ebpf:"lb_scratch"`
 	LbSrc          *ebpf.MapSpec `ebpf:"lb_src"`
 	Locals         *ebpf.MapSpec `ebpf:"locals"`
+	MasqAddrs      *ebpf.MapSpec `ebpf:"masq_addrs"`
+	MasqLinks      *ebpf.MapSpec `ebpf:"masq_links"`
 	MasqSrcs       *ebpf.MapSpec `ebpf:"masq_srcs"`
 	MigrateFwd     *ebpf.MapSpec `ebpf:"migrate_fwd"`
 	NatAddrs       *ebpf.MapSpec `ebpf:"nat_addrs"`
@@ -659,6 +672,8 @@ type overlayMaps struct {
 	LbScratch      *ebpf.Map `ebpf:"lb_scratch"`
 	LbSrc          *ebpf.Map `ebpf:"lb_src"`
 	Locals         *ebpf.Map `ebpf:"locals"`
+	MasqAddrs      *ebpf.Map `ebpf:"masq_addrs"`
+	MasqLinks      *ebpf.Map `ebpf:"masq_links"`
 	MasqSrcs       *ebpf.Map `ebpf:"masq_srcs"`
 	MigrateFwd     *ebpf.Map `ebpf:"migrate_fwd"`
 	NatAddrs       *ebpf.Map `ebpf:"nat_addrs"`
@@ -726,6 +741,8 @@ func (m *overlayMaps) Close() error {
 		m.LbScratch,
 		m.LbSrc,
 		m.Locals,
+		m.MasqAddrs,
+		m.MasqLinks,
 		m.MasqSrcs,
 		m.MigrateFwd,
 		m.NatAddrs,
@@ -787,6 +804,7 @@ type overlayPrograms struct {
 	CozyplaneHfIngress   *ebpf.Program `ebpf:"cozyplane_hf_ingress"`
 	CozyplaneLbDsr       *ebpf.Program `ebpf:"cozyplane_lb_dsr"`
 	CozyplaneLbIngress   *ebpf.Program `ebpf:"cozyplane_lb_ingress"`
+	CozyplaneLinkEgress  *ebpf.Program `ebpf:"cozyplane_link_egress"`
 	CozyplaneNatReverse  *ebpf.Program `ebpf:"cozyplane_nat_reverse"`
 	CozyplaneToPod       *ebpf.Program `ebpf:"cozyplane_to_pod"`
 	CozyplaneVpcEgress   *ebpf.Program `ebpf:"cozyplane_vpc_egress"`
@@ -801,6 +819,7 @@ func (p *overlayPrograms) Close() error {
 		p.CozyplaneHfIngress,
 		p.CozyplaneLbDsr,
 		p.CozyplaneLbIngress,
+		p.CozyplaneLinkEgress,
 		p.CozyplaneNatReverse,
 		p.CozyplaneToPod,
 		p.CozyplaneVpcEgress,

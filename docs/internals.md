@@ -796,16 +796,22 @@ pod CIDRs aren't routable outside the cluster, so without it no default-network
 pod — including a gateway forwarding tenant traffic — has an internet return
 path. `--masquerade` selects the implementation ([#10](../../issues/10)):
 
-- **`bpf` (default)** — SNAT in the eBPF datapath, no netfilter. `from_pod` at
-  the **uplink egress** (already attached there) rewrites a packet whose source
-  is in the `masq_srcs` LPM (the pod CIDRs) and whose destination is not
-  internal: source → the node IP (`params[CFG_NODE_IP]`), source port → a
+- **`bpf` (default)** — SNAT in the eBPF datapath, no netfilter. The packet is
+  masqueraded at the egress of whichever link the kernel sends it out of, to
+  that link's own address, as the kernel's `MASQUERADE` would:
+  `from_pod` at the default uplink's egress, to `params[CFG_MASQ_IP]` (v4) and
+  `node_ip6` (v6); `cozyplane_link_egress` at every other link's egress, to that
+  link's entry in `masq_links` (see [lb-ingress.md](lb-ingress.md) § "The
+  cluster-egress masquerade follows the egress link"). Either rewrites a packet
+  whose source is in the `masq_srcs` LPM (the pod CIDRs) and whose destination
+  is not internal: source → the link's address, source port → a
   masquerade port from the same `ct_fwd`/`ct_rev` machinery as the north-south
   bridge, reused with `net=0` and inverted roles (`vpc_ip`:=remote address,
   `fabric_ip`/`client_ip`:=pod address) so the map ABI is unchanged. Masquerade
   ports come from **16384–32767** — disjoint from the host's ephemeral range
   (32768+), so a reverse lookup can never capture the node's own connections.
-  `from_uplink` at the **uplink ingress** un-SNATs matching replies *before*
+  `from_uplink`, at the ingress of every masquerading link, un-SNATs replies
+  addressed to any address in `masq_addrs` *before*
   netfilter ever sees them, then hands off to the kernel: its conntrack saw the
   original pod-sourced flow leave through FORWARD, so the un-SNAT'd reply
   matches ESTABLISHED and no INVALID drop can fire even under kube-proxy. ICMP

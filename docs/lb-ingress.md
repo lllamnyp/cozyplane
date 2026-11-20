@@ -477,6 +477,49 @@ the node-wide cell, and only then to the default uplink. That middle rung is not
 vestigial: `lb_return` serves both families, and a **v6** reply reaches it with no
 `ext_links` entry to find.
 
+### The cluster-egress masquerade follows the egress link
+
+The same rule holds for the other source the node stamps on a pod's packet: the
+cluster-egress masquerade's. A default-network pod's packet to an off-cluster
+destination is forwarded by the kernel, which picks the link from its FIB, and the
+masquerade must give it an address that link can source. The kernel's
+`MASQUERADE` does exactly that: it uses the outgoing interface's address.
+
+The eBPF masquerade used to run only at the default uplink's egress and stamp one
+node-wide address. A destination the FIB routes out of any other link (a host on
+a VLAN, a VLAN-only FloatingIP or LB address, a route via a second NIC's gateway)
+left the node with the **pod's** source address. A spoof-guarding fabric drops
+that, and a fabric that delivers it gets a reply for an address it cannot route
+back. Measured on a stand: a default-network pod reached no host on its node's
+`eth1` VLAN, while a VPC pod behind a NAT gateway reached them all.
+
+So the masquerade now runs at every link's egress, to that link's address:
+
+- **The default uplink** keeps `from_pod` and its node-wide cells,
+  `CFG_MASQ_IP` (v4) and `node_ip6` (v6). `from_pod` has no stack to spare for a
+  per-link lookup.
+- **Every other link** carries `cozyplane_link_egress`, which does nothing but the
+  masquerade, sourcing from the link's entry in `masq_links` (ifindex → v4 and v6
+  address). It is not `from_pod`: `from_pod` treats any attachment other than the
+  default uplink as a pod veth, and on a node whose InternalIP sits on the second
+  link it would encapsulate the outgoing Geneve frames again.
+- **Replies** are un-SNAT'd by `from_uplink`, attached at the ingress of every
+  masquerading link, for a destination in `masq_addrs` (every masquerade address
+  of the node). The connection table needs nothing new: a reverse entry is keyed
+  by the remote end and the allocated port, which no two links share.
+
+The agent chooses the links: every link that is up and carries Ethernet, other
+than loopback, dummies and tunnel devices, with a global address, which a pod's
+host-side veth never has. Per
+family it takes the first address that is neither a secondary address nor a host
+prefix (an address configured as `/32` or `/128` is usually an attracted external
+address, not the link's own). It re-reads them when an address changes.
+
+`from_uplink` now also runs at the ingress of such a link when no FloatingIP or LB
+address binds it there, so LoadBalancer and NodePort ingress and the HostFirewall
+see traffic arriving on that link too. This is what they already did on any link
+carrying a FloatingIP or LB address.
+
 **Superseded, still written.** `CFG_FLOAT_IFINDEX`, `CFG_FLOAT_NH` and `float_net`
 held the single node-wide answer. No v4 path reads them once `ext_links` is in
 place; `CFG_FLOAT_IFINDEX` survives only as the v6 fallback above. They are still

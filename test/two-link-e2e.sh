@@ -182,6 +182,23 @@ check "address on the second link is served (client on ${XBR})" "web" \
 check "address on the default uplink is served (client on kind)" "web" \
   bash -c "docker run --rm --network kind alpine:3.20 wget -qO- -T6 http://$XDEF/hostname 2>/dev/null | cut -c1-3"
 
+phase "the cluster-egress masquerade follows the egress link"
+# A pod's packet to a host on either link leaves masqueraded to that link's own address.
+SEC_IP=$(docker exec "$NODE" sh -c "ip -o -4 addr show ${SEC_IF} | awk '{print \$4}'" | head -1 | cut -d/ -f1)
+for net in "$XBR" kind; do
+  docker rm -f "${CLUSTER}-tgt-$net" >/dev/null 2>&1
+  docker run -d --rm --name "${CLUSTER}-tgt-$net" --network "$net" registry.k8s.io/e2e-test-images/agnhost:2.47 \
+    netexec --http-port=8080 >/dev/null
+done
+trap 'docker rm -f "${CLUSTER}-tgt-$XBR" "${CLUSTER}-tgt-kind" >/dev/null 2>&1; cleanup' EXIT
+tgtip() { docker inspect -f "{{(index .NetworkSettings.Networks \"$1\").IPAddress}}" "${CLUSTER}-tgt-$1"; }
+TSEC=$(tgtip "$XBR"); TDEF=$(tgtip kind)
+$K run masqcli --image=busybox:1.36 --restart=Never -- sleep 3600 >/dev/null 2>&1
+$K wait --for=condition=Ready pod/masqcli --timeout=120s >/dev/null
+clientip() { $K exec masqcli -- wget -qO- -T6 "http://$1:8080/clientip" 2>/dev/null | cut -d: -f1; }
+check "a pod reaches a host on the second link, sourced from ${SEC_IF}'s address" "$SEC_IP" clientip "$TSEC"
+check "a pod reaches a host on the default uplink, sourced from ${DEF_IF}'s address" "$DEF_IP" clientip "$TDEF"
+
 echo
 echo "two-link e2e: $((CHECKS - FAILS)) of ${CHECKS} checks passed"
 [ "$FAILED" = "0" ] && echo "two-link e2e: ALL PASSED" || echo "two-link e2e: FAILURES"

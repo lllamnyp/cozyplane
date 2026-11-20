@@ -100,7 +100,7 @@ docker run -d --rm --name egcap --net container:egtgt nicolaka/netshoot \
 TGT=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' egtgt)
 sleep 3
 get() { $K -n $NS exec "$1" -- wget -qO- -T3 "http://$TGT/" 2>/dev/null | grep -q tgt; }
-seen() { docker exec egcap grep -q "IP $1\." /tmp/cap.txt; }
+seen() { retry 5 docker exec egcap grep -q "IP $1\." /tmp/cap.txt; }
 
 phase "no route table: no internet"
 check_fail "p1 (no table) cannot reach the external target" get p1

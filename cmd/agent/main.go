@@ -338,7 +338,21 @@ func run(nodeName string, mtu int, vni uint32, cniConfName string, genevePort ui
 		if err := mgr.SyncMasqSources(splitCIDRs(clusterCIDR)); err != nil {
 			return fmt.Errorf("program masquerade sources: %w", err)
 		}
-		log.Info("bpf cluster-egress masquerade enabled", "sources", clusterCIDR, "masqIP", masqIP.String(), "nodeIP", state.NodeIP, "nodeIPv6", nodeV6)
+		var masqIP6 net.IP
+		if nodeV6 != "" {
+			masqIP6 = net.ParseIP(nodeV6)
+		}
+		links, err := mgr.MasqLinks()
+		if err == nil {
+			err = mgr.SyncMasqLinks(links, masqIP, masqIP6)
+		}
+		if err != nil {
+			return fmt.Errorf("program masquerade links: %w", err)
+		}
+		go mgr.WatchMasqLinks(ctx, masqIP, masqIP6, log)
+		log.Info("bpf cluster-egress masquerade enabled", "sources", clusterCIDR, "masqIP", masqIP.String(), "nodeIP", state.NodeIP, "nodeIPv6", nodeV6, "links", masqLinkNames(links))
+	} else if err := mgr.SyncMasqLinks(nil, nil, nil); err != nil {
+		return fmt.Errorf("clear masquerade links: %w", err)
 	}
 
 	// VPC DNS steering (docs/services-in-vpc.md): publish the cluster DNS
@@ -521,6 +535,15 @@ func advertiseNodeAddrs(ctx context.Context, client kubernetes.Interface, nodeNa
 		return
 	}
 	log.Info("advertised node address", "addr", src.String())
+}
+
+// masqLinkNames returns the names of the masquerade links, for logging.
+func masqLinkNames(links []datapath.MasqLink) []string {
+	out := make([]string, 0, len(links))
+	for _, l := range links {
+		out = append(out, l.Name)
+	}
+	return out
 }
 
 // nodeAddresses returns the set of a node's own addresses that node_remotes
