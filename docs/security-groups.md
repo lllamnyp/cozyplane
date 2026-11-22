@@ -97,7 +97,7 @@ a reconcile; no pod restart.
   — and it keeps the CRD-mode install working when the controller cannot see
   pods.
 - The CNI **refreshes both the identity labels and the snapshot when it
-  re-binds a persistent Port** to a new launcher pod, so a migrated VM's
+  re-binds a claimed Port** to a new pod, so a migrated VM's
   membership follows its *current* pod rather than the first one that ever
   claimed the Port.
 - Enforcement is still destination-side and placement-independent; only the

@@ -1,9 +1,13 @@
-# VM live migration — persistent Ports (IP + MAC preservation)
+# VM live migration and restarts — PortClaims (IP + MAC preservation)
 
 **Hard requirement** (`design.md` §1, §5): a VM's NIC identity — its **VPC IP and
-MAC** — must survive live migration between nodes. The system-fabric `fabricIP`
-(`status.podIP`) may change; the VM never sees it. This doc is the *as-built*
-plan for realizing `design.md` §5 / `control-plane.md` §5 as a first increment.
+MAC** — must survive live migration between nodes, and a stop/start or a
+recreated VirtualMachineInstance. The system-fabric `fabricIP` (`status.podIP`)
+may change; the VM never sees it. This doc is the *as-built* design.
+
+**cozyplane knows nothing about KubeVirt.** It offers one generic mechanism, the
+`PortClaim`, and any workload controller (KubeVirt among them) maps its own
+lifecycle onto it from outside cozyplane (§ "Wiring KubeVirt").
 
 ## What KubeVirt does, and what it needs from us
 
@@ -11,162 +15,202 @@ A live migration spins up a **second** virt-launcher pod (the *target*) on the
 destination node while the *source* keeps running; the VM's memory is copied over
 a source→target connection (default/fabric network, not the VPC IP); at cutover
 KubeVirt flips execution to the target and tears the source down. Source and
-target are **different pods with different names** for the **same VMI**.
+target are **different pods with different names** for the **same VMI**. A
+stop/start deletes the VMI and its pod and later creates new ones.
 
-For the VM's L2/L3 identity to survive, the target pod's interface must carry the
-**same IP and MAC** as the source's. KubeVirt only permits this for the **pod
-(bridge) binding** and only when the VM template is annotated
-`kubevirt.io/allow-pod-bridge-network-live-migration: ""` — then the VMI reports
-`LiveMigratable=True`. (Masquerade binding NATs the VM behind a stable internal
-IP, so the pod IP is irrelevant and *not* preserved — it is not the target of
-this feature.) With bridge binding KubeVirt takes the IP+MAC cozyplane configured
-on the pod interface and hands them to the guest via its **own DHCP**; so all
-cozyplane must do is put the **same IP+MAC on the target pod's interface** and
-make the overlay deliver to wherever the VM currently runs.
+For the VM's L2/L3 identity to survive, every launcher pod's interface must carry
+the **same IP and MAC**. KubeVirt only permits migration for the **pod (bridge)
+binding** when the VM template is annotated
+`kubevirt.io/allow-pod-bridge-network-live-migration: ""`. With bridge binding
+KubeVirt moves the MAC cozyplane configured on the pod interface to the guest
+(unless the VM spec sets `interfaces[].macAddress`, which then must equal the
+MAC cozyplane pins) and hands the guest the pod IP via its **own DHCP**. A guest
+whose cloud-init netplan matches the first MAC it saw loses its network the
+moment that MAC changes, so a restart must keep it as surely as a migration.
 
-This is exactly OVN-Kubernetes' model (ovn-kubernetes.io/features/live-migration):
-a persistent logical-switch-port pins IP+MAC; only the *chassis* (node) binding
-moves; the guest keeps its DHCP lease. cozyplane's `Port` is the logical port and
-`locals`/`remotes` are the chassis binding — so the pieces already exist.
+KubeVirt passes nothing to the primary CNI: no MAC, no IP, no claim reference
+(Multus forwards `mac`/`ips` only to secondary networks). The only channel is pod
+metadata, which KubeVirt copies from `spec.template.metadata` of the
+VirtualMachine to each VMI and its launcher pod.
 
-## Identity: the persistent Port
+This is OVN-Kubernetes' model (persistent IPs via a namespaced `IPAMClaim`, made
+by the external kubevirt/ipam-extensions controller), with the MAC kept too.
+cozyplane's `Port` is the logical port and `locals`/`remotes` are the chassis
+binding.
 
-A **persistent Port** pins `{VPC, VPC IP, MAC}` to a **VM NIC identity**, not to a
-pod. A virt-launcher pod's CNI ADD **binds** to it instead of claiming a fresh IP.
+## Identity: the PortClaim
 
-A pod is a VM NIC pod when it carries the label **`vm.kubevirt.io/name`** (the VM
-name); `kubevirt.io/created-by` is the VMI UID (stable across migration) and
-`kubevirt.io/nodeName` is the **active** location (the node the VM currently runs
-on — set on the target only *after* cutover). The stable key is
-`{vpcNamespace, vpc, vm.kubevirt.io/name}`; the Port keeps the ordinary
-`v<vni>.<ip>` claim name (the name is the *address* claim, uniform across all
-Ports and registry-enforced) and carries the VM identity as the
-`sdn.cozystack.io/vm-name` label, so a lookup by VM identity is a label
-selection and needs no IP.
+The model is PersistentVolumeClaim / PersistentVolume:
 
-- **First pod** (VM start): no persistent Port exists → **create** it, allocating
-  the VPC IP (as today) and **generating a stable locally-administered MAC**
-  (`02:…`), stored in `spec.mac`. Report the fabric IP as `status.podIP` as usual.
-- **Later pod** (restart or migration target): the persistent Port exists →
-  **bind**: reuse `spec.ip` and `spec.mac`, set the **pod interface MAC** to it,
-  configure the same VPC IP. A fresh fabric IP is still allocated (per pod).
+| storage | cozyplane |
+|---|---|
+| PersistentVolume (cluster-scoped) | `Port` — the atomic `v<vni>.<ip>` address claim |
+| PersistentVolumeClaim (namespaced, tenant-owned) | `PortClaim` (aggregated API, `sdn.cozystack.io`) |
+| a pod volume naming `claimName` | pod annotation `sdn.cozystack.io/port-claim: <name>` |
+| an ephemeral volume | no annotation: the Port is created at ADD and deleted at DEL |
+| `WaitForFirstConsumer` binding | the Port is created at the first binding pod's ADD |
+| the PV's `claimRef` | the Port's `claim-namespace` / `claim-name` / `claim-uid` labels |
+| `Delete` reclaim policy | deleting the claim deletes the Port (after the node drains it) |
+
+```yaml
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: PortClaim
+metadata: {name: vm1, namespace: tenant-a}
+spec:
+  vpcRef: {name: vpc-a}         # namespace defaults to the claim's
+  mac: "02:00:00:00:00:42"      # optional; immutable
+  ip: "10.10.0.42"              # optional; immutable
+status:
+  ip: 10.10.0.42                # pinned at first bind; never changes
+  mac: "02:00:00:00:00:42"
+  conditions: [{type: Bound, status: "True", reason: PodBound}]
+```
+
+The annotation's value is a bare name, resolved **in the pod's own namespace**: a
+pod can never bind another namespace's claim. When the pod has no
+`sdn.cozystack.io/vpc` annotation, the claim's VPC is used; when it has one, the
+two must agree. The VPCBinding check applies as for any pod.
+
+**First pod (CNI ADD), no Port yet.** The CNI creates the Port with the claim's
+labels. The IP is `status.ip`, else `spec.ip`, else the next free address; a
+pinned or requested address that another Port holds, that lies outside the
+VPC's CIDR, or that is the network or `.1` address fails the ADD. The MAC is
+`status.mac`, else `spec.mac`, else a random locally-administered unicast MAC;
+one already used by another Port in the VPC fails the ADD. Because the claim's
+status keeps the identity, a Port lost to a VPCBinding revocation or an operator
+deletion comes back with the same IP and MAC.
+
+**Later pod, Port exists.** The CNI **binds**: same `spec.ip` and `spec.mac`, the
+pod interface MAC set to it, a fresh fabric IP. If the Port is detached
+(`spec.node` empty) or the pod it records is gone or finished, the CNI takes it
+over immediately (`spec.node` = this node). If another live pod still holds it,
+this pod is a **migration target**: it stages (below) and waits for cutover.
 
 The pod interface MAC is pinned because KubeVirt copies it to the guest; the
 host-veth MAC (used only for same-node redirect delivery) stays per-pod and is
 re-learned in `locals` on each bind — internal, never guest-visible.
 
-## Cutover: the location follows `kubevirt.io/nodeName`
+## Cutover: the guest decides, the pods confirm
 
-`locals` is per-node: every node programs its **local** virt-launcher pod's
+`locals` is per-node: every node programs its **local** pod's
 `{net, vpcIP} → veth,MAC` at CNI ADD, so during the overlap both the source and
-target nodes can deliver locally. `remotes` (the cross-node location) must point
-at the **active** node — the one where the VM actually runs.
+target nodes could deliver locally. `remotes` (the cross-node location) must point
+at the **active** node, and the Port's `spec.node` is that location.
 
-The active node is where the VM currently runs. A **persistent-Port
-controller** keeps the Port's `spec.node`/`spec.nodeIP` = that node; the agent
-already turns `spec.node` into the `remotes` entry, so the cutover is: the VM
-becomes live on the target → controller flips `spec.node` → every agent's
-`remotes[{net,vpcIP}]` re-points to the target. The VPC IP/MAC never change, so
-the VM and its in-VPC peers see only a sub-second reroute.
+**Guest-announcement cutover (as built).** When a VM resumes on the target it
+emits a gratuitous ARP (v4) or an unsolicited Neighbor Advertisement (v6). The
+target agent, while a target Port is staged on it (`spec.node` elsewhere, but
+the CNI ADD's veth already present), opens an `AF_PACKET` socket on that veth
+and waits for a frame whose sender is the pinned `{VPC IP, MAC}`. `from_pod`
+passes ARP/NDP straight to the kernel, so the announcement reaches the tap. On
+a match the agent patches the Port's `spec.node`/`spec.nodeIP` to itself,
+driving the fleet-wide cutover. This is the analog of OVN's
+`activation-strategy=rarp`. The listener runs only while the target is staged.
 
-**The cutover signal (the Kube-OVN model, as built).** The controller keys on
-the **VirtualMachineInstance's `status.nodeName`** — the phase-explicit signal
-KubeVirt flips to the target at cutover — mirroring how Kube-OVN reads
-`VMI.status.MigrationState` rather than guessing from pod labels. It reads the
-VMI as unstructured (no `kubevirt.io/api` dependency) and watches it only when
-the CRD is served; without KubeVirt it degrades to the launcher pod's
-`kubevirt.io/nodeName` label. The launcher-pod list is still consulted for the
-target's **fabric IP** and for GC. Validated on the dev cluster with a real `VMIM`
-migration (IP+MAC preserved, cross-VPC 0% loss). Kube-OVN goes one step
-further — it delegates the *instant* of cutover to the guest's RARP via OVN's
-`activation-strategy=rarp`, so the control-plane only opens a dual-bound
-(`requested-chassis=src,target`) window and pins the winner. The cozyplane
-analogs are the source→target forward (stage 2, below) and a GARP-triggered
-datapath flip (stage 3, planned).
+**The PortClaim controller** keeps `spec.node` consistent with the pods that
+bind the claim (found by the annotation, via a pod index):
+
+- a live pod on the Port's current node keeps it there — this is what stops the
+  controller reverting a guest-announcement cutover while the source pod still
+  runs;
+- otherwise, if exactly one live pod remains, the Port moves to it — the source
+  exited after a migration the announcement missed, or a fresh start raced the
+  detach;
+- no live pod: the Port is **detached** (`spec.node`/`spec.nodeIP` cleared);
+- several live pods and none on the current node: no change.
+
+A failed migration leaves the source on the current node, so nothing moves. A
+guest that never announces itself is unreachable from the moment it resumes on
+the target until KubeVirt's source pod exits — seconds. cozyplane reads no
+KubeVirt object for any of this.
 
 **Source-forward window (stage 2, as built).** Cutover flips `spec.node` on the
 Port; every agent re-points its `remotes[{net,vpcIP}]` entry, but not
-simultaneously — an agent that is slow to observe the update keeps encapsulating
-to the *old* node for a few informer beats. To keep that in-flight east-west
-traffic from being black-holed, the former source node bridges the gap: when a
-VM Port's `spec.node` moves off this node, the agent installs a `migrate_fwd`
-entry keyed on `{net, vpcIP}` with the target's node IP, and the `from_overlay`
-hook — after its `locals` lookup misses (local delivery was already torn down at
-cutover) — re-encapsulates the packet to the target instead of dropping it. The
-entry is removed after a 15 s grace period (`migrateFwdGrace`), comfortably
-longer than fleet-wide informer propagation. This is one-directional and
-transient: it only catches traffic that still arrives at the old node, and only
-until every remote agent has re-pointed. The map is `LIBBPF_PIN_BY_NAME` so it
-survives an agent restart mid-window.
+simultaneously. The former source node bridges the gap: when a claimed Port's
+`spec.node` moves off this node, the agent installs a `migrate_fwd` entry keyed
+on `{net, vpcIP}` with the target's node IP, and the `from_overlay` hook — after
+its `locals` lookup misses — re-encapsulates the packet to the target instead of
+dropping it. The entry is removed after a 15 s grace period (`migrateFwdGrace`),
+longer than fleet-wide informer propagation. The map is `LIBBPF_PIN_BY_NAME` so
+it survives an agent restart mid-window.
 
-**Guest-announcement cutover (stage 3, as built).** The tightest cutover signal
-is the guest itself: when a VM resumes on the target it emits a gratuitous ARP
-(v4) or an unsolicited Neighbor Advertisement (v6) — "I am here now" — earlier
-and more precise than `VMI.status.nodeName`, which KubeVirt updates only after
-the migration bookkeeping settles. The target agent, while a migration-target
-Port is staged on it (`spec.node` elsewhere, but the CNI ADD's veth already
-present), opens an `AF_PACKET` socket on that veth bound to the announcement's
-ethertype and waits for a frame whose sender is the pinned `{VPC IP, MAC}`.
-`from_pod` passes ARP/NDP straight to the kernel, so the announcement reaches
-the tap. On a match the agent patches the Port's `spec.node`/`spec.nodeIP` to
-itself, driving the fleet-wide cutover immediately rather than waiting out
-informer + VMI-status propagation. The controller's VMI-watch (stage 1) is the
-fallback for a missed announcement; the two writers converge on the same value
-(the target), so a merge patch races cleanly. This is the analog of OVN's
-`activation-strategy=rarp`. The listener's lifecycle is bounded by the staging
-window: it starts when the target is staged and stops the moment `spec.node`
-becomes this node (whether its own patch or the fallback drove it) or the Port
-is removed.
-
-**Staged locals (as built):** the target's `locals` entry is gated on the
-cutover, closing the overlap window v1 had. A migration-target ADD (the bound
-persistent Port's `spec.node` is another node) stages everything — interface,
-bridge, ports entry, alias record — but removes its own `locals` entry, so a
-client co-located with the target keeps delivering to the *active* location
-via `remotes`. At cutover the agent watching Ports sees `spec.node` become its
-node and programs `locals` from the veth's alias record (and drops the stale
-remote route); the source node's agent symmetrically removes its `locals`
-entry the moment `spec.node` leaves it — so same-node delivery flips exactly
-when cross-node delivery does, on both ends. One residue: the agent's
+**Staged locals (as built).** A migration-target ADD (the bound Port's
+`spec.node` is another node) stages everything — interface, bridge, ports entry,
+alias record — but removes its own `locals` entry, so a client co-located with
+the target keeps delivering to the *active* location via `remotes`. At cutover
+the agent watching Ports sees `spec.node` become its node and programs `locals`
+from the veth's alias record (and drops the stale remote route); the source
+node's agent symmetrically removes its `locals` entry. One residue: the agent's
 local-state rebuild (an agent restart mid-migration) re-programs a staged
-target's locals from the alias for the remainder of that window — rare enough
-to accept and documented in `internals.md`.
+target's locals from the alias for the remainder of that window — documented in
+`internals.md`.
 
 ## Lifecycle / GC
 
-Ports are cluster-scoped, so a namespaced VMI ownerRef can't GC them. The
-persistent-Port controller owns the lifecycle: it **keeps** the Port while any
-virt-launcher pod (or the VMI) for its identity exists, and **deletes** it once
-they are all gone (VM stopped/deleted). A single virt-launcher pod's CNI DEL must
-**not** delete a persistent Port (that is what lets IP+MAC survive pod churn) — it
-only clears that pod's local datapath state; contrast the ephemeral path, where
-DEL deletes the Port. The sever finalizer still guarantees the owning node drains
-before the Port is really removed.
+The Port lives exactly as long as its PortClaim; the claim's lifetime belongs to
+whoever creates it — an ownerReference to any object (Kubernetes GC, so
+cozyplane never reads the owner's kind), a Helm release, or a person. A Port
+cannot carry the ownerReference itself: it is cluster-scoped, and Kubernetes GC
+never resolves a namespaced owner for a cluster-scoped dependent.
 
-## Scope of this increment
+- **Pods come and go** (stop/start, a deleted VMI, migration): CNI DEL never
+  deletes a claimed Port; it only clears that pod's local datapath state. With
+  no live pod left the controller detaches the Port: agents drop their routes to
+  it, a FloatingIP on its address reports `TargetLive=False`, and the address
+  stays reserved, so no other workload can inherit it.
+- **The claim is deleted:** the registry put the `sdn.cozystack.io/port`
+  finalizer on every claim at create. The controller deletes the Port, the sever
+  finalizer makes the node's agent drain the datapath first (or the Port GC
+  releases it when the Port is detached or its node is gone), and only then is
+  the claim's finalizer released.
+- **Orphans:** a Port whose claim no longer exists, or belongs to an earlier
+  claim of the same name (UID mismatch), is deleted.
+- **Status:** `status.ip`/`status.mac` are pinned at first bind and immutable
+  afterwards; the `Bound` condition says whether a live pod holds the Port
+  (`PodBound`), it is reserved with no pod (`Detached`), or no pod has bound it
+  yet (`NoPort`).
+- **Quota:** `count/portclaims.sdn.cozystack.io` bounds how many addresses a
+  namespace can hold while no pod uses them.
+
+**Ports from before PortClaim.** Earlier releases keyed VM Ports on the KubeVirt
+label `vm.kubevirt.io/name` and marked them `sdn.cozystack.io/vm-name`. Creating
+a PortClaim named after the VM adopts such a Port (same name, pod namespace and
+VPC; the claim's `spec.ip`, if set, must match): it gets the claim's labels,
+loses `vm-name`, and takes `spec.mac` if the claim requests one. A running VM
+keeps its IP and MAC through the upgrade. An unadopted legacy Port is an
+ordinary Port: deleted with its pod. A VM without a PortClaim gets an ordinary
+Port per launcher pod, so its identity does not survive a restart or a migration.
+
+## Wiring KubeVirt (outside cozyplane)
+
+What a KubeVirt integration sets, per VirtualMachine NIC on a VPC:
+
+1. a `PortClaim` in the VM's namespace, typically named after the VM, with
+   `spec.vpcRef` and, if the VM spec sets `interfaces[].macAddress`, the same
+   value in `spec.mac`;
+2. `sdn.cozystack.io/port-claim: <claim name>` (and `sdn.cozystack.io/vpc`) in
+   the VM's `spec.template.metadata.annotations`, which KubeVirt copies onto
+   every launcher pod;
+3. the claim's lifetime: a chart that renders the claim next to the
+   VirtualMachine (in Cozystack, the `vm-instance` chart) ties it to the Helm
+   release; an adapter controller would create the claim with an ownerReference
+   to the VirtualMachine.
+
+## Scope
 
 - Bridge-binding VMs on the **default network path into a VPC** (primary network),
   matching KubeVirt's "only primary networks are live-migratable".
-- IP + MAC preserved; fabric IP (and thus `status.podIP`) changes per pod, and the
-  system-view DNS re-point (`control-plane.md` §5) is **later** — name-based
-  addressing isn't wired yet, so nothing depends on a stable fabric A record.
-- Cutover follows the VMI's `status.nodeName` (the Kube-OVN model, stage 1 —
-  done), backed by the source→target forward during the propagation window
-  (stage 2 — done) and driven to its tightest instant by the guest's own
-  gratuitous ARP / unsolicited NA (stage 3 — done), the way OVN's
-  `requested-chassis=src,target` + `activation-strategy=rarp` does. The
-  VMI-watch is the fallback when the announcement is missed.
-- Dropped: the `/migrate` + `/bind` Port subresources — investigation of the
-  callers showed the only caller is cozyplane's own controller, and Kube-OVN
-  (the reference) exposes no such API (it sets OVN NB options directly). The
-  authz value didn't justify the API surface; the effort went into the
-  Kube-OVN cutover model instead.
+- IP + MAC preserved across migration, restart and VMI recreation; fabric IP (and
+  thus `status.podIP`) changes per pod.
 
-## Test (dev cluster, real KubeVirt)
+## Test
 
-A bridge-bound cirros VM (annotation set) attached to a VPC: capture its VPC IP +
-MAC, `virtctl migrate`, and assert **the VPC IP and MAC are identical** on the
-target, the same guest keeps running, and an in-VPC peer reaches it throughout
-(the IP never moved from the guest's view). Repeat on the default network (no VPC)
-for the non-VPC case. Contrast with the earlier masquerade test, which could not
-show preservation because the guest IP was NATed.
+- Unit: `cmd/cni` (first bind, rebind after the holder is gone, take-over of a
+  detached Port, staged target, recreation from status, requests, cross-VPC and
+  cross-namespace refusal), `internal/controller/sdn` (detach, rebind, deletion
+  order, cutover cases, adoption, orphans), `pkg/registry/sdn/portclaim`.
+- e2e (`test/e2e.sh`, kind, no KubeVirt): pods sharing a PortClaim keep the IP
+  and MAC across pod deletion and a node change; requested IP/MAC; deleting the
+  claim frees the Port.
+- Real cluster (KubeVirt): stop/start, VMI deletion and `virtctl migrate` keep
+  the VPC IP and MAC; an in-VPC peer reaches the VM throughout the migration.

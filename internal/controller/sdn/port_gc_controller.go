@@ -46,10 +46,8 @@ import (
 //     uncleanly (node reboot, forced eviction) never runs CNI DEL, so its Port
 //     leaks; for a gateway pod that wedges the replacement forever — the fixed
 //     .1 claim fails AlreadyExists and the pod stays ContainerCreating. GC
-//     frees the name; the kubelet's next ADD retry claims it fresh. VM
-//     persistent Ports are exempt: the PersistentPortReconciler owns their
-//     lifecycle, and a launcher pod's absence must not release the pinned
-//     IP+MAC.
+//     frees the name; the kubelet's next ADD retry claims it fresh. Claimed
+//     Ports are exempt: their PortClaim owns their lifetime.
 type PortGCReconciler struct {
 	client.Client
 
@@ -114,8 +112,8 @@ func (r *PortGCReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 // is the pod recorded in the Port's pod labels at claim time; UID mismatch
 // means the name was reused by a new pod, so the old claimant is gone too.
 func (r *PortGCReconciler) reapIfAbandoned(ctx context.Context, port *sdnv1alpha1.Port) (ctrl.Result, error) {
-	if port.Labels[sdnv1alpha1.LabelVMName] != "" {
-		return ctrl.Result{}, nil // persistent: PersistentPortReconciler owns it
+	if port.Labels[sdnv1alpha1.LabelClaimUID] != "" {
+		return ctrl.Result{}, nil // claimed: PortClaimReconciler owns it
 	}
 	podNS := port.Labels[sdnv1alpha1.LabelPodNamespace]
 	podName := port.Labels[sdnv1alpha1.LabelPodName]

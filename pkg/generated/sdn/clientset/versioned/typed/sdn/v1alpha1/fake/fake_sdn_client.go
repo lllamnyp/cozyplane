@@ -44,6 +44,10 @@ func (c *FakeSdnV1alpha1) Ports() v1alpha1.PortInterface {
 	return newFakePorts(c)
 }
 
+func (c *FakeSdnV1alpha1) PortClaims(namespace string) v1alpha1.PortClaimInterface {
+	return newFakePortClaims(c, namespace)
+}
+
 func (c *FakeSdnV1alpha1) Routes(namespace string) v1alpha1.RouteInterface {
 	return newFakeRoutes(c, namespace)
 }

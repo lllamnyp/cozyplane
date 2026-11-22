@@ -32,6 +32,7 @@ type SdnV1alpha1Interface interface {
 	HostFirewallsGetter
 	NATGatewaysGetter
 	PortsGetter
+	PortClaimsGetter
 	RoutesGetter
 	RouteTablesGetter
 	SecurityGroupsGetter
@@ -61,6 +62,10 @@ func (c *SdnV1alpha1Client) NATGateways(namespace string) NATGatewayInterface {
 
 func (c *SdnV1alpha1Client) Ports() PortInterface {
 	return newPorts(c)
+}
+
+func (c *SdnV1alpha1Client) PortClaims(namespace string) PortClaimInterface {
+	return newPortClaims(c, namespace)
 }
 
 func (c *SdnV1alpha1Client) Routes(namespace string) RouteInterface {

@@ -8,6 +8,14 @@ kubectl get crd virtualmachines.kubevirt.io >/dev/null 2>&1 \
   || { echo "KubeVirt is not installed on this cluster — acts 3 and 4 need it."; exit 1; }
 
 kubectl apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: PortClaim
+metadata:
+  name: $VM
+  namespace: $RED_NS
+spec:
+  vpcRef: {name: $RED_VPC}
+---
 apiVersion: kubevirt.io/v1
 kind: VirtualMachine
 metadata:
@@ -20,6 +28,7 @@ spec:
       labels: {app: $VM}
       annotations:
         sdn.cozystack.io/vpc: $RED_VPC
+        sdn.cozystack.io/port-claim: $VM
         kubevirt.io/allow-pod-bridge-network-live-migration: ""
     spec:
       domain:
@@ -45,18 +54,18 @@ spec:
               ssh_pwauth: true
 EOF
 
-note "the VM attaches to the VPC exactly like a pod does — one annotation"
-note "(sdn.cozystack.io/vpc: $RED_VPC) on the launcher pod template. Booting..."
+note "the VM attaches to the VPC exactly like a pod does — an annotation on the"
+note "launcher pod template — and names a PortClaim that holds its identity. Booting..."
 kubectl -n "$RED_NS" wait vmi/"$VM" --for=condition=Ready --timeout=300s >/dev/null
 
 VMIP=$(vmport_field ip); VMMAC=$(vmport_field mac); VMNODE=$(vmport_field node)
 note "VM is up:"
 plain "node:   $VMNODE"
 plain "VPC IP: $VMIP"
-plain "MAC:    $VMMAC   <- locally-administered, generated for THIS VM identity"
+plain "MAC:    $VMMAC   <- locally-administered, generated for THIS PortClaim"
 
-note "its network identity is a persistent Port — pinned to the VM, not to a pod:"
-try "kubectl get port $(vmport) -o yaml | less   # spec.ip + spec.mac are the pinned pair"
+note "its network identity belongs to the PortClaim, not to a pod — stop/start keeps it:"
+try "kubectl -n $RED_NS get portclaim $VM -o yaml   # status.ip + status.mac are the pinned pair"
 
 note "SSH into it from red-1 (same VPC — no Ingress, no NodePort, no magic):"
 try "kubectl -n $RED_NS exec -it red-1 -- ssh -o StrictHostKeyChecking=no fedora@$VMIP"

@@ -28,7 +28,7 @@ done
 note "migration phase: ${phase:-unknown}"
 [ "$phase" = Succeeded ] || { echo "migration did not succeed — inspect: kubectl -n $RED_NS describe $MIG"; exit 1; }
 
-# The persistent-Port controller flips spec.node once the VM is live on the target.
+# The guest's announcement (or the source pod's exit) flips spec.node to the target.
 for _ in $(seq 30); do
   AFTER_NODE=$(vmport_field node)
   [ "$AFTER_NODE" != "$BEFORE_NODE" ] && break
@@ -45,7 +45,7 @@ try "kubectl get port $(vmport) -o yaml | grep -E 'ip:|mac:|node:'"
 plain "and the SSH session + its ping: still running. In the guest, 'ip -br addr'"
 plain "shows the same $AFTER_IP / $AFTER_MAC — the identity moved with the VM."
 
-note "what happened underneath: the VM's Port is persistent, so the target node's"
+note "what happened underneath: the VM's Port belongs to its PortClaim, so the target node's"
 note "launcher pod BOUND to the existing {IP, MAC} instead of claiming fresh ones;"
 note "at cutover only the Port's spec.node flipped, and every node's datapath"
 note "re-pointed the overlay at $AFTER_NODE. Peers saw a sub-second reroute."

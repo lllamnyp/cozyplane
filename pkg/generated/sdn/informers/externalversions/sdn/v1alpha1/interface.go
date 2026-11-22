@@ -32,6 +32,8 @@ type Interface interface {
 	NATGateways() NATGatewayInformer
 	// Ports returns a PortInformer.
 	Ports() PortInformer
+	// PortClaims returns a PortClaimInformer.
+	PortClaims() PortClaimInformer
 	// Routes returns a RouteInformer.
 	Routes() RouteInformer
 	// RouteTables returns a RouteTableInformer.
@@ -79,6 +81,11 @@ func (v *version) NATGateways() NATGatewayInformer {
 // Ports returns a PortInformer.
 func (v *version) Ports() PortInformer {
 	return &portInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
+}
+
+// PortClaims returns a PortClaimInformer.
+func (v *version) PortClaims() PortClaimInformer {
+	return &portClaimInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
 // Routes returns a RouteInformer.

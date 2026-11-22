@@ -18,7 +18,7 @@ surface someone will have to defend.
 
 | | rule | state |
 |---|---|---|
-| **R1** | A tenant can learn the network identity of its own workloads | **built** — the CNI stamps the pod |
+| **R1** | A tenant can learn the network identity of its own workloads | **built** — the CNI stamps the pod; a PortClaim keeps it while no pod exists |
 | **R2** | A tenant can enumerate nothing it does not own | **built** — structurally; namespaced roles only |
 | **R3** | ~~A tenant can list the ports of its VPC~~ | **dropped** — address-thinking (tenet 4) |
 | **R4** | A tenant opens its own door; it does not mint what is behind it | already true (`attach`) |
@@ -29,10 +29,10 @@ surface someone will have to defend.
 | **R9** | Operators are not tenants | already true |
 | **R10** | A field that selects a privileged thing is gated by an object, not RBAC | **open** — pre-existing; closed for pods, not for Services |
 
-Two things are outstanding. One is deliberately unbuilt: how a tenant reads the pinned
-address of a **stopped VM** (§ "The mechanism for R1"). The other is **R10** — a
-pre-existing gap, closed for pods and not yet for Services, and not widened by
-anything built so far.
+One thing is outstanding: **R10** — a pre-existing gap, closed for pods and not yet
+for Services, and not widened by anything built so far. How a tenant reads the
+pinned address of a **stopped VM** is answered by the PortClaim (§ "The mechanism
+for R1").
 
 ---
 
@@ -245,19 +245,17 @@ It writes them back onto **the pod**: `sdn.cozystack.io/vpc-ip`,
   remains the source of truth; nothing reads the annotation back.
 - It is also simply where a user looks first.
 
-**The one case it does not cover, and we should say so out loud:** a **persistent
-VM Port** outlives its launcher pods — that is the whole point of it. Between
-launchers there is no pod to carry the annotation, and "what address does my VM
-have?" is precisely a question a tenant asks when the VM is *stopped*.
+**The case it does not cover: a claimed Port** outlives its pods — that is the
+whole point of it. Between pods there is no pod to carry the annotation, and
+"what address does my VM have?" is precisely a question a tenant asks when the
+VM is *stopped*.
 
-For that case the durable, tenant-owned object is the **VM** (`VirtualMachine` /
-`VMI`), and the pinned identity belongs on it. That couples us to KubeVirt, which
-is a real cost and a real decision — so it is the open question, not a default:
-
-> **Open:** does the persistent Port's pinned `{IP, MAC}` get stamped onto the
-> KubeVirt object (coupling, but where a user looks), or does it justify Option B
-> (a projected read, no coupling, more machinery)? Decide when a VM tenant asks;
-> do not build ahead of it.
+That case already has a durable, tenant-owned, namespaced object: the
+**PortClaim** that holds the identity ([live-migration.md](live-migration.md)).
+Its `status.ip` / `status.mac` answer the question, with no coupling to KubeVirt.
+This is not Option A's stale copy: the claim's IP and MAC are pinned at first
+bind and immutable for the claim's life, and nothing that churns (node, pod,
+fabric IP) is copied.
 
 ---
 
@@ -338,10 +336,5 @@ stay true.
 and still open for Services. It predates cozyplane and nothing built so far widens it,
 but it is the next piece of tenancy work with teeth.
 
-**The other open item is not a gap, it is a question:** the address of a
-**stopped VM** (§ "The mechanism for R1"). A persistent Port outlives its launcher
-pods by design, so between launchers there is no pod to carry the annotation — and
-that is exactly when a tenant asks. The answer is either a stamp on the KubeVirt
-object (where a user looks, at the cost of coupling) or Option B's projected read
-(no coupling, more machinery). **Decide when a VM tenant asks; do not build ahead
-of it.**
+The address of a **stopped VM** is answered by its PortClaim's status (§ "The
+mechanism for R1").

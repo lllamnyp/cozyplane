@@ -68,6 +68,12 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &sdnv1alpha1.NATGatewayStatusApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("Port"):
 		return &sdnv1alpha1.PortApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("PortClaim"):
+		return &sdnv1alpha1.PortClaimApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("PortClaimSpec"):
+		return &sdnv1alpha1.PortClaimSpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("PortClaimStatus"):
+		return &sdnv1alpha1.PortClaimStatusApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("PortSpec"):
 		return &sdnv1alpha1.PortSpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("PortStatus"):

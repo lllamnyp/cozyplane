@@ -234,6 +234,37 @@ authorized (unless another binding in that namespace still grants the VPC) and
 severs those pods' VPC connectivity — they keep running but are cut off, like a
 deny-all NetworkPolicy. Re-granting requires recreating the pod.
 
+## Keep an address across pods with a PortClaim
+
+An ordinary pod's address lives and dies with the pod. A `PortClaim` holds a VPC
+IP and MAC for as long as the claim exists, and any pod in the same namespace
+that names it gets that identity — a VM across stop/start, a recreated
+VirtualMachineInstance or a live migration, or any workload that must keep its
+address:
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: PortClaim
+metadata: {name: db, namespace: team-a}
+spec:
+  vpcRef: {name: vpc-a}
+  # mac: "02:00:00:00:00:42"   # optional: request a MAC
+  # ip: "10.0.0.42"            # optional: request an address
+EOF
+
+kubectl -n team-a run db --image=busybox:1.36 \
+  --annotations=sdn.cozystack.io/port-claim=db -- sleep 3600
+```
+
+The pod needs no `sdn.cozystack.io/vpc` annotation: the claim names the VPC (if
+both are set they must agree, and a `VPCBinding` is required as usual). Once a
+pod has bound the claim, `kubectl -n team-a get portclaim db` shows the pinned
+address and MAC, also while no pod runs. Deleting the pod keeps the address
+reserved; deleting the claim releases it. For KubeVirt, put the annotation in
+the VirtualMachine's `spec.template.metadata.annotations`; KubeVirt copies it to
+every launcher pod ([live-migration.md](live-migration.md)).
+
 ## Peer two VPCs
 
 A `VPCPeering` connects two VPCs — including two owned by different tenants —
@@ -480,8 +511,8 @@ kubectl -n team-a get floatingip web -o \
 ```
 
 Start a pod with `10.0.0.5` in `vpc-a` and the binding goes `Ready`. Binding a
-floating IP to a VM NIC's persistent address makes it a stable public IP that
-survives pod churn and live migration.
+floating IP to a PortClaim's address makes it a stable public IP that survives
+pod churn, VM restarts and live migration.
 
 > **Status today.** Live and dev-cluster-validated end to end: the `floating` map,
 > the uplink-ingress DNAT with source preservation, the `from_pod` SNAT reply, and

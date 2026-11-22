@@ -776,3 +776,49 @@ type RouteList struct {
 	metav1.ListMeta
 	Items []Route
 }
+
+// PortClaimSpec requests a VPC interface identity that outlives the pods binding it.
+type PortClaimSpec struct {
+	// VPCRef is the VPC the claim's Port lives in; empty namespace means the claim's namespace.
+	VPCRef VPCRef
+
+	// MAC is the requested interface MAC address; empty means one is generated at first bind.
+	MAC string
+
+	// IP is the requested VPC address; empty means one is allocated at first bind.
+	IP string
+}
+
+// PortClaimStatus is the identity pinned to the claim.
+type PortClaimStatus struct {
+	// IP is the VPC address pinned to the claim.
+	IP string
+
+	// MAC is the interface MAC address pinned to the claim.
+	MAC string
+
+	// Conditions represent the latest available observations.
+	Conditions []metav1.Condition
+}
+
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// PortClaim holds a Port's IP and MAC for as long as the claim exists.
+type PortClaim struct {
+	metav1.TypeMeta
+	metav1.ObjectMeta
+
+	Spec   PortClaimSpec
+	Status PortClaimStatus
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// PortClaimList is a list of PortClaim objects.
+type PortClaimList struct {
+	metav1.TypeMeta
+	metav1.ListMeta
+
+	Items []PortClaim
+}

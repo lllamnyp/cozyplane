@@ -26,6 +26,8 @@ type NATGatewayExpansion interface{}
 
 type PortExpansion interface{}
 
+type PortClaimExpansion interface{}
+
 type RouteExpansion interface{}
 
 type RouteTableExpansion interface{}

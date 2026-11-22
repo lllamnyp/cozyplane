@@ -42,6 +42,14 @@ type NATGatewayNamespaceListerExpansion interface{}
 // PortLister.
 type PortListerExpansion interface{}
 
+// PortClaimListerExpansion allows custom methods to be added to
+// PortClaimLister.
+type PortClaimListerExpansion interface{}
+
+// PortClaimNamespaceListerExpansion allows custom methods to be added to
+// PortClaimNamespaceLister.
+type PortClaimNamespaceListerExpansion interface{}
+
 // RouteListerExpansion allows custom methods to be added to
 // RouteLister.
 type RouteListerExpansion interface{}

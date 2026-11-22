@@ -733,28 +733,33 @@ func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory,
 			}
 			return
 		}
-		// A persistent (VM) Port's locals entry follows spec.node — the
-		// staged-locals half of live migration: the target's entry appears
-		// only at cutover (programmed here from the veth's alias record),
-		// and the source's disappears at the same moment, so same-node
-		// delivery flips exactly when cross-node delivery does.
-		if port.Labels[sdnv1alpha1.LabelVMName] != "" && port.Spec.IP != "" {
+		// A claimed Port's locals entry follows spec.node (staged locals, docs/live-migration.md).
+		if port.Labels[sdnv1alpha1.LabelClaimUID] != "" && port.Spec.IP != "" {
 			if net_, ok := vniFromPortName(port.Name); ok {
 				vmIP := net.ParseIP(port.Spec.IP)
 				if port.Spec.Node == selfName {
 					if programmed, err := datapath.EnsureLocalFromVeth(net_, vmIP); err != nil {
-						log.Error("program persistent-port locals at cutover", "port", port.Name, "err", err)
+						log.Error("program claimed-port locals at cutover", "port", port.Name, "err", err)
 					} else if programmed {
-						log.Info("persistent port local delivery enabled (cutover)", "port", port.Name, "ip", port.Spec.IP)
+						log.Info("claimed port local delivery enabled (cutover)", "port", port.Name, "ip", port.Spec.IP)
 					}
 					// The route from when the VM lived elsewhere is stale now.
 					if err := mgr.DelRemote(net_, hostCIDR(port.Spec.IP)); err != nil {
-						log.Error("del stale remote for local persistent port", "port", port.Name, "err", err)
+						log.Error("del stale remote for local claimed port", "port", port.Name, "err", err)
 					}
 				} else if err := datapath.DelLocal(net_, vmIP); err != nil {
-					log.Error("del persistent-port locals (moved away)", "port", port.Name, "err", err)
+					log.Error("del claimed-port locals (moved away)", "port", port.Name, "err", err)
 				}
 			}
+		}
+		if port.Spec.Node == "" && port.Spec.IP != "" {
+			// A detached Port has no location to route to.
+			if net_, ok := vniFromPortName(port.Name); ok {
+				if err := mgr.DelRemote(net_, hostCIDR(port.Spec.IP)); err != nil {
+					log.Error("del remote for detached port", "port", port.Name, "err", err)
+				}
+			}
+			return
 		}
 		if port.Spec.Node == selfName || port.Spec.IP == "" || port.Spec.NodeIP == "" {
 			return // local ports are reached directly; skip incomplete ones
@@ -773,7 +778,7 @@ func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory,
 	}
 
 	// migrateAway installs the source-forward safety net (docs/live-migration.md
-	// stage 2). When a VM Port's spec.node moves off this node, remote nodes'
+	// stage 2). When a claimed Port's spec.node moves off this node, remote nodes'
 	// `remotes` entries still point here until their agents catch the update.
 	// For that window this (former source) node re-encapsulates the VM's traffic
 	// to the new node from its overlay hook, so in-flight east-west traffic isn't
@@ -787,8 +792,8 @@ func watchPorts(ctx context.Context, factory sdninformers.SharedInformerFactory,
 		if !ok {
 			return
 		}
-		if newPort.Labels[sdnv1alpha1.LabelVMName] == "" {
-			return // only VM Ports migrate
+		if newPort.Labels[sdnv1alpha1.LabelClaimUID] == "" {
+			return // only claimed Ports migrate
 		}
 		if oldPort.Spec.Node != selfName || newPort.Spec.Node == selfName || newPort.Spec.Node == "" {
 			return // not a move off this node
@@ -861,8 +866,7 @@ func watchGuestAnnouncements(ctx context.Context, ports sdnv1alpha1listers.PortL
 	running := map[string]context.CancelFunc{} // Port name -> listener cancel
 
 	fire := func(name, ip string) {
-		// The guest is live on this node. Claim the Port; the controller's
-		// VMI-watch would reach the same value, just later.
+		// The guest is live on this node; take the Port.
 		patch := []byte(fmt.Sprintf(`{"spec":{"node":%q,"nodeIP":%q}}`, selfName, selfIP))
 		if _, err := sdn.SdnV1alpha1().Ports().Patch(ctx, name, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
 			log.Error("flip port to self on guest announcement", "port", name, "err", err)
@@ -877,7 +881,7 @@ func watchGuestAnnouncements(ctx context.Context, ports sdnv1alpha1listers.PortL
 			log.Error("list local veths for guest-announcement watch", "err", err)
 			return
 		}
-		// Index VM Ports active elsewhere by (net, ip).
+		// Index claimed Ports active elsewhere by (net, ip).
 		type target struct {
 			ifindex int
 			mac     net.HardwareAddr
@@ -890,7 +894,7 @@ func watchGuestAnnouncements(ctx context.Context, ports sdnv1alpha1listers.PortL
 		}
 		portFor := map[string]*sdnv1alpha1.Port{} // "net|ip" -> Port
 		for _, p := range all {
-			if p.Labels[sdnv1alpha1.LabelVMName] == "" || p.Spec.IP == "" || p.Spec.Node == selfName {
+			if p.Labels[sdnv1alpha1.LabelClaimUID] == "" || p.Spec.IP == "" || p.Spec.Node == "" || p.Spec.Node == selfName {
 				continue
 			}
 			if n, ok := vniFromPortName(p.Name); ok {

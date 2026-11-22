@@ -368,8 +368,9 @@ client-masquerade removed.
   `attach` verb governs every address a tenant can wear. The address is reserved
   permanently by the controller, but it is delivered only while its target IP is a
   **live Port**. No live target ⇒ the address is held but silent (clients time out
-  cleanly rather than hitting a black hole). A persistent Port (a VM NIC) makes it
-  a stable Elastic IP that follows the VM across live migration.
+  cleanly rather than hitting a black hole). A claimed Port (a VM NIC with a
+  PortClaim) makes it a stable Elastic IP that follows the VM across restarts and
+  live migration.
 
 ## 11. Open questions, answered
 

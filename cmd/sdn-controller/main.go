@@ -202,7 +202,7 @@ func main() {
 			// advertised, registries not installed — from opening the gate.
 			Resources: []string{"vpcs", "vpcbindings", "vpcpeerings", "vpcgateways",
 				"ports", "securitygroups", "servicevips", "floatingips",
-				"natgateways", "routetables", "routes"},
+				"natgateways", "routetables", "routes", "portclaims"},
 		},
 		Interval: apiGroupPollInterval,
 		Register: func(context.Context) error { return setupSDNControllers(mgr, gateCfg) },
@@ -285,11 +285,11 @@ func setupSDNControllers(mgr manager.Manager, cfg sdnControllerConfig) error {
 		return fmt.Errorf("unable to create controller %s: %w", "FloatingIP", err)
 	}
 
-	if err := (&sdncontroller.PersistentPortReconciler{
+	if err := (&sdncontroller.PortClaimReconciler{
 		Client: c,
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("unable to create controller %s: %w", "PersistentPort", err)
+		return fmt.Errorf("unable to create controller %s: %w", "PortClaim", err)
 	}
 
 	if err := (&sdncontroller.ServiceVIPReconciler{

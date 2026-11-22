@@ -67,21 +67,21 @@ const (
 	// need not track later pod-label edits in v1. JSON-encoded map[string]string.
 	AnnotationPodLabels = "sdn.cozystack.io/pod-labels"
 
-	// LabelVMName marks a *persistent* Port and records the VM identity it is
-	// pinned to (the KubeVirt VM name, within LabelPodNamespace). A virt-launcher
-	// pod's CNI ADD binds to the persistent Port for its VM instead of claiming a
-	// fresh one, so the VPC IP + MAC survive pod churn and live migration. The
-	// persistent-Port controller selects on this to drive migration cutover and GC.
+	// AnnotationPortClaim on a pod names the PortClaim, in the pod's namespace, whose Port the pod binds; set by the pod's author.
+	AnnotationPortClaim = "sdn.cozystack.io/port-claim"
+
+	// LabelClaimNamespace is the namespace of the PortClaim a Port belongs to; written by the CNI plugin.
+	LabelClaimNamespace = "sdn.cozystack.io/claim-namespace"
+	// LabelClaimName is the name of the PortClaim a Port belongs to; written by the CNI plugin.
+	LabelClaimName = "sdn.cozystack.io/claim-name"
+	// LabelClaimUID is the UID of the PortClaim a Port belongs to; written by the CNI plugin.
+	LabelClaimUID = "sdn.cozystack.io/claim-uid"
+
+	// LabelVMName marks a Port created for a VM before PortClaim existed; read only to adopt it into a PortClaim.
 	LabelVMName = "sdn.cozystack.io/vm-name"
 
-	// KubeVirt labels on a virt-launcher pod, read to recognize a VM NIC and drive
-	// migration. The stable VM identity is (namespace, KubeVirtLabelVMName); the
-	// pod carrying the active binding has KubeVirtLabelNodeName equal to its own
-	// node (KubeVirt sets it on the migration target only after cutover).
-	KubeVirtLabelApp      = "kubevirt.io" // value "virt-launcher" on VM pods
-	KubeVirtLabelVMName   = "vm.kubevirt.io/name"
-	KubeVirtLabelNodeName = "kubevirt.io/nodeName"
-	KubeVirtLabelVMIUID   = "kubevirt.io/created-by" // the VMI UID (stable across migration)
+	// FinalizerPortClaim holds a PortClaim until its Port is gone.
+	FinalizerPortClaim = "sdn.cozystack.io/port"
 
 	// FinalizerSever holds a Port until the agent on its node has severed the
 	// live datapath (or confirmed there is nothing to sever). A revocation

@@ -55,6 +55,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&VPCPeeringList{},
 		&Port{},
 		&PortList{},
+		&PortClaim{},
+		&PortClaimList{},
 		&FloatingIP{},
 		&FloatingIPList{},
 		&ServiceVIP{},

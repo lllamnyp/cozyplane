@@ -53,6 +53,10 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.NATGatewaySpec":          schema_cozyplane_api_sdn_v1alpha1_NATGatewaySpec(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.NATGatewayStatus":        schema_cozyplane_api_sdn_v1alpha1_NATGatewayStatus(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.Port":                    schema_cozyplane_api_sdn_v1alpha1_Port(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortClaim":               schema_cozyplane_api_sdn_v1alpha1_PortClaim(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortClaimList":           schema_cozyplane_api_sdn_v1alpha1_PortClaimList(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortClaimSpec":           schema_cozyplane_api_sdn_v1alpha1_PortClaimSpec(ref),
+		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortClaimStatus":         schema_cozyplane_api_sdn_v1alpha1_PortClaimStatus(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortList":                schema_cozyplane_api_sdn_v1alpha1_PortList(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortSpec":                schema_cozyplane_api_sdn_v1alpha1_PortSpec(ref),
 		"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortStatus":              schema_cozyplane_api_sdn_v1alpha1_PortStatus(ref),
@@ -1058,6 +1062,190 @@ func schema_cozyplane_api_sdn_v1alpha1_Port(ref common.ReferenceCallback) common
 		},
 		Dependencies: []string{
 			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortSpec", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortStatus", v1.ObjectMeta{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_PortClaim(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "PortClaim holds a Port's IP and MAC for as long as the claim exists; pods bind it with the sdn.cozystack.io/port-claim annotation.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"metadata": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref(v1.ObjectMeta{}.OpenAPIModelName()),
+						},
+					},
+					"spec": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortClaimSpec"),
+						},
+					},
+					"status": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortClaimStatus"),
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortClaimSpec", "github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortClaimStatus", v1.ObjectMeta{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_PortClaimList(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "PortClaimList contains a list of PortClaim.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"metadata": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref(v1.ListMeta{}.OpenAPIModelName()),
+						},
+					},
+					"items": {
+						SchemaProps: spec.SchemaProps{
+							Type: []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortClaim"),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"items"},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.PortClaim", v1.ListMeta{}.OpenAPIModelName()},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_PortClaimSpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "PortClaimSpec requests a VPC interface identity that outlives the pods binding it.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"vpcRef": {
+						SchemaProps: spec.SchemaProps{
+							Description: "VPCRef is the VPC the claim's Port lives in; empty namespace means the claim's namespace.",
+							Default:     map[string]interface{}{},
+							Ref:         ref("github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCRef"),
+						},
+					},
+					"mac": {
+						SchemaProps: spec.SchemaProps{
+							Description: "MAC is the requested interface MAC address; empty means one is generated at first bind.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"ip": {
+						SchemaProps: spec.SchemaProps{
+							Description: "IP is the requested VPC address; empty means one is allocated at first bind.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"vpcRef"},
+			},
+		},
+		Dependencies: []string{
+			"github.com/lllamnyp/cozyplane/api/sdn/v1alpha1.VPCRef"},
+	}
+}
+
+func schema_cozyplane_api_sdn_v1alpha1_PortClaimStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "PortClaimStatus is the identity pinned to the claim.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"ip": {
+						SchemaProps: spec.SchemaProps{
+							Description: "IP is the VPC address pinned to the claim.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"mac": {
+						SchemaProps: spec.SchemaProps{
+							Description: "MAC is the interface MAC address pinned to the claim.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"conditions": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"type",
+								},
+								"x-kubernetes-list-type": "map",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "Conditions represent the latest available observations.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref(v1.Condition{}.OpenAPIModelName()),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			v1.Condition{}.OpenAPIModelName()},
 	}
 }
 
