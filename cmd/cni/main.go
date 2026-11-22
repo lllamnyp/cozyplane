@@ -25,6 +25,8 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -45,6 +47,7 @@ import (
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8stypes "k8s.io/apimachinery/pkg/types"
@@ -74,7 +77,6 @@ const (
 	labelPodNS        = sdnv1alpha1.LabelPodNamespace
 	labelPodName      = sdnv1alpha1.LabelPodName
 	labelPodUID       = sdnv1alpha1.LabelPodUID
-	labelVMName       = sdnv1alpha1.LabelVMName
 )
 
 // linkLocalGW is the on-link next hop installed in every pod, answered by the
@@ -214,17 +216,15 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 
 	// Resolve VPC membership from the pod annotations (best-effort: if the API
-	// is unreachable, fall back to the default network). A virt-launcher pod also
-	// carries its VM name, which keys the persistent Port (VPC IP + MAC that
-	// survive live migration).
-	vpcAnno, gwAnno, vmName, podLabels, routeTable := "", "", "", "", ""
+	// is unreachable, fall back to the default network).
+	vpcAnno, gwAnno, claimName, podLabels, routeTable := "", "", "", "", ""
 	if core, e := coreClient(); e == nil && podNS != "" && podName != "" {
 		if pod, e := core.CoreV1().Pods(podNS).Get(ctx, podName, metav1.GetOptions{}); e == nil {
 			vpcAnno = pod.Annotations[vpcAnnotation]
 			gwAnno = pod.Annotations[gatewayAnnotation]
 			// The pod chooses its route table (docs/vpc-egress.md §2.4).
 			routeTable = pod.Annotations[sdnv1alpha1.AnnotationRouteTable]
-			vmName = pod.Labels[sdnv1alpha1.KubeVirtLabelVMName]
+			claimName = pod.Annotations[sdnv1alpha1.AnnotationPortClaim]
 			// Snapshot the pod's labels for SecurityGroup membership: the
 			// controller resolves Port.status.groups from this claim-time copy.
 			if len(pod.Labels) > 0 {
@@ -235,12 +235,32 @@ func cmdAdd(args *skel.CmdArgs) error {
 		}
 	}
 
-	if vpcAnno != "" {
+	if claimName != "" || vpcAnno != "" {
 		if gwAnno != "" {
 			return fmt.Errorf("%s and %s are mutually exclusive: a gateway pod lives on the default network", vpcAnnotation, gatewayAnnotation)
 		}
-		vpcNS, vpcName := parseVPCRef(vpcAnno, podNS)
-		return addVPC(ctx, args, conf, vpcNS, vpcName, podNS, podName, podUID, vmName, podLabels, routeTable)
+		var claim *sdnv1alpha1.PortClaim
+		var vpcNS, vpcName string
+		if vpcAnno != "" {
+			vpcNS, vpcName = parseVPCRef(vpcAnno, podNS)
+		}
+		if claimName != "" {
+			client, err := sdnClient()
+			if err != nil {
+				return fmt.Errorf("sdn client: %w", err)
+			}
+			if claim, err = getPortClaim(ctx, client, podNS, claimName); err != nil {
+				return err
+			}
+			ref := claim.Spec.VPCRef
+			if vpcAnno == "" {
+				vpcNS, vpcName = ref.Namespace, ref.Name
+			} else if ref.Namespace != vpcNS || ref.Name != vpcName {
+				return fmt.Errorf("PortClaim %s/%s is for VPC %s/%s, but the pod attaches to %s/%s",
+					podNS, claimName, ref.Namespace, ref.Name, vpcNS, vpcName)
+			}
+		}
+		return addVPC(ctx, args, conf, vpcNS, vpcName, podNS, podName, podUID, claim, podLabels, routeTable)
 	}
 	result, err := addDefault(ctx, args, conf)
 	if err != nil {
@@ -336,7 +356,7 @@ func hostIPNet(ip net.IP) *net.IPNet {
 // addVPC attaches the pod to a VPC using the dual-address bridge: the pod's
 // interface gets the VPC (tenant) IP, while status.podIP is a unique fabric IP
 // from the node pod CIDR that the bridge DNATs to the VPC IP.
-func addVPC(ctx context.Context, args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, podUID, vmName, podLabels, routeTable string) (err error) {
+func addVPC(ctx context.Context, args *skel.CmdArgs, conf *NetConf, vpcNS, vpcName, podNS, podName, podUID string, claim *sdnv1alpha1.PortClaim, podLabels, routeTable string) (err error) {
 	client, err := sdnClient()
 	if err != nil {
 		return fmt.Errorf("sdn client: %w", err)
@@ -407,9 +427,8 @@ func addVPC(ctx context.Context, args *skel.CmdArgs, conf *NetConf, vpcNS, vpcNa
 	}()
 	fabricIP := fabricIPs[0]
 
-	// VPC IP + MAC: bind the VM's persistent Port (survives migration) or claim a
-	// fresh one. bound => the Port pre-existed; never delete it on our error.
-	vpcIP, pinnedMAC, port, bound, err := attachPort(ctx, client, vpc, vpcNS, state, fabricIP.String(), podNS, podName, podUID, vmName, podLabels, routeTable)
+	// bound: the Port pre-existed, so never delete it on our error.
+	vpcIP, pinnedMAC, port, bound, err := attachPort(ctx, client, vpc, vpcNS, state, podNS, podName, podUID, claim, podLabels, routeTable)
 	if err != nil {
 		return err
 	}
@@ -450,14 +469,7 @@ func addVPC(ctx context.Context, args *skel.CmdArgs, conf *NetConf, vpcNS, vpcNa
 		return err
 	}
 
-	// Staged locals (live-migration overlap window): a migration target binds
-	// the persistent Port while the VM is still ACTIVE on another node. Local
-	// delivery must keep following the active location until cutover —
-	// otherwise a client co-located with the target would be delivered into
-	// the not-yet-running VM. Everything else is staged now (iface, bridge,
-	// alias, ports); the agent programs locals from the veth's alias record
-	// the moment the cutover re-points spec.node here, and removes the
-	// source side's entry symmetrically.
+	// A migration target stages without local delivery until cutover (docs/live-migration.md).
 	if bound && port.Spec.Node != "" && port.Spec.Node != state.NodeName {
 		if err = datapath.DelLocal(uint32(vpc.Status.VNI), vpcIP); err != nil {
 			return err
@@ -650,16 +662,24 @@ func requireVPCBinding(ctx context.Context, client sdnclientset.Interface, podNS
 	return fmt.Errorf("no VPCBinding in namespace %q authorizes attaching to VPC %s/%s (default-deny)", podNS, vpcNS, vpcName)
 }
 
-// rebindPodIdentity re-points a reused persistent Port at the pod binding it
-// now: the identity labels the controller reverse-indexes on, the spec's
-// pod name/namespace, and the pod-labels snapshot. A no-op when nothing moved.
-func rebindPodIdentity(ctx context.Context, client sdnclientset.Interface, p *sdnv1alpha1.Port, podNS, podName, podUID, podLabels, routeTable string) error {
+// rebindPodIdentity points a claimed Port at the pod binding it now, and at node/nodeIP when set.
+func rebindPodIdentity(ctx context.Context, client sdnclientset.Interface, p *sdnv1alpha1.Port, podNS, podName, podUID, podLabels, routeTable, node, nodeIP string) error {
 	if p.Labels[sdnv1alpha1.LabelPodNamespace] == podNS &&
 		p.Labels[sdnv1alpha1.LabelPodName] == podName &&
 		p.Labels[sdnv1alpha1.LabelPodUID] == podUID &&
 		p.Spec.RouteTable == routeTable &&
+		(node == "" || (p.Spec.Node == node && p.Spec.NodeIP == nodeIP)) &&
 		(podLabels == "" || p.Annotations[sdnv1alpha1.AnnotationPodLabels] == podLabels) {
 		return nil
+	}
+	spec := map[string]any{
+		"podNamespace": podNS,
+		"podName":      podName,
+		"routeTable":   routeTable,
+	}
+	if node != "" {
+		spec["node"] = node
+		spec["nodeIP"] = nodeIP
 	}
 	patch := map[string]any{
 		"metadata": map[string]any{
@@ -669,13 +689,7 @@ func rebindPodIdentity(ctx context.Context, client sdnclientset.Interface, p *sd
 				sdnv1alpha1.LabelPodUID:       podUID,
 			},
 		},
-		"spec": map[string]any{
-			"podNamespace": podNS,
-			"podName":      podName,
-			// A VM keeps the table its launcher pod names across a live
-			// migration (docs/vpc-egress.md §2.4).
-			"routeTable": routeTable,
-		},
+		"spec": spec,
 	}
 	if podLabels != "" {
 		patch["metadata"].(map[string]any)["annotations"] = map[string]string{
@@ -695,51 +709,21 @@ func rebindPodIdentity(ctx context.Context, client sdnclientset.Interface, p *sd
 	return nil
 }
 
-// attachPort obtains the Port realizing a pod's VPC NIC and returns its VPC IP,
-// the pinned MAC (nil for an ordinary pod — the veth keeps its random MAC), and
-// the Port.
-//
-//   - Ordinary pod: picks a free IP and atomically claims it by creating a Port
-//     named v<vni>.<ip-dashed>; concurrent claims collide on the name and retry.
-//   - Virt-launcher pod (vmName != ""): binds the VM's *persistent* Port if one
-//     exists (found by the LabelVMName label, not the name) — reusing the pinned
-//     VPC IP + MAC so they survive live migration — or, on the VM's first pod,
-//     creates it (atomic IP claim as above, plus a stable MAC and the VM label).
-func attachPort(ctx context.Context, client sdnclientset.Interface, vpc *sdnv1alpha1.VPC, vpcNS string, state *datapath.AgentState, fabricIP, podNS, podName, podUID, vmName, podLabels, routeTable string) (net.IP, net.HardwareAddr, *sdnv1alpha1.Port, bool, error) {
+// attachPort returns a pod's VPC IP, pinned MAC (nil without a PortClaim), Port, and whether the Port pre-existed.
+func attachPort(ctx context.Context, client sdnclientset.Interface, vpc *sdnv1alpha1.VPC, vpcNS string, state *datapath.AgentState, podNS, podName, podUID string, claim *sdnv1alpha1.PortClaim, podLabels, routeTable string) (net.IP, net.HardwareAddr, *sdnv1alpha1.Port, bool, error) {
 	_, ipnet, err := net.ParseCIDR(vpc.Spec.CIDRs[0])
 	if err != nil {
 		return nil, nil, nil, false, fmt.Errorf("parse vpc CIDR: %w", err)
 	}
 
-	// Bind: a virt-launcher pod reuses the VM's persistent Port if it exists.
-	if vmName != "" {
-		sel := fmt.Sprintf("%s=%s,%s=%s,%s=%s", labelVPCNamespace, vpcNS, labelVPC, vpc.Name, labelVMName, vmName)
-		existing, err := client.SdnV1alpha1().Ports().List(ctx, metav1.ListOptions{LabelSelector: sel})
+	if claim != nil {
+		p, err := claimedPort(ctx, client, claim)
 		if err != nil {
-			return nil, nil, nil, false, fmt.Errorf("list persistent ports for vm %q: %w", vmName, err)
+			return nil, nil, nil, false, err
 		}
-		if len(existing.Items) > 0 {
-			p := &existing.Items[0]
-			ip := net.ParseIP(p.Spec.IP)
-			if ip == nil {
-				return nil, nil, nil, false, fmt.Errorf("persistent port %s has invalid IP %q", p.Name, p.Spec.IP)
-			}
-			mac, err := net.ParseMAC(p.Spec.MAC)
-			if err != nil {
-				return nil, nil, nil, false, fmt.Errorf("persistent port %s has invalid MAC %q: %w", p.Name, p.Spec.MAC, err)
-			}
-			// Re-point the Port's pod identity at the pod binding it NOW. The
-			// {IP, MAC} stay pinned — that is the whole point of a persistent
-			// Port — but membership must follow the live launcher, not the
-			// first one that ever claimed it, or a migrated VM's SecurityGroup
-			// membership would freeze at its original labels
-			// (docs/security-groups.md § Membership). Best-effort: a failure
-			// here must not fail the ADD, and the controller still has the
-			// snapshot to fall back on.
-			if err := rebindPodIdentity(ctx, client, p, podNS, podName, podUID, podLabels, routeTable); err != nil {
-				fmt.Fprintf(os.Stderr, "cozyplane: rebind pod identity on %s: %v\n", p.Name, err)
-			}
-			return ip, mac, p, true, nil
+		if p != nil {
+			ip, mac, err := bindClaimedPort(ctx, client, p, vpc, vpcNS, state, podNS, podName, podUID, podLabels, routeTable)
+			return ip, mac, p, err == nil, err
 		}
 	}
 
@@ -750,8 +734,10 @@ func attachPort(ctx context.Context, client sdnclientset.Interface, vpc *sdnv1al
 		return nil, nil, nil, false, fmt.Errorf("list ports: %w", err)
 	}
 	used := map[string]bool{}
+	usedMAC := map[string]bool{}
 	for i := range list.Items {
 		used[list.Items[i].Spec.IP] = true
+		usedMAC[list.Items[i].Spec.MAC] = true
 	}
 	// ServiceVIPs draw from the same per-VPC keyspace (they walk from the TOP
 	// of the CIDR down; Ports walk up) — both allocators check the live union
@@ -766,18 +752,31 @@ func attachPort(ctx context.Context, client sdnclientset.Interface, vpc *sdnv1al
 		used[vips.Items[i].Spec.IP] = true
 	}
 
-	// A persistent (VM) Port carries a stable pinned MAC; an ordinary Port has
-	// none (the veth keeps its random MAC).
+	// Start at network+2 (reserve .0 network and .1 for a future gateway).
+	first := nextIP(nextIP(cloneIP(ipnet.IP)))
+	candidate := first
+
+	// A claimed Port pins a MAC, and its pinned or requested address is the only candidate.
 	var mac net.HardwareAddr
-	if vmName != "" {
-		mac = genMAC()
+	var want net.IP
+	if claim != nil {
+		if mac, err = claimMAC(claim, usedMAC); err != nil {
+			return nil, nil, nil, false, err
+		}
+		if want, err = claimIP(claim, ipnet, first); err != nil {
+			return nil, nil, nil, false, err
+		}
+		if want != nil {
+			candidate = want
+		}
 	}
 
-	// Start at network+2 (reserve .0 network and .1 for a future gateway).
-	candidate := nextIP(nextIP(cloneIP(ipnet.IP)))
 	for ipnet.Contains(candidate) {
 		ipStr := candidate.String()
 		if used[ipStr] {
+			if want != nil {
+				return nil, nil, nil, false, fmt.Errorf("PortClaim %s/%s: address %s is held by another Port", claim.Namespace, claim.Name, ipStr)
+			}
 			candidate = nextIP(candidate)
 			continue
 		}
@@ -799,8 +798,10 @@ func attachPort(ctx context.Context, client sdnclientset.Interface, vpc *sdnv1al
 			PodName:      podName,
 			RouteTable:   routeTable,
 		}
-		if vmName != "" {
-			labels[labelVMName] = vmName
+		if claim != nil {
+			labels[sdnv1alpha1.LabelClaimNamespace] = claim.Namespace
+			labels[sdnv1alpha1.LabelClaimName] = claim.Name
+			labels[sdnv1alpha1.LabelClaimUID] = string(claim.UID)
 			spec.MAC = mac.String()
 		}
 		var annotations map[string]string
@@ -823,6 +824,9 @@ func attachPort(ctx context.Context, client sdnclientset.Interface, vpc *sdnv1al
 		// the aggregated registry's cross-kind check — a ServiceVIP holds the
 		// same address. Either way the address is taken; walk on.
 		if apierrors.IsAlreadyExists(err) || apierrors.IsConflict(err) {
+			if want != nil {
+				return nil, nil, nil, false, fmt.Errorf("PortClaim %s/%s: address %s is held by another Port", claim.Namespace, claim.Name, ipStr)
+			}
 			used[ipStr] = true
 			candidate = nextIP(candidate)
 			continue
@@ -835,8 +839,130 @@ func attachPort(ctx context.Context, client sdnclientset.Interface, vpc *sdnv1al
 	return nil, nil, nil, false, fmt.Errorf("no free address in VPC %q (%s)", vpc.Name, vpc.Spec.CIDRs[0])
 }
 
-// genMAC returns a random locally-administered unicast MAC (02:…). The Port pins
-// it so a VM keeps the same MAC across pod churn and live migration.
+// getPortClaim returns the live PortClaim name in the pod's namespace.
+func getPortClaim(ctx context.Context, client sdnclientset.Interface, podNS, name string) (*sdnv1alpha1.PortClaim, error) {
+	claim, err := client.SdnV1alpha1().PortClaims(podNS).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get PortClaim %s/%s: %w", podNS, name, err)
+	}
+	if !claim.DeletionTimestamp.IsZero() {
+		return nil, fmt.Errorf("PortClaim %s/%s is being deleted", podNS, name)
+	}
+	return claim, nil
+}
+
+// claimedPort returns the Port bound to claim, or nil if it has none yet.
+func claimedPort(ctx context.Context, client sdnclientset.Interface, claim *sdnv1alpha1.PortClaim) (*sdnv1alpha1.Port, error) {
+	list, err := client.SdnV1alpha1().Ports().List(ctx, metav1.ListOptions{
+		LabelSelector: sdnv1alpha1.LabelClaimUID + "=" + string(claim.UID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list Ports of PortClaim %s/%s: %w", claim.Namespace, claim.Name, err)
+	}
+	if len(list.Items) == 0 {
+		return nil, nil
+	}
+	return &list.Items[0], nil
+}
+
+// bindClaimedPort binds the pod to its claim's Port, taking it over when no other live pod holds it.
+func bindClaimedPort(ctx context.Context, client sdnclientset.Interface, p *sdnv1alpha1.Port, vpc *sdnv1alpha1.VPC, vpcNS string, state *datapath.AgentState, podNS, podName, podUID, podLabels, routeTable string) (net.IP, net.HardwareAddr, error) {
+	if p.Spec.VPCRef.Namespace != vpcNS || p.Spec.VPCRef.Name != vpc.Name {
+		return nil, nil, fmt.Errorf("Port %s of the pod's PortClaim is in VPC %s/%s, not %s/%s",
+			p.Name, p.Spec.VPCRef.Namespace, p.Spec.VPCRef.Name, vpcNS, vpc.Name)
+	}
+	ip := net.ParseIP(p.Spec.IP)
+	if ip == nil {
+		return nil, nil, fmt.Errorf("claimed port %s has invalid IP %q", p.Name, p.Spec.IP)
+	}
+	mac, err := net.ParseMAC(p.Spec.MAC)
+	if err != nil {
+		return nil, nil, fmt.Errorf("claimed port %s has invalid MAC %q: %w", p.Name, p.Spec.MAC, err)
+	}
+	// A live holder makes this pod a migration target, staged until cutover.
+	node, nodeIP := "", ""
+	if p.Spec.Node == "" || !holderLive(ctx, p, podUID) {
+		node, nodeIP = state.NodeName, state.NodeIP
+	}
+	if err := rebindPodIdentity(ctx, client, p, podNS, podName, podUID, podLabels, routeTable, node, nodeIP); err != nil {
+		if node != "" {
+			return nil, nil, fmt.Errorf("take over claimed port %s: %w", p.Name, err)
+		}
+		// Best-effort for a staged target: the controller re-points identity at cutover.
+		fmt.Fprintf(os.Stderr, "cozyplane: rebind pod identity on %s: %v\n", p.Name, err)
+	}
+	return ip, mac, nil
+}
+
+// holderLive reports whether the Port's recorded pod, if not selfUID, still runs; unreadable counts as running.
+func holderLive(ctx context.Context, p *sdnv1alpha1.Port, selfUID string) bool {
+	ns, name, uid := p.Labels[labelPodNS], p.Labels[labelPodName], p.Labels[labelPodUID]
+	if ns == "" || name == "" || uid == selfUID {
+		return false
+	}
+	pod, err := getPod(ctx, ns, name)
+	if apierrors.IsNotFound(err) {
+		return false
+	}
+	if err != nil {
+		return true
+	}
+	return string(pod.UID) == uid && pod.DeletionTimestamp == nil &&
+		pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed
+}
+
+// getPod reads a pod from the API server.
+var getPod = func(ctx context.Context, ns, name string) (*corev1.Pod, error) {
+	core, err := coreClient()
+	if err != nil {
+		return nil, err
+	}
+	return core.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+}
+
+// claimMAC returns the claim's pinned or requested MAC, or a fresh one unused in the VPC.
+func claimMAC(claim *sdnv1alpha1.PortClaim, used map[string]bool) (net.HardwareAddr, error) {
+	if s := cmp.Or(claim.Status.MAC, claim.Spec.MAC); s != "" {
+		if used[s] {
+			return nil, fmt.Errorf("PortClaim %s/%s: MAC %s is used by another Port in the VPC", claim.Namespace, claim.Name, s)
+		}
+		return net.ParseMAC(s)
+	}
+	for range 8 {
+		if mac := genMAC(); !used[mac.String()] {
+			return mac, nil
+		}
+	}
+	return nil, errors.New("no unused MAC found")
+}
+
+// claimIP returns the claim's pinned or requested address, nil if it has none.
+func claimIP(claim *sdnv1alpha1.PortClaim, ipnet *net.IPNet, first net.IP) (net.IP, error) {
+	s := cmp.Or(claim.Status.IP, claim.Spec.IP)
+	if s == "" {
+		return nil, nil
+	}
+	ip := net.ParseIP(s)
+	if ip == nil || !ipnet.Contains(ip) || (isV6(ip) != isV6(ipnet.IP)) {
+		return nil, fmt.Errorf("PortClaim %s/%s: address %s is outside the VPC CIDR %s", claim.Namespace, claim.Name, s, ipnet)
+	}
+	if bytesLess(ip, first) {
+		return nil, fmt.Errorf("PortClaim %s/%s: address %s is reserved in %s", claim.Namespace, claim.Name, s, ipnet)
+	}
+	return ip, nil
+}
+
+// bytesLess reports whether a sorts before b in the same address family.
+func bytesLess(a, b net.IP) bool {
+	if a4, b4 := a.To4(), b.To4(); a4 != nil && b4 != nil {
+		a, b = a4, b4
+	} else {
+		a, b = a.To16(), b.To16()
+	}
+	return bytes.Compare(a, b) < 0
+}
+
+// genMAC returns a random locally-administered unicast MAC.
 func genMAC() net.HardwareAddr {
 	b := make([]byte, 6)
 	_, _ = rand.Read(b)
@@ -854,7 +980,7 @@ func portName(vni int32, ip string) string {
 
 // setupVeth creates the pod veth, configures the pod-side address and routes,
 // configures the host side, and attaches the classifier with the given net id.
-// It also returns the pod interface MAC (the pinned one for a VM) — the bridge
+// It also returns the pod interface MAC (the pinned one for a claimed Port) — the bridge
 // records it as the fabric IP's permanent neighbour.
 func setupVeth(args *skel.CmdArgs, cniVersion string, podIPs []net.IP, pinnedMAC net.HardwareAddr, mtu int, netID uint32) (*current.Result, net.HardwareAddr, error) {
 	hostNS, err := ns.GetCurrentNS()
@@ -888,11 +1014,8 @@ func setupVeth(args *skel.CmdArgs, cniVersion string, podIPs []net.IP, pinnedMAC
 	}, podMAC, nil
 }
 
-// configurePodIface sets the pod's eth0 address, brings it up, and installs the
-// link-local default route. Runs inside the pod netns. When pinnedMAC is set (a
-// VM NIC), it is applied to eth0 so the MAC survives migration — KubeVirt's
-// bridge binding hands this MAC to the guest. Returns the eth0 MAC so the host
-// side can record it for same-node redirect delivery.
+// configurePodIface configures eth0 inside the pod netns, applying pinnedMAC when
+// set, and returns the eth0 MAC.
 func configurePodIface(podIPs []net.IP, pinnedMAC net.HardwareAddr) (net.HardwareAddr, error) {
 	link, err := netlink.LinkByName(contVethName)
 	if err != nil {
@@ -913,11 +1036,7 @@ func configurePodIface(podIPs []net.IP, pinnedMAC net.HardwareAddr) (net.Hardwar
 			return nil, err
 		}
 	}
-	// Return the MAC the host side must record in `locals` for redirect delivery.
-	// When pinned, it is the value we just set — netlink does not refresh the
-	// cached link.Attrs() after LinkSetHardwareAddr, so reading it back would give
-	// the stale pre-pin MAC and the datapath would deliver to the wrong address
-	// (KubeVirt hands the *pinned* MAC to the guest).
+	// link.Attrs() still holds the pre-pin MAC after LinkSetHardwareAddr.
 	if len(pinnedMAC) == 6 {
 		return pinnedMAC, nil
 	}
@@ -1070,7 +1189,7 @@ func cmdDel(args *skel.CmdArgs) error {
 	// Clear the ports map entries; the host veths (and their tc filters) go
 	// with the pod veths deleted below. Capture the VPC veth's net id first so the
 	// local delivery entry can be cleaned by (net, VPC IP) below even when this
-	// pod's Port cannot be consulted — a migration source whose persistent Port
+	// pod's Port cannot be consulted — a migration source whose claimed Port
 	// has been re-pointed to the target pod, so a Port lookup by this pod misses.
 	vpcNet, haveVPCNet := uint32(0), false
 	for _, name := range []string{hostVethNameFor(args.ContainerID), gwHostVethNameFor(args.ContainerID)} {
@@ -1104,10 +1223,8 @@ func cmdDel(args *skel.CmdArgs) error {
 				if net_, ok := netFromPortName(p.Name); ok {
 					_ = datapath.DelLocal(net_, net.ParseIP(p.Spec.IP))
 				}
-				// A persistent (VM NIC) Port outlives its pod so the VPC IP + MAC
-				// survive pod churn / live migration: never delete it here — the
-				// persistent-Port controller GCs it when the VM is gone.
-				if p.Labels[labelVMName] != "" {
+				// A claimed Port lives as long as its PortClaim, not its pod.
+				if p.Labels[sdnv1alpha1.LabelClaimUID] != "" {
 					continue
 				}
 				_ = client.SdnV1alpha1().Ports().Delete(ctx, p.Name, metav1.DeleteOptions{})
@@ -1156,7 +1273,7 @@ func cmdDel(args *skel.CmdArgs) error {
 		// the VPC-net entry too, keyed by (captured net, VPC IP from the veth).
 		// Doing it from the veth address makes cleanup independent of the Port,
 		// so a migration source clears its own local delivery entry even though
-		// its persistent Port now points at the target pod.
+		// its claimed Port now points at the target pod.
 		for _, a := range addrs {
 			if a.IP != nil {
 				_ = datapath.DelLocal(0, a.IP)

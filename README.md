@@ -113,7 +113,7 @@ Start with [design.md](docs/design.md) (the vision and the **design tenets**), t
 | [docs/vpc-egress.md](docs/vpc-egress.md) | *Design* — VPC egress as first-class objects: `NATGateway`, `RouteTable`/`Route`, the `internet` target, and the SNAT mechanism (expiry, port blocks, the node cap) |
 | [docs/external-addresses.md](docs/external-addresses.md) | *Design* — how external addresses are sourced (a delegated Service); cozyplane allocates/attracts/reserves none |
 | [docs/multitenancy.md](docs/multitenancy.md) | The tenancy rules, each justified or dropped (a namespace *is* the tenant) |
-| [docs/live-migration.md](docs/live-migration.md) | VM live migration via persistent Ports (IP + MAC preservation) |
+| [docs/live-migration.md](docs/live-migration.md) | VM live migration and restarts via PortClaims (IP + MAC preservation) |
 | [docs/policy-layers.md](docs/policy-layers.md) | How the three policy layers compose, and the shared trust model |
 | [docs/security-groups.md](docs/security-groups.md) | Intra-VPC policy (security groups) |
 | [docs/network-policy.md](docs/network-policy.md) | Upstream `NetworkPolicy` on the default network |
@@ -136,7 +136,7 @@ address form, etc.) live in [CLAUDE.md](CLAUDE.md).
 ```
 bpf/            eBPF datapath (C, CO-RE) — tc classifier + maps; compiled object is committed and go:embed'd
 datapath/       Go: load/pin eBPF, manage Geneve + maps, program bridges/locals/remotes/floating/peers
-cmd/cni/        CNI plugin binary (per-pod ADD/DEL; VPC attach, persistent-Port bind)
+cmd/cni/        CNI plugin binary (per-pod ADD/DEL; VPC attach, PortClaim bind)
 cmd/agent/      node agent DaemonSet (loads datapath, watches Nodes/VPCs/Ports/…)
 cmd/sdn-controller/  controllers: VNI assignment, peering, floating IPs, live-migration cutover/GC
 cmd/apiserver/  aggregated API server — serves the sdn.cozystack.io API

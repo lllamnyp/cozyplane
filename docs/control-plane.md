@@ -75,7 +75,7 @@ It never exits because an API group is missing.
 |---|---|---|
 | FabricIP GC (`local.sdn.cozystack.io`) | running | running |
 | health / readiness | Ready | Ready |
-| VPC, VPCBinding, VPCPeering, VPCGateway, PortGC, PersistentPort, PortMembership, SecurityGroup, ServiceVIP, FloatingIP, Gateway | **not registered** | running |
+| VPC, VPCBinding, VPCPeering, VPCGateway, PortGC, PortClaim, PortMembership, SecurityGroup, ServiceVIP, FloatingIP, Gateway | **not registered** | running |
 
 The degraded set is everything that needs only the kube API and the CRD-served
 group — today the FabricIP GC, which reclaims an underlay address whose pod is
@@ -243,6 +243,11 @@ Two tiers: **declarative** (authored by tenants/operators, desired state) and
   exactly one boundary (the oldest gateway wins). See [north-south.md](north-south.md).
   (`ExternalPool`, the old admin-defined CIDR list both this and FloatingIP drew
   from, is **deleted** — external-addresses.md §9.)
+- **`PortClaim`** — `{ vpcRef, mac?, ip? }`, status `{ ip, mac, Bound }`. A
+  namespaced claim on one VPC interface identity, the PersistentVolumeClaim to the
+  Port's PersistentVolume: a pod names it with `sdn.cozystack.io/port-claim`, its
+  Port lives as long as the claim, and its status publishes the pinned IP and MAC
+  while no pod exists ([live-migration.md](live-migration.md)).
 - **`HostFirewall`** (cluster-scoped, operator-only) — `{ nodeSelector,
   ingress[] (cidr/except → proto/port) }`. Ingress policy for the nodes
   themselves — the node-scoped sibling of NetworkPolicy (net-0 pods) and
@@ -265,16 +270,13 @@ Two tiers: **declarative** (authored by tenants/operators, desired state) and
     owner (pod or VM NIC), persistent }`.
   - `status`: `{ ip[], mac, identity, dnsName, binding{ node, podUID, fabricIP,
     state }, programmed }`.
-  - **Lifecycle by persistence:**
-    - *Ephemeral* (ordinary pod): created at CNI ADD, `ownerRef` → pod, garbage
-      collected with the pod.
-    - *Persistent* (VM NIC): pre-created by a controller watching
-      `VirtualMachine`s, named after the VM+NIC, holds the **pinned** MAC/IP.
-      Each virt-launcher pod's CNI ADD *binds* to it rather than creating one —
-      this is how MAC/IP survive pod churn and live migration.
-
-A persistent `Port` *is* the "PortBinding" concept from `design.md` — one kind,
-two lifecycles, rather than two kinds.
+  - **Lifecycle** (as built):
+    - *Ephemeral* (a pod without a PortClaim): created at CNI ADD, deleted at
+      CNI DEL or by the Port GC once its pod is gone.
+    - *Claimed* (a pod naming a `PortClaim`): created at the first binding pod's
+      ADD with the claim's labels and a **pinned** MAC/IP; later pods *bind* to
+      it rather than creating one, and it is deleted with the claim — this is
+      how MAC/IP survive pod churn, restarts and live migration.
 
 ### Port subresources
 
@@ -299,7 +301,7 @@ What happens when a tenant pod is scheduled to node N:
    `{ VPC, Subnet, SecurityGroups }`.
 4. Agent obtains the Port:
    - ordinary pod → **CREATE** a `Port` (server allocates IP/MAC/identity/name);
-   - VM → look up the persistent Port and **`/bind`** it.
+   - pod naming a `PortClaim` → bind the claim's Port (as built: no `/bind`).
    Either way the agent ends with `{ vpcIP, mac, identity, dnsName, fabricIP }`.
 5. Agent programs the datapath:
    - veth into the netns; configure **VPC IP + MAC**, default route to the subnet
@@ -341,7 +343,8 @@ prove it on the target runtime first.
   - *Port/IPAM* — mostly server-side at CREATE; the controller handles GC, DNS
     reconciliation, and identity assignment.
   - *Migration controller* — drives `/migrate` cutovers (§5).
-  - *VM-Port controller* — watches `VirtualMachine`s, pre-creates persistent Ports.
+  - *PortClaim controller* (as built) — ties a claimed Port to its claim and to
+    the claim's active pod; cozyplane watches no `VirtualMachine`s.
 
 Because allocation is transactional in the apiserver, controllers stay
 level-triggered reconcilers over already-consistent state — they never arbitrate

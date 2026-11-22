@@ -163,7 +163,7 @@ Tables do not select pods: a selector would let two tables select one pod. A per
 table also covers the one use subnets had here, a route table per group of workloads.
 
 The CNI copies the annotation into `Port.spec.routeTable` at ADD and when a
-persistent Port is re-bound, so a VM keeps its table across a live migration. A
+claimed Port is re-bound, so a VM keeps its table across a live migration. A
 changed annotation takes effect at the pod's next ADD.
 
 ### 2.5 NATPortBlock

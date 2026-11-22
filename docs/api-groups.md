@@ -182,7 +182,7 @@ the pod UID:
 - the **datapath's restart rebuild** never read the Port at all — it re-derives
   from the veth alias records — so it needed no change.
 
-**The sharpest instance of the bug this kills:** the persistent-Port controller
+**The sharpest instance of the bug this kills:** the VM-Port cutover controller
 used to *copy the fabric IP into the Port on every live-migration cutover*
 (`port.Spec.FabricIP = active.Status.PodIP`), because the launcher's address
 churns while the VPC IP and MAC do not. That whole sync is deleted. A cutover

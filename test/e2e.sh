@@ -1928,6 +1928,57 @@ $K label node "$W" cozyplane-e2e/hf- >/dev/null 2>&1
 docker rm -f hfext >/dev/null 2>&1
 $K delete ns hftest --wait=false >/dev/null 2>&1
 
+phase "PortClaim: a claimed identity outlives its pods"
+claimpod() { # claimpod <ns> <name> <node> <claim>
+  $K apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: $2, namespace: $1, annotations: {sdn.cozystack.io/port-claim: $4}}
+spec:
+  nodeName: $3
+  containers: [{name: c, image: busybox:1.36, command: ["sh","-c","$SRV"]}]
+EOF
+}
+podanno()   { $K -n "$1" get pod "$2" -o jsonpath="{.metadata.annotations.sdn\.cozystack\.io/$3}"; }
+claimport() { $K get ports -l "sdn.cozystack.io/claim-namespace=$1,sdn.cozystack.io/claim-name=$2" -o jsonpath="{.items[*].$3}"; }
+$K apply -f - >/dev/null <<EOF
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: PortClaim
+metadata: {name: pc1, namespace: team-a}
+spec: {vpcRef: {name: vpc-c}}
+---
+apiVersion: sdn.cozystack.io/v1alpha1
+kind: PortClaim
+metadata: {name: pc2, namespace: team-a}
+spec: {vpcRef: {name: vpc-c}, mac: "02:00:00:00:e2:e2", ip: "10.1.0.200"}
+EOF
+# pcA names only its claim: the VPC comes from the PortClaim.
+claimpod team-a pcA "$W2" pc1
+claimpod team-a pcR "$W" pc2
+$K -n team-a wait --for=condition=Ready pod/pcA pod/pcR --timeout=120s >/dev/null
+PC_IP=$(podanno team-a pcA vpc-ip); PC_MAC=$(podanno team-a pcA vpc-mac)
+check "pcA is addressed in the claim's VPC (vpc-c)" "10.1.0" bash -c "echo $PC_IP | cut -d. -f1-3"
+check "c1 -> $PC_IP reaches pcA" "pcA" httpid team-a c1 "$PC_IP"
+check "a PortClaim's requested IP and MAC are honoured" "10.1.0.200/02:00:00:00:e2:e2" \
+  bash -c "echo $(podanno team-a pcR vpc-ip)/$(podanno team-a pcR vpc-mac)"
+
+$K -n team-a delete pod pcA --wait=true >/dev/null
+for _ in $(seq 1 20); do [ -z "$(claimport team-a pc1 spec.node)" ] && break; sleep 1; done
+check "the claimed Port survives its pod, detached" "$PC_IP|" \
+  bash -c "echo \"$(claimport team-a pc1 spec.ip)|$(claimport team-a pc1 spec.node)\""
+check "the PortClaim's status keeps the pinned identity" "$PC_IP/$PC_MAC" \
+  bash -c "$K -n team-a get portclaim pc1 -o jsonpath='{.status.ip}/{.status.mac}'"
+
+claimpod team-a pcB "$W" pc1
+$K -n team-a wait --for=condition=Ready pod/pcB --timeout=120s >/dev/null
+check "a new pod on another node gets the same IP and MAC" "$PC_IP/$PC_MAC" \
+  bash -c "echo $(podanno team-a pcB vpc-ip)/$(podanno team-a pcB vpc-mac)"
+check "c1 -> $PC_IP now reaches pcB" "pcB" httpid team-a c1 "$PC_IP"
+
+$K -n team-a delete pod pcB pcR --wait=true >/dev/null
+$K -n team-a delete portclaim pc1 pc2 --wait=true --timeout=60s >/dev/null
+check "deleting the PortClaim frees its Port" "" claimport team-a pc1 metadata.name
+
 phase "revocation"
 $K -n team-a delete vpcbinding vpc-a >/dev/null
 sleep 6

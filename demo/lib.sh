@@ -21,9 +21,9 @@ vpcip()    { kubectl get ports -o jsonpath="{range .items[*]}{.spec.podName}{' '
 fabricip() { kubectl -n "${2:-$RED_NS}" get pod "$1" -o jsonpath='{.status.podIP}'; }
 podnode()  { kubectl -n "$1" get pod "$2" -o jsonpath='{.spec.nodeName}'; }
 
-# The VM's persistent Port carries the pinned identity; select it by VM name.
-vmport()      { kubectl get ports -l "sdn.cozystack.io/vm-name=$VM" -o jsonpath='{.items[0].metadata.name}'; }
-vmport_field(){ kubectl get ports -l "sdn.cozystack.io/vm-name=$VM" -o jsonpath="{.items[0].spec.$1}"; }
+# The VM's PortClaim (named after the VM) pins its identity; its Port carries the claim's name.
+vmport()      { kubectl get ports -l "sdn.cozystack.io/claim-name=$VM" -o jsonpath='{.items[0].metadata.name}'; }
+vmport_field(){ kubectl get ports -l "sdn.cozystack.io/claim-name=$VM" -o jsonpath="{.items[0].spec.$1}"; }
 
 # Two distinct Ready nodes, for pinning pods so the overlay actually crosses nodes.
 two_nodes() {

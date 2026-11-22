@@ -113,7 +113,7 @@ func TestPortGCReapsAbandonedClaims(t *testing.T) {
 	held := claimedPort("v101.10-11-0-1", "kube-system", "gw-alive", "uid-1", true)
 	reused := claimedPort("v102.10-12-0-1", "kube-system", "gw-reused", "uid-old", true)
 	persistent := claimedPort("v103-vm-mig", "tenant-a", "launcher-dead", "uid-dead2", false)
-	persistent.Labels[sdnv1alpha1.LabelVMName] = "mig"
+	persistent.Labels[sdnv1alpha1.LabelClaimUID] = "claim-mig"
 	unclaimed := &sdnv1alpha1.Port{
 		ObjectMeta: metav1.ObjectMeta{Name: "v104.10-14-0-1"},
 		Spec:       sdnv1alpha1.PortSpec{Node: "live-node", IP: "10.14.0.1"},

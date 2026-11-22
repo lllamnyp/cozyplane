@@ -26,6 +26,7 @@ import (
 	hostfirewallstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/hostfirewall"
 	natgatewaystorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/natgateway"
 	portstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/port"
+	portclaimstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/portclaim"
 	routestorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/route"
 	routetablestorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/routetable"
 	securitygroupstorage "github.com/lllamnyp/cozyplane/pkg/registry/sdn/securitygroup"
@@ -93,6 +94,10 @@ func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOpt
 	}
 	portTwin.Exists = claim.StoreExists(serviceVIPREST.Store)
 	vipTwin.Exists = claim.StoreExists(portREST.Store)
+	portClaimREST, portClaimStatusREST, err := portclaimstorage.NewREST(scheme, restOptionsGetter)
+	if err != nil {
+		panic(err)
+	}
 	securityGroupREST, securityGroupStatusREST, err := securitygroupstorage.NewREST(scheme, restOptionsGetter)
 	if err != nil {
 		panic(err)
@@ -119,6 +124,8 @@ func APIGroupInfo(scheme *runtime.Scheme, codec serializer.CodecFactory, restOpt
 	v1alpha1storage["vpcs/status"] = vpcStatusREST
 	v1alpha1storage["ports"] = portREST
 	v1alpha1storage["ports/status"] = portStatusREST
+	v1alpha1storage["portclaims"] = portClaimREST
+	v1alpha1storage["portclaims/status"] = portClaimStatusREST
 	v1alpha1storage["vpcbindings"] = defaultregistry.RESTInPeace(vpcbindingstorage.NewREST(scheme, restOptionsGetter, auth))
 	v1alpha1storage["vpcgateways"] = vpcGatewayREST
 	v1alpha1storage["vpcgateways/status"] = vpcGatewayStatusREST

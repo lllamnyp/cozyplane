@@ -340,7 +340,7 @@ etcd pods (or VM-hosted members) in `vpc-a`, Services annotated into the VPC:
   `ServiceVIP`, the pod→Port idiom; the `VPCBinding` is the authz gate, as
   for pods. One idiom for tenants: "annotate the thing into the VPC."
   Escape hatch by precedent if per-attachment knobs ever become real:
-  persistent Ports are user-created while ordinary Ports are materialized —
+  claimed Ports follow a user-created PortClaim while ordinary Ports are materialized —
   `ServiceVIP` can grow the same dual pattern.
 
 **Projection is annotation-gated for headless Services too** — nothing

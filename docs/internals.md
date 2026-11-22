@@ -942,10 +942,9 @@ misses:
   runs CNI DEL, so its Port leaks; for an ordinary pod that leaks an address,
   but for a **gateway pod it wedges the replacement forever** — the fixed `.1`
   claim fails `AlreadyExists` and the pod stays ContainerCreating. GC frees the
-  name; the kubelet's next ADD retry claims it fresh. VM persistent Ports
-  (`vm-name` label) are exempt — the PersistentPortReconciler owns their
-  lifecycle, and a launcher pod's absence there must *not* release the pinned
-  IP+MAC. Deletion still passes through the sever finalizer, so the owning node
+  name; the kubelet's next ADD retry claims it fresh. Claimed Ports
+  (`claim-uid` label) are exempt — their PortClaim owns their lifetime, and a
+  pod's absence must *not* release the pinned IP+MAC. Deletion still passes through the sever finalizer, so the owning node
   drains first (or PortGC's node-gone path releases it). Before deleting, the
   claimant's absence is confirmed against the API server directly — the
   informer cache could lag a *just-created* pod and GC would otherwise kill a
