@@ -167,8 +167,9 @@ never resolves a namespaced owner for a cluster-scoped dependent.
   claim of the same name (UID mismatch), is deleted.
 - **Status:** `status.ip`/`status.mac` are pinned at first bind and immutable
   afterwards; the `Bound` condition says whether a live pod holds the Port
-  (`PodBound`), it is reserved with no pod (`Detached`), or no pod has bound it
-  yet (`NoPort`).
+  (`PodBound`), a live pod that does not name the claim holds it
+  (`PreClaimPod`, below), it is reserved with no pod (`Detached`), or no pod has
+  bound it yet (`NoPort`).
 - **Quota:** `count/portclaims.sdn.cozystack.io` bounds how many addresses a
   namespace can hold while no pod uses them.
 
@@ -176,8 +177,16 @@ never resolves a namespaced owner for a cluster-scoped dependent.
 label `vm.kubevirt.io/name` and marked them `sdn.cozystack.io/vm-name`. Creating
 a PortClaim named after the VM adopts such a Port (same name, pod namespace and
 VPC; the claim's `spec.ip`, if set, must match): it gets the claim's labels,
-loses `vm-name`, and takes `spec.mac` if the claim requests one. A running VM
-keeps its IP and MAC through the upgrade. An unadopted legacy Port is an
+loses `vm-name`, and takes `spec.mac` if the claim requests one.
+
+A VM running at adoption time keeps its IP, MAC and binding: its launcher pod
+predates the `sdn.cozystack.io/port-claim` annotation, but it is the pod the
+Port records (same name and UID), so the controller counts it as the holder
+until it ends, and reports `Bound=True` with reason `PreClaimPod`. Such a VM
+must be **restarted before it is live-migrated**: KubeVirt builds the migration
+target from the running VMI, which predates the annotation, so the target would
+get an ordinary Port with a new IP. A restart creates a VMI that carries the
+annotation (KubeVirt marks VMs whose template changed `RestartRequired`). An unadopted legacy Port is an
 ordinary Port: deleted with its pod. A VM without a PortClaim gets an ordinary
 Port per launcher pod, so its identity does not survive a restart or a migration.
 

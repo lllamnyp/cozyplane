@@ -265,3 +265,97 @@ func TestPortClaimGoneDeletesPorts(t *testing.T) {
 		t.Error("port of a missing claim kept")
 	}
 }
+
+func preClaimSetup(t *testing.T, node string, podUID string) (*sdnv1alpha1.Port, *corev1.Pod) {
+	t.Helper()
+	port := claimedPortOn("vm1", "u1", node, "pod-a")
+	port.Labels[sdnv1alpha1.LabelPodName] = "launcher-a"
+	pod := claimPod("launcher-a", podUID, "node-a", corev1.PodRunning)
+	pod.Annotations = nil
+	return port, pod
+}
+
+func boundReason(t *testing.T, r *PortClaimReconciler) string {
+	t.Helper()
+	c := meta.FindStatusCondition(getClaim(t, r, "vm1").Status.Conditions, sdnv1alpha1.PortClaimConditionBound)
+	if c == nil {
+		t.Fatal("no Bound condition")
+	}
+	return string(c.Status) + "/" + c.Reason
+}
+
+// A pod started before its Port was adopted keeps the Port until it ends; a new annotated pod then binds it.
+func TestPortClaimAdoptionKeepsPreClaimPod(t *testing.T) {
+	legacy, pod := preClaimSetup(t, "node-a", "pod-a")
+	for _, k := range []string{sdnv1alpha1.LabelClaimNamespace, sdnv1alpha1.LabelClaimName, sdnv1alpha1.LabelClaimUID} {
+		delete(legacy.Labels, k)
+	}
+	legacy.Labels[sdnv1alpha1.LabelVMName] = "vm1"
+	r := newPCReconciler(t, newPortClaim("vm1", "u1"), legacy, pod)
+	ctx := context.Background()
+
+	reconcileClaim(t, r, "vm1")
+	if p := getClaimPort(t, r); p.Spec.Node != "node-a" || p.Spec.NodeIP != "192.0.2.1" || p.Labels[sdnv1alpha1.LabelClaimUID] != "u1" {
+		t.Fatalf("adopted port lost its binding: node %q/%q labels %v", p.Spec.Node, p.Spec.NodeIP, p.Labels)
+	}
+	if got := boundReason(t, r); got != "True/PreClaimPod" {
+		t.Errorf("Bound = %s, want True/PreClaimPod", got)
+	}
+
+	if err := r.Delete(ctx, pod); err != nil {
+		t.Fatal(err)
+	}
+	reconcileClaim(t, r, "vm1")
+	if p := getClaimPort(t, r); p.Spec.Node != "" || !p.DeletionTimestamp.IsZero() {
+		t.Fatalf("port after the pod ended: node %q, terminating %v; want reserved and detached", p.Spec.Node, !p.DeletionTimestamp.IsZero())
+	}
+	if got := boundReason(t, r); got != "False/Detached" {
+		t.Errorf("Bound = %s, want False/Detached", got)
+	}
+
+	if err := r.Create(ctx, claimPod("launcher-b", "pod-b", "node-b", corev1.PodRunning)); err != nil {
+		t.Fatal(err)
+	}
+	reconcileClaim(t, r, "vm1")
+	p := getClaimPort(t, r)
+	if p.Spec.Node != "node-b" || p.Spec.IP != "10.10.0.4" || p.Spec.MAC != "02:00:00:00:00:04" {
+		t.Errorf("new pod bound %s/%s on %q, want 10.10.0.4/02:00:00:00:00:04 on node-b", p.Spec.IP, p.Spec.MAC, p.Spec.Node)
+	}
+	if got := boundReason(t, r); got != "True/PodBound" {
+		t.Errorf("Bound = %s, want True/PodBound", got)
+	}
+}
+
+// A Port detached while its pre-claim pod still runs is bound back to that pod.
+func TestPortClaimReattachesPreClaimPod(t *testing.T) {
+	port, pod := preClaimSetup(t, "", "pod-a")
+	r := newPCReconciler(t, newPortClaim("vm1", "u1"), port, pod)
+	reconcileClaim(t, r, "vm1")
+	if p := getClaimPort(t, r); p.Spec.Node != "node-a" || p.Spec.NodeIP != "192.0.2.1" {
+		t.Errorf("node = %q/%q, want node-a/192.0.2.1", p.Spec.Node, p.Spec.NodeIP)
+	}
+}
+
+// A different pod reusing the recorded pod's name does not hold the Port.
+func TestPortClaimIgnoresReusedPodName(t *testing.T) {
+	port, pod := preClaimSetup(t, "node-a", "someone-else")
+	r := newPCReconciler(t, newPortClaim("vm1", "u1"), port, pod)
+	reconcileClaim(t, r, "vm1")
+	if n := getClaimPort(t, r).Spec.Node; n != "" {
+		t.Errorf("node = %q, want detached", n)
+	}
+}
+
+func TestMapPodToClaimFollowsPreClaimPod(t *testing.T) {
+	port, pod := preClaimSetup(t, "node-a", "pod-a")
+	r := newPCReconciler(t, newPortClaim("vm1", "u1"), port)
+	ctx := context.Background()
+	if reqs := r.mapPodToClaim(ctx, pod); len(reqs) != 0 {
+		t.Errorf("running pre-claim pod enqueued %v", reqs)
+	}
+	pod.Status.Phase = corev1.PodSucceeded
+	want := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "tenant", Name: "vm1"}}
+	if reqs := r.mapPodToClaim(ctx, pod); len(reqs) != 1 || reqs[0] != want {
+		t.Errorf("finished pre-claim pod enqueued %v, want [%v]", reqs, want)
+	}
+}
