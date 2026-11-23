@@ -102,17 +102,17 @@ func (r *PortClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		port = adopted
 	}
 
-	bound := false
+	var holder *corev1.Pod
 	if port != nil && port.DeletionTimestamp.IsZero() {
 		var err error
-		if bound, err = r.bind(ctx, claim, port); err != nil {
+		if holder, err = r.bind(ctx, claim, port); err != nil {
 			if apierrors.IsConflict(err) {
 				return ctrl.Result{Requeue: true}, nil
 			}
 			return ctrl.Result{}, err
 		}
 	}
-	return ctrl.Result{}, r.updateStatus(ctx, claim, port, bound)
+	return ctrl.Result{}, r.updateStatus(ctx, claim, port, holder)
 }
 
 // release deletes a gone or terminating claim's Ports, then drops its finalizer.
@@ -179,34 +179,41 @@ func (r *PortClaimReconciler) adopt(ctx context.Context, claim *sdnv1alpha1.Port
 	return nil, nil
 }
 
-// bind points the Port at the claim's active pod or detaches it, and reports whether a pod holds it.
-func (r *PortClaimReconciler) bind(ctx context.Context, claim *sdnv1alpha1.PortClaim, port *sdnv1alpha1.Port) (bool, error) {
+// bind points the Port at the claim's active pod or detaches it, and returns the pod holding it.
+func (r *PortClaimReconciler) bind(ctx context.Context, claim *sdnv1alpha1.PortClaim, port *sdnv1alpha1.Port) (*corev1.Pod, error) {
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods, client.InNamespace(claim.Namespace),
 		client.MatchingFields{PodPortClaimIndex: claim.Name}); err != nil {
-		return false, fmt.Errorf("list pods of portclaim %s/%s: %w", claim.Namespace, claim.Name, err)
+		return nil, fmt.Errorf("list pods of portclaim %s/%s: %w", claim.Namespace, claim.Name, err)
 	}
-	active := activePod(livePods(pods.Items), port.Spec.Node)
+	candidates := pods.Items
+	if p, err := r.preClaimPod(ctx, claim, port); err != nil {
+		return nil, err
+	} else if p != nil {
+		candidates = append(candidates, *p)
+	}
+	live := livePods(candidates)
+	active := activePod(live, port.Spec.Node)
 
 	if active == nil {
-		if port.Spec.Node == "" || len(livePods(pods.Items)) > 0 {
-			return false, nil // detached already, or several candidates and none current
+		if port.Spec.Node == "" || len(live) > 0 {
+			return nil, nil // detached already, or several candidates and none current
 		}
 		port.Spec.Node, port.Spec.NodeIP = "", ""
 		if err := r.Update(ctx, port); err != nil {
-			return false, err
+			return nil, err
 		}
 		log.FromContext(ctx).Info("detached claimed port; no pod holds it", "port", port.Name)
-		return false, nil
+		return nil, nil
 	}
 
 	nodeIP, err := r.nodeInternalIP(ctx, active.Spec.NodeName)
 	if err != nil {
-		return true, err
+		return active, err
 	}
 	if port.Spec.Node == active.Spec.NodeName && port.Spec.NodeIP == nodeIP &&
 		port.Labels[sdnv1alpha1.LabelPodUID] == string(active.UID) {
-		return true, nil
+		return active, nil
 	}
 	moved := port.Spec.Node != active.Spec.NodeName
 	port.Spec.Node = active.Spec.NodeName
@@ -217,12 +224,28 @@ func (r *PortClaimReconciler) bind(ctx context.Context, claim *sdnv1alpha1.PortC
 	port.Labels[sdnv1alpha1.LabelPodName] = active.Name
 	port.Labels[sdnv1alpha1.LabelPodUID] = string(active.UID)
 	if err := r.Update(ctx, port); err != nil {
-		return true, err
+		return active, err
 	}
 	if moved {
 		log.FromContext(ctx).Info("claimed port re-pointed", "port", port.Name, "node", active.Spec.NodeName, "pod", active.Name)
 	}
-	return true, nil
+	return active, nil
+}
+
+// preClaimPod returns the pod the Port records when it exists and names no PortClaim, such as a pod started before its Port was adopted.
+func (r *PortClaimReconciler) preClaimPod(ctx context.Context, claim *sdnv1alpha1.PortClaim, port *sdnv1alpha1.Port) (*corev1.Pod, error) {
+	name, uid := port.Labels[sdnv1alpha1.LabelPodName], port.Labels[sdnv1alpha1.LabelPodUID]
+	if name == "" || uid == "" || port.Labels[sdnv1alpha1.LabelPodNamespace] != claim.Namespace {
+		return nil, nil
+	}
+	pod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: claim.Namespace, Name: name}, pod); err != nil {
+		return nil, client.IgnoreNotFound(err)
+	}
+	if string(pod.UID) != uid || len(PodPortClaim(pod)) > 0 {
+		return nil, nil
+	}
+	return pod, nil
 }
 
 // livePods returns the pods that are scheduled and neither terminating nor finished.
@@ -251,7 +274,7 @@ func activePod(live []*corev1.Pod, node string) *corev1.Pod {
 	return nil
 }
 
-func (r *PortClaimReconciler) updateStatus(ctx context.Context, claim *sdnv1alpha1.PortClaim, port *sdnv1alpha1.Port, bound bool) error {
+func (r *PortClaimReconciler) updateStatus(ctx context.Context, claim *sdnv1alpha1.PortClaim, port *sdnv1alpha1.Port, holder *corev1.Pod) error {
 	status := *claim.Status.DeepCopy()
 	if port != nil {
 		status.IP, status.MAC = port.Spec.IP, port.Spec.MAC
@@ -261,8 +284,10 @@ func (r *PortClaimReconciler) updateStatus(ctx context.Context, claim *sdnv1alph
 	switch {
 	case port == nil:
 		cond.Status, cond.Reason, cond.Message = metav1.ConditionFalse, "NoPort", "no pod has bound the claim yet"
-	case !bound:
+	case holder == nil:
 		cond.Status, cond.Reason, cond.Message = metav1.ConditionFalse, "Detached", "the claim's Port is reserved; no pod holds it"
+	case len(PodPortClaim(holder)) == 0:
+		cond.Reason, cond.Message = "PreClaimPod", "a pod that does not name the claim holds its Port; restart the workload before migrating it"
 	}
 	meta.SetStatusCondition(&status.Conditions, cond)
 	if status.IP == claim.Status.IP && status.MAC == claim.Status.MAC &&
@@ -298,7 +323,7 @@ func (r *PortClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&sdnv1alpha1.PortClaim{}).
 		Watches(&sdnv1alpha1.Port{}, handler.EnqueueRequestsFromMapFunc(mapPortToClaim)).
-		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(mapPodToClaim)).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.mapPodToClaim)).
 		Named("portclaim").
 		Complete(r)
 }
@@ -315,10 +340,21 @@ func mapPortToClaim(_ context.Context, obj client.Object) []ctrl.Request {
 	return nil
 }
 
-// mapPodToClaim enqueues the claim a pod's annotation names.
-func mapPodToClaim(_ context.Context, obj client.Object) []ctrl.Request {
+// mapPodToClaim enqueues the claim a pod's annotation names, or the claim of the Port an ending pre-claim pod holds.
+func (r *PortClaimReconciler) mapPodToClaim(ctx context.Context, obj client.Object) []ctrl.Request {
 	if names := PodPortClaim(obj); len(names) == 1 {
 		return []ctrl.Request{{NamespacedName: types.NamespacedName{Namespace: obj.GetNamespace(), Name: names[0]}}}
 	}
-	return nil
+	if pod, ok := obj.(*corev1.Pod); !ok || len(livePods([]corev1.Pod{*pod})) > 0 {
+		return nil
+	}
+	var ports sdnv1alpha1.PortList
+	if err := r.List(ctx, &ports, client.MatchingLabels{sdnv1alpha1.LabelPodUID: string(obj.GetUID())}); err != nil {
+		return nil
+	}
+	var reqs []ctrl.Request
+	for i := range ports.Items {
+		reqs = append(reqs, mapPortToClaim(ctx, &ports.Items[i])...)
+	}
+	return reqs
 }
