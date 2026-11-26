@@ -98,6 +98,10 @@ type FloatingIPStatus struct {
 	// +optional
 	Phase FloatingIPPhase `json:"phase,omitempty"`
 
+	// ObservedGeneration is the metadata.generation this status was computed for.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
 	// Conditions represent the latest available observations.
 	// +listType=map
 	// +listMapKey=type

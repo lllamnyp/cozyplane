@@ -23,6 +23,7 @@ import (
 	"slices"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -76,6 +77,7 @@ func (vpcStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 	// never sets it.
 	vpc := obj.(*sdn.VPC)
 	vpc.Status = sdn.VPCStatus{}
+	vpc.Generation = 1
 }
 
 func (vpcStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
@@ -83,6 +85,9 @@ func (vpcStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object
 	newVPC := obj.(*sdn.VPC)
 	oldVPC := old.(*sdn.VPC)
 	newVPC.Status = oldVPC.Status
+	if !apiequality.Semantic.DeepEqual(newVPC.Spec, oldVPC.Spec) {
+		newVPC.Generation = oldVPC.Generation + 1
+	}
 }
 
 func (vpcStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {

@@ -292,7 +292,8 @@ func (r *PortClaimReconciler) updateStatus(ctx context.Context, claim *sdnv1alph
 	meta.SetStatusCondition(&status.Conditions, cond)
 	if status.IP == claim.Status.IP && status.MAC == claim.Status.MAC &&
 		meta.IsStatusConditionPresentAndEqual(claim.Status.Conditions, cond.Type, cond.Status) &&
-		meta.FindStatusCondition(claim.Status.Conditions, cond.Type).Reason == cond.Reason {
+		meta.FindStatusCondition(claim.Status.Conditions, cond.Type).Reason == cond.Reason &&
+		meta.FindStatusCondition(claim.Status.Conditions, cond.Type).ObservedGeneration == cond.ObservedGeneration {
 		return nil
 	}
 	claim.Status = status

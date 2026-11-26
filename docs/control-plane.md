@@ -559,6 +559,13 @@ The registries live in `pkg/registry/sdn/{vpc,port,vpcbinding,vpcgateway,…}`; 
 carries a `/status` subresource so the controller's `Status().Update()` works
 unchanged; the Port name is the atomic IP claim (etcd name-uniqueness).
 
+The same holds for `metadata.generation`: nothing outside the strategies sets it.
+Every kind's strategy sets it to 1 on create and increments it on an update that
+changes the spec, as the built-in registries do; a `/status` update never touches
+it. Controllers stamp each condition's `observedGeneration` on every reconcile,
+including one whose computed status did not change, so a condition stamped with an
+older generation means the controller has not yet reconciled the current spec.
+
 ## 7. First milestone to build
 
 Smallest slice that is observably alive, in order:

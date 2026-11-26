@@ -193,11 +193,11 @@ func (r *NATGatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			"NoFreeBlock", fmt.Sprintf("all %d port blocks are leased; a node without one cannot NAT through this NAT gateway", total))
 	}
 
-	if natStatusEqual(ngw.Status, status) {
-		return ctrl.Result{}, nil
-	}
 	for i := range status.Conditions {
 		status.Conditions[i].ObservedGeneration = ngw.Generation
+	}
+	if natStatusEqual(ngw.Status, status) {
+		return ctrl.Result{}, nil
 	}
 	ngw.Status = status
 	if err := r.Status().Update(ctx, ngw); err != nil {
@@ -799,7 +799,8 @@ func conditionsEqual(a, b []metav1.Condition) bool {
 	}
 	for _, ca := range a {
 		cb := meta.FindStatusCondition(b, ca.Type)
-		if cb == nil || cb.Status != ca.Status || cb.Reason != ca.Reason || cb.Message != ca.Message {
+		if cb == nil || cb.Status != ca.Status || cb.Reason != ca.Reason || cb.Message != ca.Message ||
+			cb.ObservedGeneration != ca.ObservedGeneration {
 			return false
 		}
 	}

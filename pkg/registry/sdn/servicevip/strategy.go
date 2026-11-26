@@ -23,6 +23,7 @@ import (
 	"net"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -76,13 +77,17 @@ func (serviceVIPStrategy) PrepareForCreate(ctx context.Context, obj runtime.Obje
 	// never sets it.
 	svip := obj.(*sdn.ServiceVIP)
 	svip.Status = sdn.ServiceVIPStatus{}
+	svip.Generation = 1
 }
 
 func (serviceVIPStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	// A spec update must not change status (that goes through /status).
-	newFIP := obj.(*sdn.ServiceVIP)
-	oldFIP := old.(*sdn.ServiceVIP)
-	newFIP.Status = oldFIP.Status
+	newVIP := obj.(*sdn.ServiceVIP)
+	oldVIP := old.(*sdn.ServiceVIP)
+	newVIP.Status = oldVIP.Status
+	if !apiequality.Semantic.DeepEqual(newVIP.Spec, oldVIP.Spec) {
+		newVIP.Generation = oldVIP.Generation + 1
+	}
 }
 
 // Validate pins the name to the address claim: a ServiceVIP must be named

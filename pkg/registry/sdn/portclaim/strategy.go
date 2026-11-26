@@ -22,6 +22,7 @@ import (
 	"net"
 	"slices"
 
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -72,10 +73,11 @@ func (portClaimStrategy) NamespaceScoped() bool {
 	return true
 }
 
-// PrepareForCreate clears status, defaults the VPC namespace to the claim's, and adds the Port finalizer.
+// PrepareForCreate clears status, sets generation 1, defaults the VPC namespace to the claim's, and adds the Port finalizer.
 func (portClaimStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 	pc := obj.(*sdn.PortClaim)
 	pc.Status = sdn.PortClaimStatus{}
+	pc.Generation = 1
 	if pc.Spec.VPCRef.Namespace == "" {
 		pc.Spec.VPCRef.Namespace = pc.Namespace
 		if pc.Spec.VPCRef.Namespace == "" {
@@ -91,6 +93,9 @@ func (portClaimStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.
 	newPC := obj.(*sdn.PortClaim)
 	oldPC := old.(*sdn.PortClaim)
 	newPC.Status = oldPC.Status
+	if !apiequality.Semantic.DeepEqual(newPC.Spec, oldPC.Spec) {
+		newPC.Generation = oldPC.Generation + 1
+	}
 }
 
 func (portClaimStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {

@@ -21,6 +21,7 @@ import (
 	"errors"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -67,15 +68,20 @@ func NewStrategy(typer runtime.ObjectTyper) strategy {
 
 func (strategy) NamespaceScoped() bool { return true }
 
-// PrepareForCreate clears status: it is the controller's, via /status.
+// PrepareForCreate clears status (the controller's, via /status) and sets generation 1.
 func (strategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 	o := obj.(*sdn.NATGateway)
 	o.Status = sdn.NATGatewayStatus{}
+	o.Generation = 1
 }
 
-// PrepareForUpdate keeps status: a spec update never changes it.
+// PrepareForUpdate keeps status and bumps the generation on a spec change.
 func (strategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
-	obj.(*sdn.NATGateway).Status = old.(*sdn.NATGateway).Status
+	n, o := obj.(*sdn.NATGateway), old.(*sdn.NATGateway)
+	n.Status = o.Status
+	if !apiequality.Semantic.DeepEqual(n.Spec, o.Spec) {
+		n.Generation = o.Generation + 1
+	}
 }
 
 func (strategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {

@@ -23,6 +23,7 @@ import (
 	"net"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -76,6 +77,7 @@ func (portStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 	// Status (group membership) is controller-owned via the /status subresource.
 	port := obj.(*sdn.Port)
 	port.Status = sdn.PortStatus{}
+	port.Generation = 1
 }
 
 func (portStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
@@ -84,6 +86,9 @@ func (portStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Objec
 	newPort := obj.(*sdn.Port)
 	oldPort := old.(*sdn.Port)
 	newPort.Status = oldPort.Status
+	if !apiequality.Semantic.DeepEqual(newPort.Spec, oldPort.Spec) {
+		newPort.Generation = oldPort.Generation + 1
+	}
 }
 
 // Validate pins the name to the address claim: a Port must be named exactly

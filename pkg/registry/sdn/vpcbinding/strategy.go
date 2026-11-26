@@ -23,6 +23,7 @@ import (
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
 	"github.com/lllamnyp/cozyplane/pkg/registry/sdn/authz"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -76,9 +77,14 @@ func (vpcBindingStrategy) NamespaceScoped() bool {
 }
 
 func (vpcBindingStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
+	obj.(*sdn.VPCBinding).Generation = 1
 }
 
 func (vpcBindingStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
+	n, o := obj.(*sdn.VPCBinding), old.(*sdn.VPCBinding)
+	if !apiequality.Semantic.DeepEqual(n.Spec, o.Spec) {
+		n.Generation = o.Generation + 1
+	}
 }
 
 // ExportVerb is the virtual verb on the referenced VPC that gates creating a

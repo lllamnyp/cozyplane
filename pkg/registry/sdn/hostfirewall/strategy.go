@@ -22,6 +22,7 @@ import (
 	"net"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -75,6 +76,7 @@ func (hostFirewallStrategy) PrepareForCreate(ctx context.Context, obj runtime.Ob
 	// never sets it.
 	hf := obj.(*sdn.HostFirewall)
 	hf.Status = sdn.HostFirewallStatus{}
+	hf.Generation = 1
 }
 
 func (hostFirewallStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
@@ -82,6 +84,9 @@ func (hostFirewallStrategy) PrepareForUpdate(ctx context.Context, obj, old runti
 	newHF := obj.(*sdn.HostFirewall)
 	oldHF := old.(*sdn.HostFirewall)
 	newHF.Status = oldHF.Status
+	if !apiequality.Semantic.DeepEqual(newHF.Spec, oldHF.Spec) {
+		newHF.Generation = oldHF.Generation + 1
+	}
 }
 
 func (hostFirewallStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {

@@ -324,6 +324,13 @@ func schema_cozyplane_api_sdn_v1alpha1_FloatingIPStatus(ref common.ReferenceCall
 							Format:      "",
 						},
 					},
+					"observedGeneration": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ObservedGeneration is the metadata.generation this status was computed for.",
+							Type:        []string{"integer"},
+							Format:      "int64",
+						},
+					},
 					"conditions": {
 						VendorExtensible: spec.VendorExtensible{
 							Extensions: spec.Extensions{

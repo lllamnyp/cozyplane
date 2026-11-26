@@ -126,6 +126,15 @@ spec:
   source-preserving) *and* `floating_egress` (the pod leaves *as* the address) — the
   egress identity a Service cannot express (tenet 5). The Service only supplies the
   address; cozyplane does the 1:1.
+- **Status names the spec it describes.** The apiserver sets `metadata.generation`
+  to 1 on create and bumps it on every spec change; the controller stamps
+  `status.observedGeneration` and each condition's `observedGeneration` on every
+  reconcile, including one whose computed status did not change. A consumer reads
+  `status.phase: Ready` as current only when `status.observedGeneration` equals
+  `metadata.generation`: after a retarget, the old target's `Ready` stays in place
+  until the controller has reconciled the new spec. The top-level field exists
+  because readiness is `status.phase` and `status.address`, which no condition
+  carries.
 
 ## 5. The VPCGateway NAT identity — a backend-less sibling
 
