@@ -85,11 +85,11 @@ func (r *VPCPeeringReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		status.Phase = sdnv1alpha1.VPCPeeringPhaseReady
 	}
 
-	if statusEqual(peering.Status, status) {
-		return ctrl.Result{}, nil
-	}
 	for i := range status.Conditions {
 		status.Conditions[i].ObservedGeneration = peering.Generation
+	}
+	if statusEqual(peering.Status, status) {
+		return ctrl.Result{}, nil
 	}
 	peering.Status = status
 	if err := r.Status().Update(ctx, peering); err != nil {
@@ -141,15 +141,16 @@ func setCondition(status *sdnv1alpha1.VPCPeeringStatus, condType string, ok bool
 	meta.SetStatusCondition(&status.Conditions, cond)
 }
 
-// statusEqual compares status ignoring condition timestamps/generation, so
-// reconciles converge instead of updating forever.
+// statusEqual compares status ignoring condition timestamps, so reconciles
+// converge instead of updating forever.
 func statusEqual(a, b sdnv1alpha1.VPCPeeringStatus) bool {
 	if a.Phase != b.Phase || a.PeerVNI != b.PeerVNI || len(a.Conditions) != len(b.Conditions) {
 		return false
 	}
 	for _, ca := range a.Conditions {
 		cb := meta.FindStatusCondition(b.Conditions, ca.Type)
-		if cb == nil || cb.Status != ca.Status || cb.Reason != ca.Reason || cb.Message != ca.Message {
+		if cb == nil || cb.Status != ca.Status || cb.Reason != ca.Reason || cb.Message != ca.Message ||
+			cb.ObservedGeneration != ca.ObservedGeneration {
 			return false
 		}
 	}

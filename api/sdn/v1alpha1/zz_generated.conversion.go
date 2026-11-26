@@ -857,6 +857,7 @@ func Convert_sdn_FloatingIPSpec_To_v1alpha1_FloatingIPSpec(in *sdn.FloatingIPSpe
 func autoConvert_v1alpha1_FloatingIPStatus_To_sdn_FloatingIPStatus(in *FloatingIPStatus, out *sdn.FloatingIPStatus, s conversion.Scope) error {
 	out.Address = in.Address
 	out.Phase = sdn.FloatingIPPhase(in.Phase)
+	out.ObservedGeneration = in.ObservedGeneration
 	out.Conditions = *(*[]v1.Condition)(unsafe.Pointer(&in.Conditions))
 	return nil
 }
@@ -869,6 +870,7 @@ func Convert_v1alpha1_FloatingIPStatus_To_sdn_FloatingIPStatus(in *FloatingIPSta
 func autoConvert_sdn_FloatingIPStatus_To_v1alpha1_FloatingIPStatus(in *sdn.FloatingIPStatus, out *FloatingIPStatus, s conversion.Scope) error {
 	out.Address = in.Address
 	out.Phase = FloatingIPPhase(in.Phase)
+	out.ObservedGeneration = in.ObservedGeneration
 	out.Conditions = *(*[]v1.Condition)(unsafe.Pointer(&in.Conditions))
 	return nil
 }

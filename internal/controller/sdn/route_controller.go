@@ -107,11 +107,11 @@ func (r *RouteTableReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
-	if status.ID == rt.Status.ID && conditionsEqual(status.Conditions, rt.Status.Conditions) {
-		return ctrl.Result{}, nil
-	}
 	for i := range status.Conditions {
 		status.Conditions[i].ObservedGeneration = rt.Generation
+	}
+	if status.ID == rt.Status.ID && conditionsEqual(status.Conditions, rt.Status.Conditions) {
+		return ctrl.Result{}, nil
 	}
 	rt.Status = status
 	if err := r.Status().Update(ctx, rt); err != nil {
@@ -283,11 +283,11 @@ func (r *RouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		Conditions: append([]metav1.Condition(nil), rt.Status.Conditions...),
 	}
 	setCond(&status.Conditions, sdnv1alpha1.RouteConditionResolved, v.state == sdnv1alpha1.RouteStateActive, v.reason, v.message)
-	if status.State == rt.Status.State && conditionsEqual(status.Conditions, rt.Status.Conditions) {
-		return ctrl.Result{}, nil
-	}
 	for i := range status.Conditions {
 		status.Conditions[i].ObservedGeneration = rt.Generation
+	}
+	if status.State == rt.Status.State && conditionsEqual(status.Conditions, rt.Status.Conditions) {
+		return ctrl.Result{}, nil
 	}
 	rt.Status = status
 	if err := r.Status().Update(ctx, rt); err != nil {

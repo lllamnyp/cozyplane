@@ -448,3 +448,43 @@ func TestFloatingIPClaimAnnotationOwnership(t *testing.T) {
 		t.Errorf("service %v, want a new Service annotated my-eip", got)
 	}
 }
+
+// A retarget onto another live Port leaves the computed status unchanged, but the
+// status must still acknowledge the new generation.
+func TestFloatingIPRetargetRestampsObservedGeneration(t *testing.T) {
+	fip := floatingIP("team-a", "web", "vpc-a", "10.0.0.5")
+	fip.Generation = 1
+	c := fipClient(t,
+		livePort("team-a", "vpc-a", "10.0.0.5", "node-1"),
+		livePort("team-a", "vpc-a", "10.0.0.6", "node-2"),
+		fip,
+	)
+	reconcileFIP(t, c, "team-a", "web")
+	assignServiceAddress(t, c, ownedFloatingService(t, c, "team-a", "web"), "203.0.113.7")
+	before := reconcileFIP(t, c, "team-a", "web")
+	if before.Status.Phase != sdnv1alpha1.FloatingIPPhaseReady || before.Status.ObservedGeneration != 1 {
+		t.Fatalf("before retarget: phase %q, observedGeneration %d; want Ready at 1",
+			before.Status.Phase, before.Status.ObservedGeneration)
+	}
+
+	// The apiserver bumps the generation on a spec change; the fake client does not.
+	before.Spec.Target = "10.0.0.6"
+	before.Generation = 2
+	if err := c.Update(context.Background(), before); err != nil {
+		t.Fatalf("retarget: %v", err)
+	}
+
+	after := reconcileFIP(t, c, "team-a", "web")
+	if after.Status.Phase != sdnv1alpha1.FloatingIPPhaseReady || after.Status.Address != before.Status.Address {
+		t.Fatalf("test is broken: the retarget should leave the status unchanged, got phase %q address %q",
+			after.Status.Phase, after.Status.Address)
+	}
+	if after.Status.ObservedGeneration != 2 {
+		t.Errorf("status.observedGeneration = %d, want 2", after.Status.ObservedGeneration)
+	}
+	for _, cond := range after.Status.Conditions {
+		if cond.ObservedGeneration != 2 {
+			t.Errorf("condition %s observedGeneration = %d, want 2", cond.Type, cond.ObservedGeneration)
+		}
+	}
+}

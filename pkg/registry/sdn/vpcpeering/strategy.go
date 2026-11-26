@@ -22,6 +22,7 @@ import (
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
 	"github.com/lllamnyp/cozyplane/pkg/registry/sdn/authz"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -86,6 +87,7 @@ func (vpcPeeringStrategy) PrepareForCreate(ctx context.Context, obj runtime.Obje
 	// never sets it.
 	peering := obj.(*sdn.VPCPeering)
 	peering.Status = sdn.VPCPeeringStatus{}
+	peering.Generation = 1
 }
 
 func (vpcPeeringStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
@@ -93,6 +95,9 @@ func (vpcPeeringStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime
 	newPeering := obj.(*sdn.VPCPeering)
 	oldPeering := old.(*sdn.VPCPeering)
 	newPeering.Status = oldPeering.Status
+	if !apiequality.Semantic.DeepEqual(newPeering.Spec, oldPeering.Spec) {
+		newPeering.Generation = oldPeering.Generation + 1
+	}
 }
 
 func (s vpcPeeringStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {

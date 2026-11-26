@@ -130,11 +130,11 @@ func (r *VPCGatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		status.Phase = sdnv1alpha1.VPCGatewayPhaseReady
 	}
 
-	if gwStatusEqual(gw.Status, status) {
-		return ctrl.Result{}, nil
-	}
 	for i := range status.Conditions {
 		status.Conditions[i].ObservedGeneration = gw.Generation
+	}
+	if gwStatusEqual(gw.Status, status) {
+		return ctrl.Result{}, nil
 	}
 	gw.Status = status
 	if err := r.Status().Update(ctx, gw); err != nil {
@@ -400,7 +400,8 @@ func gwStatusEqual(a, b sdnv1alpha1.VPCGatewayStatus) bool {
 	// timestamps are deliberately not compared — they change on every rebuild.
 	for _, ca := range a.Conditions {
 		cb := meta.FindStatusCondition(b.Conditions, ca.Type)
-		if cb == nil || cb.Status != ca.Status || cb.Reason != ca.Reason || cb.Message != ca.Message {
+		if cb == nil || cb.Status != ca.Status || cb.Reason != ca.Reason || cb.Message != ca.Message ||
+			cb.ObservedGeneration != ca.ObservedGeneration {
 			return false
 		}
 	}

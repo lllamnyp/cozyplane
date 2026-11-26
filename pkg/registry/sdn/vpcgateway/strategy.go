@@ -21,6 +21,7 @@ import (
 	"errors"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -77,13 +78,17 @@ func (vpcGatewayStrategy) PrepareForCreate(ctx context.Context, obj runtime.Obje
 	// never sets it.
 	gw := obj.(*sdn.VPCGateway)
 	gw.Status = sdn.VPCGatewayStatus{}
+	gw.Generation = 1
 }
 
 func (vpcGatewayStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	// A spec update must not change status (that goes through /status).
-	newPeering := obj.(*sdn.VPCGateway)
-	oldPeering := old.(*sdn.VPCGateway)
-	newPeering.Status = oldPeering.Status
+	newGW := obj.(*sdn.VPCGateway)
+	oldGW := old.(*sdn.VPCGateway)
+	newGW.Status = oldGW.Status
+	if !apiequality.Semantic.DeepEqual(newGW.Spec, oldGW.Spec) {
+		newGW.Generation = oldGW.Generation + 1
+	}
 }
 
 func (s vpcGatewayStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {

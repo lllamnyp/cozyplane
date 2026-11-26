@@ -22,6 +22,7 @@ import (
 	"net"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -75,6 +76,7 @@ func (floatingIPStrategy) PrepareForCreate(ctx context.Context, obj runtime.Obje
 	// never sets it.
 	fip := obj.(*sdn.FloatingIP)
 	fip.Status = sdn.FloatingIPStatus{}
+	fip.Generation = 1
 }
 
 func (floatingIPStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
@@ -82,6 +84,9 @@ func (floatingIPStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime
 	newFIP := obj.(*sdn.FloatingIP)
 	oldFIP := old.(*sdn.FloatingIP)
 	newFIP.Status = oldFIP.Status
+	if !apiequality.Semantic.DeepEqual(newFIP.Spec, oldFIP.Spec) {
+		newFIP.Generation = oldFIP.Generation + 1
+	}
 }
 
 func (floatingIPStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {

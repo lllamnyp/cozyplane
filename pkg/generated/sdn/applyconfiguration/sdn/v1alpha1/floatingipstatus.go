@@ -32,6 +32,8 @@ type FloatingIPStatusApplyConfiguration struct {
 	Address *string `json:"address,omitempty"`
 	// Phase is the current lifecycle phase of the FloatingIP.
 	Phase *sdnv1alpha1.FloatingIPPhase `json:"phase,omitempty"`
+	// ObservedGeneration is the metadata.generation this status was computed for.
+	ObservedGeneration *int64 `json:"observedGeneration,omitempty"`
 	// Conditions represent the latest available observations.
 	Conditions []v1.ConditionApplyConfiguration `json:"conditions,omitempty"`
 }
@@ -55,6 +57,14 @@ func (b *FloatingIPStatusApplyConfiguration) WithAddress(value string) *Floating
 // If called multiple times, the Phase field is set to the value of the last call.
 func (b *FloatingIPStatusApplyConfiguration) WithPhase(value sdnv1alpha1.FloatingIPPhase) *FloatingIPStatusApplyConfiguration {
 	b.Phase = &value
+	return b
+}
+
+// WithObservedGeneration sets the ObservedGeneration field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the ObservedGeneration field is set to the value of the last call.
+func (b *FloatingIPStatusApplyConfiguration) WithObservedGeneration(value int64) *FloatingIPStatusApplyConfiguration {
+	b.ObservedGeneration = &value
 	return b
 }
 

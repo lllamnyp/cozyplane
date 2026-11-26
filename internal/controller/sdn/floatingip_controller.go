@@ -165,11 +165,12 @@ func (r *FloatingIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		status.Phase = sdnv1alpha1.FloatingIPPhaseReady
 	}
 
-	if fipStatusEqual(fip.Status, status) {
-		return ctrl.Result{}, nil
-	}
+	status.ObservedGeneration = fip.Generation
 	for i := range status.Conditions {
 		status.Conditions[i].ObservedGeneration = fip.Generation
+	}
+	if fipStatusEqual(fip.Status, status) {
+		return ctrl.Result{}, nil
 	}
 	fip.Status = status
 	if err := r.Status().Update(ctx, fip); err != nil {
@@ -517,15 +518,17 @@ func setFIPCondition(status *sdnv1alpha1.FloatingIPStatus, condType string, ok b
 	meta.SetStatusCondition(&status.Conditions, cond)
 }
 
-// fipStatusEqual compares status ignoring condition timestamps/generation so
-// reconciles converge instead of updating forever.
+// fipStatusEqual compares status ignoring condition timestamps so reconciles
+// converge instead of updating forever.
 func fipStatusEqual(a, b sdnv1alpha1.FloatingIPStatus) bool {
-	if a.Phase != b.Phase || a.Address != b.Address || len(a.Conditions) != len(b.Conditions) {
+	if a.Phase != b.Phase || a.Address != b.Address || a.ObservedGeneration != b.ObservedGeneration ||
+		len(a.Conditions) != len(b.Conditions) {
 		return false
 	}
 	for _, ca := range a.Conditions {
 		cb := meta.FindStatusCondition(b.Conditions, ca.Type)
-		if cb == nil || cb.Status != ca.Status || cb.Reason != ca.Reason || cb.Message != ca.Message {
+		if cb == nil || cb.Status != ca.Status || cb.Reason != ca.Reason || cb.Message != ca.Message ||
+			cb.ObservedGeneration != ca.ObservedGeneration {
 			return false
 		}
 	}

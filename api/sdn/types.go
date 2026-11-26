@@ -352,6 +352,9 @@ type FloatingIPStatus struct {
 	// Phase is the current lifecycle phase of the FloatingIP.
 	Phase FloatingIPPhase
 
+	// ObservedGeneration is the metadata.generation this status was computed for.
+	ObservedGeneration int64
+
 	// Conditions represent the latest available observations.
 	Conditions []metav1.Condition
 }

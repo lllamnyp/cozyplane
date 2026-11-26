@@ -22,6 +22,7 @@ import (
 	"net"
 
 	"github.com/lllamnyp/cozyplane/api/sdn"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -75,12 +76,16 @@ func (securityGroupStrategy) PrepareForCreate(ctx context.Context, obj runtime.O
 	// Status (including the allocated id) is controller-owned via /status.
 	sg := obj.(*sdn.SecurityGroup)
 	sg.Status = sdn.SecurityGroupStatus{}
+	sg.Generation = 1
 }
 
 func (securityGroupStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	newSG := obj.(*sdn.SecurityGroup)
 	oldSG := old.(*sdn.SecurityGroup)
 	newSG.Status = oldSG.Status
+	if !apiequality.Semantic.DeepEqual(newSG.Spec, oldSG.Spec) {
+		newSG.Generation = oldSG.Generation + 1
+	}
 }
 
 func (securityGroupStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
